@@ -821,6 +821,380 @@ impl GdnLayerFusedKernel {
     }
 }
 
+pub struct CausalConv1dUpdateKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl CausalConv1dUpdateKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("causal_conv1d_update.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Decode-step causal 1D convolution update.
+    ///
+    /// state:  [conv_dim, kernel_size-1]  updated in-place
+    /// input:  [conv_dim]
+    /// weight: [conv_dim, kernel_size]
+    /// output: [conv_dim]
+    pub fn forward(
+        &self,
+        state: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        conv_dim: u32,
+        kernel_size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(state.device(), self.device);
+        assert_eq!(input.device(), self.device);
+        assert_eq!(weight.device(), self.device);
+        assert_eq!(output.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("causal_conv1d_update_f32")?;
+
+        let mut state_ptr: *mut c_void = state.as_mut_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut w_ptr: *const c_void = weight.as_ptr().cast();
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut cd = conv_dim as i32;
+        let mut ks = kernel_size as i32;
+
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(state_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(cd).cast(),
+            std::ptr::addr_of_mut!(ks).cast(),
+        ];
+
+        let block_size = 256u32;
+        let grid_size = (conv_dim + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
+}
+
+pub struct QkNormKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl QkNormKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("qk_norm.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Per-head RMSNorm on Q and K in-place.
+    ///
+    /// q:        [num_q_heads, head_dim]
+    /// k:        [num_kv_heads, head_dim]
+    /// q_weight: [head_dim]
+    /// k_weight: [head_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        q: &mut DeviceBuffer<f32>,
+        k: &mut DeviceBuffer<f32>,
+        q_weight: &DeviceBuffer<f32>,
+        k_weight: &DeviceBuffer<f32>,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        eps: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(q.device(), self.device);
+        assert_eq!(k.device(), self.device);
+        assert_eq!(q_weight.device(), self.device);
+        assert_eq!(k_weight.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("qk_norm_f32")?;
+
+        let mut q_ptr: *mut c_void = q.as_mut_ptr().cast();
+        let mut k_ptr: *mut c_void = k.as_mut_ptr().cast();
+        let mut qw_ptr: *const c_void = q_weight.as_ptr().cast();
+        let mut kw_ptr: *const c_void = k_weight.as_ptr().cast();
+        let mut nqh = num_q_heads as i32;
+        let mut nkh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+
+        let mut args: [*mut c_void; 8] = [
+            std::ptr::addr_of_mut!(q_ptr).cast(),
+            std::ptr::addr_of_mut!(k_ptr).cast(),
+            std::ptr::addr_of_mut!(qw_ptr).cast(),
+            std::ptr::addr_of_mut!(kw_ptr).cast(),
+            std::ptr::addr_of_mut!(nqh).cast(),
+            std::ptr::addr_of_mut!(nkh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(),
+            std::ptr::addr_of_mut!(ep).cast(),
+        ];
+
+        let total_heads = num_q_heads + num_kv_heads;
+        let block_size = 256u32.min(head_dim);
+        func.launch(
+            (total_heads, 1, 1),
+            (block_size, 1, 1),
+            block_size * 4,
+            stream,
+            &mut args,
+        )
+    }
+}
+
+pub struct RmsNormGatedKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl RmsNormGatedKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("rmsnorm_gated.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Gated RMSNorm: output = rms_norm(x) * silu(z)
+    ///
+    /// x, z:   [num_heads, value_dim]
+    /// weight: [value_dim]
+    /// output: [num_heads, value_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        z: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        num_heads: u32,
+        value_dim: u32,
+        eps: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(output.device(), self.device);
+        assert_eq!(x.device(), self.device);
+        assert_eq!(z.device(), self.device);
+        assert_eq!(weight.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("rmsnorm_gated_f32")?;
+
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut x_ptr: *const c_void = x.as_ptr().cast();
+        let mut z_ptr: *const c_void = z.as_ptr().cast();
+        let mut w_ptr: *const c_void = weight.as_ptr().cast();
+        let mut nh = num_heads as i32;
+        let mut vd = value_dim as i32;
+        let mut ep = eps;
+
+        let mut args: [*mut c_void; 7] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(x_ptr).cast(),
+            std::ptr::addr_of_mut!(z_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(nh).cast(),
+            std::ptr::addr_of_mut!(vd).cast(),
+            std::ptr::addr_of_mut!(ep).cast(),
+        ];
+
+        let block_size = 256u32.min(value_dim);
+        func.launch(
+            (num_heads, 1, 1),
+            (block_size, 1, 1),
+            block_size * 4,
+            stream,
+            &mut args,
+        )
+    }
+}
+
+pub struct OutputGateKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl OutputGateKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("output_gate.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// output = attn_output * sigmoid(gate)
+    pub fn forward(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        attn_output: &DeviceBuffer<f32>,
+        gate: &DeviceBuffer<f32>,
+        size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(output.device(), self.device);
+        assert_eq!(attn_output.device(), self.device);
+        assert_eq!(gate.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("output_gate_f32")?;
+
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut attn_ptr: *const c_void = attn_output.as_ptr().cast();
+        let mut gate_ptr: *const c_void = gate.as_ptr().cast();
+        let mut sz = size as i32;
+
+        let mut args: [*mut c_void; 4] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(attn_ptr).cast(),
+            std::ptr::addr_of_mut!(gate_ptr).cast(),
+            std::ptr::addr_of_mut!(sz).cast(),
+        ];
+
+        let block_size = 256u32;
+        let grid_size = (size + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
+}
+
+pub struct GdnGateKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl GdnGateKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("gdn_gate.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Compute GDN decay gate: gate[h] = exp(-exp(A_log[h]) * softplus(a[h] + dt_bias[h]))
+    ///
+    /// Output is in (0, 1) — a proper decay factor.
+    pub fn forward(
+        &self,
+        gate: &mut DeviceBuffer<f32>,
+        a_log: &DeviceBuffer<f32>,
+        a: &DeviceBuffer<f32>,
+        dt_bias: &DeviceBuffer<f32>,
+        num_heads: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(gate.device(), self.device);
+        assert_eq!(a_log.device(), self.device);
+        assert_eq!(a.device(), self.device);
+        assert_eq!(dt_bias.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("gdn_gate_f32")?;
+
+        let mut gate_ptr: *mut c_void = gate.as_mut_ptr().cast();
+        let mut alog_ptr: *const c_void = a_log.as_ptr().cast();
+        let mut a_ptr: *const c_void = a.as_ptr().cast();
+        let mut dt_ptr: *const c_void = dt_bias.as_ptr().cast();
+        let mut nh = num_heads as i32;
+
+        let mut args: [*mut c_void; 5] = [
+            std::ptr::addr_of_mut!(gate_ptr).cast(),
+            std::ptr::addr_of_mut!(alog_ptr).cast(),
+            std::ptr::addr_of_mut!(a_ptr).cast(),
+            std::ptr::addr_of_mut!(dt_ptr).cast(),
+            std::ptr::addr_of_mut!(nh).cast(),
+        ];
+
+        let block_size = 256u32;
+        let grid_size = (num_heads + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
+}
+
+pub struct GdnRecurrentStepV2Kernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl GdnRecurrentStepV2Kernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("gdn_recurrent_step_v2.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// GDN recurrent step v2: pre-computed decay gate, L2-normalized Q and K.
+    ///
+    /// q, k:   [num_heads, key_dim]
+    /// v:      [num_heads, value_dim]
+    /// gate:   [num_heads] — pre-computed decay factors in (0,1) from GdnGateKernel
+    /// b:      [num_heads] — beta logits (sigmoid applied inside)
+    /// state:  [num_heads, key_dim, value_dim]  updated in-place
+    /// output: [num_heads, value_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<f32>,
+        v: &DeviceBuffer<f32>,
+        gate: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        state: &mut DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        num_heads: u32,
+        key_dim: u32,
+        value_dim: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(q.device(), self.device);
+        assert_eq!(k.device(), self.device);
+        assert_eq!(v.device(), self.device);
+        assert_eq!(gate.device(), self.device);
+        assert_eq!(b.device(), self.device);
+        assert_eq!(state.device(), self.device);
+        assert_eq!(output.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("gdn_recurrent_step_v2_f32")?;
+
+        let mut q_ptr: *const c_void = q.as_ptr().cast();
+        let mut k_ptr: *const c_void = k.as_ptr().cast();
+        let mut v_ptr: *const c_void = v.as_ptr().cast();
+        let mut gate_ptr: *const c_void = gate.as_ptr().cast();
+        let mut b_ptr: *const c_void = b.as_ptr().cast();
+        let mut state_ptr: *mut c_void = state.as_mut_ptr().cast();
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut kd = key_dim as i32;
+        let mut vd = value_dim as i32;
+
+        let mut args: [*mut c_void; 9] = [
+            std::ptr::addr_of_mut!(q_ptr).cast(),
+            std::ptr::addr_of_mut!(k_ptr).cast(),
+            std::ptr::addr_of_mut!(v_ptr).cast(),
+            std::ptr::addr_of_mut!(gate_ptr).cast(),
+            std::ptr::addr_of_mut!(b_ptr).cast(),
+            std::ptr::addr_of_mut!(state_ptr).cast(),
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(kd).cast(),
+            std::ptr::addr_of_mut!(vd).cast(),
+        ];
+
+        // Shared memory: 2 * block_size floats for q/k norm reductions
+        let block_size = 256u32;
+        let shared_bytes = block_size * 4 * 2;
+        func.launch(
+            (num_heads, 1, 1),
+            (block_size, 1, 1),
+            shared_bytes,
+            stream,
+            &mut args,
+        )
+    }
+}
+
 pub struct AttnLayerFusedKernel {
     module: Module,
     device: DeviceId,

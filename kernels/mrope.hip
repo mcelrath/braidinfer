@@ -19,7 +19,7 @@ extern "C" __global__ void mrope_f32(
     const int num_q_heads,
     const int num_kv_heads,
     const int head_dim,
-    const int rope_dim,           // = 32 for Qwen3.5-0.8B
+    const int rope_dim,           // = 64 for Qwen3.5-0.8B
     const int section0_pairs,     // = 11
     const int section1_pairs,     // = 11
     const int section2_pairs      // = 10
