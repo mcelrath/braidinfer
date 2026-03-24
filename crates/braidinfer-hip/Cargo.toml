@@ -1,0 +1,12 @@
+[package]
+name = "braidinfer-hip"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+links = "braidinfer_kernels"
+
+[dependencies]
+braidinfer-core = { workspace = true }
+
+[build-dependencies]
+cc = "1"

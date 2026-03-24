@@ -1,0 +1,8 @@
+[package]
+name = "braidinfer-runtime"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+braidinfer-core = { workspace = true }
+braidinfer-hip = { workspace = true }

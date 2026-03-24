@@ -1,0 +1,146 @@
+use crate::{error, ffi, HipResult};
+use braidinfer_core::types::DeviceId;
+use std::marker::PhantomData;
+use std::ptr;
+
+/// GPU device memory buffer. Encodes device ID to prevent cross-device misuse.
+/// Deliberately NOT Send/Sync — GPU pointers are device-local.
+pub struct DeviceBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+    device: DeviceId,
+    _marker: PhantomData<*mut T>, // !Send, !Sync
+}
+
+impl<T> DeviceBuffer<T> {
+    pub fn alloc(device: DeviceId, len: usize) -> HipResult<Self> {
+        crate::device::Device::set_current(device)?;
+        let size = len * std::mem::size_of::<T>();
+        let mut ptr: *mut std::ffi::c_void = ptr::null_mut();
+        error::check(unsafe { ffi::hipMalloc(&mut ptr, size) })?;
+        Ok(DeviceBuffer {
+            ptr: ptr.cast(),
+            len,
+            device,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    pub fn size_bytes(&self) -> usize {
+        self.len * std::mem::size_of::<T>()
+    }
+
+    pub fn copy_from_host(&mut self, data: &[T]) -> HipResult<()> {
+        assert!(data.len() <= self.len, "source larger than buffer");
+        let size = data.len() * std::mem::size_of::<T>();
+        error::check(unsafe {
+            ffi::hipMemcpy(
+                self.ptr.cast(),
+                data.as_ptr().cast(),
+                size,
+                ffi::hipMemcpyHostToDevice,
+            )
+        })
+    }
+
+    pub fn copy_to_host(&self, data: &mut [T]) -> HipResult<()> {
+        assert!(data.len() >= self.len, "destination smaller than buffer");
+        let size = self.len * std::mem::size_of::<T>();
+        error::check(unsafe {
+            ffi::hipMemcpy(
+                data.as_mut_ptr().cast(),
+                self.ptr.cast(),
+                size,
+                ffi::hipMemcpyDeviceToHost,
+            )
+        })
+    }
+}
+
+impl<T> Drop for DeviceBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            let _ = crate::device::Device::set_current(self.device);
+            unsafe { ffi::hipFree(self.ptr.cast()) };
+        }
+    }
+}
+
+/// Pinned host memory buffer. Required for hipMemcpyAsync.
+/// Safe to access from any thread (IS Send+Sync).
+pub struct PinnedBuffer<T> {
+    ptr: *mut T,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+// Pinned memory is host memory, safe to share across threads
+unsafe impl<T: Send> Send for PinnedBuffer<T> {}
+unsafe impl<T: Sync> Sync for PinnedBuffer<T> {}
+
+impl<T> PinnedBuffer<T> {
+    pub fn alloc(len: usize) -> HipResult<Self> {
+        let size = len * std::mem::size_of::<T>();
+        let mut ptr: *mut std::ffi::c_void = ptr::null_mut();
+        error::check(unsafe {
+            ffi::hipHostMalloc(&mut ptr, size, ffi::hipHostMallocDefault)
+        })?;
+        Ok(PinnedBuffer {
+            ptr: ptr.cast(),
+            len,
+            _marker: PhantomData,
+        })
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.ptr
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl<T> Drop for PinnedBuffer<T> {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::hipHostFree(self.ptr.cast()) };
+        }
+    }
+}
