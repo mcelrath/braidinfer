@@ -88,6 +88,25 @@ unsafe extern "C" {
         extra: *mut *mut c_void,
     ) -> hipError_t;
     pub fn hipModuleUnload(module: hipModule_t) -> hipError_t;
+    pub fn hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(
+        num_blocks: *mut c_int,
+        func: hipFunction_t,
+        block_size: c_int,
+        dyn_shared_mem_per_blk: usize,
+    ) -> hipError_t;
+    // Cooperative kernel launch (module-loaded kernels)
+    pub fn hipModuleLaunchCooperativeKernel(
+        f: hipFunction_t,
+        grid_dim_x: c_uint,
+        grid_dim_y: c_uint,
+        grid_dim_z: c_uint,
+        block_dim_x: c_uint,
+        block_dim_y: c_uint,
+        block_dim_z: c_uint,
+        shared_mem_bytes: c_uint,
+        stream: hipStream_t,
+        kernel_params: *mut *mut c_void,
+    ) -> hipError_t;
 
     // Event management
     pub fn hipEventCreate(event: *mut hipEvent_t) -> hipError_t;

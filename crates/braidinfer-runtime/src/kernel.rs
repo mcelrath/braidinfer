@@ -6,7 +6,7 @@ use braidinfer_hip::HipResult;
 use std::ffi::c_void;
 use std::path::PathBuf;
 
-fn kernel_dir() -> PathBuf {
+pub(crate) fn kernel_dir() -> PathBuf {
     PathBuf::from(env!("BRAIDINFER_KERNEL_DIR"))
 }
 

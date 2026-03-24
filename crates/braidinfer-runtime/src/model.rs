@@ -201,18 +201,18 @@ impl AllKernels {
 // ---- Main model struct ----
 
 pub struct Qwen35Model {
-    config: ModelConfig,
-    device: DeviceId,
-    stream: Stream,
+    pub(crate) config: ModelConfig,
+    pub(crate) device: DeviceId,
+    pub(crate) stream: Stream,
     kernels: AllKernels,
-    embed_weight: DeviceBuffer<f32>,
-    final_norm_weight: DeviceBuffer<f32>,
-    layers: Vec<LayerWeights>,
-    activations: ActivationBuffers,
-    gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
-    kv_caches: Vec<KvCache>,
-    gdn_states: Vec<GdnState>,
-    seq_len: u32,
+    pub(crate) embed_weight: DeviceBuffer<f32>,
+    pub(crate) final_norm_weight: DeviceBuffer<f32>,
+    pub(crate) layers: Vec<LayerWeights>,
+    pub(crate) activations: ActivationBuffers,
+    pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
+    pub(crate) kv_caches: Vec<KvCache>,
+    pub(crate) gdn_states: Vec<GdnState>,
+    pub(crate) seq_len: u32,
 }
 
 // ---- Error type ----
@@ -989,6 +989,20 @@ impl Qwen35Model {
         unsafe {
             self.ffn_forward(&*post_norm_w, &*w_gate_w, &*w_up_w, &*w_down_w)
         }
+    }
+
+    pub fn stream(&self) -> &Stream { &self.stream }
+    pub fn vocab_size(&self) -> usize { self.config.vocab_size }
+
+    pub fn set_position(&mut self, position: u32) -> HipResult<()> {
+        let pos_data = [position as i32, position as i32, position as i32];
+        self.activations.position_ids.copy_from_host(&pos_data)
+    }
+
+    pub fn read_logits(&self) -> Result<Vec<f32>, ModelError> {
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
+        Ok(logits)
     }
 
     /// Run a single decode step. Returns logits [vocab_size].
