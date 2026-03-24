@@ -14,7 +14,7 @@ fn main() {
         .join("kernels");
 
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
-    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "gdn_recurrent_step", "mrope", "gqa_attention"];
+    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "gdn_recurrent_step", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused"];
 
     for kernel in &kernels {
         let src = kernel_dir.join(format!("{kernel}.hip"));

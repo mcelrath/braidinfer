@@ -476,6 +476,129 @@ impl MRoPEKernel {
     }
 }
 
+pub struct FfnFusedKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl FfnFusedKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("ffn_fused.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Sub-kernel 1: RMSNorm → gate_proj + up_proj → silu(gate)*up → scratch
+    ///
+    /// input:      [hidden_size]
+    /// rms_weight: [hidden_size]
+    /// w_gate:     [intermediate_size, hidden_size]
+    /// w_up:       [intermediate_size, hidden_size]
+    /// scratch:    [intermediate_size]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_gate_up(
+        &self,
+        scratch: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        rms_weight: &DeviceBuffer<f32>,
+        w_gate: &DeviceBuffer<f32>,
+        w_up: &DeviceBuffer<f32>,
+        hidden_size: u32,
+        intermediate_size: u32,
+        eps: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(input.device(), self.device);
+        assert_eq!(rms_weight.device(), self.device);
+        assert_eq!(w_gate.device(), self.device);
+        assert_eq!(w_up.device(), self.device);
+        assert_eq!(scratch.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("ffn_fused_gate_up_f32")?;
+
+        let mut scratch_ptr: *mut c_void = scratch.as_mut_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut rw_ptr: *const c_void = rms_weight.as_ptr().cast();
+        let mut wg_ptr: *const c_void = w_gate.as_ptr().cast();
+        let mut wu_ptr: *const c_void = w_up.as_ptr().cast();
+        let mut hs = hidden_size as i32;
+        let mut is_ = intermediate_size as i32;
+        let mut ep = eps;
+
+        let mut args: [*mut c_void; 8] = [
+            std::ptr::addr_of_mut!(scratch_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(rw_ptr).cast(),
+            std::ptr::addr_of_mut!(wg_ptr).cast(),
+            std::ptr::addr_of_mut!(wu_ptr).cast(),
+            std::ptr::addr_of_mut!(hs).cast(),
+            std::ptr::addr_of_mut!(is_).cast(),
+            std::ptr::addr_of_mut!(ep).cast(),
+        ];
+
+        let block_size = 256u32.min(hidden_size);
+        func.launch(
+            (intermediate_size, 1, 1),
+            (block_size, 1, 1),
+            block_size * 4,
+            stream,
+            &mut args,
+        )
+    }
+
+    /// Sub-kernel 2: down_proj(scratch) + residual(input) → output
+    ///
+    /// output:  [hidden_size]
+    /// input:   [hidden_size] — original input (residual)
+    /// w_down:  [hidden_size, intermediate_size]
+    /// scratch: [intermediate_size]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_down_residual(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        w_down: &DeviceBuffer<f32>,
+        scratch: &DeviceBuffer<f32>,
+        hidden_size: u32,
+        intermediate_size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(output.device(), self.device);
+        assert_eq!(input.device(), self.device);
+        assert_eq!(w_down.device(), self.device);
+        assert_eq!(scratch.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let func = self.module.get_function("ffn_fused_down_residual_f32")?;
+
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut wd_ptr: *const c_void = w_down.as_ptr().cast();
+        let mut sc_ptr: *const c_void = scratch.as_ptr().cast();
+        let mut hs = hidden_size as i32;
+        let mut is_ = intermediate_size as i32;
+
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(wd_ptr).cast(),
+            std::ptr::addr_of_mut!(sc_ptr).cast(),
+            std::ptr::addr_of_mut!(hs).cast(),
+            std::ptr::addr_of_mut!(is_).cast(),
+        ];
+
+        let block_size = 256u32.min(intermediate_size);
+        func.launch(
+            (hidden_size, 1, 1),
+            (block_size, 1, 1),
+            block_size * 4,
+            stream,
+            &mut args,
+        )
+    }
+}
+
 pub struct GqaAttentionKernel {
     module: Module,
     device: DeviceId,
@@ -548,5 +671,388 @@ impl GqaAttentionKernel {
             stream,
             &mut args,
         )
+    }
+}
+
+pub struct GdnLayerFusedKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl GdnLayerFusedKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("gdn_layer_fused.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Fused GDN decode layer: RMSNorm + Q/K/V/g/b projections + recurrent step + output proj + residual.
+    ///
+    /// scratch: [2*num_heads*key_dim + num_heads*value_dim + 2*num_heads + num_heads*value_dim] floats
+    /// state:   [num_heads * key_dim * value_dim] persistent recurrent state (updated in-place)
+    /// output:  [hidden_size]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        scratch: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        rms_weight: &DeviceBuffer<f32>,
+        w_q: &DeviceBuffer<f32>,
+        w_k: &DeviceBuffer<f32>,
+        w_v: &DeviceBuffer<f32>,
+        w_g: &DeviceBuffer<f32>,
+        w_b: &DeviceBuffer<f32>,
+        w_o: &DeviceBuffer<f32>,
+        state: &mut DeviceBuffer<f32>,
+        hidden_size: u32,
+        num_heads: u32,
+        key_dim: u32,
+        value_dim: u32,
+        eps: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(output.device(), self.device);
+        assert_eq!(scratch.device(), self.device);
+        assert_eq!(input.device(), self.device);
+        assert_eq!(rms_weight.device(), self.device);
+        assert_eq!(w_q.device(), self.device);
+        assert_eq!(w_k.device(), self.device);
+        assert_eq!(w_v.device(), self.device);
+        assert_eq!(w_g.device(), self.device);
+        assert_eq!(w_b.device(), self.device);
+        assert_eq!(w_o.device(), self.device);
+        assert_eq!(state.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        // --- Sub-kernel 1: RMSNorm + projections ---
+        {
+            let func = self.module.get_function("gdn_fused_proj_f32")?;
+
+            let mut scratch_ptr: *mut c_void = scratch.as_mut_ptr().cast();
+            let mut input_ptr: *const c_void = input.as_ptr().cast();
+            let mut rms_ptr: *const c_void = rms_weight.as_ptr().cast();
+            let mut wq_ptr: *const c_void = w_q.as_ptr().cast();
+            let mut wk_ptr: *const c_void = w_k.as_ptr().cast();
+            let mut wv_ptr: *const c_void = w_v.as_ptr().cast();
+            let mut wg_ptr: *const c_void = w_g.as_ptr().cast();
+            let mut wb_ptr: *const c_void = w_b.as_ptr().cast();
+            let mut hs = hidden_size as i32;
+            let mut nh = num_heads as i32;
+            let mut kd = key_dim as i32;
+            let mut vd = value_dim as i32;
+            let mut ep = eps;
+
+            let mut args: [*mut c_void; 13] = [
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(input_ptr).cast(),
+                std::ptr::addr_of_mut!(rms_ptr).cast(),
+                std::ptr::addr_of_mut!(wq_ptr).cast(),
+                std::ptr::addr_of_mut!(wk_ptr).cast(),
+                std::ptr::addr_of_mut!(wv_ptr).cast(),
+                std::ptr::addr_of_mut!(wg_ptr).cast(),
+                std::ptr::addr_of_mut!(wb_ptr).cast(),
+                std::ptr::addr_of_mut!(hs).cast(),
+                std::ptr::addr_of_mut!(nh).cast(),
+                std::ptr::addr_of_mut!(kd).cast(),
+                std::ptr::addr_of_mut!(vd).cast(),
+                std::ptr::addr_of_mut!(ep).cast(),
+            ];
+
+            let nk = num_heads * key_dim;
+            let nv = num_heads * value_dim;
+            let grid = 2 * nk + nv + 2 * num_heads;
+            let block_size = 256u32.min(hidden_size);
+            let shared_bytes = block_size * 4;
+            func.launch((grid, 1, 1), (block_size, 1, 1), shared_bytes, stream, &mut args)?;
+        }
+
+        // --- Sub-kernel 2: recurrent step ---
+        {
+            let func = self.module.get_function("gdn_fused_recurrent_f32")?;
+
+            let mut scratch_ptr: *mut c_void = scratch.as_mut_ptr().cast();
+            let mut state_ptr: *mut c_void = state.as_mut_ptr().cast();
+            let mut nh = num_heads as i32;
+            let mut kd = key_dim as i32;
+            let mut vd = value_dim as i32;
+
+            let mut args: [*mut c_void; 5] = [
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(state_ptr).cast(),
+                std::ptr::addr_of_mut!(nh).cast(),
+                std::ptr::addr_of_mut!(kd).cast(),
+                std::ptr::addr_of_mut!(vd).cast(),
+            ];
+
+            func.launch((num_heads, 1, 1), (256, 1, 1), 0, stream, &mut args)?;
+        }
+
+        // --- Sub-kernel 3: output projection + residual ---
+        {
+            let func = self.module.get_function("gdn_fused_output_f32")?;
+
+            let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+            let mut scratch_ptr: *const c_void = scratch.as_ptr().cast();
+            let mut input_ptr: *const c_void = input.as_ptr().cast();
+            let mut wo_ptr: *const c_void = w_o.as_ptr().cast();
+            let mut hs = hidden_size as i32;
+            let mut nh = num_heads as i32;
+            let mut kd = key_dim as i32;
+            let mut vd = value_dim as i32;
+
+            let mut args: [*mut c_void; 8] = [
+                std::ptr::addr_of_mut!(out_ptr).cast(),
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(input_ptr).cast(),
+                std::ptr::addr_of_mut!(wo_ptr).cast(),
+                std::ptr::addr_of_mut!(hs).cast(),
+                std::ptr::addr_of_mut!(nh).cast(),
+                std::ptr::addr_of_mut!(kd).cast(),
+                std::ptr::addr_of_mut!(vd).cast(),
+            ];
+
+            let block_size = 256u32.min(hidden_size);
+            let shared_bytes = block_size * 4;
+            func.launch((hidden_size, 1, 1), (block_size, 1, 1), shared_bytes, stream, &mut args)?;
+        }
+
+        Ok(())
+    }
+}
+
+pub struct AttnLayerFusedKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl AttnLayerFusedKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("attn_layer_fused.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    /// Fused attention decode layer:
+    ///   RMSNorm → QKV proj → mRoPE → KV-cache write → GQA attn → output proj → residual
+    ///
+    /// scratch:      [5120 f32] temporary workspace (q/k/v/attn_out)
+    /// input:        [hidden_size]
+    /// rms_weight:   [hidden_size]
+    /// w_q:          [num_q_heads*head_dim, hidden_size]
+    /// w_k:          [num_kv_heads*head_dim, hidden_size]
+    /// w_v:          [num_kv_heads*head_dim, hidden_size]
+    /// w_o:          [hidden_size, num_q_heads*head_dim]
+    /// inv_freq:     [rope_dim/2]
+    /// position_ids: [3]
+    /// k_cache:      [max_seq_len, num_kv_heads, head_dim]
+    /// v_cache:      [max_seq_len, num_kv_heads, head_dim]
+    /// output:       [hidden_size]
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        scratch: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        rms_weight: &DeviceBuffer<f32>,
+        w_q: &DeviceBuffer<f32>,
+        w_k: &DeviceBuffer<f32>,
+        w_v: &DeviceBuffer<f32>,
+        w_o: &DeviceBuffer<f32>,
+        inv_freq: &DeviceBuffer<f32>,
+        position_ids: &DeviceBuffer<i32>,
+        k_cache: &mut DeviceBuffer<f32>,
+        v_cache: &mut DeviceBuffer<f32>,
+        hidden_size: u32,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        rope_dim: u32,
+        section0_pairs: u32,
+        section1_pairs: u32,
+        section2_pairs: u32,
+        seq_pos: u32,
+        seq_len: u32,
+        max_seq_len: u32,
+        eps: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert_eq!(output.device(), self.device);
+        assert_eq!(scratch.device(), self.device);
+        assert_eq!(input.device(), self.device);
+        assert_eq!(rms_weight.device(), self.device);
+        assert_eq!(w_q.device(), self.device);
+        assert_eq!(w_k.device(), self.device);
+        assert_eq!(w_v.device(), self.device);
+        assert_eq!(w_o.device(), self.device);
+        assert_eq!(inv_freq.device(), self.device);
+        assert_eq!(position_ids.device(), self.device);
+        assert_eq!(k_cache.device(), self.device);
+        assert_eq!(v_cache.device(), self.device);
+        assert_eq!(stream.device(), self.device);
+
+        let q_out_dim  = num_q_heads  * head_dim;
+        let kv_out_dim = num_kv_heads * head_dim;
+
+        // Sub-kernel 1: RMSNorm + QKV projections
+        {
+            let func = self.module.get_function("attn_fused_proj_f32")?;
+
+            let mut scratch_ptr: *mut c_void   = scratch.as_mut_ptr().cast();
+            let mut in_ptr: *const c_void       = input.as_ptr().cast();
+            let mut rms_ptr: *const c_void      = rms_weight.as_ptr().cast();
+            let mut wq_ptr: *const c_void       = w_q.as_ptr().cast();
+            let mut wk_ptr: *const c_void       = w_k.as_ptr().cast();
+            let mut wv_ptr: *const c_void       = w_v.as_ptr().cast();
+            let mut hs  = hidden_size  as i32;
+            let mut nqh = num_q_heads  as i32;
+            let mut nkh = num_kv_heads as i32;
+            let mut hd  = head_dim     as i32;
+            let mut ep  = eps;
+
+            let mut args: [*mut c_void; 11] = [
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(in_ptr).cast(),
+                std::ptr::addr_of_mut!(rms_ptr).cast(),
+                std::ptr::addr_of_mut!(wq_ptr).cast(),
+                std::ptr::addr_of_mut!(wk_ptr).cast(),
+                std::ptr::addr_of_mut!(wv_ptr).cast(),
+                std::ptr::addr_of_mut!(hs).cast(),
+                std::ptr::addr_of_mut!(nqh).cast(),
+                std::ptr::addr_of_mut!(nkh).cast(),
+                std::ptr::addr_of_mut!(hd).cast(),
+                std::ptr::addr_of_mut!(ep).cast(),
+            ];
+
+            let grid_size  = q_out_dim + kv_out_dim * 2;
+            let block_size = 256u32.min(hidden_size);
+            func.launch(
+                (grid_size, 1, 1),
+                (block_size, 1, 1),
+                block_size * 4,
+                stream,
+                &mut args,
+            )?;
+        }
+
+        // Sub-kernel 2: mRoPE on Q,K + KV cache write
+        {
+            let func = self.module.get_function("attn_fused_rope_cache_f32")?;
+
+            let mut scratch_ptr: *mut c_void   = scratch.as_mut_ptr().cast();
+            let mut kc_ptr: *mut c_void         = k_cache.as_mut_ptr().cast();
+            let mut vc_ptr: *mut c_void         = v_cache.as_mut_ptr().cast();
+            let mut inv_ptr: *const c_void      = inv_freq.as_ptr().cast();
+            let mut pos_ptr: *const c_void      = position_ids.as_ptr().cast();
+            let mut nqh = num_q_heads   as i32;
+            let mut nkh = num_kv_heads  as i32;
+            let mut hd  = head_dim      as i32;
+            let mut rd  = rope_dim      as i32;
+            let mut s0  = section0_pairs as i32;
+            let mut s1  = section1_pairs as i32;
+            let mut s2  = section2_pairs as i32;
+            let mut sp  = seq_pos        as i32;
+            let mut msl = max_seq_len    as i32;
+
+            let mut args: [*mut c_void; 14] = [
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(kc_ptr).cast(),
+                std::ptr::addr_of_mut!(vc_ptr).cast(),
+                std::ptr::addr_of_mut!(inv_ptr).cast(),
+                std::ptr::addr_of_mut!(pos_ptr).cast(),
+                std::ptr::addr_of_mut!(nqh).cast(),
+                std::ptr::addr_of_mut!(nkh).cast(),
+                std::ptr::addr_of_mut!(hd).cast(),
+                std::ptr::addr_of_mut!(rd).cast(),
+                std::ptr::addr_of_mut!(s0).cast(),
+                std::ptr::addr_of_mut!(s1).cast(),
+                std::ptr::addr_of_mut!(s2).cast(),
+                std::ptr::addr_of_mut!(sp).cast(),
+                std::ptr::addr_of_mut!(msl).cast(),
+            ];
+
+            let total_heads = num_q_heads + num_kv_heads;
+            let total_pairs = rope_dim / 2;
+            // block must cover both rope pairs and head_dim for cache write
+            let block_size = 32u32.max(total_pairs).next_power_of_two().max(head_dim.min(256)).min(256);
+            func.launch(
+                (total_heads, 1, 1),
+                (block_size, 1, 1),
+                0,
+                stream,
+                &mut args,
+            )?;
+        }
+
+        // Sub-kernel 3: GQA decode attention
+        {
+            let func = self.module.get_function("attn_fused_attention_f32")?;
+
+            let mut scratch_ptr: *mut c_void   = scratch.as_mut_ptr().cast();
+            let mut kc_ptr: *const c_void       = k_cache.as_ptr().cast();
+            let mut vc_ptr: *const c_void       = v_cache.as_ptr().cast();
+            let mut nqh = num_q_heads  as i32;
+            let mut nkh = num_kv_heads as i32;
+            let mut hd  = head_dim     as i32;
+            let mut sl  = seq_len      as i32;
+            let mut msl = max_seq_len  as i32;
+
+            let mut args: [*mut c_void; 8] = [
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(kc_ptr).cast(),
+                std::ptr::addr_of_mut!(vc_ptr).cast(),
+                std::ptr::addr_of_mut!(nqh).cast(),
+                std::ptr::addr_of_mut!(nkh).cast(),
+                std::ptr::addr_of_mut!(hd).cast(),
+                std::ptr::addr_of_mut!(sl).cast(),
+                std::ptr::addr_of_mut!(msl).cast(),
+            ];
+
+            let block_size   = head_dim.min(256);
+            let shared_bytes = block_size * 4;
+            func.launch(
+                (num_q_heads, 1, 1),
+                (block_size, 1, 1),
+                shared_bytes,
+                stream,
+                &mut args,
+            )?;
+        }
+
+        // Sub-kernel 4: Output projection + residual
+        {
+            let func = self.module.get_function("attn_fused_output_f32")?;
+
+            let mut out_ptr: *mut c_void       = output.as_mut_ptr().cast();
+            let mut scratch_ptr: *const c_void = scratch.as_ptr().cast();
+            let mut in_ptr: *const c_void       = input.as_ptr().cast();
+            let mut wo_ptr: *const c_void       = w_o.as_ptr().cast();
+            let mut hs  = hidden_size  as i32;
+            let mut nqh = num_q_heads  as i32;
+            let mut nkh = num_kv_heads as i32;
+            let mut hd  = head_dim     as i32;
+
+            let mut args: [*mut c_void; 8] = [
+                std::ptr::addr_of_mut!(out_ptr).cast(),
+                std::ptr::addr_of_mut!(scratch_ptr).cast(),
+                std::ptr::addr_of_mut!(in_ptr).cast(),
+                std::ptr::addr_of_mut!(wo_ptr).cast(),
+                std::ptr::addr_of_mut!(hs).cast(),
+                std::ptr::addr_of_mut!(nqh).cast(),
+                std::ptr::addr_of_mut!(nkh).cast(),
+                std::ptr::addr_of_mut!(hd).cast(),
+            ];
+
+            let block_size = 256u32.min(q_out_dim);
+            func.launch(
+                (hidden_size, 1, 1),
+                (block_size, 1, 1),
+                256 * 4,
+                stream,
+                &mut args,
+            )?;
+        }
+
+        Ok(())
     }
 }
