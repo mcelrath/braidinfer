@@ -1,7 +1,7 @@
 #include <hip/hip_runtime.h>
 
 // Causal 1D convolution decode update (single token).
-// Shifts conv state left, inserts new input, computes depthwise conv + SiLU.
+// Computes depthwise conv + SiLU, then updates state for next step.
 //
 // state:   [conv_dim, kernel_size-1]  (updated in-place)
 // input:   [conv_dim]
@@ -24,14 +24,8 @@ extern "C" __global__ void causal_conv1d_update_f32(
     float* s = state + ch * hist;
     const float* w = weight + ch * kernel_size;
 
-    // Shift state left: s[0..hist-2] = s[1..hist-1]
-    for (int i = 0; i < hist - 1; i++) {
-        s[i] = s[i + 1];
-    }
-    // Insert new input at end
-    s[hist - 1] = input[ch];
-
-    // Compute depthwise conv: sum over kernel_size elements
+    // Compute depthwise conv: state holds previous (kernel_size-1) inputs
+    // conv = sum(s[k] * w[k] for k in 0..hist) + input * w[hist]
     float acc = 0.0f;
     for (int k = 0; k < hist; k++) {
         acc += s[k] * w[k];
@@ -40,4 +34,10 @@ extern "C" __global__ void causal_conv1d_update_f32(
 
     // SiLU activation
     output[ch] = acc / (1.0f + expf(-acc));
+
+    // Update state: shift left and insert new input for next step
+    for (int i = 0; i < hist - 1; i++) {
+        s[i] = s[i + 1];
+    }
+    s[hist - 1] = input[ch];
 }

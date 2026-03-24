@@ -54,6 +54,6 @@ extern "C" __global__ void qk_norm_f32(
     float rms = rsqrtf(shared[0] / (float)head_dim + eps);
 
     for (int i = tid; i < head_dim; i += stride) {
-        head_ptr[i] = head_ptr[i] * rms * weight_ptr[i];
+        head_ptr[i] = head_ptr[i] * rms * (1.0f + weight_ptr[i]);
     }
 }

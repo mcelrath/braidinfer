@@ -1,10 +1,17 @@
 #include <hip/hip_runtime.h>
 
-// GDN recurrent decode step v2: correct gate computation and QK L2-norm.
+// GDN recurrent decode step v2: Gated Delta Rule with QK L2-norm.
 // One block per head.
 //
-// Gate is pre-computed (already in (0,1) via gdn_gate kernel).
-// Q and K are L2-normalized per-head before outer product.
+// Implements the gated delta rule recurrence:
+//   q_norm = l2norm(q), k_norm = l2norm(k)
+//   q_scaled = q_norm / sqrt(key_dim)
+//   decay = gate (pre-computed, in (0,1))
+//   state *= decay
+//   kv_mem[j] = sum_i state[i,j] * k_norm[i]
+//   delta[j] = (v[j] - kv_mem[j]) * beta
+//   state[i,j] += k_norm[i] * delta[j]
+//   output[j] = sum_i state[i,j] * q_scaled[i]
 //
 // q, k: [num_heads, key_dim]
 // v:    [num_heads, value_dim]
@@ -62,26 +69,37 @@ extern "C" __global__ void gdn_recurrent_step_v2_f32(
         __syncthreads();
     }
 
-    float q_inv_norm = rsqrtf(sq[0] + 1e-8f);
-    float k_inv_norm = rsqrtf(sk[0] + 1e-8f);
+    float q_inv_norm = rsqrtf(sq[0] + 1e-6f);
+    float k_inv_norm = rsqrtf(sk[0] + 1e-6f);
+    float q_scale = q_inv_norm * rsqrtf((float)key_dim);
 
-    // Update state: S[i,j] = decay * S[i,j] + beta * v[j] * k_norm[i]
+    // Step 1: state *= decay
     const int total = key_dim * value_dim;
     for (int idx = tid; idx < total; idx += block_size) {
-        const int i = idx / value_dim;
-        const int j = idx % value_dim;
-        float k_norm_i = kh[i] * k_inv_norm;
-        sh[idx] = decay * sh[idx] + beta * vh[j] * k_norm_i;
+        sh[idx] *= decay;
     }
-
     __syncthreads();
 
-    // Output: o[j] = sum_i S[i,j] * q_norm[i]
+    // Step 2: kv_mem[j] = sum_i state[i,j] * k_norm[i], then delta[j] = (v[j] - kv_mem[j]) * beta
+    // Step 3: state[i,j] += k_norm[i] * delta[j]
+    // We process one j (value_dim column) per thread iteration
+    for (int j = tid; j < value_dim; j += block_size) {
+        float kv_mem = 0.0f;
+        for (int i = 0; i < key_dim; i++) {
+            kv_mem += sh[i * value_dim + j] * (kh[i] * k_inv_norm);
+        }
+        float delta = (vh[j] - kv_mem) * beta;
+        for (int i = 0; i < key_dim; i++) {
+            sh[i * value_dim + j] += (kh[i] * k_inv_norm) * delta;
+        }
+    }
+    __syncthreads();
+
+    // Step 4: output[j] = sum_i state[i,j] * q_scaled[i]
     for (int j = tid; j < value_dim; j += block_size) {
         float sum = 0.0f;
         for (int i = 0; i < key_dim; i++) {
-            float q_norm_i = qh[i] * q_inv_norm;
-            sum += sh[i * value_dim + j] * q_norm_i;
+            sum += sh[i * value_dim + j] * (qh[i] * q_scale);
         }
         oh[j] = sum;
     }

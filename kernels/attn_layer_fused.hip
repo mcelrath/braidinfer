@@ -83,7 +83,7 @@ extern "C" __global__ void attn_fused_proj_f32(
     // dot(w_row, rms_normalized_input)
     float acc = 0.0f;
     for (int i = tid; i < hidden_size; i += block_size) {
-        float normed = input[i] * rms * rms_weight[i];
+        float normed = input[i] * rms * (1.0f + rms_weight[i]);
         acc += w_row[i] * normed;
     }
     shmem[tid] = acc;

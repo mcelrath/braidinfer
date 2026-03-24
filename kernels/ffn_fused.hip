@@ -52,7 +52,7 @@ extern "C" __global__ void ffn_fused_gate_up_f32(
     float acc_gate = 0.0f;
     float acc_up   = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) {
-        float normed = input[i] * rms_scale * rms_weight[i];
+        float normed = input[i] * rms_scale * (1.0f + rms_weight[i]);
         acc_gate += wg[i] * normed;
         acc_up   += wu[i] * normed;
     }

@@ -97,7 +97,7 @@ extern "C" __global__ void gdn_fused_proj_f32(
     __syncthreads();
     float acc = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) {
-        acc += w[i] * (input[i] * rms * rms_weight[i]);
+        acc += w[i] * (input[i] * rms * (1.0f + rms_weight[i]));
     }
     shared[tid] = acc;
     __syncthreads();

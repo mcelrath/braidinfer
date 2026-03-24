@@ -881,11 +881,18 @@ impl Qwen35Model {
             )?;
         }
 
-        // 3. Split q_gate_attn: q=[nqh*hd=2048], gate=[nqh*hd=2048]
+        // 3. Split q_gate_attn: interleaved [q0_hd, gate0_hd, q1_hd, gate1_hd, ...]
+        //    → q=[nqh*hd], gate=[nqh*hd]
         let q_size = nqh as usize * hd as usize;
+        let hd_usize = hd as usize;
         unsafe {
-            d2d_copy_f32(&mut self.activations.q_attn, 0, &self.activations.q_gate_attn, 0, q_size)?;
-            d2d_copy_f32(&mut self.activations.gate_attn, 0, &self.activations.q_gate_attn, q_size, q_size)?;
+            for h in 0..nqh as usize {
+                let src_q = h * hd_usize * 2;
+                let src_g = h * hd_usize * 2 + hd_usize;
+                let dst = h * hd_usize;
+                d2d_copy_f32(&mut self.activations.q_attn, dst, &self.activations.q_gate_attn, src_q, hd_usize)?;
+                d2d_copy_f32(&mut self.activations.gate_attn, dst, &self.activations.q_gate_attn, src_g, hd_usize)?;
+            }
         }
 
         // 4. QK norm (in-place on q_attn, k_attn)
@@ -1044,6 +1051,209 @@ impl Qwen35Model {
 
         self.seq_len = position + 1;
         Ok(logits)
+    }
+
+    fn read_hidden(&self) -> Result<Vec<f32>, ModelError> {
+        self.stream.synchronize()?;
+        let mut buf = vec![0.0f32; self.config.hidden_size];
+        self.activations.hidden.copy_to_host(&mut buf)?;
+        Ok(buf)
+    }
+
+    pub fn decode_step_traced(&mut self, token_id: u32, position: u32) -> Result<(Vec<f32>, Vec<(String, Vec<f32>)>), ModelError> {
+        let hs = self.config.hidden_size as u32;
+        let vs = self.config.vocab_size as u32;
+        let mut traces: Vec<(String, Vec<f32>)> = Vec::new();
+
+        self.kernels.embedding.forward(
+            &mut self.activations.hidden, &self.embed_weight,
+            token_id as i32, hs, &self.stream,
+        )?;
+        traces.push(("embed".into(), self.read_hidden()?));
+
+        let mut gdn_idx = 0usize;
+        let mut kv_idx = 0usize;
+        for i in 0..self.config.num_layers {
+            if self.config.layer_is_attention[i] {
+                self.attention_forward(i, kv_idx, position)?;
+                kv_idx += 1;
+            } else {
+                self.gdn_forward(i, gdn_idx)?;
+                gdn_idx += 1;
+            }
+            traces.push((format!("layer_{i}"), self.read_hidden()?));
+        }
+
+        unsafe { d2d_copy_f32(&mut self.activations.normed, 0, &self.activations.hidden, 0, hs as usize)?; }
+        self.kernels.rmsnorm.forward(
+            &mut self.activations.hidden, &self.activations.normed,
+            &self.final_norm_weight, 1, hs, self.config.rms_norm_eps, &self.stream,
+        )?;
+        traces.push(("final_norm".into(), self.read_hidden()?));
+
+        self.kernels.lm_head.forward(
+            &mut self.activations.logits, &self.embed_weight,
+            &self.activations.hidden, vs, hs, &self.stream,
+        )?;
+        self.stream.synchronize()?;
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
+        self.seq_len = position + 1;
+        Ok((logits, traces))
+    }
+
+    fn read_buf(&self, buf: &DeviceBuffer<f32>) -> Result<Vec<f32>, ModelError> {
+        self.stream.synchronize()?;
+        let mut v = vec![0.0f32; buf.len()];
+        buf.copy_to_host(&mut v)?;
+        Ok(v)
+    }
+
+    pub fn gdn_layer0_trace(&mut self, token_id: u32) -> Result<Vec<(String, Vec<f32>)>, ModelError> {
+        let hs = self.config.hidden_size as u32;
+        let nh = self.config.linear_num_heads as u32;
+        let kd = self.config.linear_key_head_dim as u32;
+        let vd = self.config.linear_value_head_dim as u32;
+        let ck = self.config.linear_conv_kernel_dim as u32;
+        let eps = self.config.rms_norm_eps;
+        let mut traces: Vec<(String, Vec<f32>)> = Vec::new();
+
+        // Embedding
+        self.kernels.embedding.forward(
+            &mut self.activations.hidden, &self.embed_weight,
+            token_id as i32, hs, &self.stream,
+        )?;
+        traces.push(("embed".into(), self.read_hidden()?));
+
+        let weights = match &self.layers[0] {
+            LayerWeights::Gdn(w) => w as *const GdnLayerWeights,
+            _ => panic!("layer 0 not GDN"),
+        };
+        let w = unsafe { &*weights };
+
+        // RMSNorm
+        self.kernels.rmsnorm.forward(
+            &mut self.activations.normed, &self.activations.hidden,
+            &w.input_norm, 1, hs, eps, &self.stream,
+        )?;
+        traces.push(("normed".into(), self.read_buf(&self.activations.normed)?));
+
+        // QKV projection
+        self.kernels.linear_proj.forward(
+            &mut self.activations.qkv, &w.w_qkv, &self.activations.normed,
+            nh * kd * 2 + nh * vd, hs, &self.stream,
+        )?;
+        traces.push(("qkv_pre_conv".into(), self.read_buf(&self.activations.qkv)?));
+
+        // a, b, z projections
+        self.kernels.linear_proj.forward(
+            &mut self.activations.a_proj, &w.w_a, &self.activations.normed,
+            nh, hs, &self.stream,
+        )?;
+        self.kernels.linear_proj.forward(
+            &mut self.activations.b_proj, &w.w_b, &self.activations.normed,
+            nh, hs, &self.stream,
+        )?;
+        self.kernels.linear_proj.forward(
+            &mut self.activations.z_proj, &w.w_z, &self.activations.normed,
+            nh * vd, hs, &self.stream,
+        )?;
+        traces.push(("a_proj".into(), self.read_buf(&self.activations.a_proj)?));
+        traces.push(("b_proj".into(), self.read_buf(&self.activations.b_proj)?));
+        traces.push(("z_proj".into(), self.read_buf(&self.activations.z_proj)?));
+
+        // Conv1d: split qkv, run 3 separate convs, reassemble
+        let conv_q_len = (nh * kd) as usize;
+        let conv_k_len = (nh * kd) as usize;
+        let conv_v_len = (nh * vd) as usize;
+        let ck_usize = ck as usize;
+
+        unsafe {
+            d2d_copy_f32(&mut self.activations.q_gdn, 0, &self.activations.qkv, 0, conv_q_len)?;
+            d2d_copy_f32(&mut self.activations.k_gdn, 0, &self.activations.qkv, conv_q_len, conv_k_len)?;
+            d2d_copy_f32(&mut self.activations.v_gdn, 0, &self.activations.qkv, conv_q_len + conv_k_len, conv_v_len)?;
+        }
+
+        let mut conv_w_q = DeviceBuffer::<f32>::alloc(self.device, conv_q_len * ck_usize)?;
+        let mut conv_w_k = DeviceBuffer::<f32>::alloc(self.device, conv_k_len * ck_usize)?;
+        let mut conv_w_v = DeviceBuffer::<f32>::alloc(self.device, conv_v_len * ck_usize)?;
+        unsafe {
+            d2d_copy_f32(&mut conv_w_q, 0, &w.conv1d_weight, 0, conv_q_len * ck_usize)?;
+            d2d_copy_f32(&mut conv_w_k, 0, &w.conv1d_weight, conv_q_len * ck_usize, conv_k_len * ck_usize)?;
+            d2d_copy_f32(&mut conv_w_v, 0, &w.conv1d_weight, (conv_q_len + conv_k_len) * ck_usize, conv_v_len * ck_usize)?;
+        }
+
+        let conv_state_q_len = conv_q_len * (ck_usize - 1);
+        let conv_state_k_len = conv_k_len * (ck_usize - 1);
+        let conv_state_v_len = conv_v_len * (ck_usize - 1);
+
+        let mut cs_q = DeviceBuffer::<f32>::alloc(self.device, conv_state_q_len)?;
+        let mut cs_k = DeviceBuffer::<f32>::alloc(self.device, conv_state_k_len)?;
+        let mut cs_v = DeviceBuffer::<f32>::alloc(self.device, conv_state_v_len)?;
+        unsafe {
+            d2d_copy_f32(&mut cs_q, 0, &self.gdn_conv_states[0], 0, conv_state_q_len)?;
+            d2d_copy_f32(&mut cs_k, 0, &self.gdn_conv_states[0], conv_state_q_len, conv_state_k_len)?;
+            d2d_copy_f32(&mut cs_v, 0, &self.gdn_conv_states[0], conv_state_q_len + conv_state_k_len, conv_state_v_len)?;
+        }
+
+        let mut conv_out_q = DeviceBuffer::<f32>::alloc(self.device, conv_q_len)?;
+        let mut conv_out_k = DeviceBuffer::<f32>::alloc(self.device, conv_k_len)?;
+        let mut conv_out_v = DeviceBuffer::<f32>::alloc(self.device, conv_v_len)?;
+
+        self.kernels.causal_conv1d.forward(&mut cs_q, &self.activations.q_gdn, &conv_w_q, &mut conv_out_q, conv_q_len as u32, ck, &self.stream)?;
+        self.kernels.causal_conv1d.forward(&mut cs_k, &self.activations.k_gdn, &conv_w_k, &mut conv_out_k, conv_k_len as u32, ck, &self.stream)?;
+        self.kernels.causal_conv1d.forward(&mut cs_v, &self.activations.v_gdn, &conv_w_v, &mut conv_out_v, conv_v_len as u32, ck, &self.stream)?;
+
+        traces.push(("conv_out_q".into(), self.read_buf(&conv_out_q)?));
+        traces.push(("conv_out_k".into(), self.read_buf(&conv_out_k)?));
+        traces.push(("conv_out_v".into(), self.read_buf(&conv_out_v)?));
+
+        // Copy conv outputs to q/k/v
+        unsafe {
+            d2d_copy_f32(&mut self.activations.q_gdn, 0, &conv_out_q, 0, conv_q_len)?;
+            d2d_copy_f32(&mut self.activations.k_gdn, 0, &conv_out_k, 0, conv_k_len)?;
+            d2d_copy_f32(&mut self.activations.v_gdn, 0, &conv_out_v, 0, conv_v_len)?;
+        }
+
+        // Gate
+        self.kernels.gdn_gate.forward(
+            &mut self.activations.gate_gdn, &w.a_log, &self.activations.a_proj,
+            &w.dt_bias, nh, &self.stream,
+        )?;
+        traces.push(("gate".into(), self.read_buf(&self.activations.gate_gdn)?));
+
+        // Recurrent
+        self.kernels.gdn_recurrent_v2.forward(
+            &self.activations.q_gdn, &self.activations.k_gdn, &self.activations.v_gdn,
+            &self.activations.gate_gdn, &self.activations.b_proj,
+            &mut self.gdn_states[0].recurrent, &mut self.activations.recurrent_out,
+            nh, kd, vd, &self.stream,
+        )?;
+        traces.push(("recurrent_out".into(), self.read_buf(&self.activations.recurrent_out)?));
+
+        // RMSNormGated
+        self.kernels.rmsnorm_gated.forward(
+            &mut self.activations.normed_gated, &self.activations.recurrent_out,
+            &self.activations.z_proj, &w.output_norm, nh, vd, eps, &self.stream,
+        )?;
+        traces.push(("normed_gated".into(), self.read_buf(&self.activations.normed_gated)?));
+
+        // out_proj
+        self.kernels.linear_proj.forward(
+            &mut self.activations.out_proj, &w.w_out, &self.activations.normed_gated,
+            hs, nh * vd, &self.stream,
+        )?;
+        traces.push(("out_proj".into(), self.read_buf(&self.activations.out_proj)?));
+
+        // Residual
+        unsafe { d2d_copy_f32(&mut self.activations.residual, 0, &self.activations.hidden, 0, hs as usize)?; }
+        self.kernels.residual_add.forward(
+            &mut self.activations.hidden, &self.activations.out_proj,
+            &self.activations.residual, hs, &self.stream,
+        )?;
+        traces.push(("after_residual".into(), self.read_hidden()?));
+
+        Ok(traces)
     }
 
     pub fn reset_state(&mut self) -> Result<(), ModelError> {

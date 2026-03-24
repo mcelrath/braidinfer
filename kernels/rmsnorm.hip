@@ -41,6 +41,6 @@ extern "C" __global__ void rmsnorm_f32(
 
     // Normalize and scale
     for (int i = tid; i < hidden_size; i += stride) {
-        y[i] = x[i] * rms * weight[i];
+        y[i] = x[i] * rms * (1.0f + weight[i]);
     }
 }
