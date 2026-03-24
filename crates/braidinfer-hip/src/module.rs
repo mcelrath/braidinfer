@@ -1,43 +1,61 @@
-use crate::{error, ffi, HipResult};
+use crate::{error, ffi, HipError, HipResult};
+use braidinfer_core::types::DeviceId;
 use std::ffi::{c_void, CString};
+use std::marker::PhantomData;
 use std::path::Path;
 
-/// A loaded HIP module (compiled .hsaco or .co binary).
+/// A loaded HIP module (compiled .co/.hsaco binary). Tied to the device it was loaded on.
 pub struct Module {
     raw: ffi::hipModule_t,
+    device: DeviceId,
 }
 
 impl Module {
-    pub fn load(path: &Path) -> HipResult<Self> {
-        let path_str = CString::new(path.to_str().expect("invalid path")).unwrap();
+    pub fn load(device: DeviceId, path: &Path) -> HipResult<Self> {
+        crate::device::Device::set_current(device)?;
+        let path_str = path
+            .to_str()
+            .ok_or(HipError(ffi::hipErrorInvalidValue))?;
+        let path_c = CString::new(path_str).map_err(|_| HipError(ffi::hipErrorInvalidValue))?;
         let mut raw = std::ptr::null_mut();
-        error::check(unsafe { ffi::hipModuleLoad(&mut raw, path_str.as_ptr()) })?;
-        Ok(Module { raw })
+        error::check(unsafe { ffi::hipModuleLoad(&mut raw, path_c.as_ptr()) })?;
+        Ok(Module { raw, device })
     }
 
-    pub fn get_function(&self, name: &str) -> HipResult<Function> {
-        let name_c = CString::new(name).unwrap();
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    pub fn get_function(&self, name: &str) -> HipResult<Function<'_>> {
+        let name_c = CString::new(name).map_err(|_| HipError(ffi::hipErrorInvalidValue))?;
         let mut func = std::ptr::null_mut();
         error::check(unsafe {
             ffi::hipModuleGetFunction(&mut func, self.raw, name_c.as_ptr())
         })?;
-        Ok(Function { raw: func })
+        Ok(Function {
+            raw: func,
+            _module: PhantomData,
+        })
     }
 }
 
 impl Drop for Module {
     fn drop(&mut self) {
         if !self.raw.is_null() {
+            let _ = crate::device::Device::set_current(self.device);
             unsafe { ffi::hipModuleUnload(self.raw) };
         }
     }
 }
 
-pub struct Function {
+/// A kernel function handle. Borrows the Module it was loaded from —
+/// cannot outlive it.
+pub struct Function<'module> {
     raw: ffi::hipFunction_t,
+    _module: PhantomData<&'module Module>,
 }
 
-impl Function {
+impl Function<'_> {
     pub fn launch(
         &self,
         grid: (u32, u32, u32),

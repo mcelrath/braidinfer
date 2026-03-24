@@ -26,6 +26,7 @@ fn main() {
                 "--genco",
                 "-O3",
                 "-std=c++17",
+                "-mwavefrontsize64", // Required for WMMA (V_WMMA_F32_16X16X16_F16)
                 "-o",
             ])
             .arg(&hsaco)

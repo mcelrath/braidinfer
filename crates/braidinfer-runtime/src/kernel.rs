@@ -17,9 +17,8 @@ pub struct RmsNormKernel {
 
 impl RmsNormKernel {
     pub fn load(device: DeviceId) -> HipResult<Self> {
-        braidinfer_hip::Device::set_current(device)?;
         let path = kernel_dir().join("rmsnorm.hsaco");
-        let module = Module::load(&path)?;
+        let module = Module::load(device, &path)?;
         Ok(Self { module, device })
     }
 
@@ -40,9 +39,12 @@ impl RmsNormKernel {
 
         let func = self.module.get_function("rmsnorm_f32")?;
 
-        let mut out_ptr = output.as_mut_ptr() as *mut c_void;
-        let mut in_ptr = input.as_ptr() as *mut c_void;
-        let mut w_ptr = weight.as_ptr() as *mut c_void;
+        // kernel_params are pointers-to-arg-values. The GPU reads through these
+        // indirections; the const→mut cast at the FFI boundary is required by
+        // hipModuleLaunchKernel's signature but does not cause writes.
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut w_ptr: *const c_void = weight.as_ptr().cast();
         let mut hs = hidden_size as i32;
         let mut ep = eps;
 
@@ -58,7 +60,7 @@ impl RmsNormKernel {
         func.launch(
             (num_rows, 1, 1),
             (block_size, 1, 1),
-            256 * 4,
+            256 * 4, // shared memory upper bound: 256 floats
             stream,
             &mut args,
         )

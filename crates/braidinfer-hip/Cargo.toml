@@ -9,4 +9,3 @@ links = "braidinfer_kernels"
 braidinfer-core = { workspace = true }
 
 [build-dependencies]
-cc = "1"

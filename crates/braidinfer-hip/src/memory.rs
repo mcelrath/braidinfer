@@ -80,7 +80,15 @@ impl<T> DeviceBuffer<T> {
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            let _ = crate::device::Device::set_current(self.device);
+            if crate::device::Device::set_current(self.device).is_err() {
+                // Accept leak rather than free on wrong device
+                eprintln!(
+                    "braidinfer: leaked {}B on {:?} (set_current failed)",
+                    self.size_bytes(),
+                    self.device
+                );
+                return;
+            }
             unsafe { ffi::hipFree(self.ptr.cast()) };
         }
     }

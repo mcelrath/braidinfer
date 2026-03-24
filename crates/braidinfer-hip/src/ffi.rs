@@ -101,6 +101,7 @@ unsafe extern "C" {
     ) -> hipError_t;
 
     // Peer access
+    pub fn hipDeviceEnablePeerAccess(peer_device: c_int, flags: c_uint) -> hipError_t;
     pub fn hipDeviceCanAccessPeer(
         can_access: *mut c_int,
         device: c_int,

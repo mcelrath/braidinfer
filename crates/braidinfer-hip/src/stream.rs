@@ -28,12 +28,15 @@ impl Stream {
         error::check(unsafe { ffi::hipStreamSynchronize(self.raw) })
     }
 
-    pub fn copy_async<T>(
+    /// Async H2D copy from pinned host memory. Requires PinnedBuffer to guarantee
+    /// true async transfer — regular heap memory silently degrades to synchronous.
+    pub fn copy_to_device_async<T>(
         &self,
         dst: &mut crate::memory::DeviceBuffer<T>,
-        src: &[T],
+        src: &crate::memory::PinnedBuffer<T>,
     ) -> HipResult<()> {
         assert_eq!(dst.device(), self.device, "stream/buffer device mismatch");
+        assert!(src.len() <= dst.len(), "source larger than destination");
         let size = src.len() * std::mem::size_of::<T>();
         error::check(unsafe {
             ffi::hipMemcpyAsync(
@@ -41,6 +44,26 @@ impl Stream {
                 src.as_ptr().cast(),
                 size,
                 ffi::hipMemcpyHostToDevice,
+                self.raw,
+            )
+        })
+    }
+
+    /// Async D2H copy to pinned host memory.
+    pub fn copy_to_host_async<T>(
+        &self,
+        dst: &mut crate::memory::PinnedBuffer<T>,
+        src: &crate::memory::DeviceBuffer<T>,
+    ) -> HipResult<()> {
+        assert_eq!(src.device(), self.device, "stream/buffer device mismatch");
+        assert!(src.len() <= dst.len(), "source larger than destination");
+        let size = src.len() * std::mem::size_of::<T>();
+        error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                dst.as_mut_ptr().cast(),
+                src.as_ptr().cast(),
+                size,
+                ffi::hipMemcpyDeviceToHost,
                 self.raw,
             )
         })
