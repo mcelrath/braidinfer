@@ -26,7 +26,7 @@ extern "C" __global__ void rmsnorm_f32(
     }
 
     // Block reduction
-    __shared__ float shared[256];
+    extern __shared__ float shared[];
     shared[tid] = sum_sq;
     __syncthreads();
 
