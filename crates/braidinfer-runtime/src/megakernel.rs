@@ -36,6 +36,7 @@ const OP_D2D_COPY: u32 = 17;
 const OP_ATTN_PAGED: u32 = 18;
 const OP_ATTN_PREFILL: u32 = 19;
 const OP_DEINTERLEAVE: u32 = 20;
+const OP_KV_QUANTIZE: u32 = 21;
 
 const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 

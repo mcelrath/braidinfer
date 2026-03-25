@@ -46,6 +46,7 @@
 #define OP_ATTN_PAGED  18
 #define OP_ATTN_PREFILL 19
 #define OP_DEINTERLEAVE 20
+#define OP_KV_QUANTIZE  21
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -1024,6 +1025,117 @@ __device__ void op_deinterleave(const u64* inst, u32 vblock) {
     dst_odd[dst_offset] = src[src_offset + head_dim + elem];
 }
 
+// OP_KV_QUANTIZE: Quantize a full f32 chunk (64 tokens) to residual_pc int4.
+// One virtual block per channel (nkh * head_dim). Each block quantizes 64 values.
+// args: [1]=f32_src (staging buffer region for this K or V, layout [nkh, chunk_tokens, hd])
+//       [2]=q1_data_dst (int4 packed output, [nkh * chunk_tokens * hd / 2] bytes)
+//       [3]=q1_scale_dst (f32 per-channel scales, [nkh * hd])
+//       [4]=r_data_dst (residual int4 packed)
+//       [5]=r_scale_dst (residual f32 scales)
+//       [6]=num_kv_heads, [7]=head_dim, [8]=chunk_tokens (64)
+// grid_x = nkh * head_dim (one block per channel)
+__device__ void op_kv_quantize(const u64* inst, u32 vblock) {
+    const float* src = inst_fptr(inst, 1);
+    unsigned char* q1_data = (unsigned char*)(inst[2]);
+    float* q1_scale = inst_fptr(inst, 3);
+    unsigned char* r_data = (unsigned char*)(inst[4]);
+    float* r_scale = inst_fptr(inst, 5);
+    int nkh = inst_int(inst, 6);
+    int hd = inst_int(inst, 7);
+    int ct = inst_int(inst, 8);
+
+    int channel = vblock;
+    int total_channels = nkh * hd;
+    if (channel >= total_channels) return;
+
+    int head = channel / hd;
+    int dim = channel % hd;
+    int tid = threadIdx.x;
+
+    // Each channel has ct (64) values at stride hd: src[head * ct * hd + t * hd + dim]
+    // With 256 threads and 64 values, first 64 threads each handle one value
+    extern __shared__ float shmem[];
+    float* vals = shmem;             // [ct] f32 values for this channel
+    float* residuals = shmem + ct;   // [ct] residuals
+
+    // Load values into shared memory
+    if (tid < ct) {
+        vals[tid] = src[(long long)head * ct * hd + tid * hd + dim];
+    }
+    __syncthreads();
+
+    // Pass 1: find max absolute value for scale
+    float local_max = 0.0f;
+    if (tid < ct) {
+        local_max = fabsf(vals[tid]);
+    }
+    // Reduce max across threads (only first ct=64 threads have data, but reduce all 256)
+    shmem[256 + tid] = local_max;  // use extra shmem region for reduction
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) shmem[256 + tid] = fmaxf(shmem[256 + tid], shmem[256 + tid + s]);
+        __syncthreads();
+    }
+    float max_val = shmem[256];
+    float s1 = (max_val > 0.0f) ? max_val / 7.0f : 1.0f;  // symmetric: [-8,7] mapped to [-8s,7s]
+    float inv_s1 = 1.0f / s1;
+
+    // Quantize pass 1 and compute residuals
+    if (tid < ct) {
+        float v = vals[tid];
+        int q = __float2int_rn(v * inv_s1);
+        q = max(-8, min(7, q));
+        vals[tid] = (float)q;  // store quantized int for packing
+        residuals[tid] = v - (float)q * s1;
+    }
+    __syncthreads();
+
+    // Pass 2: find max absolute residual
+    float local_rmax = 0.0f;
+    if (tid < ct) {
+        local_rmax = fabsf(residuals[tid]);
+    }
+    shmem[256 + tid] = local_rmax;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) shmem[256 + tid] = fmaxf(shmem[256 + tid], shmem[256 + tid + s]);
+        __syncthreads();
+    }
+    float rmax_val = shmem[256];
+    float s2 = (rmax_val > 0.0f) ? rmax_val / 7.0f : 1.0f;
+    float inv_s2 = 1.0f / s2;
+
+    // Quantize residuals
+    if (tid < ct) {
+        float r = residuals[tid];
+        int q = __float2int_rn(r * inv_s2);
+        residuals[tid] = (float)max(-8, min(7, q));
+    }
+    __syncthreads();
+
+    // Pack int4 values: 2 values per byte, low-nibble-first
+    // Layout: q1_data[head * ct/2 * hd + pair * hd + dim] for pair in 0..ct/2
+    // Each thread packs one pair (2 consecutive tokens)
+    if (tid < ct / 2) {
+        int even = (int)vals[tid * 2];
+        int odd = (int)vals[tid * 2 + 1];
+        unsigned char packed = ((unsigned char)(odd & 0xF) << 4) | ((unsigned char)(even & 0xF));
+        long long data_idx = (long long)head * (ct / 2) * hd + tid * hd + dim;
+        q1_data[data_idx] = packed;
+
+        int r_even = (int)residuals[tid * 2];
+        int r_odd = (int)residuals[tid * 2 + 1];
+        unsigned char r_packed = ((unsigned char)(r_odd & 0xF) << 4) | ((unsigned char)(r_even & 0xF));
+        r_data[data_idx] = r_packed;
+    }
+
+    // Write scales (one thread per channel)
+    if (tid == 0) {
+        q1_scale[channel] = s1;
+        r_scale[channel] = s2;
+    }
+}
+
 // ============================================================
 // Main megakernel entry point
 // ============================================================
@@ -1067,6 +1179,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
                 case OP_ATTN_PAGED:   op_attn_paged(inst, vb); break;
                 case OP_ATTN_PREFILL: op_attn_prefill(inst, vb); break;
                 case OP_DEINTERLEAVE: op_deinterleave(inst, vb); break;
+                case OP_KV_QUANTIZE:  op_kv_quantize(inst, vb); break;
                 default: break;
             }
         }
