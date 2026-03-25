@@ -60,6 +60,12 @@ unsafe extern "C" {
         flags: c_uint,
     ) -> hipError_t;
     pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
+    pub fn hipHostRegister(
+        host_ptr: *mut c_void,
+        size_bytes: usize,
+        flags: c_uint,
+    ) -> hipError_t;
+    pub fn hipHostUnregister(host_ptr: *mut c_void) -> hipError_t;
 
     // Stream management
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;

@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+memmap2 = "0.9"
+safetensors = "0.7"
+serde_json = "1"

@@ -12,3 +12,4 @@ serde_json = { version = "1" }
 minijinja = { version = "2", features = ["builtins"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 rand = "0.8"
+safetensors = "0.7.0"

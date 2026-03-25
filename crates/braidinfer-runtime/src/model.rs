@@ -7,6 +7,7 @@ use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{ffi, HipResult};
 use braidinfer_core::safetensors::SafeTensorSet;
+use safetensors::Dtype;
 
 use crate::kernel::{
     CausalConv1dUpdateKernel, EmbeddingKernel, FfnFusedKernel, GdnGateKernel,
@@ -538,43 +539,64 @@ impl std::error::Error for ModelError {}
 
 // ---- Helper: load a tensor by name, convert to f32, upload to GPU ----
 
+/// Load a tensor as f32 from safetensors. For f32 on disk, zero-copy reinterpret.
+/// For bf16 on disk, converts to f32 on the CPU.
 fn load_weight(
     st: &SafeTensorSet,
     name: &str,
     device: DeviceId,
     expected_len: usize,
 ) -> Result<DeviceBuffer<f32>, ModelError> {
-    let data = st
-        .tensor_as_f32(name)
+    let info = st.tensor_info(name)
         .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
-    assert_eq!(
-        data.len(),
-        expected_len,
-        "weight {name}: expected {expected_len} elements, got {}",
-        data.len()
-    );
+    let raw = st.tensor_data(name)
+        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
+    let data: Vec<f32> = match info.dtype {
+        Dtype::F32 => {
+            assert_eq!(raw.len(), expected_len * 4, "weight {name}: size mismatch");
+            raw.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        }
+        Dtype::BF16 => {
+            assert_eq!(raw.len(), expected_len * 2, "weight {name}: size mismatch");
+            raw.chunks_exact(2)
+                .map(|b| {
+                    let bits = u16::from_le_bytes(b.try_into().unwrap());
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()
+        }
+        other => panic!("load_weight: unsupported dtype {other:?} for {name}"),
+    };
     let mut buf = DeviceBuffer::<f32>::alloc(device, expected_len)?;
     buf.copy_from_host(&data)?;
     Ok(buf)
 }
 
+/// Load a tensor as bf16 (u16) from safetensors. For bf16 on disk, zero-copy
+/// reinterpret of the mmap'd bytes — no allocation, direct hipMemcpy from mmap.
 fn load_weight_bf16(
     st: &SafeTensorSet,
     name: &str,
     device: DeviceId,
     expected_len: usize,
 ) -> Result<DeviceBuffer<u16>, ModelError> {
-    let data = st
-        .tensor_as_u16(name)
-        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    let raw = st.tensor_data(name)
+        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
     assert_eq!(
-        data.len(),
-        expected_len,
-        "weight {name}: expected {expected_len} elements, got {}",
-        data.len()
+        raw.len(),
+        expected_len * 2,
+        "weight {name}: expected {} bytes, got {}",
+        expected_len * 2,
+        raw.len()
     );
     let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
-    buf.copy_from_host(&data)?;
+    // raw is &[u8] from mmap, reinterpret as &[u16] for copy_from_host
+    let data: &[u16] = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
+    };
+    buf.copy_from_host(data)?;
     Ok(buf)
 }
 
@@ -705,13 +727,15 @@ impl Qwen35Model {
                 let q_dim = nh * kd;
                 let v_dim = nh * vd;
                 let conv_total = qkv_out * ck;
-                let conv_raw = st
-                    .tensor_as_u16(&format!("{p}linear_attn.conv1d.weight"))
-                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}linear_attn.conv1d.weight")))?;
-                assert_eq!(conv_raw.len(), conv_total);
+                let conv_name = format!("{p}linear_attn.conv1d.weight");
+                let conv_raw_bytes = st.tensor_data(&conv_name)
+                    .map_err(|_| ModelError::MissingWeight(conv_name.clone()))?;
+                assert_eq!(conv_raw_bytes.len(), conv_total * 2);
+                let conv_raw: &[u16] = unsafe {
+                    std::slice::from_raw_parts(conv_raw_bytes.as_ptr() as *const u16, conv_total)
+                };
                 let mut conv1d_weight_buf = DeviceBuffer::<u16>::alloc(device, conv_total)?;
-                conv1d_weight_buf.copy_from_host(&conv_raw)?;
-                // Pre-split on host: rows 0..q_dim, q_dim..2*q_dim, 2*q_dim..qkv_out
+                conv1d_weight_buf.copy_from_host(conv_raw)?;
                 let mut conv_w_q_buf = DeviceBuffer::<u16>::alloc(device, q_dim * ck)?;
                 let mut conv_w_k_buf = DeviceBuffer::<u16>::alloc(device, q_dim * ck)?;
                 let mut conv_w_v_buf = DeviceBuffer::<u16>::alloc(device, v_dim * ck)?;
