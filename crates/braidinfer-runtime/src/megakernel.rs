@@ -59,7 +59,10 @@ impl Instruction {
         self.words[idx] = ptr as u64;
     }
 
-    fn set_mut_ptr<T>(&mut self, idx: usize, ptr: *const T) {
+    /// Set a slot to a GPU output pointer. Uses *const T because DeviceBuffer
+    /// pointers are stable addresses — the GPU writes through them regardless
+    /// of Rust borrow state. Named distinctly from set_ptr for documentation.
+    fn set_output_ptr<T>(&mut self, idx: usize, ptr: *const T) {
         self.words[idx] = ptr as u64;
     }
 
@@ -212,7 +215,7 @@ impl MegakernelProgram {
         let embedding_inst_idx = instructions.len();
         {
             let mut inst = Instruction::new(OP_EMBEDDING, div_ceil(hs as u32, 256));
-            inst.set_mut_ptr(1, act.hidden.as_ptr());
+            inst.set_output_ptr(1, act.hidden.as_ptr());
             inst.set_ptr(2, model.embed_weight.as_ptr());
             inst.set_int(3, 0); // token_id — updated per step
             inst.set_int(4, hs as i32);
@@ -264,14 +267,14 @@ impl MegakernelProgram {
         // Final RMSNorm: copy hidden→normed, then norm normed→hidden
         {
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_mut_ptr(1, act.normed.as_ptr());
+            inst.set_output_ptr(1, act.normed.as_ptr());
             inst.set_ptr(2, act.hidden.as_ptr());
             inst.set_int(3, hs as i32);
             instructions.push(inst);
         }
         {
             let mut inst = Instruction::new(OP_RMSNORM, 1);
-            inst.set_mut_ptr(1, act.hidden.as_ptr());
+            inst.set_output_ptr(1, act.hidden.as_ptr());
             inst.set_ptr(2, act.normed.as_ptr());
             inst.set_ptr(3, model.final_norm_weight.as_ptr());
             inst.set_int(4, hs as i32);
@@ -282,7 +285,7 @@ impl MegakernelProgram {
         // LM head (= linear_proj with vocab_size output rows)
         {
             let mut inst = Instruction::new(OP_LINEAR_PROJ, vs as u32);
-            inst.set_mut_ptr(1, act.logits.as_ptr());
+            inst.set_output_ptr(1, act.logits.as_ptr());
             inst.set_ptr(2, model.embed_weight.as_ptr()); // weight-tied
             inst.set_ptr(3, act.hidden.as_ptr());
             inst.set_int(4, vs as i32);
@@ -363,7 +366,7 @@ impl MegakernelProgram {
         let embedding_inst_idx = instructions.len();
         for t in 0..n {
             let mut inst = Instruction::new(OP_EMBEDDING, div_ceil(hs as u32, 256));
-            inst.set_mut_ptr(1, unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) });
+            inst.set_output_ptr(1, unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) });
             inst.set_ptr(2, model.embed_weight.as_ptr());
             inst.set_int(3, tokens[t] as i32);
             inst.set_int(4, hs as i32);
@@ -404,7 +407,7 @@ impl MegakernelProgram {
                 // 1. Batched RMSNorm (N tokens)
                 {
                     let mut inst = Instruction::new(OP_RMSNORM, n as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.normed.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.normed.as_ptr());
                     inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
                     inst.set_ptr(3, w.input_norm.as_ptr());
                     inst.set_int(4, hs as i32);
@@ -415,7 +418,7 @@ impl MegakernelProgram {
                 // 2. Batched Q+gate, K, V projections (batch=N)
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.q_gate_attn.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.q_gate_attn.as_ptr());
                     inst.set_ptr(2, w.w_q_gate.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, (nqh * hd * 2) as i32);
@@ -426,7 +429,7 @@ impl MegakernelProgram {
                 }
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.k_attn.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.k_attn.as_ptr());
                     inst.set_ptr(2, w.w_k.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, (nkh * hd) as i32);
@@ -437,7 +440,7 @@ impl MegakernelProgram {
                 }
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.v_attn.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.v_attn.as_ptr());
                     inst.set_ptr(2, w.w_v.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, (nkh * hd) as i32);
@@ -450,8 +453,8 @@ impl MegakernelProgram {
                 {
                     let total_elems = n * nqh * hd;
                     let mut inst = Instruction::new(OP_DEINTERLEAVE, div_ceil(total_elems as u32, 256));
-                    inst.set_mut_ptr(1, prefill_bufs.q_attn.as_ptr());
-                    inst.set_mut_ptr(2, prefill_bufs.gate_attn.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.q_attn.as_ptr());
+                    inst.set_output_ptr(2, prefill_bufs.gate_attn.as_ptr());
                     inst.set_ptr(3, prefill_bufs.q_gate_attn.as_ptr());
                     inst.set_int(4, nqh as i32);
                     inst.set_int(5, hd as i32);
@@ -462,8 +465,8 @@ impl MegakernelProgram {
                 // 4. Batched QK norm (N × (nqh + nkh) blocks)
                 {
                     let mut inst = Instruction::new(OP_QK_NORM, (n * (nqh + nkh)) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.q_attn.as_ptr());
-                    inst.set_mut_ptr(2, prefill_bufs.k_attn.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.q_attn.as_ptr());
+                    inst.set_output_ptr(2, prefill_bufs.k_attn.as_ptr());
                     inst.set_ptr(3, w.q_norm.as_ptr());
                     inst.set_ptr(4, w.k_norm.as_ptr());
                     inst.set_int(5, nqh as i32);
@@ -477,8 +480,8 @@ impl MegakernelProgram {
                 // 5. Batched mRoPE (N × (nqh + nkh) blocks)
                 {
                     let mut inst = Instruction::new(OP_MROPE, (n * (nqh + nkh)) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.q_attn.as_ptr());
-                    inst.set_mut_ptr(2, prefill_bufs.k_attn.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.q_attn.as_ptr());
+                    inst.set_output_ptr(2, prefill_bufs.k_attn.as_ptr());
                     inst.set_ptr(3, act.inv_freq.as_ptr());
                     inst.set_ptr(4, prefill_bufs.position_ids.as_ptr());
                     inst.set_int(5, nqh as i32);
@@ -499,7 +502,7 @@ impl MegakernelProgram {
                     let k_dst = unsafe { kv_cache.k.as_ptr().add(start_pos as usize * kv_stride) };
                     let total_kv = n * kv_stride;
                     let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
-                    inst.set_mut_ptr(1, k_dst);
+                    inst.set_output_ptr(1, k_dst);
                     inst.set_ptr(2, prefill_bufs.k_attn.as_ptr());
                     inst.set_int(3, total_kv as i32);
                     inst.set_no_sync();
@@ -509,7 +512,7 @@ impl MegakernelProgram {
                     let v_dst = unsafe { kv_cache.v.as_ptr().add(start_pos as usize * kv_stride) };
                     let total_kv = n * kv_stride;
                     let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
-                    inst.set_mut_ptr(1, v_dst);
+                    inst.set_output_ptr(1, v_dst);
                     inst.set_ptr(2, prefill_bufs.v_attn.as_ptr());
                     inst.set_int(3, total_kv as i32);
                     instructions.push(inst);
@@ -520,7 +523,7 @@ impl MegakernelProgram {
                 // OP_ATTN_PREFILL: all N queries with causal mask
                 {
                     let mut inst = Instruction::new(OP_ATTN_PREFILL, (n * nqh) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.attn_out.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.attn_out.as_ptr());
                     inst.set_ptr(2, prefill_bufs.q_attn.as_ptr());
                     inst.set_ptr(3, kv_cache.k.as_ptr());
                     inst.set_ptr(4, kv_cache.v.as_ptr());
@@ -537,7 +540,7 @@ impl MegakernelProgram {
                 {
                     let total_gate_size = n * q_head_size;
                     let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(total_gate_size as u32, 256));
-                    inst.set_mut_ptr(1, prefill_bufs.gated_out.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.gated_out.as_ptr());
                     inst.set_ptr(2, prefill_bufs.attn_out.as_ptr());
                     inst.set_ptr(3, prefill_bufs.gate_attn.as_ptr());
                     inst.set_int(4, total_gate_size as i32);
@@ -547,7 +550,7 @@ impl MegakernelProgram {
                 // Batched output projection (batch=N)
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.out_proj.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.out_proj.as_ptr());
                     inst.set_ptr(2, w.w_o.as_ptr());
                     inst.set_ptr(3, prefill_bufs.gated_out.as_ptr());
                     inst.set_int(4, hs as i32);
@@ -560,7 +563,7 @@ impl MegakernelProgram {
                 {
                     let total = n * hs;
                     let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
-                    inst.set_mut_ptr(1, prefill_bufs.hidden.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.hidden.as_ptr());
                     inst.set_ptr(2, prefill_bufs.out_proj.as_ptr());
                     inst.set_ptr(3, prefill_bufs.hidden.as_ptr());
                     inst.set_int(4, total as i32);
@@ -584,7 +587,7 @@ impl MegakernelProgram {
                 // RMSNorm (grid_x=N, one block per token)
                 {
                     let mut inst = Instruction::new(OP_RMSNORM, n as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.normed.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.normed.as_ptr());
                     inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
                     inst.set_ptr(3, w.input_norm.as_ptr());
                     inst.set_int(4, hs as i32);
@@ -595,7 +598,7 @@ impl MegakernelProgram {
                 // QKV projection (batch=N)
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, conv_dim as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.qkv.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.qkv.as_ptr());
                     inst.set_ptr(2, w.w_qkv.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, conv_dim as i32);
@@ -608,7 +611,7 @@ impl MegakernelProgram {
                 // a projection (batch=N)
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, nh_gdn as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.a_proj.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.a_proj.as_ptr());
                     inst.set_ptr(2, w.w_a.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, nh_gdn as i32);
@@ -621,7 +624,7 @@ impl MegakernelProgram {
                 // b projection (batch=N)
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, nh_gdn as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.b_proj.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.b_proj.as_ptr());
                     inst.set_ptr(2, w.w_b.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, nh_gdn as i32);
@@ -634,7 +637,7 @@ impl MegakernelProgram {
                 // z projection (batch=N) — SYNC before sequential part
                 {
                     let mut inst = Instruction::new(OP_LINEAR_PROJ, (nh_gdn * vd) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.z_proj.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.z_proj.as_ptr());
                     inst.set_ptr(2, w.w_z.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
                     inst.set_int(4, (nh_gdn * vd) as i32);
@@ -652,10 +655,10 @@ impl MegakernelProgram {
                     // Conv1d on Q (from batched qkv[t])
                     {
                         let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
-                        inst.set_mut_ptr(1, conv_state.as_ptr());
+                        inst.set_output_ptr(1, conv_state.as_ptr());
                         inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim) });
                         inst.set_ptr(3, w.conv1d_weight_q.as_ptr());
-                        inst.set_mut_ptr(4, act.q_gdn.as_ptr());
+                        inst.set_output_ptr(4, act.q_gdn.as_ptr());
                         inst.set_int(5, q_dim as i32);
                         inst.set_int(6, ck as i32);
                         inst.set_no_sync();
@@ -664,10 +667,10 @@ impl MegakernelProgram {
                     // Conv1d on K
                     {
                         let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
-                        inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
+                        inst.set_output_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
                         inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim) });
                         inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
-                        inst.set_mut_ptr(4, act.k_gdn.as_ptr());
+                        inst.set_output_ptr(4, act.k_gdn.as_ptr());
                         inst.set_int(5, k_dim as i32);
                         inst.set_int(6, ck as i32);
                         inst.set_no_sync();
@@ -676,10 +679,10 @@ impl MegakernelProgram {
                     // Conv1d on V
                     {
                         let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
-                        inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add((q_dim + k_dim) * (ck - 1)) });
+                        inst.set_output_ptr(1, unsafe { conv_state.as_ptr().add((q_dim + k_dim) * (ck - 1)) });
                         inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim) });
                         inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
-                        inst.set_mut_ptr(4, act.v_gdn.as_ptr());
+                        inst.set_output_ptr(4, act.v_gdn.as_ptr());
                         inst.set_int(5, v_dim as i32);
                         inst.set_int(6, ck as i32);
                         instructions.push(inst);
@@ -688,7 +691,7 @@ impl MegakernelProgram {
                     // GDN gate (from batched a_proj[t])
                     {
                         let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nh_gdn as u32, 256));
-                        inst.set_mut_ptr(1, act.gate_gdn.as_ptr());
+                        inst.set_output_ptr(1, act.gate_gdn.as_ptr());
                         inst.set_ptr(2, unsafe { prefill_bufs.a_proj.as_ptr().add(t * nh_gdn) });
                         inst.set_ptr(3, w.a_log.as_ptr());
                         inst.set_ptr(4, w.dt_bias.as_ptr());
@@ -704,8 +707,8 @@ impl MegakernelProgram {
                         inst.set_ptr(3, act.v_gdn.as_ptr());
                         inst.set_ptr(4, act.gate_gdn.as_ptr());
                         inst.set_ptr(5, unsafe { prefill_bufs.b_proj.as_ptr().add(t * nh_gdn) });
-                        inst.set_mut_ptr(6, gdn_state.recurrent.as_ptr());
-                        inst.set_mut_ptr(7, act.recurrent_out.as_ptr());
+                        inst.set_output_ptr(6, gdn_state.recurrent.as_ptr());
+                        inst.set_output_ptr(7, act.recurrent_out.as_ptr());
                         inst.set_int(8, kd as i32);
                         inst.set_int(9, vd as i32);
                         instructions.push(inst);
@@ -714,7 +717,7 @@ impl MegakernelProgram {
                     // RMSNorm gated (z from batched z_proj[t])
                     {
                         let mut inst = Instruction::new(OP_RMSNORM_GATE, nh_gdn as u32);
-                        inst.set_mut_ptr(1, act.normed_gated.as_ptr());
+                        inst.set_output_ptr(1, act.normed_gated.as_ptr());
                         inst.set_ptr(2, act.recurrent_out.as_ptr());
                         inst.set_ptr(3, unsafe { prefill_bufs.z_proj.as_ptr().add(t * nh_gdn * vd) });
                         inst.set_ptr(4, w.output_norm.as_ptr());
@@ -727,7 +730,7 @@ impl MegakernelProgram {
                     // Output projection
                     {
                         let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+                        inst.set_output_ptr(1, act.out_proj.as_ptr());
                         inst.set_ptr(2, w.w_out.as_ptr());
                         inst.set_ptr(3, act.normed_gated.as_ptr());
                         inst.set_int(4, hs as i32);
@@ -739,7 +742,7 @@ impl MegakernelProgram {
                     {
                         let hidden_t = unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) };
                         let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                        inst.set_mut_ptr(1, hidden_t);
+                        inst.set_output_ptr(1, hidden_t);
                         inst.set_ptr(2, act.out_proj.as_ptr());
                         inst.set_ptr(3, hidden_t);
                         inst.set_int(4, hs as i32);
@@ -753,7 +756,7 @@ impl MegakernelProgram {
                 // FFN gate+up (batch=N)
                 {
                     let mut inst = Instruction::new(OP_FFN_GATE_UP, (is * n) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.ffn_act.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.ffn_act.as_ptr());
                     inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
                     inst.set_ptr(3, post_norm.as_ptr());
                     inst.set_ptr(4, w_gate.as_ptr());
@@ -768,7 +771,7 @@ impl MegakernelProgram {
                 // Save residual (N hidden states)
                 {
                     let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((n * hs) as u32, 256));
-                    inst.set_mut_ptr(1, prefill_bufs.residual.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.residual.as_ptr());
                     inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
                     inst.set_int(3, (n * hs) as i32);
                     instructions.push(inst);
@@ -777,7 +780,7 @@ impl MegakernelProgram {
                 // FFN down + residual (batch=N)
                 {
                     let mut inst = Instruction::new(OP_FFN_DOWN_RES, (hs * n) as u32);
-                    inst.set_mut_ptr(1, prefill_bufs.hidden.as_ptr());
+                    inst.set_output_ptr(1, prefill_bufs.hidden.as_ptr());
                     inst.set_ptr(2, prefill_bufs.residual.as_ptr());
                     inst.set_ptr(3, w_down.as_ptr());
                     inst.set_ptr(4, prefill_bufs.ffn_act.as_ptr());
@@ -795,7 +798,7 @@ impl MegakernelProgram {
         // Copy last token's hidden to act.hidden
         {
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_mut_ptr(1, act.hidden.as_ptr());
+            inst.set_output_ptr(1, act.hidden.as_ptr());
             inst.set_ptr(2, unsafe { prefill_bufs.hidden.as_ptr().add((n - 1) * hs) });
             inst.set_int(3, hs as i32);
             instructions.push(inst);
@@ -803,14 +806,14 @@ impl MegakernelProgram {
         // RMSNorm
         {
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_mut_ptr(1, act.normed.as_ptr());
+            inst.set_output_ptr(1, act.normed.as_ptr());
             inst.set_ptr(2, act.hidden.as_ptr());
             inst.set_int(3, hs as i32);
             instructions.push(inst);
         }
         {
             let mut inst = Instruction::new(OP_RMSNORM, 1);
-            inst.set_mut_ptr(1, act.hidden.as_ptr());
+            inst.set_output_ptr(1, act.hidden.as_ptr());
             inst.set_ptr(2, act.normed.as_ptr());
             inst.set_ptr(3, model.final_norm_weight.as_ptr());
             inst.set_int(4, hs as i32);
@@ -820,7 +823,7 @@ impl MegakernelProgram {
         // LM head
         {
             let mut inst = Instruction::new(OP_LINEAR_PROJ, cfg.vocab_size as u32);
-            inst.set_mut_ptr(1, act.logits.as_ptr());
+            inst.set_output_ptr(1, act.logits.as_ptr());
             inst.set_ptr(2, model.embed_weight.as_ptr());
             inst.set_ptr(3, act.hidden.as_ptr());
             inst.set_int(4, cfg.vocab_size as i32);
@@ -882,7 +885,7 @@ impl MegakernelProgram {
 
         // 1. RMSNorm
         let mut inst = Instruction::new(OP_RMSNORM, 1);
-        inst.set_mut_ptr(1, act.normed.as_ptr());
+        inst.set_output_ptr(1, act.normed.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_ptr(3, w.input_norm.as_ptr());
         inst.set_int(4, hs as i32);
@@ -892,7 +895,7 @@ impl MegakernelProgram {
         // 2. QKV projection [6144, 1024] @ [1024] → [6144]
         // NO_SYNC: next 3 instructions (a/b/z proj) read normed, not qkv
         let mut inst = Instruction::new(OP_LINEAR_PROJ, qkv_dim as u32);
-        inst.set_mut_ptr(1, act.qkv.as_ptr());
+        inst.set_output_ptr(1, act.qkv.as_ptr());
         inst.set_ptr(2, w.w_qkv.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, qkv_dim as i32);
@@ -902,7 +905,7 @@ impl MegakernelProgram {
 
         // 3. Project a [nh], b [nh], z [nh*vd] — all read normed, write disjoint buffers
         let mut inst = Instruction::new(OP_LINEAR_PROJ, nh as u32);
-        inst.set_mut_ptr(1, act.a_proj.as_ptr());
+        inst.set_output_ptr(1, act.a_proj.as_ptr());
         inst.set_ptr(2, w.w_a.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, nh as i32);
@@ -911,7 +914,7 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_LINEAR_PROJ, nh as u32);
-        inst.set_mut_ptr(1, act.b_proj.as_ptr());
+        inst.set_output_ptr(1, act.b_proj.as_ptr());
         inst.set_ptr(2, w.w_b.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, nh as i32);
@@ -921,7 +924,7 @@ impl MegakernelProgram {
 
         // z proj: SYNC here ensures QKV+a+b+z all complete before conv1d reads qkv
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nh * vd) as u32);
-        inst.set_mut_ptr(1, act.z_proj.as_ptr());
+        inst.set_output_ptr(1, act.z_proj.as_ptr());
         inst.set_ptr(2, w.w_z.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nh * vd) as i32);
@@ -935,10 +938,10 @@ impl MegakernelProgram {
 
         // Conv on Q portion — NO_SYNC: conv_k reads different qkv slice, writes different state/output
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
-        inst.set_mut_ptr(1, conv_state.as_ptr());
+        inst.set_output_ptr(1, conv_state.as_ptr());
         inst.set_ptr(2, act.qkv.as_ptr());
         inst.set_ptr(3, w.conv1d_weight_q.as_ptr());
-        inst.set_mut_ptr(4, act.q_gdn.as_ptr());
+        inst.set_output_ptr(4, act.q_gdn.as_ptr());
         inst.set_int(5, q_dim as i32);
         inst.set_int(6, ck as i32);
         inst.set_no_sync();
@@ -946,10 +949,10 @@ impl MegakernelProgram {
 
         // Conv on K portion — NO_SYNC: conv_v reads different slice
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
-        inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
+        inst.set_output_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim) });
         inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
-        inst.set_mut_ptr(4, act.k_gdn.as_ptr());
+        inst.set_output_ptr(4, act.k_gdn.as_ptr());
         inst.set_int(5, k_dim as i32);
         inst.set_int(6, ck as i32);
         inst.set_no_sync();
@@ -957,17 +960,17 @@ impl MegakernelProgram {
 
         // Conv on V portion
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
-        inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add((q_dim + k_dim) * (ck - 1)) });
+        inst.set_output_ptr(1, unsafe { conv_state.as_ptr().add((q_dim + k_dim) * (ck - 1)) });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim + k_dim) });
         inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
-        inst.set_mut_ptr(4, act.v_gdn.as_ptr());
+        inst.set_output_ptr(4, act.v_gdn.as_ptr());
         inst.set_int(5, v_dim as i32);
         inst.set_int(6, ck as i32);
         instructions.push(inst);
 
         // 5. GDN gate
         let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nh as u32, 256));
-        inst.set_mut_ptr(1, act.gate_gdn.as_ptr());
+        inst.set_output_ptr(1, act.gate_gdn.as_ptr());
         inst.set_ptr(2, act.a_proj.as_ptr());
         inst.set_ptr(3, w.a_log.as_ptr());
         inst.set_ptr(4, w.dt_bias.as_ptr());
@@ -981,15 +984,15 @@ impl MegakernelProgram {
         inst.set_ptr(3, act.v_gdn.as_ptr());
         inst.set_ptr(4, act.gate_gdn.as_ptr());
         inst.set_ptr(5, act.b_proj.as_ptr());
-        inst.set_mut_ptr(6, gdn_state.recurrent.as_ptr());
-        inst.set_mut_ptr(7, act.recurrent_out.as_ptr());
+        inst.set_output_ptr(6, gdn_state.recurrent.as_ptr());
+        inst.set_output_ptr(7, act.recurrent_out.as_ptr());
         inst.set_int(8, kd as i32);
         inst.set_int(9, vd as i32);
         instructions.push(inst);
 
         // 7. RMSNorm gated
         let mut inst = Instruction::new(OP_RMSNORM_GATE, nh as u32);
-        inst.set_mut_ptr(1, act.normed_gated.as_ptr());
+        inst.set_output_ptr(1, act.normed_gated.as_ptr());
         inst.set_ptr(2, act.recurrent_out.as_ptr());
         inst.set_ptr(3, act.z_proj.as_ptr());
         inst.set_ptr(4, w.output_norm.as_ptr());
@@ -1000,7 +1003,7 @@ impl MegakernelProgram {
 
         // 8. Output projection [1024, 2048]
         let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+        inst.set_output_ptr(1, act.out_proj.as_ptr());
         inst.set_ptr(2, w.w_out.as_ptr());
         inst.set_ptr(3, act.normed_gated.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1009,13 +1012,13 @@ impl MegakernelProgram {
 
         // 9. Residual: copy hidden→residual, then add
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.residual.as_ptr());
+        inst.set_output_ptr(1, act.residual.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_int(3, hs as i32);
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.hidden.as_ptr());
+        inst.set_output_ptr(1, act.hidden.as_ptr());
         inst.set_ptr(2, act.out_proj.as_ptr());
         inst.set_ptr(3, act.residual.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1046,7 +1049,7 @@ impl MegakernelProgram {
 
         // 1. RMSNorm
         let mut inst = Instruction::new(OP_RMSNORM, 1);
-        inst.set_mut_ptr(1, act.normed.as_ptr());
+        inst.set_output_ptr(1, act.normed.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_ptr(3, w.input_norm.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1055,7 +1058,7 @@ impl MegakernelProgram {
 
         // 2. Q+gate [4096], K [512], V [512] projections — all read normed, write disjoint
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
-        inst.set_mut_ptr(1, act.q_gate_attn.as_ptr());
+        inst.set_output_ptr(1, act.q_gate_attn.as_ptr());
         inst.set_ptr(2, w.w_q_gate.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nqh * hd * 2) as i32);
@@ -1064,7 +1067,7 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_mut_ptr(1, act.k_attn.as_ptr());
+        inst.set_output_ptr(1, act.k_attn.as_ptr());
         inst.set_ptr(2, w.w_k.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nkh * hd) as i32);
@@ -1074,7 +1077,7 @@ impl MegakernelProgram {
 
         // V proj: SYNC here ensures Q+gate, K, V all complete before deinterleave
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_mut_ptr(1, act.v_attn.as_ptr());
+        inst.set_output_ptr(1, act.v_attn.as_ptr());
         inst.set_ptr(2, w.w_v.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nkh * hd) as i32);
@@ -1090,14 +1093,14 @@ impl MegakernelProgram {
             let is_last = h == nqh - 1;
 
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_mut_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
+            inst.set_output_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
             inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
             inst.set_int(3, hd as i32);
             inst.set_no_sync();
             instructions.push(inst);
 
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_mut_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
+            inst.set_output_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
             inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
             inst.set_int(3, hd as i32);
             if !is_last { inst.set_no_sync(); }
@@ -1106,8 +1109,8 @@ impl MegakernelProgram {
 
         // 4. QK norm
         let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
-        inst.set_mut_ptr(1, act.q_attn.as_ptr());
-        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+        inst.set_output_ptr(1, act.q_attn.as_ptr());
+        inst.set_output_ptr(2, act.k_attn.as_ptr());
         inst.set_ptr(3, w.q_norm.as_ptr());
         inst.set_ptr(4, w.k_norm.as_ptr());
         inst.set_int(5, nqh as i32);
@@ -1120,8 +1123,8 @@ impl MegakernelProgram {
         let mrope_idx = instructions.len();
         mrope_indices.push(mrope_idx);
         let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
-        inst.set_mut_ptr(1, act.q_attn.as_ptr());
-        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+        inst.set_output_ptr(1, act.q_attn.as_ptr());
+        inst.set_output_ptr(2, act.k_attn.as_ptr());
         inst.set_ptr(3, act.inv_freq.as_ptr());
         inst.set_ptr(4, act.position_ids.as_ptr());
         inst.set_int(5, nqh as i32);
@@ -1131,13 +1134,14 @@ impl MegakernelProgram {
         inst.set_int(9, cfg.mrope_section[0] as i32);
         inst.set_int(10, cfg.mrope_section[1] as i32);
         inst.set_int(11, cfg.mrope_section[2] as i32);
+        inst.set_int(12, 1); // batch=1 for decode
         instructions.push(inst);
 
         // 6. Write K,V to cache — k_copy NO_SYNC (v_copy writes different buffer)
         let kv_stride = nkh * hd;
         let k_copy_idx = instructions.len();
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_mut_ptr(1, kv_cache.k.as_ptr());
+        inst.set_output_ptr(1, kv_cache.k.as_ptr());
         inst.set_ptr(2, act.k_attn.as_ptr());
         inst.set_int(3, kv_stride as i32);
         inst.set_no_sync();
@@ -1145,7 +1149,7 @@ impl MegakernelProgram {
 
         let v_copy_idx = instructions.len();
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_mut_ptr(1, kv_cache.v.as_ptr());
+        inst.set_output_ptr(1, kv_cache.v.as_ptr());
         inst.set_ptr(2, act.v_attn.as_ptr());
         inst.set_int(3, kv_stride as i32);
         instructions.push(inst);
@@ -1156,7 +1160,7 @@ impl MegakernelProgram {
         let gqa_idx = instructions.len();
         gqa_indices.push(gqa_idx);
         let mut inst = Instruction::new(OP_GQA_ATTN, nqh as u32);
-        inst.set_mut_ptr(1, act.attn_out.as_ptr());
+        inst.set_output_ptr(1, act.attn_out.as_ptr());
         inst.set_ptr(2, act.q_attn.as_ptr());
         inst.set_ptr(3, kv_cache.k.as_ptr());
         inst.set_ptr(4, kv_cache.v.as_ptr());
@@ -1170,7 +1174,7 @@ impl MegakernelProgram {
         // 8. Output gate
         let gate_size = nqh * hd;
         let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-        inst.set_mut_ptr(1, act.gated_out.as_ptr());
+        inst.set_output_ptr(1, act.gated_out.as_ptr());
         inst.set_ptr(2, act.attn_out.as_ptr());
         inst.set_ptr(3, act.gate_attn.as_ptr());
         inst.set_int(4, gate_size as i32);
@@ -1178,7 +1182,7 @@ impl MegakernelProgram {
 
         // 9. Output projection [1024, 2048]
         let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+        inst.set_output_ptr(1, act.out_proj.as_ptr());
         inst.set_ptr(2, w.w_o.as_ptr());
         inst.set_ptr(3, act.gated_out.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1187,13 +1191,13 @@ impl MegakernelProgram {
 
         // 10. Residual
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.residual.as_ptr());
+        inst.set_output_ptr(1, act.residual.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_int(3, hs as i32);
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.hidden.as_ptr());
+        inst.set_output_ptr(1, act.hidden.as_ptr());
         inst.set_ptr(2, act.out_proj.as_ptr());
         inst.set_ptr(3, act.residual.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1226,7 +1230,7 @@ impl MegakernelProgram {
 
         // 1. RMSNorm
         let mut inst = Instruction::new(OP_RMSNORM, 1);
-        inst.set_mut_ptr(1, act.normed.as_ptr());
+        inst.set_output_ptr(1, act.normed.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_ptr(3, w.input_norm.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1235,7 +1239,7 @@ impl MegakernelProgram {
 
         // 2. Q+gate, K, V projections — all read normed, write disjoint
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
-        inst.set_mut_ptr(1, act.q_gate_attn.as_ptr());
+        inst.set_output_ptr(1, act.q_gate_attn.as_ptr());
         inst.set_ptr(2, w.w_q_gate.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nqh * hd * 2) as i32);
@@ -1244,7 +1248,7 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_mut_ptr(1, act.k_attn.as_ptr());
+        inst.set_output_ptr(1, act.k_attn.as_ptr());
         inst.set_ptr(2, w.w_k.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nkh * hd) as i32);
@@ -1253,7 +1257,7 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_mut_ptr(1, act.v_attn.as_ptr());
+        inst.set_output_ptr(1, act.v_attn.as_ptr());
         inst.set_ptr(2, w.w_v.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nkh * hd) as i32);
@@ -1268,14 +1272,14 @@ impl MegakernelProgram {
             let is_last = h == nqh - 1;
 
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_mut_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
+            inst.set_output_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
             inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
             inst.set_int(3, hd as i32);
             inst.set_no_sync();
             instructions.push(inst);
 
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_mut_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
+            inst.set_output_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
             inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
             inst.set_int(3, hd as i32);
             if !is_last { inst.set_no_sync(); }
@@ -1284,8 +1288,8 @@ impl MegakernelProgram {
 
         // 4. QK norm
         let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
-        inst.set_mut_ptr(1, act.q_attn.as_ptr());
-        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+        inst.set_output_ptr(1, act.q_attn.as_ptr());
+        inst.set_output_ptr(2, act.k_attn.as_ptr());
         inst.set_ptr(3, w.q_norm.as_ptr());
         inst.set_ptr(4, w.k_norm.as_ptr());
         inst.set_int(5, nqh as i32);
@@ -1308,7 +1312,7 @@ impl MegakernelProgram {
         // At compile time, store kv_cache base ptr as placeholder.
         let k_copy_idx = instructions.len();
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_mut_ptr(1, kv_cache.k.as_ptr());
+        inst.set_output_ptr(1, kv_cache.k.as_ptr());
         inst.set_ptr(2, act.k_attn.as_ptr());
         inst.set_int(3, kv_stride as i32);
         inst.set_no_sync();
@@ -1316,7 +1320,7 @@ impl MegakernelProgram {
 
         let v_copy_idx = instructions.len();
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_mut_ptr(1, kv_cache.v.as_ptr());
+        inst.set_output_ptr(1, kv_cache.v.as_ptr());
         inst.set_ptr(2, act.v_attn.as_ptr());
         inst.set_int(3, kv_stride as i32);
         instructions.push(inst);
@@ -1327,8 +1331,8 @@ impl MegakernelProgram {
         let mrope_idx = instructions.len();
         mrope_indices.push(mrope_idx);
         let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
-        inst.set_mut_ptr(1, act.q_attn.as_ptr());
-        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+        inst.set_output_ptr(1, act.q_attn.as_ptr());
+        inst.set_output_ptr(2, act.k_attn.as_ptr());
         inst.set_ptr(3, act.inv_freq.as_ptr());
         inst.set_ptr(4, act.position_ids.as_ptr());
         inst.set_int(5, nqh as i32);
@@ -1338,13 +1342,14 @@ impl MegakernelProgram {
         inst.set_int(9, cfg.mrope_section[0] as i32);
         inst.set_int(10, cfg.mrope_section[1] as i32);
         inst.set_int(11, cfg.mrope_section[2] as i32);
+        inst.set_int(12, 1); // batch=1 for decode
         instructions.push(inst);
 
         // 7. OP_ATTN_PAGED: page_table_ptr and position_table_ptr are patched per step
         let paged_idx = instructions.len();
         attn_paged_indices.push(paged_idx);
         let mut inst = Instruction::new(OP_ATTN_PAGED, nqh as u32);
-        inst.set_mut_ptr(1, act.attn_out.as_ptr());
+        inst.set_output_ptr(1, act.attn_out.as_ptr());
         inst.set_ptr(2, act.q_attn.as_ptr());
         inst.set_int(3, 0); // page_table_ptr — patched per step
         inst.set_int(4, 0); // position_table_ptr — patched per step
@@ -1362,7 +1367,7 @@ impl MegakernelProgram {
         // 8. Output gate
         let gate_size = nqh * hd;
         let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-        inst.set_mut_ptr(1, act.gated_out.as_ptr());
+        inst.set_output_ptr(1, act.gated_out.as_ptr());
         inst.set_ptr(2, act.attn_out.as_ptr());
         inst.set_ptr(3, act.gate_attn.as_ptr());
         inst.set_int(4, gate_size as i32);
@@ -1370,7 +1375,7 @@ impl MegakernelProgram {
 
         // 9. Output projection
         let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+        inst.set_output_ptr(1, act.out_proj.as_ptr());
         inst.set_ptr(2, w.w_o.as_ptr());
         inst.set_ptr(3, act.gated_out.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1379,13 +1384,13 @@ impl MegakernelProgram {
 
         // 10. Residual
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.residual.as_ptr());
+        inst.set_output_ptr(1, act.residual.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_int(3, hs as i32);
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.hidden.as_ptr());
+        inst.set_output_ptr(1, act.hidden.as_ptr());
         inst.set_ptr(2, act.out_proj.as_ptr());
         inst.set_ptr(3, act.residual.as_ptr());
         inst.set_int(4, hs as i32);
@@ -1410,7 +1415,7 @@ impl MegakernelProgram {
 
         // FFN gate+up (batch=N)
         let mut inst = Instruction::new(OP_FFN_GATE_UP, (is * n) as u32);
-        inst.set_mut_ptr(1, bufs.ffn_act.as_ptr());
+        inst.set_output_ptr(1, bufs.ffn_act.as_ptr());
         inst.set_ptr(2, bufs.hidden.as_ptr());
         inst.set_ptr(3, post_norm.as_ptr());
         inst.set_ptr(4, w_gate.as_ptr());
@@ -1423,14 +1428,14 @@ impl MegakernelProgram {
 
         // Save residual
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((n * hs) as u32, 256));
-        inst.set_mut_ptr(1, bufs.residual.as_ptr());
+        inst.set_output_ptr(1, bufs.residual.as_ptr());
         inst.set_ptr(2, bufs.hidden.as_ptr());
         inst.set_int(3, (n * hs) as i32);
         instructions.push(inst);
 
         // FFN down + residual (batch=N)
         let mut inst = Instruction::new(OP_FFN_DOWN_RES, (hs * n) as u32);
-        inst.set_mut_ptr(1, bufs.hidden.as_ptr());
+        inst.set_output_ptr(1, bufs.hidden.as_ptr());
         inst.set_ptr(2, bufs.residual.as_ptr());
         inst.set_ptr(3, w_down.as_ptr());
         inst.set_ptr(4, bufs.ffn_act.as_ptr());
@@ -1457,7 +1462,7 @@ impl MegakernelProgram {
 
         // FFN gate+up (fused with RMSNorm)
         let mut inst = Instruction::new(OP_FFN_GATE_UP, is as u32);
-        inst.set_mut_ptr(1, act.ffn_act.as_ptr());
+        inst.set_output_ptr(1, act.ffn_act.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_ptr(3, post_norm.as_ptr());
         inst.set_ptr(4, w_gate.as_ptr());
@@ -1469,14 +1474,14 @@ impl MegakernelProgram {
 
         // Save residual
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_mut_ptr(1, act.residual.as_ptr());
+        inst.set_output_ptr(1, act.residual.as_ptr());
         inst.set_ptr(2, act.hidden.as_ptr());
         inst.set_int(3, hs as i32);
         instructions.push(inst);
 
         // FFN down + residual
         let mut inst = Instruction::new(OP_FFN_DOWN_RES, hs as u32);
-        inst.set_mut_ptr(1, act.hidden.as_ptr());
+        inst.set_output_ptr(1, act.hidden.as_ptr());
         inst.set_ptr(2, act.residual.as_ptr());
         inst.set_ptr(3, w_down.as_ptr());
         inst.set_ptr(4, act.ffn_act.as_ptr());
@@ -1489,7 +1494,7 @@ impl MegakernelProgram {
     pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
         assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
 
-        let cfg_nkh_hd = 512usize; // nkh * hd = 2 * 256
+        let cfg_nkh_hd = self.kv_stride_paged;
         let mut changed: Vec<usize> = Vec::new();
 
         // Update embedding token_id
