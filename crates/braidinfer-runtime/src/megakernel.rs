@@ -46,15 +46,11 @@ impl Instruction {
         Instruction { words }
     }
 
-    fn set_ptr(&mut self, idx: usize, ptr: *const f32) {
+    fn set_ptr<T>(&mut self, idx: usize, ptr: *const T) {
         self.words[idx] = ptr as u64;
     }
 
-    fn set_mut_ptr(&mut self, idx: usize, ptr: *const f32) {
-        self.words[idx] = ptr as u64;
-    }
-
-    fn set_int_ptr(&mut self, idx: usize, ptr: *const i32) {
+    fn set_mut_ptr<T>(&mut self, idx: usize, ptr: *const T) {
         self.words[idx] = ptr as u64;
     }
 
@@ -458,7 +454,7 @@ impl MegakernelProgram {
         inst.set_mut_ptr(1, act.q_attn.as_ptr());
         inst.set_mut_ptr(2, act.k_attn.as_ptr());
         inst.set_ptr(3, act.inv_freq.as_ptr());
-        inst.set_int_ptr(4, act.position_ids.as_ptr());
+        inst.set_ptr(4, act.position_ids.as_ptr());
         inst.set_int(5, nqh as i32);
         inst.set_int(6, nkh as i32);
         inst.set_int(7, hd as i32);

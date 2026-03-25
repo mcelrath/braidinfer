@@ -1,13 +1,14 @@
 #include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
+#include "bf16_utils.h"
 
 // RMSNorm: y = x * weight / sqrt(mean(x^2) + eps)
 // One block per row. Reduction within block via shared memory.
+// weight is BF16 (unsigned short).
 
 extern "C" __global__ void rmsnorm_f32(
     float* __restrict__ output,
     const float* __restrict__ input,
-    const float* __restrict__ weight,
+    const unsigned short* __restrict__ weight,
     const int hidden_size,
     const float eps
 ) {
@@ -41,6 +42,6 @@ extern "C" __global__ void rmsnorm_f32(
 
     // Normalize and scale
     for (int i = tid; i < hidden_size; i += stride) {
-        y[i] = x[i] * rms * (1.0f + weight[i]);
+        y[i] = x[i] * rms * (1.0f + bf16_to_f32(weight[i]));
     }
 }

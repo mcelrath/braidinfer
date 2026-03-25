@@ -1,13 +1,14 @@
 #include <hip/hip_runtime.h>
+#include "bf16_utils.h"
 
 // Matrix-vector multiply: y = W @ x
-// W is [out_dim x in_dim] row-major, x is [in_dim], y is [out_dim]
+// W is [out_dim x in_dim] row-major BF16, x is [in_dim] f32, y is [out_dim] f32.
 // One block per output row, dot product with shared mem reduction.
 // For decode batch=1 only.
 
 extern "C" __global__ void linear_proj_f32(
     float* __restrict__ output,
-    const float* __restrict__ weight,
+    const unsigned short* __restrict__ weight,
     const float* __restrict__ input,
     const int out_dim,
     const int in_dim
@@ -18,11 +19,11 @@ extern "C" __global__ void linear_proj_f32(
 
     if (row >= out_dim) return;
 
-    const float* w = weight + row * in_dim;
+    const unsigned short* w = weight + row * in_dim;
 
     float acc = 0.0f;
     for (int i = tid; i < in_dim; i += stride) {
-        acc += w[i] * input[i];
+        acc += bf16_to_f32(w[i]) * input[i];
     }
 
     __shared__ float shared[256];

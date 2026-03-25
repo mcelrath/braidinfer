@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
+#include "bf16_utils.h"
 
 // Megakernel: persistent cooperative kernel that executes a program of instructions.
 // Launched once with max cooperative blocks (384 on gfx1100 with 256 threads).
@@ -48,6 +49,9 @@ __device__ __forceinline__ u32 inst_grid_x(const u64* inst) {
 __device__ __forceinline__ float* inst_fptr(const u64* inst, int idx) {
     return (float*)(inst[idx]);
 }
+__device__ __forceinline__ const unsigned short* inst_u16ptr(const u64* inst, int idx) {
+    return (const unsigned short*)(inst[idx]);
+}
 __device__ __forceinline__ int inst_int(const u64* inst, int idx) {
     return (int)(inst[idx]);
 }
@@ -69,7 +73,7 @@ __device__ __forceinline__ float inst_float(const u64* inst, int idx) {
 __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
     float* output = inst_fptr(inst, 1);
     const float* input = inst_fptr(inst, 2);
-    const float* weight = inst_fptr(inst, 3);
+    const unsigned short* weight = inst_u16ptr(inst, 3);
     int hidden_size = inst_int(inst, 4);
     float eps = inst_float(inst, 5);
 
@@ -92,7 +96,7 @@ __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
     float rms = rsqrtf(shared[0] / (float)hidden_size + eps);
 
     for (int i = tid; i < hidden_size; i += stride) {
-        output[i] = input[i] * rms * (1.0f + weight[i]);
+        output[i] = input[i] * rms * (1.0f + bf16_to_f32(weight[i]));
     }
 }
 
@@ -100,7 +104,7 @@ __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
 // args: [1]=output, [2]=weight, [3]=input, [4]=out_dim, [5]=in_dim
 __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     float* output = inst_fptr(inst, 1);
-    const float* weight = inst_fptr(inst, 2);
+    const unsigned short* weight = inst_u16ptr(inst, 2);
     const float* input = inst_fptr(inst, 3);
     int out_dim = inst_int(inst, 4);
     int in_dim = inst_int(inst, 5);
@@ -110,11 +114,11 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
-    const float* w = weight + row * in_dim;
+    const unsigned short* w = weight + row * in_dim;
 
     float acc = 0.0f;
     for (int i = tid; i < in_dim; i += stride) {
-        acc += w[i] * input[i];
+        acc += bf16_to_f32(w[i]) * input[i];
     }
 
     extern __shared__ float shared[];
@@ -132,24 +136,23 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
 __device__ void op_conv1d(const u64* inst, u32 vblock) {
     float* state = inst_fptr(inst, 1);
     const float* input = inst_fptr(inst, 2);
-    const float* weight = inst_fptr(inst, 3);
+    const unsigned short* weight = inst_u16ptr(inst, 3);
     float* output = inst_fptr(inst, 4);
     int conv_dim = inst_int(inst, 5);
     int kernel_size = inst_int(inst, 6);
 
-    // Each virtual block handles blockDim.x channels starting at vblock*blockDim.x
     int ch = vblock * blockDim.x + threadIdx.x;
     if (ch >= conv_dim) return;
 
     int hist = kernel_size - 1;
     float* s = state + ch * hist;
-    const float* w = weight + ch * kernel_size;
+    const unsigned short* w = weight + ch * kernel_size;
 
     float acc = 0.0f;
     for (int k = 0; k < hist; k++) {
-        acc += s[k] * w[k];
+        acc += s[k] * bf16_to_f32(w[k]);
     }
-    acc += input[ch] * w[hist];
+    acc += input[ch] * bf16_to_f32(w[hist]);
     output[ch] = acc / (1.0f + expf(-acc));
 
     for (int i = 0; i < hist - 1; i++) {
@@ -164,7 +167,7 @@ __device__ void op_gdn_gate(const u64* inst, u32 vblock) {
     float* gate_out = inst_fptr(inst, 1);
     const float* a_input = inst_fptr(inst, 2);
     const float* A_log = inst_fptr(inst, 3);
-    const float* dt_bias = inst_fptr(inst, 4);
+    const unsigned short* dt_bias = inst_u16ptr(inst, 4);
     int num_heads = inst_int(inst, 5);
 
     int h = vblock * blockDim.x + threadIdx.x;
@@ -172,7 +175,7 @@ __device__ void op_gdn_gate(const u64* inst, u32 vblock) {
 
     float a = a_input[h];
     float A = expf(A_log[h]);
-    float sp = log1pf(expf(a + dt_bias[h]));
+    float sp = log1pf(expf(a + bf16_to_f32(dt_bias[h])));
     gate_out[h] = expf(-A * sp);
 }
 
@@ -320,9 +323,9 @@ __device__ void op_residual_add(const u64* inst, u32 vblock) {
 __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
     float* scratch = inst_fptr(inst, 1);
     const float* input = inst_fptr(inst, 2);
-    const float* rms_weight = inst_fptr(inst, 3);
-    const float* w_gate = inst_fptr(inst, 4);
-    const float* w_up = inst_fptr(inst, 5);
+    const unsigned short* rms_weight = inst_u16ptr(inst, 3);
+    const unsigned short* w_gate = inst_u16ptr(inst, 4);
+    const unsigned short* w_up = inst_u16ptr(inst, 5);
     int hidden_size = inst_int(inst, 6);
     int intermediate_size = inst_int(inst, 7);
     float eps = inst_float(inst, 8);
@@ -346,13 +349,13 @@ __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
     float rms_scale = rsqrtf(shared[0] / (float)hidden_size + eps);
     __syncthreads();
 
-    const float* wg = w_gate + row * hidden_size;
-    const float* wu = w_up + row * hidden_size;
+    const unsigned short* wg = w_gate + row * hidden_size;
+    const unsigned short* wu = w_up + row * hidden_size;
     float acc_gate = 0.0f, acc_up = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) {
-        float normed = input[i] * rms_scale * (1.0f + rms_weight[i]);
-        acc_gate += wg[i] * normed;
-        acc_up += wu[i] * normed;
+        float normed = input[i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[i]));
+        acc_gate += bf16_to_f32(wg[i]) * normed;
+        acc_up += bf16_to_f32(wu[i]) * normed;
     }
 
     shared[tid] = acc_gate;
@@ -383,7 +386,7 @@ __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
 __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
     float* output = inst_fptr(inst, 1);
     const float* residual = inst_fptr(inst, 2);
-    const float* w_down = inst_fptr(inst, 3);
+    const unsigned short* w_down = inst_u16ptr(inst, 3);
     const float* scratch = inst_fptr(inst, 4);
     int hidden_size = inst_int(inst, 5);
     int intermediate_size = inst_int(inst, 6);
@@ -393,10 +396,10 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
-    const float* w = w_down + row * intermediate_size;
+    const unsigned short* w = w_down + row * intermediate_size;
 
     float acc = 0.0f;
-    for (int i = tid; i < intermediate_size; i += stride) acc += w[i] * scratch[i];
+    for (int i = tid; i < intermediate_size; i += stride) acc += bf16_to_f32(w[i]) * scratch[i];
 
     extern __shared__ float shared[];
     shared[tid] = acc;
@@ -412,13 +415,13 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
 // args: [1]=output, [2]=table, [3]=token_id, [4]=hidden_size
 __device__ void op_embedding(const u64* inst, u32 vblock) {
     float* output = inst_fptr(inst, 1);
-    const float* table = inst_fptr(inst, 2);
+    const unsigned short* table = inst_u16ptr(inst, 2);
     int token_id = inst_int(inst, 3);
     int hidden_size = inst_int(inst, 4);
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < hidden_size) {
-        output[idx] = table[token_id * hidden_size + idx];
+        output[idx] = bf16_to_f32(table[(long long)token_id * hidden_size + idx]);
     }
 }
 
@@ -433,8 +436,8 @@ __device__ void op_lm_head(const u64* inst, u32 vblock) {
 __device__ void op_qk_norm(const u64* inst, u32 vblock) {
     float* q = inst_fptr(inst, 1);
     float* k = inst_fptr(inst, 2);
-    const float* q_weight = inst_fptr(inst, 3);
-    const float* k_weight = inst_fptr(inst, 4);
+    const unsigned short* q_weight = inst_u16ptr(inst, 3);
+    const unsigned short* k_weight = inst_u16ptr(inst, 4);
     int num_q_heads = inst_int(inst, 5);
     int num_kv_heads = inst_int(inst, 6);
     int head_dim = inst_int(inst, 7);
@@ -442,7 +445,7 @@ __device__ void op_qk_norm(const u64* inst, u32 vblock) {
 
     int head_idx = vblock;
     float* head_ptr;
-    const float* weight_ptr;
+    const unsigned short* weight_ptr;
     if (head_idx < num_q_heads) {
         head_ptr = q + head_idx * head_dim;
         weight_ptr = q_weight;
@@ -466,7 +469,7 @@ __device__ void op_qk_norm(const u64* inst, u32 vblock) {
     float rms = rsqrtf(shared[0] / (float)head_dim + eps);
 
     for (int i = tid; i < head_dim; i += stride) {
-        head_ptr[i] = head_ptr[i] * rms * (1.0f + weight_ptr[i]);
+        head_ptr[i] = head_ptr[i] * rms * (1.0f + bf16_to_f32(weight_ptr[i]));
     }
 }
 

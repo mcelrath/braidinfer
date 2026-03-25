@@ -93,6 +93,14 @@ impl SafeTensors {
         let raw = self.tensor_data(name)?;
         Some(convert_to_f32(raw, info.dtype))
     }
+
+    /// Return raw u16 values for BF16/F16 tensors (no conversion).
+    /// For F32 tensors, converts to BF16 (truncates mantissa).
+    pub fn tensor_as_u16(&self, name: &str) -> Option<Vec<u16>> {
+        let info = self.tensors.get(name)?;
+        let raw = self.tensor_data(name)?;
+        Some(convert_to_u16(raw, info.dtype))
+    }
 }
 
 fn convert_to_f32(raw: &[u8], dtype: DType) -> Vec<f32> {
@@ -124,6 +132,23 @@ fn convert_to_f32(raw: &[u8], dtype: DType) -> Vec<f32> {
                 [lo as f32, hi as f32]
             })
             .collect(),
+    }
+}
+
+fn convert_to_u16(raw: &[u8], dtype: DType) -> Vec<u16> {
+    match dtype {
+        DType::BF16 | DType::F16 => raw
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
+            .collect(),
+        DType::F32 => raw
+            .chunks_exact(4)
+            .map(|b| {
+                let bits = u32::from_le_bytes(b.try_into().unwrap());
+                (bits >> 16) as u16 // FP32 → BF16 truncation
+            })
+            .collect(),
+        _ => panic!("tensor_as_u16 unsupported for {:?}", dtype),
     }
 }
 
@@ -482,6 +507,11 @@ impl SafeTensorSet {
     pub fn tensor_as_f32(&self, name: &str) -> Option<Vec<f32>> {
         let &shard_idx = self.index.get(name)?;
         self.shards[shard_idx].tensor_as_f32(name)
+    }
+
+    pub fn tensor_as_u16(&self, name: &str) -> Option<Vec<u16>> {
+        let &shard_idx = self.index.get(name)?;
+        self.shards[shard_idx].tensor_as_u16(name)
     }
 }
 

@@ -71,34 +71,34 @@ impl ModelConfig {
 // ---- Layer weight structs ----
 
 pub struct GdnLayerWeights {
-    pub input_norm: DeviceBuffer<f32>,
-    pub w_qkv: DeviceBuffer<f32>,    // [6144, 1024]
-    pub w_a: DeviceBuffer<f32>,      // [16, 1024]
-    pub w_b: DeviceBuffer<f32>,      // [16, 1024]
-    pub w_z: DeviceBuffer<f32>,      // [2048, 1024]
-    pub conv1d_weight: DeviceBuffer<f32>, // [6144, 4] (reshaped from [6144,1,4])
-    pub a_log: DeviceBuffer<f32>,    // [16]
-    pub dt_bias: DeviceBuffer<f32>,  // [16]
-    pub output_norm: DeviceBuffer<f32>, // [128]
-    pub w_out: DeviceBuffer<f32>,    // [1024, 2048]
-    pub post_norm: DeviceBuffer<f32>,
-    pub w_gate: DeviceBuffer<f32>,   // [3584, 1024]
-    pub w_up: DeviceBuffer<f32>,     // [3584, 1024]
-    pub w_down: DeviceBuffer<f32>,   // [1024, 3584]
+    pub input_norm: DeviceBuffer<u16>,  // bf16: (1+w) pattern, zeros init
+    pub w_qkv: DeviceBuffer<u16>,      // bf16 [6144, 1024]
+    pub w_a: DeviceBuffer<u16>,        // bf16 [16, 1024]
+    pub w_b: DeviceBuffer<u16>,        // bf16 [16, 1024]
+    pub w_z: DeviceBuffer<u16>,        // bf16 [2048, 1024]
+    pub conv1d_weight: DeviceBuffer<u16>, // bf16 [6144, 4]
+    pub a_log: DeviceBuffer<f32>,      // f32 (special: log space)
+    pub dt_bias: DeviceBuffer<u16>,    // bf16 [16]
+    pub output_norm: DeviceBuffer<f32>, // f32 [128] (QK-norm, (1+w) pattern)
+    pub w_out: DeviceBuffer<u16>,      // bf16 [1024, 2048]
+    pub post_norm: DeviceBuffer<u16>,  // bf16
+    pub w_gate: DeviceBuffer<u16>,     // bf16 [3584, 1024]
+    pub w_up: DeviceBuffer<u16>,       // bf16 [3584, 1024]
+    pub w_down: DeviceBuffer<u16>,     // bf16 [1024, 3584]
 }
 
 pub struct AttentionLayerWeights {
-    pub input_norm: DeviceBuffer<f32>,
-    pub w_q_gate: DeviceBuffer<f32>, // [4096, 1024] (Q + gate fused)
-    pub w_k: DeviceBuffer<f32>,      // [512, 1024]
-    pub w_v: DeviceBuffer<f32>,      // [512, 1024]
-    pub w_o: DeviceBuffer<f32>,      // [1024, 2048]
-    pub q_norm: DeviceBuffer<f32>,   // [256]
-    pub k_norm: DeviceBuffer<f32>,   // [256]
-    pub post_norm: DeviceBuffer<f32>,
-    pub w_gate: DeviceBuffer<f32>,
-    pub w_up: DeviceBuffer<f32>,
-    pub w_down: DeviceBuffer<f32>,
+    pub input_norm: DeviceBuffer<u16>,  // bf16: (1+w) pattern
+    pub w_q_gate: DeviceBuffer<u16>,   // bf16 [4096, 1024]
+    pub w_k: DeviceBuffer<u16>,        // bf16 [512, 1024]
+    pub w_v: DeviceBuffer<u16>,        // bf16 [512, 1024]
+    pub w_o: DeviceBuffer<u16>,        // bf16 [1024, 2048]
+    pub q_norm: DeviceBuffer<u16>,     // bf16 [256] (QK-norm, (1+w) pattern)
+    pub k_norm: DeviceBuffer<u16>,     // bf16 [256] (QK-norm, (1+w) pattern)
+    pub post_norm: DeviceBuffer<u16>,  // bf16
+    pub w_gate: DeviceBuffer<u16>,     // bf16
+    pub w_up: DeviceBuffer<u16>,       // bf16
+    pub w_down: DeviceBuffer<u16>,     // bf16
 }
 
 pub enum LayerWeights {
@@ -205,8 +205,8 @@ pub struct Qwen35Model {
     pub(crate) device: DeviceId,
     pub(crate) stream: Stream,
     kernels: AllKernels,
-    pub(crate) embed_weight: DeviceBuffer<f32>,
-    pub(crate) final_norm_weight: DeviceBuffer<f32>,
+    pub(crate) embed_weight: DeviceBuffer<u16>,
+    pub(crate) final_norm_weight: DeviceBuffer<u16>,
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) activations: ActivationBuffers,
     pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
@@ -272,6 +272,46 @@ fn load_weight(
     Ok(buf)
 }
 
+fn load_weight_bf16(
+    st: &SafeTensorSet,
+    name: &str,
+    device: DeviceId,
+    expected_len: usize,
+) -> Result<DeviceBuffer<u16>, ModelError> {
+    let data = st
+        .tensor_as_u16(name)
+        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    assert_eq!(
+        data.len(),
+        expected_len,
+        "weight {name}: expected {expected_len} elements, got {}",
+        data.len()
+    );
+    let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
+    buf.copy_from_host(&data)?;
+    Ok(buf)
+}
+
+// D2D memcpy: copy `count` u16 elements from src at offset src_off to dst at offset dst_off
+unsafe fn d2d_copy_u16(
+    dst: &mut DeviceBuffer<u16>,
+    dst_off: usize,
+    src: &DeviceBuffer<u16>,
+    src_off: usize,
+    count: usize,
+) -> HipResult<()> {
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr().add(dst_off) as *mut std::ffi::c_void;
+        let src_ptr = src.as_ptr().add(src_off) as *const std::ffi::c_void;
+        braidinfer_hip::error::check(ffi::hipMemcpy(
+            dst_ptr,
+            src_ptr,
+            count * 2,
+            ffi::hipMemcpyDeviceToDevice,
+        ))
+    }
+}
+
 // D2D memcpy: copy `count` f32 elements from src at offset src_off to dst at offset dst_off
 unsafe fn d2d_copy_f32(
     dst: &mut DeviceBuffer<f32>,
@@ -315,14 +355,14 @@ impl Qwen35Model {
         let stream = Stream::new(device)?;
         let kernels = AllKernels::load(device)?;
 
-        // Global weights
-        let embed_weight = load_weight(
+        // Global weights (BF16)
+        let embed_weight = load_weight_bf16(
             &st,
             &format!("{prefix}embed_tokens.weight"),
             device,
             config.vocab_size * config.hidden_size,
         )?;
-        let final_norm_weight = load_weight(
+        let final_norm_weight = load_weight_bf16(
             &st,
             &format!("{prefix}norm.weight"),
             device,
@@ -335,17 +375,17 @@ impl Qwen35Model {
             let p = format!("{prefix}layers.{i}.");
             if config.layer_is_attention[i] {
                 let w = AttentionLayerWeights {
-                    input_norm: load_weight(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
-                    w_q_gate: load_weight(&st, &format!("{p}self_attn.q_proj.weight"), device, 4096 * config.hidden_size)?,
-                    w_k: load_weight(&st, &format!("{p}self_attn.k_proj.weight"), device, 512 * config.hidden_size)?,
-                    w_v: load_weight(&st, &format!("{p}self_attn.v_proj.weight"), device, 512 * config.hidden_size)?,
-                    w_o: load_weight(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * 2048)?,
-                    q_norm: load_weight(&st, &format!("{p}self_attn.q_norm.weight"), device, config.head_dim)?,
-                    k_norm: load_weight(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?,
-                    post_norm: load_weight(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
-                    w_gate: load_weight(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_up: load_weight(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_down: load_weight(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?,
+                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
+                    w_q_gate: load_weight_bf16(&st, &format!("{p}self_attn.q_proj.weight"), device, 4096 * config.hidden_size)?,
+                    w_k: load_weight_bf16(&st, &format!("{p}self_attn.k_proj.weight"), device, 512 * config.hidden_size)?,
+                    w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, 512 * config.hidden_size)?,
+                    w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * 2048)?,
+                    q_norm: load_weight_bf16(&st, &format!("{p}self_attn.q_norm.weight"), device, config.head_dim)?,
+                    k_norm: load_weight_bf16(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?,
+                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
+                    w_gate: load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
+                    w_up: load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
+                    w_down: load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?,
                 };
                 layers.push(LayerWeights::Attention(w));
             } else {
@@ -355,20 +395,20 @@ impl Qwen35Model {
                 let qkv_out = nh * kd + nh * kd + nh * vd; // 2048+2048+2048=6144
                 let z_out = nh * vd; // 2048
                 let w = GdnLayerWeights {
-                    input_norm: load_weight(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
-                    w_qkv: load_weight(&st, &format!("{p}linear_attn.in_proj_qkv.weight"), device, qkv_out * config.hidden_size)?,
-                    w_a: load_weight(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nh * config.hidden_size)?,
-                    w_b: load_weight(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nh * config.hidden_size)?,
-                    w_z: load_weight(&st, &format!("{p}linear_attn.in_proj_z.weight"), device, z_out * config.hidden_size)?,
-                    conv1d_weight: load_weight(&st, &format!("{p}linear_attn.conv1d.weight"), device, qkv_out * config.linear_conv_kernel_dim)?,
-                    a_log: load_weight(&st, &format!("{p}linear_attn.A_log"), device, nh)?,
-                    dt_bias: load_weight(&st, &format!("{p}linear_attn.dt_bias"), device, nh)?,
-                    output_norm: load_weight(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,
-                    w_out: load_weight(&st, &format!("{p}linear_attn.out_proj.weight"), device, config.hidden_size * z_out)?,
-                    post_norm: load_weight(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
-                    w_gate: load_weight(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_up: load_weight(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_down: load_weight(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?,
+                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
+                    w_qkv: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_qkv.weight"), device, qkv_out * config.hidden_size)?,
+                    w_a: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nh * config.hidden_size)?,
+                    w_b: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nh * config.hidden_size)?,
+                    w_z: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_z.weight"), device, z_out * config.hidden_size)?,
+                    conv1d_weight: load_weight_bf16(&st, &format!("{p}linear_attn.conv1d.weight"), device, qkv_out * config.linear_conv_kernel_dim)?,
+                    a_log: load_weight(&st, &format!("{p}linear_attn.A_log"), device, nh)?,  // f32
+                    dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nh)?,
+                    output_norm: load_weight(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,  // f32
+                    w_out: load_weight_bf16(&st, &format!("{p}linear_attn.out_proj.weight"), device, config.hidden_size * z_out)?,
+                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
+                    w_gate: load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
+                    w_up: load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
+                    w_down: load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?,
                 };
                 layers.push(LayerWeights::Gdn(w));
             }
@@ -598,9 +638,9 @@ impl Qwen35Model {
         let conv_v_out_len = nh as usize * vd as usize;
         let ck_usize = ck as usize;
 
-        let mut conv_w_q = DeviceBuffer::<f32>::alloc(self.device, conv_q_out_len * ck_usize)?;
-        let mut conv_w_k = DeviceBuffer::<f32>::alloc(self.device, conv_k_out_len * ck_usize)?;
-        let mut conv_w_v = DeviceBuffer::<f32>::alloc(self.device, conv_v_out_len * ck_usize)?;
+        let mut conv_w_q = DeviceBuffer::<u16>::alloc(self.device, conv_q_out_len * ck_usize)?;
+        let mut conv_w_k = DeviceBuffer::<u16>::alloc(self.device, conv_k_out_len * ck_usize)?;
+        let mut conv_w_v = DeviceBuffer::<u16>::alloc(self.device, conv_v_out_len * ck_usize)?;
 
         // NOTE: conv1d_weight layout is [6144, ck] row-major. Each row is one channel's kernel.
         // We need rows 0..2048 for q, 2048..4096 for k, 4096..6144 for v.
@@ -609,9 +649,9 @@ impl Qwen35Model {
                 LayerWeights::Gdn(w) => w,
                 _ => unreachable!(),
             };
-            d2d_copy_f32(&mut conv_w_q, 0, &weights_gdn.conv1d_weight, 0, conv_q_out_len * ck_usize)?;
-            d2d_copy_f32(&mut conv_w_k, 0, &weights_gdn.conv1d_weight, conv_q_out_len * ck_usize, conv_k_out_len * ck_usize)?;
-            d2d_copy_f32(&mut conv_w_v, 0, &weights_gdn.conv1d_weight, (conv_q_out_len + conv_k_out_len) * ck_usize, conv_v_out_len * ck_usize)?;
+            d2d_copy_u16(&mut conv_w_q, 0, &weights_gdn.conv1d_weight, 0, conv_q_out_len * ck_usize)?;
+            d2d_copy_u16(&mut conv_w_k, 0, &weights_gdn.conv1d_weight, conv_q_out_len * ck_usize, conv_k_out_len * ck_usize)?;
+            d2d_copy_u16(&mut conv_w_v, 0, &weights_gdn.conv1d_weight, (conv_q_out_len + conv_k_out_len) * ck_usize, conv_v_out_len * ck_usize)?;
         }
 
         // For the conv state, we need sub-views too.
@@ -753,10 +793,10 @@ impl Qwen35Model {
         // 10. FFN — extract raw pointers to avoid borrow conflict with &mut self
         let (post_norm_p, w_gate_p, w_up_p, w_down_p) = match &self.layers[layer_idx] {
             LayerWeights::Gdn(w) => (
-                &w.post_norm as *const _,
-                &w.w_gate as *const _,
-                &w.w_up as *const _,
-                &w.w_down as *const _,
+                &w.post_norm as *const DeviceBuffer<u16>,
+                &w.w_gate as *const DeviceBuffer<u16>,
+                &w.w_up as *const DeviceBuffer<u16>,
+                &w.w_down as *const DeviceBuffer<u16>,
             ),
             _ => unreachable!(),
         };
@@ -765,10 +805,10 @@ impl Qwen35Model {
 
     fn ffn_forward(
         &mut self,
-        post_norm: &DeviceBuffer<f32>,
-        w_gate: &DeviceBuffer<f32>,
-        w_up: &DeviceBuffer<f32>,
-        w_down: &DeviceBuffer<f32>,
+        post_norm: &DeviceBuffer<u16>,
+        w_gate: &DeviceBuffer<u16>,
+        w_up: &DeviceBuffer<u16>,
+        w_down: &DeviceBuffer<u16>,
     ) -> HipResult<()> {
         let hs = self.config.hidden_size as u32;
         let is = self.config.intermediate_size as u32;
@@ -821,7 +861,7 @@ impl Qwen35Model {
 
         // 1. RMSNorm
         let input_norm = match &self.layers[layer_idx] {
-            LayerWeights::Attention(w) => &w.input_norm as *const DeviceBuffer<f32>,
+            LayerWeights::Attention(w) => &w.input_norm as *const DeviceBuffer<u16>,
             _ => panic!("expected attention layer"),
         };
         unsafe {
@@ -840,16 +880,16 @@ impl Qwen35Model {
         let (w_q_gate, w_k, w_v, w_o_ptr, q_norm_w, k_norm_w, post_norm_w, w_gate_w, w_up_w, w_down_w) =
             match &self.layers[layer_idx] {
                 LayerWeights::Attention(w) => (
-                    &w.w_q_gate as *const _,
-                    &w.w_k as *const _,
-                    &w.w_v as *const _,
-                    &w.w_o as *const _,
-                    &w.q_norm as *const _,
-                    &w.k_norm as *const _,
-                    &w.post_norm as *const _,
-                    &w.w_gate as *const _,
-                    &w.w_up as *const _,
-                    &w.w_down as *const _,
+                    &w.w_q_gate as *const DeviceBuffer<u16>,
+                    &w.w_k as *const DeviceBuffer<u16>,
+                    &w.w_v as *const DeviceBuffer<u16>,
+                    &w.w_o as *const DeviceBuffer<u16>,
+                    &w.q_norm as *const DeviceBuffer<u16>,
+                    &w.k_norm as *const DeviceBuffer<u16>,
+                    &w.post_norm as *const DeviceBuffer<u16>,
+                    &w.w_gate as *const DeviceBuffer<u16>,
+                    &w.w_up as *const DeviceBuffer<u16>,
+                    &w.w_down as *const DeviceBuffer<u16>,
                 ),
                 _ => unreachable!(),
             };
@@ -1188,13 +1228,13 @@ impl Qwen35Model {
             d2d_copy_f32(&mut self.activations.v_gdn, 0, &self.activations.qkv, conv_q_len + conv_k_len, conv_v_len)?;
         }
 
-        let mut conv_w_q = DeviceBuffer::<f32>::alloc(self.device, conv_q_len * ck_usize)?;
-        let mut conv_w_k = DeviceBuffer::<f32>::alloc(self.device, conv_k_len * ck_usize)?;
-        let mut conv_w_v = DeviceBuffer::<f32>::alloc(self.device, conv_v_len * ck_usize)?;
+        let mut conv_w_q = DeviceBuffer::<u16>::alloc(self.device, conv_q_len * ck_usize)?;
+        let mut conv_w_k = DeviceBuffer::<u16>::alloc(self.device, conv_k_len * ck_usize)?;
+        let mut conv_w_v = DeviceBuffer::<u16>::alloc(self.device, conv_v_len * ck_usize)?;
         unsafe {
-            d2d_copy_f32(&mut conv_w_q, 0, &w.conv1d_weight, 0, conv_q_len * ck_usize)?;
-            d2d_copy_f32(&mut conv_w_k, 0, &w.conv1d_weight, conv_q_len * ck_usize, conv_k_len * ck_usize)?;
-            d2d_copy_f32(&mut conv_w_v, 0, &w.conv1d_weight, (conv_q_len + conv_k_len) * ck_usize, conv_v_len * ck_usize)?;
+            d2d_copy_u16(&mut conv_w_q, 0, &w.conv1d_weight, 0, conv_q_len * ck_usize)?;
+            d2d_copy_u16(&mut conv_w_k, 0, &w.conv1d_weight, conv_q_len * ck_usize, conv_k_len * ck_usize)?;
+            d2d_copy_u16(&mut conv_w_v, 0, &w.conv1d_weight, (conv_q_len + conv_k_len) * ck_usize, conv_v_len * ck_usize)?;
         }
 
         let conv_state_q_len = conv_q_len * (ck_usize - 1);

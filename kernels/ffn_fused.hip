@@ -1,10 +1,12 @@
 #include <hip/hip_runtime.h>
+#include "bf16_utils.h"
 
 // Fused FFN decode kernel — two sub-kernels, 2 launches instead of 6.
 //
 // Sub-kernel 1: RMSNorm(input) -> gate_proj + up_proj -> silu(gate)*up -> scratch
 // Sub-kernel 2: down_proj(scratch) + residual(input) -> output
 //
+// All weights are BF16, activations are f32.
 // hidden_size = 1024, intermediate_size = 3584 for Qwen3.5-0.8B
 
 // ffn_fused_gate_up_f32:
@@ -12,11 +14,11 @@
 //   block: (block_size, 1, 1)         — threads collaborate on dot product over hidden_size
 //   smem:  block_size * sizeof(float) for reduction
 extern "C" __global__ void ffn_fused_gate_up_f32(
-    float* __restrict__ scratch,         // [intermediate_size] — silu(gate)*up output
-    const float* __restrict__ input,     // [hidden_size]
-    const float* __restrict__ rms_weight,// [hidden_size]
-    const float* __restrict__ w_gate,   // [intermediate_size, hidden_size]
-    const float* __restrict__ w_up,     // [intermediate_size, hidden_size]
+    float* __restrict__ scratch,                  // [intermediate_size] — silu(gate)*up output
+    const float* __restrict__ input,              // [hidden_size]
+    const unsigned short* __restrict__ rms_weight,// [hidden_size] BF16
+    const unsigned short* __restrict__ w_gate,    // [intermediate_size, hidden_size] BF16
+    const unsigned short* __restrict__ w_up,      // [intermediate_size, hidden_size] BF16
     int hidden_size,
     int intermediate_size,
     float eps
@@ -46,15 +48,15 @@ extern "C" __global__ void ffn_fused_gate_up_f32(
     __syncthreads();
 
     // Step 2: gate dot product and up dot product in the same loop
-    const float* wg = w_gate + row * hidden_size;
-    const float* wu = w_up   + row * hidden_size;
+    const unsigned short* wg = w_gate + row * hidden_size;
+    const unsigned short* wu = w_up   + row * hidden_size;
 
     float acc_gate = 0.0f;
     float acc_up   = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) {
-        float normed = input[i] * rms_scale * (1.0f + rms_weight[i]);
-        acc_gate += wg[i] * normed;
-        acc_up   += wu[i] * normed;
+        float normed = input[i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[i]));
+        acc_gate += bf16_to_f32(wg[i]) * normed;
+        acc_up   += bf16_to_f32(wu[i]) * normed;
     }
 
     // Reduction for gate
@@ -88,10 +90,10 @@ extern "C" __global__ void ffn_fused_gate_up_f32(
 //   block: (block_size, 1, 1)          — threads collaborate on dot product over intermediate_size
 //   smem:  block_size * sizeof(float)
 extern "C" __global__ void ffn_fused_down_residual_f32(
-    float* __restrict__ output,          // [hidden_size]
-    const float* __restrict__ input,     // [hidden_size] — original input (residual)
-    const float* __restrict__ w_down,    // [hidden_size, intermediate_size]
-    const float* __restrict__ scratch,   // [intermediate_size]
+    float* __restrict__ output,                // [hidden_size]
+    const float* __restrict__ input,           // [hidden_size] — original input (residual)
+    const unsigned short* __restrict__ w_down, // [hidden_size, intermediate_size] BF16
+    const float* __restrict__ scratch,         // [intermediate_size]
     int hidden_size,
     int intermediate_size
 ) {
@@ -101,11 +103,11 @@ extern "C" __global__ void ffn_fused_down_residual_f32(
 
     if (row >= hidden_size) return;
 
-    const float* w = w_down + row * intermediate_size;
+    const unsigned short* w = w_down + row * intermediate_size;
 
     float acc = 0.0f;
     for (int i = tid; i < intermediate_size; i += stride) {
-        acc += w[i] * scratch[i];
+        acc += bf16_to_f32(w[i]) * scratch[i];
     }
 
     extern __shared__ float shared[];
