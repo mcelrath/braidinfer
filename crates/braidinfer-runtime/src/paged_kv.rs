@@ -82,6 +82,7 @@ pub struct PageAllocator {
     free_list: Vec<u32>,
     device: DeviceId,
     chunk_bytes: usize,
+    #[allow(dead_code)]
     chunk_tokens: usize,
 }
 

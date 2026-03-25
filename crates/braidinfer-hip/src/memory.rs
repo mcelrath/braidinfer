@@ -151,7 +151,7 @@ impl<T> PinnedBuffer<T> {
     /// # Safety
     /// Caller must ensure no other references to this buffer exist.
     pub unsafe fn as_mut_slice(&mut self) -> &mut [T] {
-        std::slice::from_raw_parts_mut(self.ptr, self.len)
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 

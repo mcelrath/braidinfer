@@ -6,7 +6,7 @@ use braidinfer_hip::HipResult;
 use std::ffi::c_void;
 
 use crate::model::{
-    ActivationBuffers, AttentionLayerWeights, GdnLayerWeights, KvCache, GdnState,
+    ActivationBuffers, AttentionLayerWeights, KvCache, GdnState,
     LayerWeights, ModelConfig, Qwen35Model,
 };
 use crate::paged_kv::{PageAllocator, SequenceState};
@@ -15,7 +15,7 @@ use crate::paged_kv::{PageAllocator, SequenceState};
 pub const CHUNK_TOKENS: usize = 64;
 
 // Opcode constants — must match megakernel.hip
-const OP_NOP: u32 = 0;
+const _OP_NOP: u32 = 0;
 const OP_RMSNORM: u32 = 1;
 const OP_LINEAR_PROJ: u32 = 2;
 const OP_CONV1D: u32 = 3;
@@ -30,7 +30,7 @@ const OP_OUTPUT_GATE: u32 = 11;
 const OP_FFN_GATE_UP: u32 = 12;
 const OP_FFN_DOWN_RES: u32 = 13;
 const OP_EMBEDDING: u32 = 14;
-const OP_LM_HEAD: u32 = 15;
+const _OP_LM_HEAD: u32 = 15;
 const OP_HALT: u32 = 16;
 const OP_D2D_COPY: u32 = 17;
 const OP_ATTN_PAGED: u32 = 18;
@@ -90,7 +90,7 @@ pub struct MegakernelProgram {
     device: DeviceId,
     // Indices of instructions that need per-step updates
     embedding_inst_idx: usize,
-    mrope_inst_indices: Vec<usize>,    // one per attention layer
+    _mrope_inst_indices: Vec<usize>,    // one per attention layer (reserved for future mRoPE patching)
     gqa_attn_inst_indices: Vec<usize>, // seq_len changes each step
     kv_write_indices: Vec<Vec<(usize, usize)>>, // per attn layer, per kv_head: (k_copy_idx, v_copy_idx)
     // Base KV cache pointers (position=0) for computing per-step write offsets
@@ -234,12 +234,12 @@ impl MegakernelProgram {
         let nh_gdn = cfg.linear_num_heads;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
-        let conv_dim = nh_gdn * kd * 2 + nh_gdn * vd; // 6144
-        let ck = cfg.linear_conv_kernel_dim;
-        let nqh = cfg.num_q_heads;
-        let nkh = cfg.num_kv_heads;
-        let hd = cfg.head_dim;
-        let is = cfg.intermediate_size;
+        let _conv_dim = nh_gdn * kd * 2 + nh_gdn * vd; // 6144
+        let _ck = cfg.linear_conv_kernel_dim;
+        let _nqh = cfg.num_q_heads;
+        let _nkh = cfg.num_kv_heads;
+        let _hd = cfg.head_dim;
+        let _is = cfg.intermediate_size;
         let vs = cfg.vocab_size;
         let eps = cfg.rms_norm_eps;
 
@@ -346,7 +346,7 @@ impl MegakernelProgram {
             num_blocks,
             device,
             embedding_inst_idx,
-            mrope_inst_indices,
+            _mrope_inst_indices: mrope_inst_indices,
             gqa_attn_inst_indices,
             kv_write_indices,
             kv_base_ptrs,
@@ -398,9 +398,9 @@ impl MegakernelProgram {
         let vd = cfg.linear_value_head_dim;
         let conv_dim = nh_gdn * kd * 2 + nh_gdn * vd;
         let ck = cfg.linear_conv_kernel_dim;
-        let nqh = cfg.num_q_heads;
-        let nkh = cfg.num_kv_heads;
-        let hd = cfg.head_dim;
+        let _nqh = cfg.num_q_heads;
+        let _nkh = cfg.num_kv_heads;
+        let _hd = cfg.head_dim;
         let is = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
 
@@ -431,7 +431,7 @@ impl MegakernelProgram {
         // === Layers ===
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
-        let mut attn_layer_count = 0usize;
+        let mut _attn_layer_count = 0usize;
 
         for layer_i in 0..cfg.num_layers {
             if cfg.layer_is_attention[layer_i] {
@@ -452,7 +452,7 @@ impl MegakernelProgram {
 
                 // Batched FFN
                 Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
-                attn_layer_count += 1;
+                _attn_layer_count += 1;
                 kv_idx += 1;
             } else {
                 // GDN layers: batched projections + sequential recurrence
@@ -728,7 +728,7 @@ impl MegakernelProgram {
             num_blocks,
             device,
             embedding_inst_idx,
-            mrope_inst_indices: Vec::new(),
+            _mrope_inst_indices: Vec::new(),
             gqa_attn_inst_indices: Vec::new(),
             kv_write_indices: Vec::new(),
             kv_base_ptrs: Vec::new(),
@@ -1527,7 +1527,7 @@ impl MegakernelProgram {
         })?;
 
         // Update KV cache write offsets (position-dependent, [H,T,D] layout)
-        let nkh = self.num_kv_heads_attn;
+        let _nkh = self.num_kv_heads_attn;
         let hd = self.head_dim_attn;
         let max_sl = self.max_seq_len as usize;
         let head_stride = max_sl * hd; // elements between consecutive heads
@@ -1612,7 +1612,7 @@ impl MegakernelProgram {
         // The write target is len-1 (the slot just reserved).
         let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
         let kv_stride = self.kv_stride_paged;
-        let nkh = self.num_kv_heads_attn;
+        let _nkh = self.num_kv_heads_attn;
         let hd = self.head_dim_attn;
         let chunk_head_stride = CHUNK_TOKENS * hd; // elements between heads within chunk
 
@@ -1744,7 +1744,7 @@ impl MegakernelProgram {
                     let f32_ptr = allocator.slot_ptr(sealed_chunk.slot_index());
 
                     // Allocate quantized chunk slot
-                    let (q_slot, q_ptr) = q_alloc.alloc()
+                    let (_q_slot, q_ptr) = q_alloc.alloc()
                         .ok_or(braidinfer_hip::HipError(braidinfer_hip::ffi::hipErrorOutOfMemory))?;
 
                     // Run quantize kernel

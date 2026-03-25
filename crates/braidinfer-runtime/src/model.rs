@@ -92,6 +92,7 @@ struct TextConfig {
     num_key_value_heads: usize,
     head_dim: usize,
     rms_norm_eps: Option<f64>,
+    #[allow(dead_code)]
     layer_norm_epsilon: Option<f64>,
     max_position_embeddings: Option<usize>,
     rope_parameters: Option<RopeParameters>,
@@ -100,6 +101,7 @@ struct TextConfig {
     linear_key_head_dim: Option<usize>,
     linear_value_head_dim: Option<usize>,
     linear_conv_kernel_dim: Option<usize>,
+    #[allow(dead_code)]
     model_type: Option<String>,
 }
 
@@ -542,6 +544,7 @@ impl std::error::Error for ModelError {}
 
 /// Load a tensor's raw bytes from safetensors directly to GPU. Zero-copy from mmap.
 /// Returns DeviceBuffer<u8> containing the on-disk representation.
+#[allow(dead_code)]
 fn load_tensor_raw(
     st: &SafeTensorSet,
     name: &str,
@@ -1184,7 +1187,7 @@ impl Qwen35Model {
         let s1 = cfg.mrope_section[1] as u32;
         let s2 = cfg.mrope_section[2] as u32;
         let eps = cfg.rms_norm_eps;
-        let max_sl = cfg.max_seq_len as u32;
+        let _max_sl = cfg.max_seq_len as u32;
 
         // 1. RMSNorm
         let input_norm = match &self.layers[layer_idx] {
@@ -1250,7 +1253,7 @@ impl Qwen35Model {
 
         // 3. Split q_gate_attn: interleaved [q0_hd, gate0_hd, q1_hd, gate1_hd, ...]
         //    → q=[nqh*hd], gate=[nqh*hd]
-        let q_size = nqh as usize * hd as usize;
+        let _q_size = nqh as usize * hd as usize;
         let hd_usize = hd as usize;
         unsafe {
             for h in 0..nqh as usize {
