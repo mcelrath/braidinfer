@@ -129,19 +129,32 @@ fn test_prefill_benchmark() {
     let n = 128;
     let tokens: Vec<u32> = (0..n).map(|i| 9707 + (i % 10) as u32).collect();
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load");
-
-    // Warmup
-    model.prefill(&tokens[..8]).expect("warmup");
-
-    // Benchmark
-    let mut model = Qwen35Model::load(model_dir, device).expect("reload");
+    // Sequential decode baseline
+    let mut model_seq = Qwen35Model::load(model_dir, device).expect("load");
+    for (i, &tok) in tokens[..8].iter().enumerate() {
+        model_seq.decode_step_paged(tok, i as u32).expect("warmup");
+    }
+    let mut model_seq = Qwen35Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
-    let _logits = model.prefill(&tokens).expect("prefill");
+    for (i, &tok) in tokens.iter().enumerate() {
+        model_seq.decode_step_paged(tok, i as u32).expect("decode");
+    }
     let elapsed = start.elapsed();
     let per_token_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
     let tokens_per_sec = n as f64 / elapsed.as_secs_f64();
-    println!("Sequential prefill {n} tokens: {:.3}s = {per_token_ms:.2} ms/token = {tokens_per_sec:.1} tok/s",
+    println!("Sequential decode {n} tokens: {:.3}s = {per_token_ms:.2} ms/token = {tokens_per_sec:.1} tok/s",
+        elapsed.as_secs_f64());
+
+    // Batched prefill API (uses compile_prefill internally)
+    let mut model_pre = Qwen35Model::load(model_dir, device).expect("reload");
+    model_pre.prefill(&tokens[..8]).expect("warmup");
+    let mut model_pre = Qwen35Model::load(model_dir, device).expect("reload");
+    let start = Instant::now();
+    let _logits = model_pre.prefill(&tokens).expect("prefill");
+    let elapsed = start.elapsed();
+    let per_token_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
+    let tokens_per_sec = n as f64 / elapsed.as_secs_f64();
+    println!("Batched prefill {n} tokens: {:.3}s = {per_token_ms:.2} ms/token = {tokens_per_sec:.1} tok/s",
         elapsed.as_secs_f64());
 
     // Batched prefill benchmark (64 tokens = 1 chunk)

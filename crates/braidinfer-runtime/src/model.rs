@@ -14,7 +14,7 @@ use crate::kernel::{
     MRoPEKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel,
     RmsNormKernel,
 };
-use crate::megakernel::{MegakernelProgram, CHUNK_TOKENS};
+use crate::megakernel::{MegakernelProgram, PrefillBuffers, CHUNK_TOKENS};
 use crate::paged_kv::{self, PageAllocator, RecurrentCheckpointPool, SequenceState};
 
 // ---- Model config ----
@@ -1394,15 +1394,18 @@ impl Qwen35Model {
         if tokens.is_empty() {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
-        let mut logits = vec![];
-        for (i, &tok) in tokens.iter().enumerate() {
-            logits = self.decode_step_paged(tok, i as u32)?;
-            // Save GDN checkpoint at chunk boundaries
-            if (i + 1) % CHUNK_TOKENS == 0 && i + 1 < tokens.len() {
+        let mut pos = 0u32;
+        for chunk in tokens.chunks(CHUNK_TOKENS) {
+            let mut bufs = PrefillBuffers::alloc(self.device, &self.config, chunk.len())?;
+            let program = MegakernelProgram::compile_prefill(self, chunk, pos, &mut bufs)?;
+            program.execute(&self.stream)?;
+            self.stream.synchronize()?;
+            pos += chunk.len() as u32;
+            if pos < tokens.len() as u32 {
                 let _slot = self.save_recurrent_checkpoint()?;
             }
         }
-        Ok(logits)
+        self.read_logits()
     }
 
     /// Read all GDN recurrent state to host (for testing).
