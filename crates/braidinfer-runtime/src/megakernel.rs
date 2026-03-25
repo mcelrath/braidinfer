@@ -9,6 +9,10 @@ use crate::model::{
     ActivationBuffers, AttentionLayerWeights, GdnLayerWeights, KvCache, GdnState,
     LayerWeights, ModelConfig, Qwen35Model,
 };
+use crate::paged_kv::{PageAllocator, SequenceState};
+
+/// Tokens per paged KV chunk — must match compile_attention_layer_paged.
+pub const CHUNK_TOKENS: usize = 64;
 
 // Opcode constants — must match megakernel.hip
 const OP_NOP: u32 = 0;
@@ -29,6 +33,7 @@ const OP_EMBEDDING: u32 = 14;
 const OP_LM_HEAD: u32 = 15;
 const OP_HALT: u32 = 16;
 const OP_D2D_COPY: u32 = 17;
+const OP_ATTN_PAGED: u32 = 18;
 
 const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
@@ -87,6 +92,14 @@ pub struct MegakernelProgram {
     position_ids_dev_ptr: u64,
     // Bounds check
     max_seq_len: u32,
+    // Paged KV cache support
+    paged: bool,
+    page_table: Option<DeviceBuffer<u64>>,     // array of chunk base pointers, uploaded per step
+    position_table: Option<DeviceBuffer<i32>>, // position per token, uploaded per step
+    attn_paged_inst_indices: Vec<usize>,        // indices of OP_ATTN_PAGED instructions
+    last_page_table_len: usize,                 // track when a new chunk was added
+    // kv_stride for paged KV write offset computation (nkh * hd)
+    kv_stride_paged: usize,
 }
 
 fn div_ceil(a: u32, b: u32) -> u32 {
@@ -98,6 +111,14 @@ impl MegakernelProgram {
     pub fn block_count(&self) -> u32 { self.num_blocks }
 
     pub fn compile(model: &Qwen35Model) -> HipResult<Self> {
+        Self::compile_inner(model, false)
+    }
+
+    pub fn compile_paged(model: &Qwen35Model) -> HipResult<Self> {
+        Self::compile_inner(model, true)
+    }
+
+    fn compile_inner(model: &Qwen35Model, paged: bool) -> HipResult<Self> {
         let cfg = &model.config;
         let device = model.device;
         let act = &model.activations;
@@ -140,17 +161,32 @@ impl MegakernelProgram {
         }
 
         // Layers
+        let mut attn_paged_inst_indices = Vec::new();
+        let mut attn_layer_count = 0usize;
+
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
         for layer_i in 0..cfg.num_layers {
             if cfg.layer_is_attention[layer_i] {
-                Self::compile_attention_layer(
-                    cfg, &model.layers[layer_i], act,
-                    &model.kv_caches[kv_idx],
-                    &mut instructions, &mut mrope_inst_indices,
-                    &mut gqa_attn_inst_indices, &mut kv_write_indices,
-                    &mut kv_base_ptrs,
-                );
+                if paged {
+                    Self::compile_attention_layer_paged(
+                        cfg, &model.layers[layer_i], act,
+                        &model.kv_caches[kv_idx],
+                        attn_layer_count,
+                        &mut instructions, &mut mrope_inst_indices,
+                        &mut kv_write_indices, &mut kv_base_ptrs,
+                        &mut attn_paged_inst_indices,
+                    );
+                } else {
+                    Self::compile_attention_layer(
+                        cfg, &model.layers[layer_i], act,
+                        &model.kv_caches[kv_idx],
+                        &mut instructions, &mut mrope_inst_indices,
+                        &mut gqa_attn_inst_indices, &mut kv_write_indices,
+                        &mut kv_base_ptrs,
+                    );
+                }
+                attn_layer_count += 1;
                 kv_idx += 1;
             } else {
                 Self::compile_gdn_layer(
@@ -220,6 +256,12 @@ impl MegakernelProgram {
             kv_base_ptrs,
             position_ids_dev_ptr: act.position_ids.as_ptr() as u64,
             max_seq_len: cfg.max_seq_len as u32,
+            paged,
+            page_table: None,
+            position_table: None,
+            attn_paged_inst_indices,
+            last_page_table_len: 0,
+            kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
         })
     }
 
@@ -563,6 +605,198 @@ impl MegakernelProgram {
         instructions.push(inst);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn compile_attention_layer_paged(
+        cfg: &ModelConfig,
+        layer: &LayerWeights,
+        act: &ActivationBuffers,
+        kv_cache: &KvCache,
+        attn_layer_index: usize,
+        instructions: &mut Vec<Instruction>,
+        mrope_indices: &mut Vec<usize>,
+        kv_write_indices: &mut Vec<(usize, usize)>,
+        kv_base_ptrs: &mut Vec<(u64, u64)>,
+        attn_paged_indices: &mut Vec<usize>,
+    ) {
+        let w = match layer {
+            LayerWeights::Attention(w) => w,
+            _ => panic!("expected attention layer"),
+        };
+        let hs = cfg.hidden_size;
+        let nqh = cfg.num_q_heads;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let eps = cfg.rms_norm_eps;
+        let rd = cfg.rope_dim;
+
+        // 1. RMSNorm
+        let mut inst = Instruction::new(OP_RMSNORM, 1);
+        inst.set_mut_ptr(1, act.normed.as_ptr());
+        inst.set_ptr(2, act.hidden.as_ptr());
+        inst.set_ptr(3, w.input_norm.as_ptr());
+        inst.set_int(4, hs as i32);
+        inst.set_float(5, eps);
+        instructions.push(inst);
+
+        // 2. Q+gate, K, V projections — all read normed, write disjoint
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
+        inst.set_mut_ptr(1, act.q_gate_attn.as_ptr());
+        inst.set_ptr(2, w.w_q_gate.as_ptr());
+        inst.set_ptr(3, act.normed.as_ptr());
+        inst.set_int(4, (nqh * hd * 2) as i32);
+        inst.set_int(5, hs as i32);
+        inst.set_no_sync();
+        instructions.push(inst);
+
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
+        inst.set_mut_ptr(1, act.k_attn.as_ptr());
+        inst.set_ptr(2, w.w_k.as_ptr());
+        inst.set_ptr(3, act.normed.as_ptr());
+        inst.set_int(4, (nkh * hd) as i32);
+        inst.set_int(5, hs as i32);
+        inst.set_no_sync();
+        instructions.push(inst);
+
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
+        inst.set_mut_ptr(1, act.v_attn.as_ptr());
+        inst.set_ptr(2, w.w_v.as_ptr());
+        inst.set_ptr(3, act.normed.as_ptr());
+        inst.set_int(4, (nkh * hd) as i32);
+        inst.set_int(5, hs as i32);
+        instructions.push(inst);
+
+        // 3. Q/gate deinterleave
+        for h in 0..nqh {
+            let src_q_offset = h * hd * 2;
+            let src_g_offset = h * hd * 2 + hd;
+            let dst_offset = h * hd;
+            let is_last = h == nqh - 1;
+
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+            inst.set_mut_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
+            inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
+            inst.set_int(3, hd as i32);
+            inst.set_no_sync();
+            instructions.push(inst);
+
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+            inst.set_mut_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
+            inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
+            inst.set_int(3, hd as i32);
+            if !is_last { inst.set_no_sync(); }
+            instructions.push(inst);
+        }
+
+        // 4. QK norm
+        let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
+        inst.set_mut_ptr(1, act.q_attn.as_ptr());
+        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+        inst.set_ptr(3, w.q_norm.as_ptr());
+        inst.set_ptr(4, w.k_norm.as_ptr());
+        inst.set_int(5, nqh as i32);
+        inst.set_int(6, nkh as i32);
+        inst.set_int(7, hd as i32);
+        inst.set_float(8, eps);
+        instructions.push(inst);
+
+        // 5. KV write — BEFORE mRoPE: stores pre-RoPE K into paged cache
+        // Chunk layout per chunk: [layer0_K, layer0_V, layer1_K, layer1_V, ...]
+        // Each K or V block is chunk_tokens * kv_stride f32s.
+        let kv_stride = nkh * hd;
+        let chunk_tokens: usize = 64;
+        let layer_k_offset_bytes =
+            (attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+        let layer_v_offset_bytes =
+            layer_k_offset_bytes + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+
+        // Destination ptr is patched per step by update_step_paged.
+        // At compile time, store kv_cache base ptr as placeholder.
+        let k_copy_idx = instructions.len();
+        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+        inst.set_mut_ptr(1, kv_cache.k.as_ptr());
+        inst.set_ptr(2, act.k_attn.as_ptr());
+        inst.set_int(3, kv_stride as i32);
+        inst.set_no_sync();
+        instructions.push(inst);
+
+        let v_copy_idx = instructions.len();
+        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+        inst.set_mut_ptr(1, kv_cache.v.as_ptr());
+        inst.set_ptr(2, act.v_attn.as_ptr());
+        inst.set_int(3, kv_stride as i32);
+        instructions.push(inst);
+        kv_write_indices.push((k_copy_idx, v_copy_idx));
+        kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
+
+        // 6. mRoPE — still needed for Q in activation buffer
+        let mrope_idx = instructions.len();
+        mrope_indices.push(mrope_idx);
+        let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
+        inst.set_mut_ptr(1, act.q_attn.as_ptr());
+        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+        inst.set_ptr(3, act.inv_freq.as_ptr());
+        inst.set_ptr(4, act.position_ids.as_ptr());
+        inst.set_int(5, nqh as i32);
+        inst.set_int(6, nkh as i32);
+        inst.set_int(7, hd as i32);
+        inst.set_int(8, rd as i32);
+        inst.set_int(9, cfg.mrope_section[0] as i32);
+        inst.set_int(10, cfg.mrope_section[1] as i32);
+        inst.set_int(11, cfg.mrope_section[2] as i32);
+        instructions.push(inst);
+
+        // 7. OP_ATTN_PAGED: page_table_ptr and position_table_ptr are patched per step
+        let paged_idx = instructions.len();
+        attn_paged_indices.push(paged_idx);
+        let mut inst = Instruction::new(OP_ATTN_PAGED, nqh as u32);
+        inst.set_mut_ptr(1, act.attn_out.as_ptr());
+        inst.set_ptr(2, act.q_attn.as_ptr());
+        inst.set_int(3, 0); // page_table_ptr — patched per step
+        inst.set_int(4, 0); // position_table_ptr — patched per step
+        inst.set_ptr(5, act.inv_freq.as_ptr());
+        inst.set_int(6, nqh as i32);
+        inst.set_int(7, nkh as i32);
+        inst.set_int(8, hd as i32);
+        inst.set_int(9, 1); // seq_len — patched per step
+        inst.set_int(10, chunk_tokens as i32);
+        inst.set_int(11, rd as i32);
+        inst.words[12] = layer_k_offset_bytes;
+        inst.words[13] = layer_v_offset_bytes;
+        instructions.push(inst);
+
+        // 8. Output gate
+        let gate_size = nqh * hd;
+        let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
+        inst.set_mut_ptr(1, act.gated_out.as_ptr());
+        inst.set_ptr(2, act.attn_out.as_ptr());
+        inst.set_ptr(3, act.gate_attn.as_ptr());
+        inst.set_int(4, gate_size as i32);
+        instructions.push(inst);
+
+        // 9. Output projection
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+        inst.set_ptr(2, w.w_o.as_ptr());
+        inst.set_ptr(3, act.gated_out.as_ptr());
+        inst.set_int(4, hs as i32);
+        inst.set_int(5, (nqh * hd) as i32);
+        instructions.push(inst);
+
+        // 10. Residual
+        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+        inst.set_mut_ptr(1, act.residual.as_ptr());
+        inst.set_ptr(2, act.hidden.as_ptr());
+        inst.set_int(3, hs as i32);
+        instructions.push(inst);
+
+        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+        inst.set_mut_ptr(1, act.hidden.as_ptr());
+        inst.set_ptr(2, act.out_proj.as_ptr());
+        inst.set_ptr(3, act.residual.as_ptr());
+        inst.set_int(4, hs as i32);
+        instructions.push(inst);
+    }
+
     fn compile_ffn(
         cfg: &ModelConfig,
         layer: &LayerWeights,
@@ -665,6 +899,155 @@ impl MegakernelProgram {
                     stream.raw(),
                 )
             })?;
+        }
+        Ok(())
+    }
+
+    /// Update per-step fields for the paged KV path.
+    /// Must be called before `execute()` each decode step.
+    pub fn update_step_paged(
+        &mut self,
+        token_id: u32,
+        position: u32,
+        seq: &SequenceState,
+        allocator: &PageAllocator,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
+        assert!(self.paged, "update_step_paged called on non-paged program");
+
+        let mut changed: Vec<usize> = Vec::new();
+
+        // 1. Patch embedding token_id
+        self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
+        changed.push(self.embedding_inst_idx);
+
+        // 2. Append scalar position to position_table on device at offset [position]
+        {
+            let pos_scalar = position as i32;
+            let pos_table_ptr = self.position_table.as_ref().expect("position_table not allocated").as_ptr();
+            let dst = unsafe { (pos_table_ptr as *mut u8).add(position as usize * std::mem::size_of::<i32>()) };
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    dst.cast(),
+                    std::ptr::addr_of!(pos_scalar).cast(),
+                    std::mem::size_of::<i32>(),
+                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                    stream.raw(),
+                )
+            })?;
+        }
+
+        // Also update position_ids for mRoPE (same as flat path)
+        let pos_data = [position as i32, position as i32, position as i32];
+        braidinfer_hip::error::check(unsafe {
+            braidinfer_hip::ffi::hipMemcpyAsync(
+                self.position_ids_dev_ptr as *mut std::ffi::c_void,
+                pos_data.as_ptr().cast(),
+                3 * std::mem::size_of::<i32>(),
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                stream.raw(),
+            )
+        })?;
+
+        // 3. Patch KV write D2D_COPY destinations from paged chunk layout
+        // The write target is: chunk_base + layer_k/v_offset + chunk_offset * kv_stride * sizeof(f32)
+        // current_chunk_offset() returns len (post-increment from append_token).
+        // The write target is len-1 (the slot just reserved).
+        let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
+        let kv_stride = self.kv_stride_paged;
+        let token_byte_stride = kv_stride * std::mem::size_of::<f32>();
+
+        for (layer_i, &(k_idx, v_idx)) in self.kv_write_indices.iter().enumerate() {
+            let chunk_slot = if seq.chunks.is_empty() { 0 } else {
+                seq.chunks.last().unwrap().slot_index()
+            };
+            let chunk_base = allocator.slot_ptr(chunk_slot) as u64;
+            // layer_k_offset_bytes is baked into OP_ATTN_PAGED word[12]
+            // recompute here: layout is [layer0_K, layer0_V, layer1_K, layer1_V, ...]
+            let layer_k_offset = (layer_i * 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+            let layer_v_offset = layer_k_offset + (CHUNK_TOKENS * token_byte_stride) as u64;
+            let k_ptr = chunk_base + layer_k_offset + (chunk_offset * token_byte_stride) as u64;
+            let v_ptr = chunk_base + layer_v_offset + (chunk_offset * token_byte_stride) as u64;
+            self.instructions[k_idx].words[1] = k_ptr;
+            self.instructions[v_idx].words[1] = v_ptr;
+            changed.push(k_idx);
+            changed.push(v_idx);
+        }
+
+        // 4. Patch OP_ATTN_PAGED seq_len and page_table/position_table ptrs
+        let seq_len = (position + 1) as i32;
+        let page_table_ptr = self.page_table.as_ref().expect("page_table not allocated").as_ptr() as u64;
+        let pos_table_ptr = self.position_table.as_ref().expect("position_table not allocated").as_ptr() as u64;
+        for &idx in &self.attn_paged_inst_indices {
+            self.instructions[idx].words[3] = page_table_ptr;
+            self.instructions[idx].words[4] = pos_table_ptr;
+            self.instructions[idx].set_int(9, seq_len);
+            changed.push(idx);
+        }
+
+        // 5. Upload page_table if chunk list changed
+        if seq.chunks.len() != self.last_page_table_len {
+            let page_table_dev = self.page_table.as_mut().expect("page_table not allocated");
+            let host_ptrs: Vec<u64> = seq.chunks.iter()
+                .map(|c| allocator.slot_ptr(c.slot_index()) as u64)
+                .collect();
+            let dst = page_table_dev.as_mut_ptr() as *mut u8;
+            let bytes = host_ptrs.len() * std::mem::size_of::<u64>();
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    dst.cast(),
+                    host_ptrs.as_ptr().cast(),
+                    bytes,
+                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                    stream.raw(),
+                )
+            })?;
+            self.last_page_table_len = seq.chunks.len();
+        }
+
+        // 6. Upload changed instructions
+        let dev_ptr = self.device_program.as_mut_ptr();
+        for inst_idx in changed {
+            let words = &self.instructions[inst_idx].words;
+            let byte_offset = inst_idx * INST_SIZE * std::mem::size_of::<u64>();
+            let size = INST_SIZE * std::mem::size_of::<u64>();
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    (dev_ptr as *mut u8).add(byte_offset).cast(),
+                    words.as_ptr().cast(),
+                    size,
+                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                    stream.raw(),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Allocate the next chunk if the current one just filled up.
+    /// Call after execute() + stream sync, before next update_step_paged().
+    pub fn post_step_paged(
+        &self,
+        position: u32,
+        seq: &mut SequenceState,
+        allocator: &mut PageAllocator,
+    ) -> HipResult<()> {
+        // If we just wrote the last token slot in this chunk, pre-allocate the next chunk.
+        if (position as usize + 1) % CHUNK_TOKENS == 0 {
+            seq.append_token(allocator)?;
+        }
+        Ok(())
+    }
+
+    /// Lazily allocate the page_table and position_table device buffers.
+    /// Must be called once before the first update_step_paged().
+    pub fn init_paged_buffers(&mut self, max_chunks: usize) -> HipResult<()> {
+        if self.page_table.is_none() {
+            self.page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
+        }
+        if self.position_table.is_none() {
+            self.position_table = Some(DeviceBuffer::alloc(self.device, self.max_seq_len as usize)?);
         }
         Ok(())
     }

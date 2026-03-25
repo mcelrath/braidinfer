@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use serde::Deserialize;
+
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::stream::Stream;
@@ -12,9 +14,33 @@ use crate::kernel::{
     MRoPEKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel,
     RmsNormKernel,
 };
-use crate::megakernel::MegakernelProgram;
+use crate::megakernel::{MegakernelProgram, CHUNK_TOKENS};
+use crate::paged_kv::{PageAllocator, SequenceState};
 
 // ---- Model config ----
+
+#[derive(Debug, Clone)]
+pub enum RecurrentLayerKind {
+    Gdn {
+        num_heads: usize,
+        key_value_dim: usize,
+        conv_dim: usize,
+        kernel_size: usize,
+    },
+    Mamba2 {
+        state_dim: usize,
+        num_heads: usize,
+        head_dim: usize,
+        conv_kernel: usize,
+    },
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub enum RopeType {
+    Standard { rotary_dim: usize },
+    MRope { sections: [usize; 3] },
+}
 
 pub struct ModelConfig {
     pub hidden_size: usize,
@@ -37,6 +63,64 @@ pub struct ModelConfig {
     // layer types: true = full_attention, false = linear_attention (GDN)
     pub layer_is_attention: Vec<bool>,
     pub max_seq_len: usize,
+    // Extended config
+    pub recurrent_kind: RecurrentLayerKind,
+    pub rope_type: RopeType,
+    pub has_qk_norm: bool,
+    pub attention_layer_indices: Vec<usize>,
+    pub model_type: String,
+}
+
+// Serde structs for config.json parsing
+
+#[derive(Deserialize)]
+struct RopeParameters {
+    #[serde(default)]
+    mrope_section: Option<[usize; 3]>,
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct TextConfig {
+    hidden_size: usize,
+    num_hidden_layers: usize,
+    intermediate_size: usize,
+    vocab_size: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    rms_norm_eps: Option<f64>,
+    layer_norm_epsilon: Option<f64>,
+    rope_parameters: Option<RopeParameters>,
+    layer_types: Option<Vec<String>>,
+    linear_num_key_heads: Option<usize>,
+    linear_key_head_dim: Option<usize>,
+    linear_value_head_dim: Option<usize>,
+    linear_conv_kernel_dim: Option<usize>,
+    model_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawConfig {
+    model_type: String,
+    text_config: Option<TextConfig>,
+    // Nemotron-style: top-level fields
+    hidden_size: Option<usize>,
+    num_hidden_layers: Option<usize>,
+    intermediate_size: Option<usize>,
+    vocab_size: Option<usize>,
+    num_attention_heads: Option<usize>,
+    num_key_value_heads: Option<usize>,
+    head_dim: Option<usize>,
+    norm_eps: Option<f64>,
+    rope_theta: Option<f64>,
+    partial_rotary_factor: Option<f64>,
+    hybrid_override_pattern: Option<String>,
+    ssm_state_size: Option<usize>,
+    mamba_num_heads: Option<usize>,
+    mamba_head_dim: Option<usize>,
+    conv_kernel: Option<usize>,
 }
 
 impl ModelConfig {
@@ -44,7 +128,8 @@ impl ModelConfig {
         // From config.json: layer_types = ["linear_attention"]*3 + ["full_attention"] repeated 6x
         // → 24 layers total:  0,1,2 = GDN; 3 = attn; 4,5,6 = GDN; 7 = attn; ...
         let mut layer_is_attention = vec![false; 24];
-        for &i in &[3usize, 7, 11, 15, 19, 23] {
+        let attention_layer_indices: Vec<usize> = vec![3, 7, 11, 15, 19, 23];
+        for &i in &attention_layer_indices {
             layer_is_attention[i] = true;
         }
         ModelConfig {
@@ -65,7 +150,189 @@ impl ModelConfig {
             linear_conv_kernel_dim: 4,
             layer_is_attention,
             max_seq_len: 2048,
+            recurrent_kind: RecurrentLayerKind::Gdn {
+                num_heads: 16,
+                key_value_dim: 128,
+                conv_dim: 6144,
+                kernel_size: 4,
+            },
+            rope_type: RopeType::MRope { sections: [11, 11, 10] },
+            has_qk_norm: true,
+            attention_layer_indices,
+            model_type: "qwen3_5".to_string(),
         }
+    }
+
+    pub fn from_config_json(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let data = std::fs::read_to_string(path)?;
+        let raw: RawConfig = serde_json::from_str(&data)?;
+
+        match raw.model_type.as_str() {
+            "qwen3_5" => Self::from_qwen35_config(raw),
+            "nemotron_h" => Self::from_nemotron_config(raw),
+            other => Err(format!("Unknown model_type: {other}").into()),
+        }
+    }
+
+    fn from_qwen35_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let tc = raw.text_config.ok_or("qwen3_5 config missing text_config")?;
+
+        let num_layers = tc.num_hidden_layers;
+        let layer_types = tc.layer_types.unwrap_or_else(|| vec!["linear_attention".to_string(); num_layers]);
+
+        let attention_layer_indices: Vec<usize> = layer_types.iter().enumerate()
+            .filter(|(_, t)| t.as_str() == "full_attention")
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut layer_is_attention = vec![false; num_layers];
+        for &i in &attention_layer_indices {
+            layer_is_attention[i] = true;
+        }
+
+        let rope_params = tc.rope_parameters.unwrap_or(RopeParameters {
+            mrope_section: None,
+            rope_theta: None,
+            partial_rotary_factor: None,
+        });
+
+        let rope_theta = rope_params.rope_theta.unwrap_or(10_000_000.0) as f32;
+        let partial_rotary_factor = rope_params.partial_rotary_factor.unwrap_or(0.25);
+        let rope_dim = ((tc.head_dim as f64) * partial_rotary_factor) as usize;
+        let mrope_section = rope_params.mrope_section.unwrap_or([0, 0, 0]);
+
+        let rope_type = if let Some(sec) = rope_params.mrope_section {
+            RopeType::MRope { sections: sec }
+        } else {
+            RopeType::Standard { rotary_dim: rope_dim }
+        };
+
+        let linear_num_heads = tc.linear_num_key_heads.unwrap_or(16);
+        let linear_key_head_dim = tc.linear_key_head_dim.unwrap_or(128);
+        let linear_value_head_dim = tc.linear_value_head_dim.unwrap_or(128);
+        let linear_conv_kernel_dim = tc.linear_conv_kernel_dim.unwrap_or(4);
+        let conv_dim = linear_num_heads * (linear_key_head_dim + linear_value_head_dim);
+
+        Ok(ModelConfig {
+            hidden_size: tc.hidden_size,
+            num_layers,
+            intermediate_size: tc.intermediate_size,
+            vocab_size: tc.vocab_size,
+            num_q_heads: tc.num_attention_heads,
+            num_kv_heads: tc.num_key_value_heads,
+            head_dim: tc.head_dim,
+            rope_dim,
+            rope_theta,
+            rms_norm_eps: tc.rms_norm_eps.unwrap_or(1e-6) as f32,
+            mrope_section,
+            linear_num_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            linear_conv_kernel_dim,
+            layer_is_attention,
+            max_seq_len: 2048,
+            recurrent_kind: RecurrentLayerKind::Gdn {
+                num_heads: linear_num_heads,
+                key_value_dim: linear_key_head_dim,
+                conv_dim,
+                kernel_size: linear_conv_kernel_dim,
+            },
+            rope_type,
+            has_qk_norm: true,
+            attention_layer_indices,
+            model_type: "qwen3_5".to_string(),
+        })
+    }
+
+    fn from_nemotron_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
+        let head_dim = raw.head_dim.ok_or("missing head_dim")?;
+        let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
+        let num_kv_heads = raw.num_key_value_heads.ok_or("missing num_key_value_heads")?;
+        let intermediate_size = raw.intermediate_size.ok_or("missing intermediate_size")?;
+        let vocab_size = raw.vocab_size.ok_or("missing vocab_size")?;
+        let rope_theta = raw.rope_theta.unwrap_or(10000.0) as f32;
+        let partial_rotary_factor = raw.partial_rotary_factor.unwrap_or(1.0);
+        let rope_dim = ((head_dim as f64) * partial_rotary_factor) as usize;
+        let rms_norm_eps = raw.norm_eps.unwrap_or(1e-5) as f32;
+
+        let pattern = raw.hybrid_override_pattern.unwrap_or_default();
+        let attention_layer_indices: Vec<usize> = pattern.chars().enumerate()
+            .filter(|(_, c)| *c == '*')
+            .map(|(i, _)| i)
+            .collect();
+        let mut layer_is_attention = vec![false; num_layers];
+        for &i in &attention_layer_indices {
+            if i < num_layers {
+                layer_is_attention[i] = true;
+            }
+        }
+
+        let ssm_state_dim = raw.ssm_state_size.unwrap_or(128);
+        let mamba_num_heads = raw.mamba_num_heads.unwrap_or(64);
+        let mamba_head_dim = raw.mamba_head_dim.unwrap_or(64);
+        let conv_kernel = raw.conv_kernel.unwrap_or(4);
+
+        Ok(ModelConfig {
+            hidden_size,
+            num_layers,
+            intermediate_size,
+            vocab_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            rope_theta,
+            rms_norm_eps,
+            mrope_section: [0, 0, 0],
+            linear_num_heads: mamba_num_heads,
+            linear_key_head_dim: mamba_head_dim,
+            linear_value_head_dim: mamba_head_dim,
+            linear_conv_kernel_dim: conv_kernel,
+            layer_is_attention,
+            max_seq_len: 2048,
+            recurrent_kind: RecurrentLayerKind::Mamba2 {
+                state_dim: ssm_state_dim,
+                num_heads: mamba_num_heads,
+                head_dim: mamba_head_dim,
+                conv_kernel,
+            },
+            rope_type: RopeType::Standard { rotary_dim: rope_dim },
+            has_qk_norm: false,
+            attention_layer_indices,
+            model_type: "nemotron_h".to_string(),
+        })
+    }
+
+    pub fn chunk_kv_bytes(&self, chunk_tokens: usize) -> usize {
+        let num_attn = self.num_attn_layers();
+        // k and v, each: chunk_tokens * num_kv_heads * head_dim * 4 bytes (f32)
+        2 * num_attn * chunk_tokens * self.num_kv_heads * self.head_dim * 4
+    }
+
+    pub fn recurrent_state_bytes_per_layer(&self) -> usize {
+        match &self.recurrent_kind {
+            RecurrentLayerKind::Gdn { num_heads, key_value_dim, .. } => {
+                num_heads * key_value_dim * key_value_dim * 4
+            }
+            RecurrentLayerKind::Mamba2 { state_dim, num_heads, head_dim, .. } => {
+                num_heads * head_dim * state_dim * 4
+            }
+            RecurrentLayerKind::None => 0,
+        }
+    }
+
+    pub fn total_recurrent_checkpoint_bytes(&self) -> usize {
+        self.num_recurrent_layers() * self.recurrent_state_bytes_per_layer()
+    }
+
+    pub fn num_attn_layers(&self) -> usize {
+        self.layer_is_attention.iter().filter(|&&a| a).count()
+    }
+
+    pub fn num_recurrent_layers(&self) -> usize {
+        self.layer_is_attention.iter().filter(|&&a| !a).count()
     }
 }
 
@@ -225,6 +492,10 @@ pub struct Qwen35Model {
     pub(crate) gdn_states: Vec<GdnState>,
     pub(crate) seq_len: u32,
     megakernel: Option<MegakernelProgram>,
+    // Paged KV path (lazy-init)
+    megakernel_paged: Option<MegakernelProgram>,
+    page_allocator: Option<PageAllocator>,
+    paged_seq: Option<SequenceState>,
 }
 
 // ---- Error type ----
@@ -554,6 +825,9 @@ impl Qwen35Model {
             gdn_states,
             seq_len: 0,
             megakernel: None,
+            megakernel_paged: None,
+            page_allocator: None,
+            paged_seq: None,
         })
     }
 
@@ -1045,6 +1319,53 @@ impl Qwen35Model {
         self.activations.logits.copy_to_host(&mut logits)?;
 
         self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// Run a single decode step using the paged KV cache path.
+    /// Returns logits [vocab_size].
+    pub fn decode_step_paged(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        // Lazy-init: compile paged megakernel
+        if self.megakernel_paged.is_none() {
+            let mut mk = MegakernelProgram::compile_paged(self)?;
+            // max_chunks: enough for max_seq_len tokens in CHUNK_TOKENS-sized chunks
+            let max_chunks = (self.config.max_seq_len + CHUNK_TOKENS - 1) / CHUNK_TOKENS;
+            mk.init_paged_buffers(max_chunks)?;
+            self.megakernel_paged = Some(mk);
+        }
+
+        // Lazy-init: PageAllocator and SequenceState
+        if self.page_allocator.is_none() {
+            let max_chunks = (self.config.max_seq_len + CHUNK_TOKENS - 1) / CHUNK_TOKENS;
+            self.page_allocator = Some(PageAllocator::new(
+                self.device,
+                &self.config,
+                CHUNK_TOKENS,
+                max_chunks as u32,
+            )?);
+            let seq = SequenceState::new(CHUNK_TOKENS as u32);
+            self.paged_seq = Some(seq);
+        }
+
+        // append_token: allocates new chunk if needed + increments chunk len.
+        // Must happen BEFORE update_step_paged so current_chunk_offset() is correct.
+        {
+            let seq_mut = self.paged_seq.as_mut().unwrap();
+            let alloc_mut = self.page_allocator.as_mut().unwrap();
+            seq_mut.append_token(alloc_mut)?;
+        }
+
+        let stream = &self.stream;
+        let mk = self.megakernel_paged.as_mut().unwrap();
+        let seq = self.paged_seq.as_ref().unwrap();
+        let allocator = self.page_allocator.as_ref().unwrap();
+
+        mk.update_step_paged(token_id, position, seq, allocator, stream)?;
+        mk.execute(stream)?;
+        stream.synchronize()?;
+
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
         Ok(logits)
     }
 

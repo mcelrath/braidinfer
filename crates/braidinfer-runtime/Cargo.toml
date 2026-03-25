@@ -7,3 +7,5 @@ edition.workspace = true
 braidinfer-core = { workspace = true }
 braidinfer-hip = { workspace = true }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }

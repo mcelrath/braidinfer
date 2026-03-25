@@ -63,6 +63,8 @@ version = "0.1.0"
 dependencies = [
  "braidinfer-core",
  "braidinfer-hip",
+ "serde",
+ "serde_json",
  "tokenizers",
 ]
 

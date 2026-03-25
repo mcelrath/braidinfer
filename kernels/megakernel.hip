@@ -43,6 +43,7 @@
 #define OP_LM_HEAD     15
 #define OP_HALT        16
 #define OP_D2D_COPY    17
+#define OP_ATTN_PAGED  18
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -666,6 +667,149 @@ __device__ void op_output_gate(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_ATTN_PAGED: Paged GQA decode attention with lazy RoPE recurrence applied to K.
+// One virtual block per Q head. Walks paged KV chunks, applies RoPE to pre-RoPE K
+// via trig recurrence (4 FMA per pair per token step — no cos/sin lookup table).
+// args: [1]=output, [2]=q (post-RoPE), [3]=page_table (u64* chunk base ptrs),
+//       [4]=position_table (int* per-token positions), [5]=inv_freq (float*, rope_dim/2 freqs),
+//       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len,
+//       [10]=chunk_tokens(64), [11]=rope_dim, [12]=layer_k_offset_bytes, [13]=layer_v_offset_bytes
+__device__ void op_attn_paged(const u64* inst, u32 vblock) {
+    float* output          = inst_fptr(inst, 1);
+    const float* q         = inst_fptr(inst, 2);
+    const u64* page_table  = (const u64*)(inst[3]);
+    const int* position_table = (const int*)(inst[4]);
+    const float* inv_freq  = inst_fptr(inst, 5);
+    int num_q_heads        = inst_int(inst, 6);
+    int num_kv_heads       = inst_int(inst, 7);
+    int head_dim           = inst_int(inst, 8);
+    int seq_len            = inst_int(inst, 9);
+    int chunk_tokens       = inst_int(inst, 10);
+    int rope_dim           = inst_int(inst, 11);
+    long long layer_k_offset = (long long)(u64)(inst[12]);
+    long long layer_v_offset = (long long)(u64)(inst[13]);
+
+    int q_head = vblock;
+    if (q_head >= num_q_heads) return;
+
+    int gqa_group = num_q_heads / num_kv_heads;
+    int kv_head = q_head / gqa_group;
+    float scale = rsqrtf((float)head_dim);
+    const float* q_ptr = q + q_head * head_dim;
+
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;  // 256
+
+    extern __shared__ float shmem[];
+    float* sh_k   = shmem;          // head_dim floats
+    float* partial = shmem;         // reused after dot product
+
+    int rope_pairs = rope_dim / 2;
+
+    // Precompute per-step trig increments (model-constant inv_freq).
+    // Thread tid < rope_pairs computes cos_freq[tid] = cos(inv_freq[tid])
+    // These are the same for every chunk so compute once.
+    float cos_freq = 0.0f, sin_freq = 0.0f;
+    if (tid < rope_pairs) {
+        float freq = inv_freq[tid];
+        cos_freq = cosf(freq);
+        sin_freq = sinf(freq);
+    }
+
+    // Online softmax state
+    float m = -1e30f, d = 0.0f;
+    // V accumulation: head_dim=256, block_size=256, so exactly 1 element per thread
+    float v_acc = 0.0f;
+
+    int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
+
+    // Trig recurrence state per thread (for tid < rope_pairs)
+    float cos_state = 0.0f, sin_state = 0.0f;
+
+    for (int c = 0; c < num_chunks; c++) {
+        const char* chunk_base = (const char*)(page_table[c]);
+        const float* k_base = (const float*)(chunk_base + layer_k_offset);
+        const float* v_base = (const float*)(chunk_base + layer_v_offset);
+        int tokens_in_chunk = chunk_tokens;
+        if (c == num_chunks - 1) {
+            tokens_in_chunk = seq_len - c * chunk_tokens;
+        }
+
+        // Seed trig recurrence at chunk start from position_table
+        if (tid < rope_pairs) {
+            int pos0 = position_table[c * chunk_tokens];
+            float theta0 = (float)pos0 * inv_freq[tid];
+            cos_state = cosf(theta0);
+            sin_state = sinf(theta0);
+        }
+
+        for (int t = 0; t < tokens_in_chunk; t++) {
+            int token_idx = t * num_kv_heads + kv_head;
+
+            // Load K into shared memory (head_dim == block_size == 256, one element per thread)
+            if (tid < head_dim) {
+                sh_k[tid] = k_base[token_idx * head_dim + tid];
+            }
+            __syncthreads();
+
+            // Apply lazy RoPE rotation to sh_k (in-place, rope_dim elements only)
+            // Threads 0..rope_pairs-1 handle pairs (tid*2, tid*2+1)
+            if (tid < rope_pairs) {
+                int i0 = tid * 2;
+                int i1 = tid * 2 + 1;
+                float x0 = sh_k[i0];
+                float x1 = sh_k[i1];
+                sh_k[i0] = x0 * cos_state - x1 * sin_state;
+                sh_k[i1] = x0 * sin_state + x1 * cos_state;
+            }
+            __syncthreads();
+
+            // Q·K dot product (one element per thread since head_dim == block_size)
+            float dot = 0.0f;
+            if (tid < head_dim) {
+                dot = q_ptr[tid] * sh_k[tid];
+            }
+            // Reduce dot via shared memory (reuse sh_k alias partial)
+            partial[tid] = dot;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) partial[tid] += partial[tid + s];
+                __syncthreads();
+            }
+            float score = partial[0] * scale;
+
+            // Online softmax update
+            float m_new = fmaxf(m, score);
+            float correction = expf(m - m_new);
+            float w = expf(score - m_new);
+            d = d * correction + w;
+
+            // V accumulation (no RoPE on V)
+            if (tid < head_dim) {
+                float vval = v_base[token_idx * head_dim + tid];
+                v_acc = v_acc * correction + w * vval;
+            }
+            m = m_new;
+
+            // Advance trig recurrence to next token:
+            // cos(θ+Δ) = cosθ·cosΔ - sinθ·sinΔ
+            // sin(θ+Δ) = sinθ·cosΔ + cosθ·sinΔ
+            if (tid < rope_pairs) {
+                float cos_new = cos_state * cos_freq - sin_state * sin_freq;
+                float sin_new = sin_state * cos_freq + cos_state * sin_freq;
+                cos_state = cos_new;
+                sin_state = sin_new;
+            }
+        }
+    }
+
+    // Write normalized output
+    float* out_ptr = output + q_head * head_dim;
+    if (tid < head_dim) {
+        out_ptr[tid] = v_acc / d;
+    }
+}
+
 // ============================================================
 // Main megakernel entry point
 // ============================================================
@@ -706,6 +850,7 @@ extern "C" __global__ void megakernel_f32(
                 case OP_EMBEDDING:    op_embedding(inst, vb); break;
                 case OP_LM_HEAD:      op_lm_head(inst, vb); break;
                 case OP_D2D_COPY:     op_d2d_copy(inst, vb); break;
+                case OP_ATTN_PAGED:   op_attn_paged(inst, vb); break;
                 default: break;
             }
         }
