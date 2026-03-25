@@ -6,3 +6,4 @@ edition.workspace = true
 [dependencies]
 braidinfer-core = { workspace = true }
 braidinfer-hip = { workspace = true }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }

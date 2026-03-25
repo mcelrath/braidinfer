@@ -83,6 +83,10 @@ pub struct MegakernelProgram {
     kv_write_indices: Vec<(usize, usize)>, // (k_copy_idx, v_copy_idx) per attn layer
     // Base KV cache pointers (position=0) for computing per-step write offsets
     kv_base_ptrs: Vec<(u64, u64)>, // (k_base, v_base) per attention layer
+    // mRoPE position_ids device pointer (3 i32s: temporal, height, width)
+    position_ids_dev_ptr: u64,
+    // Bounds check
+    max_seq_len: u32,
 }
 
 fn div_ceil(a: u32, b: u32) -> u32 {
@@ -214,6 +218,8 @@ impl MegakernelProgram {
             gqa_attn_inst_indices,
             kv_write_indices,
             kv_base_ptrs,
+            position_ids_dev_ptr: act.position_ids.as_ptr() as u64,
+            max_seq_len: cfg.max_seq_len as u32,
         })
     }
 
@@ -294,7 +300,7 @@ impl MegakernelProgram {
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
         inst.set_mut_ptr(1, conv_state.as_ptr());
         inst.set_ptr(2, act.qkv.as_ptr());
-        inst.set_ptr(3, w.conv1d_weight.as_ptr());
+        inst.set_ptr(3, w.conv1d_weight_q.as_ptr());
         inst.set_mut_ptr(4, act.q_gdn.as_ptr());
         inst.set_int(5, q_dim as i32);
         inst.set_int(6, ck as i32);
@@ -305,7 +311,7 @@ impl MegakernelProgram {
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
         inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim) });
-        inst.set_ptr(3, unsafe { w.conv1d_weight.as_ptr().add(q_dim * ck) });
+        inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
         inst.set_mut_ptr(4, act.k_gdn.as_ptr());
         inst.set_int(5, k_dim as i32);
         inst.set_int(6, ck as i32);
@@ -316,7 +322,7 @@ impl MegakernelProgram {
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
         inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add((q_dim + k_dim) * (ck - 1)) });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim + k_dim) });
-        inst.set_ptr(3, unsafe { w.conv1d_weight.as_ptr().add((q_dim + k_dim) * ck) });
+        inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
         inst.set_mut_ptr(4, act.v_gdn.as_ptr());
         inst.set_int(5, v_dim as i32);
         inst.set_int(6, ck as i32);
@@ -604,12 +610,25 @@ impl MegakernelProgram {
 
     /// Update per-step fields (token_id, position) and upload only changed instructions.
     pub fn update_step(&mut self, token_id: u32, position: u32) -> HipResult<()> {
+        assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
+
         let cfg_nkh_hd = 512usize; // nkh * hd = 2 * 256
         let mut changed: Vec<usize> = Vec::new();
 
         // Update embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
         changed.push(self.embedding_inst_idx);
+
+        // Update position_ids on device ([temporal, height, width] = all equal position for text)
+        let pos_data = [position as i32, position as i32, position as i32];
+        braidinfer_hip::error::check(unsafe {
+            braidinfer_hip::ffi::hipMemcpy(
+                self.position_ids_dev_ptr as *mut std::ffi::c_void,
+                pos_data.as_ptr().cast(),
+                3 * std::mem::size_of::<i32>(),
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+            )
+        })?;
 
         // Update KV cache write offsets (position-dependent)
         let pos_offset = position as usize * cfg_nkh_hd;

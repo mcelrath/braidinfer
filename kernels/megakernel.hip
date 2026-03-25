@@ -288,15 +288,15 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
 
     for (int j = tid; j < value_dim; j += block_size) {
         float kv_mem = 0.0f;
-        for (int i = 0; i < key_dim; i++) kv_mem += sh[i * value_dim + j] * (kh[i] * k_inv_norm);
+        for (int i = 0; i < key_dim; i++) kv_mem += sh[j * key_dim + i] * (kh[i] * k_inv_norm);
         float delta = (vh[j] - kv_mem) * beta;
-        for (int i = 0; i < key_dim; i++) sh[i * value_dim + j] += (kh[i] * k_inv_norm) * delta;
+        for (int i = 0; i < key_dim; i++) sh[j * key_dim + i] += (kh[i] * k_inv_norm) * delta;
     }
     __syncthreads();
 
     for (int j = tid; j < value_dim; j += block_size) {
         float sum = 0.0f;
-        for (int i = 0; i < key_dim; i++) sum += sh[i * value_dim + j] * (qh[i] * q_scale);
+        for (int i = 0; i < key_dim; i++) sum += sh[j * key_dim + i] * (qh[i] * q_scale);
         oh[j] = sum;
     }
 }

@@ -17,7 +17,7 @@
 // v:    [num_heads, value_dim]
 // gate: [num_heads]  -- pre-computed decay in (0,1)
 // b:    [num_heads]  -- beta (sigmoid applied here)
-// state:[num_heads, key_dim, value_dim]  (updated in-place)
+// state:[num_heads, value_dim, key_dim]  (transposed for coalesced access; updated in-place)
 // output:[num_heads, value_dim]
 
 extern "C" __global__ void gdn_recurrent_step_v2_f32(
@@ -86,20 +86,20 @@ extern "C" __global__ void gdn_recurrent_step_v2_f32(
     for (int j = tid; j < value_dim; j += block_size) {
         float kv_mem = 0.0f;
         for (int i = 0; i < key_dim; i++) {
-            kv_mem += sh[i * value_dim + j] * (kh[i] * k_inv_norm);
+            kv_mem += sh[j * key_dim + i] * (kh[i] * k_inv_norm);
         }
         float delta = (vh[j] - kv_mem) * beta;
         for (int i = 0; i < key_dim; i++) {
-            sh[i * value_dim + j] += (kh[i] * k_inv_norm) * delta;
+            sh[j * key_dim + i] += (kh[i] * k_inv_norm) * delta;
         }
     }
     __syncthreads();
 
-    // Step 4: output[j] = sum_i state[i,j] * q_scaled[i]
+    // Step 4: output[j] = sum_i state[j,i] * q_scaled[i]
     for (int j = tid; j < value_dim; j += block_size) {
         float sum = 0.0f;
         for (int i = 0; i < key_dim; i++) {
-            sum += sh[i * value_dim + j] * (qh[i] * q_scale);
+            sum += sh[j * key_dim + i] * (qh[i] * q_scale);
         }
         oh[j] = sum;
     }
