@@ -185,3 +185,45 @@ fn test_megakernel_benchmark() {
     println!("Megakernel: {n} steps in {:.3}s = {per_token_ms:.3} ms/token = {tokens_per_sec:.1} tok/s",
         elapsed.as_secs_f64());
 }
+
+#[test]
+fn test_multi_step_decode() {
+    let device = DeviceId(0);
+    let model_dir = Path::new(MODEL_DIR);
+    if !model_dir.exists() {
+        eprintln!("Model not found, skipping");
+        return;
+    }
+
+    let n_steps = 10;
+    let seed_token = 9707u32;
+
+    let run = |label: &str| -> Vec<u32> {
+        let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+        let mut argmax_seq = Vec::with_capacity(n_steps);
+        let mut next_token = seed_token;
+        for step in 0..n_steps {
+            let logits = model.decode_step_paged(next_token, step as u32).expect("decode step");
+            assert!(
+                logits.iter().all(|&x| x.is_finite()),
+                "{label} step {step}: logits contain NaN or Inf"
+            );
+            assert!(
+                logits.iter().any(|&x| x != 0.0),
+                "{label} step {step}: logits are all zero"
+            );
+            let (idx, val) = argmax(&logits);
+            println!("{label} step {step}: token={next_token} -> argmax={idx}, logit={val:.4}");
+            argmax_seq.push(idx as u32);
+            next_token = idx as u32;
+        }
+        argmax_seq
+    };
+
+    let seq1 = run("run1");
+    let seq2 = run("run2");
+
+    println!("run1 argmax sequence: {seq1:?}");
+    println!("run2 argmax sequence: {seq2:?}");
+    assert_eq!(seq1, seq2, "multi-step decode is not deterministic");
+}

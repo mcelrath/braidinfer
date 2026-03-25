@@ -220,7 +220,7 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     }
 }
 
-// OP_CONV1D: causal conv1d update (one virtual block per channel)
+// OP_CONV1D: causal conv1d update with SiLU activation (one virtual block per channel)
 // args: [1]=state, [2]=input, [3]=weight, [4]=output, [5]=conv_dim, [6]=kernel_size
 __device__ void op_conv1d(const u64* inst, u32 vblock) {
     float* state = inst_fptr(inst, 1);
@@ -242,7 +242,7 @@ __device__ void op_conv1d(const u64* inst, u32 vblock) {
         acc += s[k] * bf16_to_f32(w[k]);
     }
     acc += input[ch] * bf16_to_f32(w[hist]);
-    output[ch] = acc / (1.0f + expf(-acc));
+    output[ch] = acc / (1.0f + expf(-acc)); // SiLU: x * sigmoid(x)
 
     for (int i = 0; i < hist - 1; i++) {
         s[i] = s[i + 1];

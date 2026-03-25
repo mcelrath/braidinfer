@@ -312,6 +312,11 @@ pub fn save_checkpoint(
     stream: ffi::hipStream_t,
 ) -> HipResult<u32> {
     let (slot, dst_ptr) = pool.alloc().ok_or(HipError(ffi::hipErrorOutOfMemory))?;
+    debug_assert_eq!(
+        pool.state_bytes() % (recurrent_states.len() * std::mem::size_of::<f32>()),
+        0,
+        "state_bytes not evenly divisible by num_layers * sizeof(f32)"
+    );
     let floats_per_layer = pool.state_bytes() / recurrent_states.len() / std::mem::size_of::<f32>();
     for (i, state) in recurrent_states.iter().enumerate() {
         let layer_offset = i * floats_per_layer * std::mem::size_of::<f32>();

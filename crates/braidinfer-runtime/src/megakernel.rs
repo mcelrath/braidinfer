@@ -168,6 +168,16 @@ fn div_ceil(a: u32, b: u32) -> u32 {
     (a + b - 1) / b
 }
 
+/// Discriminates the variant parts (KV write + attention op) of an attention layer.
+enum AttentionVariant<'a> {
+    /// Flat (non-paged) decode: GQA attention, KV written after mRoPE.
+    FlatKv { kv_cache: &'a KvCache },
+    /// Paged decode: OP_ATTN_PAGED, KV written BEFORE mRoPE.
+    PagedKv { kv_cache: &'a KvCache, attn_layer_index: usize },
+    /// Prefill (N tokens): OP_ATTN_PREFILL, bulk KV write after mRoPE.
+    Prefill { kv_cache: &'a KvCache, start_pos: u32 },
+}
+
 impl MegakernelProgram {
     pub fn instruction_count(&self) -> usize { self.instructions.len() }
     pub fn block_count(&self) -> u32 { self.num_blocks }
@@ -398,177 +408,15 @@ impl MegakernelProgram {
                     _ => panic!("expected attention layer"),
                 };
                 let kv_cache = &model.kv_caches[kv_idx];
-                let rd = cfg.rope_dim;
-                let kv_stride = nkh * hd;
 
-                // --- Fully batched attention layer ---
-                let q_head_size = nqh * hd;
-
-                // 1. Batched RMSNorm (N tokens)
-                {
-                    let mut inst = Instruction::new(OP_RMSNORM, n as u32);
-                    inst.set_output_ptr(1, prefill_bufs.normed.as_ptr());
-                    inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
-                    inst.set_ptr(3, w.input_norm.as_ptr());
-                    inst.set_int(4, hs as i32);
-                    inst.set_float(5, eps);
-                    instructions.push(inst);
-                }
-
-                // 2. Batched Q+gate, K, V projections (batch=N)
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.q_gate_attn.as_ptr());
-                    inst.set_ptr(2, w.w_q_gate.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, (nqh * hd * 2) as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.k_attn.as_ptr());
-                    inst.set_ptr(2, w.w_k.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, (nkh * hd) as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.v_attn.as_ptr());
-                    inst.set_ptr(2, w.w_v.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, (nkh * hd) as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    instructions.push(inst);
-                }
-
-                // 3. Batched deinterleave Q+gate → Q, gate
-                {
-                    let total_elems = n * nqh * hd;
-                    let mut inst = Instruction::new(OP_DEINTERLEAVE, div_ceil(total_elems as u32, 256));
-                    inst.set_output_ptr(1, prefill_bufs.q_attn.as_ptr());
-                    inst.set_output_ptr(2, prefill_bufs.gate_attn.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.q_gate_attn.as_ptr());
-                    inst.set_int(4, nqh as i32);
-                    inst.set_int(5, hd as i32);
-                    inst.set_int(6, n as i32);
-                    instructions.push(inst);
-                }
-
-                // 4. Batched QK norm (N × (nqh + nkh) blocks)
-                {
-                    let mut inst = Instruction::new(OP_QK_NORM, (n * (nqh + nkh)) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.q_attn.as_ptr());
-                    inst.set_output_ptr(2, prefill_bufs.k_attn.as_ptr());
-                    inst.set_ptr(3, w.q_norm.as_ptr());
-                    inst.set_ptr(4, w.k_norm.as_ptr());
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_float(8, eps);
-                    inst.set_int(9, n as i32);
-                    instructions.push(inst);
-                }
-
-                // 5. Batched mRoPE (N × (nqh + nkh) blocks)
-                {
-                    let mut inst = Instruction::new(OP_MROPE, (n * (nqh + nkh)) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.q_attn.as_ptr());
-                    inst.set_output_ptr(2, prefill_bufs.k_attn.as_ptr());
-                    inst.set_ptr(3, act.inv_freq.as_ptr());
-                    inst.set_ptr(4, prefill_bufs.position_ids.as_ptr());
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_section[0] as i32);
-                    inst.set_int(10, cfg.mrope_section[1] as i32);
-                    inst.set_int(11, cfg.mrope_section[2] as i32);
-                    inst.set_int(12, n as i32);
-                    instructions.push(inst);
-                }
-
-                // 6. Write all K,V to cache (contiguous block copy)
-                // K: prefill_bufs.k_attn[N × nkh × hd] → kv_cache.k[start_pos..start_pos+N]
-                // V: same pattern
-                {
-                    let k_dst = unsafe { kv_cache.k.as_ptr().add(start_pos as usize * kv_stride) };
-                    let total_kv = n * kv_stride;
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
-                    inst.set_output_ptr(1, k_dst);
-                    inst.set_ptr(2, prefill_bufs.k_attn.as_ptr());
-                    inst.set_int(3, total_kv as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
-                {
-                    let v_dst = unsafe { kv_cache.v.as_ptr().add(start_pos as usize * kv_stride) };
-                    let total_kv = n * kv_stride;
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
-                    inst.set_output_ptr(1, v_dst);
-                    inst.set_ptr(2, prefill_bufs.v_attn.as_ptr());
-                    inst.set_int(3, total_kv as i32);
-                    instructions.push(inst);
-                }
-
-                // --- Phase B: Batched attention + post-processing ---
-
-                // OP_ATTN_PREFILL: all N queries with causal mask
-                {
-                    let mut inst = Instruction::new(OP_ATTN_PREFILL, (n * nqh) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.attn_out.as_ptr());
-                    inst.set_ptr(2, prefill_bufs.q_attn.as_ptr());
-                    inst.set_ptr(3, kv_cache.k.as_ptr());
-                    inst.set_ptr(4, kv_cache.v.as_ptr());
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, start_pos as i32);
-                    inst.set_int(9, n as i32);
-                    inst.set_int(10, cfg.max_seq_len as i32);
-                    instructions.push(inst);
-                }
-
-                // Batched output gate: size = N * nqh * hd
-                {
-                    let total_gate_size = n * q_head_size;
-                    let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(total_gate_size as u32, 256));
-                    inst.set_output_ptr(1, prefill_bufs.gated_out.as_ptr());
-                    inst.set_ptr(2, prefill_bufs.attn_out.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.gate_attn.as_ptr());
-                    inst.set_int(4, total_gate_size as i32);
-                    instructions.push(inst);
-                }
-
-                // Batched output projection (batch=N)
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                    inst.set_output_ptr(1, prefill_bufs.out_proj.as_ptr());
-                    inst.set_ptr(2, w.w_o.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.gated_out.as_ptr());
-                    inst.set_int(4, hs as i32);
-                    inst.set_int(5, (nqh * hd) as i32);
-                    inst.set_int(6, n as i32);
-                    instructions.push(inst);
-                }
-
-                // Batched residual: hidden = hidden + out_proj (N tokens)
-                {
-                    let total = n * hs;
-                    let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
-                    inst.set_output_ptr(1, prefill_bufs.hidden.as_ptr());
-                    inst.set_ptr(2, prefill_bufs.out_proj.as_ptr());
-                    inst.set_ptr(3, prefill_bufs.hidden.as_ptr());
-                    inst.set_int(4, total as i32);
-                    instructions.push(inst);
-                }
+                Self::emit_attention_layer(
+                    cfg, w, act,
+                    Some((prefill_bufs, n)),
+                    &AttentionVariant::Prefill { kv_cache, start_pos },
+                    &mut instructions,
+                    &mut Vec::new(), &mut Vec::new(), &mut Vec::new(), &mut Vec::new(),
+                    &mut Vec::new(),
+                );
 
                 // Batched FFN
                 Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
@@ -863,6 +711,402 @@ impl MegakernelProgram {
         })
     }
 
+    /// Shared attention-layer emit helper.
+    ///
+    /// Emits steps 1–7 (RMSNorm → QKV proj → deinterleave → QK-norm → [KV-write] → mRoPE)
+    /// and steps 10–12 (output-gate → out-proj+residual).
+    /// Steps 8–9 (KV-write placement and attention op) vary by variant and are inserted
+    /// at the appropriate point inside this function.
+    ///
+    /// Returns the index of the emitted mRoPE instruction.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_attention_layer(
+        cfg: &ModelConfig,
+        w: &AttentionLayerWeights,
+        act: &ActivationBuffers,
+        // Prefill overrides: if Some, use prefill pointers and batch=n; else batch=1 and act.*
+        prefill: Option<(&PrefillBuffers, usize)>,
+        variant: &AttentionVariant,
+        instructions: &mut Vec<Instruction>,
+        mrope_indices: &mut Vec<usize>,
+        gqa_attn_inst_indices: &mut Vec<usize>,
+        kv_write_indices: &mut Vec<(usize, usize)>,
+        kv_base_ptrs: &mut Vec<(u64, u64)>,
+        attn_paged_indices: &mut Vec<usize>,
+    ) {
+        let hs = cfg.hidden_size;
+        let nqh = cfg.num_q_heads;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let eps = cfg.rms_norm_eps;
+        let rd = cfg.rope_dim;
+        let n = prefill.as_ref().map_or(1, |&(_, n)| n);
+
+        // Buffer pointers — either prefill or single-token activation buffers
+        let (normed_ptr, hidden_ptr, q_gate_attn_ptr, k_attn_ptr, v_attn_ptr,
+             q_attn_ptr, gate_attn_ptr, attn_out_ptr, gated_out_ptr,
+             out_proj_ptr, position_ids_ptr, ffn_hidden_ptr) =
+        if let Some((pb, _)) = &prefill {
+            (pb.normed.as_ptr(), pb.hidden.as_ptr(),
+             pb.q_gate_attn.as_ptr(), pb.k_attn.as_ptr(), pb.v_attn.as_ptr(),
+             pb.q_attn.as_ptr(), pb.gate_attn.as_ptr(),
+             pb.attn_out.as_ptr(), pb.gated_out.as_ptr(),
+             pb.out_proj.as_ptr(), pb.position_ids.as_ptr(), pb.hidden.as_ptr())
+        } else {
+            (act.normed.as_ptr(), act.hidden.as_ptr(),
+             act.q_gate_attn.as_ptr(), act.k_attn.as_ptr(), act.v_attn.as_ptr(),
+             act.q_attn.as_ptr(), act.gate_attn.as_ptr(),
+             act.attn_out.as_ptr(), act.gated_out.as_ptr(),
+             act.out_proj.as_ptr(), act.position_ids.as_ptr(), act.hidden.as_ptr())
+        };
+
+        // 1. RMSNorm
+        {
+            let mut inst = Instruction::new(OP_RMSNORM, n as u32);
+            inst.set_output_ptr(1, normed_ptr);
+            inst.set_ptr(2, hidden_ptr);
+            inst.set_ptr(3, w.input_norm.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_float(5, eps);
+            instructions.push(inst);
+        }
+
+        // 2. Q+gate, K, V projections
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
+            inst.set_output_ptr(1, q_gate_attn_ptr);
+            inst.set_ptr(2, w.w_q_gate.as_ptr());
+            inst.set_ptr(3, normed_ptr);
+            inst.set_int(4, (nqh * hd * 2) as i32);
+            inst.set_int(5, hs as i32);
+            if n > 1 { inst.set_int(6, n as i32); }
+            inst.set_no_sync();
+            instructions.push(inst);
+        }
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
+            inst.set_output_ptr(1, k_attn_ptr);
+            inst.set_ptr(2, w.w_k.as_ptr());
+            inst.set_ptr(3, normed_ptr);
+            inst.set_int(4, (nkh * hd) as i32);
+            inst.set_int(5, hs as i32);
+            if n > 1 { inst.set_int(6, n as i32); }
+            inst.set_no_sync();
+            instructions.push(inst);
+        }
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
+            inst.set_output_ptr(1, v_attn_ptr);
+            inst.set_ptr(2, w.w_v.as_ptr());
+            inst.set_ptr(3, normed_ptr);
+            inst.set_int(4, (nkh * hd) as i32);
+            inst.set_int(5, hs as i32);
+            if n > 1 { inst.set_int(6, n as i32); }
+            instructions.push(inst);
+        }
+
+        // 3. Deinterleave Q+gate → Q, gate
+        if n > 1 {
+            // Batched: single OP_DEINTERLEAVE
+            let total_elems = n * nqh * hd;
+            let mut inst = Instruction::new(OP_DEINTERLEAVE, div_ceil(total_elems as u32, 256));
+            inst.set_output_ptr(1, q_attn_ptr);
+            inst.set_output_ptr(2, gate_attn_ptr);
+            inst.set_ptr(3, q_gate_attn_ptr);
+            inst.set_int(4, nqh as i32);
+            inst.set_int(5, hd as i32);
+            inst.set_int(6, n as i32);
+            instructions.push(inst);
+        } else {
+            // Single-token: per-head D2D_COPY loop
+            for h in 0..nqh {
+                let src_q_offset = h * hd * 2;
+                let src_g_offset = h * hd * 2 + hd;
+                let dst_offset = h * hd;
+                let is_last = h == nqh - 1;
+                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                inst.set_output_ptr(1, unsafe { q_attn_ptr.add(dst_offset) });
+                inst.set_ptr(2, unsafe { q_gate_attn_ptr.add(src_q_offset) });
+                inst.set_int(3, hd as i32);
+                inst.set_no_sync();
+                instructions.push(inst);
+                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                inst.set_output_ptr(1, unsafe { gate_attn_ptr.add(dst_offset) });
+                inst.set_ptr(2, unsafe { q_gate_attn_ptr.add(src_g_offset) });
+                inst.set_int(3, hd as i32);
+                if !is_last { inst.set_no_sync(); }
+                instructions.push(inst);
+            }
+        }
+
+        // 4. QK norm
+        {
+            let mut inst = Instruction::new(OP_QK_NORM, (n * (nqh + nkh)) as u32);
+            inst.set_output_ptr(1, q_attn_ptr);
+            inst.set_output_ptr(2, k_attn_ptr);
+            inst.set_ptr(3, w.q_norm.as_ptr());
+            inst.set_ptr(4, w.k_norm.as_ptr());
+            inst.set_int(5, nqh as i32);
+            inst.set_int(6, nkh as i32);
+            inst.set_int(7, hd as i32);
+            inst.set_float(8, eps);
+            if n > 1 { inst.set_int(9, n as i32); }
+            instructions.push(inst);
+        }
+
+        // Steps 5 (KV write paged — before mRoPE) or 6 (KV write flat/prefill — after mRoPE)
+        // is emitted by the variant block below. We emit mRoPE between them when needed.
+
+        // Variant-specific: KV write placement and attention op
+        match variant {
+            AttentionVariant::FlatKv { kv_cache } => {
+                // mRoPE first (step 5), then KV write (step 6), then GQA (step 7)
+                let mrope_idx = instructions.len();
+                mrope_indices.push(mrope_idx);
+                {
+                    let mut inst = Instruction::new(OP_MROPE, (n * (nqh + nkh)) as u32);
+                    inst.set_output_ptr(1, q_attn_ptr);
+                    inst.set_output_ptr(2, k_attn_ptr);
+                    inst.set_ptr(3, act.inv_freq.as_ptr());
+                    inst.set_ptr(4, position_ids_ptr);
+                    inst.set_int(5, nqh as i32);
+                    inst.set_int(6, nkh as i32);
+                    inst.set_int(7, hd as i32);
+                    inst.set_int(8, rd as i32);
+                    inst.set_int(9, cfg.mrope_section[0] as i32);
+                    inst.set_int(10, cfg.mrope_section[1] as i32);
+                    inst.set_int(11, cfg.mrope_section[2] as i32);
+                    inst.set_int(12, n as i32);
+                    instructions.push(inst);
+                }
+
+                let kv_stride = nkh * hd;
+                {
+                    let k_copy_idx = instructions.len();
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+                    inst.set_output_ptr(1, kv_cache.k.as_ptr());
+                    inst.set_ptr(2, k_attn_ptr);
+                    inst.set_int(3, kv_stride as i32);
+                    inst.set_no_sync();
+                    instructions.push(inst);
+                    let v_copy_idx = instructions.len();
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+                    inst.set_output_ptr(1, kv_cache.v.as_ptr());
+                    inst.set_ptr(2, v_attn_ptr);
+                    inst.set_int(3, kv_stride as i32);
+                    instructions.push(inst);
+                    kv_write_indices.push((k_copy_idx, v_copy_idx));
+                    kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
+                }
+
+                // GQA attention
+                let gqa_idx = instructions.len();
+                gqa_attn_inst_indices.push(gqa_idx);
+                let mut inst = Instruction::new(OP_GQA_ATTN, nqh as u32);
+                inst.set_output_ptr(1, attn_out_ptr);
+                inst.set_ptr(2, q_attn_ptr);
+                inst.set_ptr(3, kv_cache.k.as_ptr());
+                inst.set_ptr(4, kv_cache.v.as_ptr());
+                inst.set_int(5, nqh as i32);
+                inst.set_int(6, nkh as i32);
+                inst.set_int(7, hd as i32);
+                inst.set_int(8, 1); // seq_len — updated per step
+                inst.set_int(9, cfg.max_seq_len as i32);
+                instructions.push(inst);
+            }
+
+            AttentionVariant::PagedKv { kv_cache, attn_layer_index } => {
+                // KV write BEFORE mRoPE (paged stores pre-RoPE K)
+                let kv_stride = nkh * hd;
+                let chunk_tokens: usize = 64;
+                let layer_k_offset_bytes =
+                    (*attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+                let layer_v_offset_bytes =
+                    layer_k_offset_bytes + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+
+                let k_copy_idx = instructions.len();
+                {
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+                    inst.set_output_ptr(1, kv_cache.k.as_ptr());
+                    inst.set_ptr(2, k_attn_ptr);
+                    inst.set_int(3, kv_stride as i32);
+                    inst.set_no_sync();
+                    instructions.push(inst);
+                }
+                let v_copy_idx = instructions.len();
+                {
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+                    inst.set_output_ptr(1, kv_cache.v.as_ptr());
+                    inst.set_ptr(2, v_attn_ptr);
+                    inst.set_int(3, kv_stride as i32);
+                    instructions.push(inst);
+                }
+                kv_write_indices.push((k_copy_idx, v_copy_idx));
+                kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
+
+                // mRoPE after KV write
+                let mrope_idx = instructions.len();
+                mrope_indices.push(mrope_idx);
+                {
+                    let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
+                    inst.set_output_ptr(1, q_attn_ptr);
+                    inst.set_output_ptr(2, k_attn_ptr);
+                    inst.set_ptr(3, act.inv_freq.as_ptr());
+                    inst.set_ptr(4, position_ids_ptr);
+                    inst.set_int(5, nqh as i32);
+                    inst.set_int(6, nkh as i32);
+                    inst.set_int(7, hd as i32);
+                    inst.set_int(8, rd as i32);
+                    inst.set_int(9, cfg.mrope_section[0] as i32);
+                    inst.set_int(10, cfg.mrope_section[1] as i32);
+                    inst.set_int(11, cfg.mrope_section[2] as i32);
+                    inst.set_int(12, 1); // batch=1 for decode
+                    instructions.push(inst);
+                }
+
+                // OP_ATTN_PAGED
+                let paged_idx = instructions.len();
+                attn_paged_indices.push(paged_idx);
+                {
+                    let mut inst = Instruction::new(OP_ATTN_PAGED, nqh as u32);
+                    inst.set_output_ptr(1, attn_out_ptr);
+                    inst.set_ptr(2, q_attn_ptr);
+                    inst.set_int(3, 0); // page_table_ptr — patched per step
+                    inst.set_int(4, 0); // position_table_ptr — patched per step
+                    inst.set_ptr(5, act.inv_freq.as_ptr());
+                    inst.set_int(6, nqh as i32);
+                    inst.set_int(7, nkh as i32);
+                    inst.set_int(8, hd as i32);
+                    inst.set_int(9, 1); // seq_len — patched per step
+                    inst.set_int(10, chunk_tokens as i32);
+                    inst.set_int(11, rd as i32);
+                    inst.words[12] = layer_k_offset_bytes;
+                    inst.words[13] = layer_v_offset_bytes;
+                    instructions.push(inst);
+                }
+            }
+
+            AttentionVariant::Prefill { kv_cache, start_pos } => {
+                // mRoPE first (batched)
+                let mrope_idx = instructions.len();
+                mrope_indices.push(mrope_idx);
+                {
+                    let mut inst = Instruction::new(OP_MROPE, (n * (nqh + nkh)) as u32);
+                    inst.set_output_ptr(1, q_attn_ptr);
+                    inst.set_output_ptr(2, k_attn_ptr);
+                    inst.set_ptr(3, act.inv_freq.as_ptr());
+                    inst.set_ptr(4, position_ids_ptr);
+                    inst.set_int(5, nqh as i32);
+                    inst.set_int(6, nkh as i32);
+                    inst.set_int(7, hd as i32);
+                    inst.set_int(8, rd as i32);
+                    inst.set_int(9, cfg.mrope_section[0] as i32);
+                    inst.set_int(10, cfg.mrope_section[1] as i32);
+                    inst.set_int(11, cfg.mrope_section[2] as i32);
+                    inst.set_int(12, n as i32);
+                    instructions.push(inst);
+                }
+
+                // Bulk KV write for N tokens
+                let kv_stride = nkh * hd;
+                {
+                    let k_dst = unsafe { kv_cache.k.as_ptr().add(*start_pos as usize * kv_stride) };
+                    let total_kv = n * kv_stride;
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
+                    inst.set_output_ptr(1, k_dst);
+                    inst.set_ptr(2, k_attn_ptr);
+                    inst.set_int(3, total_kv as i32);
+                    inst.set_no_sync();
+                    instructions.push(inst);
+                }
+                {
+                    let v_dst = unsafe { kv_cache.v.as_ptr().add(*start_pos as usize * kv_stride) };
+                    let total_kv = n * kv_stride;
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
+                    inst.set_output_ptr(1, v_dst);
+                    inst.set_ptr(2, v_attn_ptr);
+                    inst.set_int(3, total_kv as i32);
+                    instructions.push(inst);
+                }
+
+                // OP_ATTN_PREFILL
+                {
+                    let mut inst = Instruction::new(OP_ATTN_PREFILL, (n * nqh) as u32);
+                    inst.set_output_ptr(1, attn_out_ptr);
+                    inst.set_ptr(2, q_attn_ptr);
+                    inst.set_ptr(3, kv_cache.k.as_ptr());
+                    inst.set_ptr(4, kv_cache.v.as_ptr());
+                    inst.set_int(5, nqh as i32);
+                    inst.set_int(6, nkh as i32);
+                    inst.set_int(7, hd as i32);
+                    inst.set_int(8, *start_pos as i32);
+                    inst.set_int(9, n as i32);
+                    inst.set_int(10, cfg.max_seq_len as i32);
+                    instructions.push(inst);
+                }
+            }
+        }
+
+        // 10. Output gate
+        {
+            let gate_size = n * nqh * hd;
+            let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
+            inst.set_output_ptr(1, gated_out_ptr);
+            inst.set_ptr(2, attn_out_ptr);
+            inst.set_ptr(3, gate_attn_ptr);
+            inst.set_int(4, gate_size as i32);
+            instructions.push(inst);
+        }
+
+        // 11. Output projection + residual
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+            inst.set_output_ptr(1, out_proj_ptr);
+            inst.set_ptr(2, w.w_o.as_ptr());
+            inst.set_ptr(3, gated_out_ptr);
+            inst.set_int(4, hs as i32);
+            inst.set_int(5, (nqh * hd) as i32);
+            if n > 1 { inst.set_int(6, n as i32); }
+            instructions.push(inst);
+        }
+        if n > 1 {
+            // Batched residual: hidden = hidden + out_proj (N tokens)
+            let total = n * hs;
+            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
+            inst.set_output_ptr(1, ffn_hidden_ptr);
+            inst.set_ptr(2, out_proj_ptr);
+            inst.set_ptr(3, ffn_hidden_ptr);
+            inst.set_int(4, total as i32);
+            instructions.push(inst);
+        } else if prefill.is_some() {
+            // Single-token prefill: residual uses prefill buffer (hidden_ptr = pb.hidden)
+            let total = hs;
+            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
+            inst.set_output_ptr(1, hidden_ptr);
+            inst.set_ptr(2, out_proj_ptr);
+            inst.set_ptr(3, hidden_ptr);
+            inst.set_int(4, total as i32);
+            instructions.push(inst);
+        } else {
+            // Single-token decode: two-step residual via act.residual scratch
+            {
+                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+                inst.set_output_ptr(1, act.residual.as_ptr());
+                inst.set_ptr(2, hidden_ptr);
+                inst.set_int(3, hs as i32);
+                instructions.push(inst);
+            }
+            {
+                let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+                inst.set_output_ptr(1, act.hidden.as_ptr());
+                inst.set_ptr(2, out_proj_ptr);
+                inst.set_ptr(3, act.residual.as_ptr());
+                inst.set_int(4, hs as i32);
+                instructions.push(inst);
+            }
+        }
+    }
+
     fn compile_gdn_layer(
         cfg: &ModelConfig,
         layer: &LayerWeights,
@@ -1040,168 +1284,12 @@ impl MegakernelProgram {
             LayerWeights::Attention(w) => w,
             _ => panic!("expected attention layer"),
         };
-        let hs = cfg.hidden_size;
-        let nqh = cfg.num_q_heads;
-        let nkh = cfg.num_kv_heads;
-        let hd = cfg.head_dim;
-        let eps = cfg.rms_norm_eps;
-        let rd = cfg.rope_dim;
-
-        // 1. RMSNorm
-        let mut inst = Instruction::new(OP_RMSNORM, 1);
-        inst.set_output_ptr(1, act.normed.as_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_ptr(3, w.input_norm.as_ptr());
-        inst.set_int(4, hs as i32);
-        inst.set_float(5, eps);
-        instructions.push(inst);
-
-        // 2. Q+gate [4096], K [512], V [512] projections — all read normed, write disjoint
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
-        inst.set_output_ptr(1, act.q_gate_attn.as_ptr());
-        inst.set_ptr(2, w.w_q_gate.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nqh * hd * 2) as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_output_ptr(1, act.k_attn.as_ptr());
-        inst.set_ptr(2, w.w_k.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nkh * hd) as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        // V proj: SYNC here ensures Q+gate, K, V all complete before deinterleave
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_output_ptr(1, act.v_attn.as_ptr());
-        inst.set_ptr(2, w.w_v.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nkh * hd) as i32);
-        inst.set_int(5, hs as i32);
-        instructions.push(inst);
-
-        // 3. Q/gate deinterleave: 8 heads × 2 copies each = 16 d2d copies
-        // All write to non-overlapping regions — skip sync on all but last
-        for h in 0..nqh {
-            let src_q_offset = h * hd * 2;
-            let src_g_offset = h * hd * 2 + hd;
-            let dst_offset = h * hd;
-            let is_last = h == nqh - 1;
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_output_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
-            inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
-            inst.set_int(3, hd as i32);
-            inst.set_no_sync();
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_output_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
-            inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
-            inst.set_int(3, hd as i32);
-            if !is_last { inst.set_no_sync(); }
-            instructions.push(inst);
-        }
-
-        // 4. QK norm
-        let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
-        inst.set_output_ptr(1, act.q_attn.as_ptr());
-        inst.set_output_ptr(2, act.k_attn.as_ptr());
-        inst.set_ptr(3, w.q_norm.as_ptr());
-        inst.set_ptr(4, w.k_norm.as_ptr());
-        inst.set_int(5, nqh as i32);
-        inst.set_int(6, nkh as i32);
-        inst.set_int(7, hd as i32);
-        inst.set_float(8, eps);
-        instructions.push(inst);
-
-        // 5. mRoPE (position updated per step)
-        let mrope_idx = instructions.len();
-        mrope_indices.push(mrope_idx);
-        let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
-        inst.set_output_ptr(1, act.q_attn.as_ptr());
-        inst.set_output_ptr(2, act.k_attn.as_ptr());
-        inst.set_ptr(3, act.inv_freq.as_ptr());
-        inst.set_ptr(4, act.position_ids.as_ptr());
-        inst.set_int(5, nqh as i32);
-        inst.set_int(6, nkh as i32);
-        inst.set_int(7, hd as i32);
-        inst.set_int(8, rd as i32);
-        inst.set_int(9, cfg.mrope_section[0] as i32);
-        inst.set_int(10, cfg.mrope_section[1] as i32);
-        inst.set_int(11, cfg.mrope_section[2] as i32);
-        inst.set_int(12, 1); // batch=1 for decode
-        instructions.push(inst);
-
-        // 6. Write K,V to cache — k_copy NO_SYNC (v_copy writes different buffer)
-        let kv_stride = nkh * hd;
-        let k_copy_idx = instructions.len();
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_output_ptr(1, kv_cache.k.as_ptr());
-        inst.set_ptr(2, act.k_attn.as_ptr());
-        inst.set_int(3, kv_stride as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        let v_copy_idx = instructions.len();
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_output_ptr(1, kv_cache.v.as_ptr());
-        inst.set_ptr(2, act.v_attn.as_ptr());
-        inst.set_int(3, kv_stride as i32);
-        instructions.push(inst);
-        kv_write_indices.push((k_copy_idx, v_copy_idx));
-        kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
-
-        // 7. GQA attention (seq_len updated per step)
-        let gqa_idx = instructions.len();
-        gqa_indices.push(gqa_idx);
-        let mut inst = Instruction::new(OP_GQA_ATTN, nqh as u32);
-        inst.set_output_ptr(1, act.attn_out.as_ptr());
-        inst.set_ptr(2, act.q_attn.as_ptr());
-        inst.set_ptr(3, kv_cache.k.as_ptr());
-        inst.set_ptr(4, kv_cache.v.as_ptr());
-        inst.set_int(5, nqh as i32);
-        inst.set_int(6, nkh as i32);
-        inst.set_int(7, hd as i32);
-        inst.set_int(8, 1); // seq_len — updated per step
-        inst.set_int(9, cfg.max_seq_len as i32);
-        instructions.push(inst);
-
-        // 8. Output gate
-        let gate_size = nqh * hd;
-        let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-        inst.set_output_ptr(1, act.gated_out.as_ptr());
-        inst.set_ptr(2, act.attn_out.as_ptr());
-        inst.set_ptr(3, act.gate_attn.as_ptr());
-        inst.set_int(4, gate_size as i32);
-        instructions.push(inst);
-
-        // 9. Output projection [1024, 2048]
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-        inst.set_output_ptr(1, act.out_proj.as_ptr());
-        inst.set_ptr(2, w.w_o.as_ptr());
-        inst.set_ptr(3, act.gated_out.as_ptr());
-        inst.set_int(4, hs as i32);
-        inst.set_int(5, (nqh * hd) as i32);
-        instructions.push(inst);
-
-        // 10. Residual
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.residual.as_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_int(3, hs as i32);
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.hidden.as_ptr());
-        inst.set_ptr(2, act.out_proj.as_ptr());
-        inst.set_ptr(3, act.residual.as_ptr());
-        inst.set_int(4, hs as i32);
-        instructions.push(inst);
+        Self::emit_attention_layer(
+            cfg, w, act, None,
+            &AttentionVariant::FlatKv { kv_cache },
+            instructions, mrope_indices, gqa_indices, kv_write_indices, kv_base_ptrs,
+            &mut Vec::new(),
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1221,180 +1309,12 @@ impl MegakernelProgram {
             LayerWeights::Attention(w) => w,
             _ => panic!("expected attention layer"),
         };
-        let hs = cfg.hidden_size;
-        let nqh = cfg.num_q_heads;
-        let nkh = cfg.num_kv_heads;
-        let hd = cfg.head_dim;
-        let eps = cfg.rms_norm_eps;
-        let rd = cfg.rope_dim;
-
-        // 1. RMSNorm
-        let mut inst = Instruction::new(OP_RMSNORM, 1);
-        inst.set_output_ptr(1, act.normed.as_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_ptr(3, w.input_norm.as_ptr());
-        inst.set_int(4, hs as i32);
-        inst.set_float(5, eps);
-        instructions.push(inst);
-
-        // 2. Q+gate, K, V projections — all read normed, write disjoint
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
-        inst.set_output_ptr(1, act.q_gate_attn.as_ptr());
-        inst.set_ptr(2, w.w_q_gate.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nqh * hd * 2) as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_output_ptr(1, act.k_attn.as_ptr());
-        inst.set_ptr(2, w.w_k.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nkh * hd) as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-        inst.set_output_ptr(1, act.v_attn.as_ptr());
-        inst.set_ptr(2, w.w_v.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nkh * hd) as i32);
-        inst.set_int(5, hs as i32);
-        instructions.push(inst);
-
-        // 3. Q/gate deinterleave
-        for h in 0..nqh {
-            let src_q_offset = h * hd * 2;
-            let src_g_offset = h * hd * 2 + hd;
-            let dst_offset = h * hd;
-            let is_last = h == nqh - 1;
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_output_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
-            inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
-            inst.set_int(3, hd as i32);
-            inst.set_no_sync();
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-            inst.set_output_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
-            inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
-            inst.set_int(3, hd as i32);
-            if !is_last { inst.set_no_sync(); }
-            instructions.push(inst);
-        }
-
-        // 4. QK norm
-        let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
-        inst.set_output_ptr(1, act.q_attn.as_ptr());
-        inst.set_output_ptr(2, act.k_attn.as_ptr());
-        inst.set_ptr(3, w.q_norm.as_ptr());
-        inst.set_ptr(4, w.k_norm.as_ptr());
-        inst.set_int(5, nqh as i32);
-        inst.set_int(6, nkh as i32);
-        inst.set_int(7, hd as i32);
-        inst.set_float(8, eps);
-        instructions.push(inst);
-
-        // 5. KV write — BEFORE mRoPE: stores pre-RoPE K into paged cache
-        // Chunk layout per chunk: [layer0_K, layer0_V, layer1_K, layer1_V, ...]
-        // Each K or V block is chunk_tokens * kv_stride f32s.
-        let kv_stride = nkh * hd;
-        let chunk_tokens: usize = 64;
-        let layer_k_offset_bytes =
-            (attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
-        let layer_v_offset_bytes =
-            layer_k_offset_bytes + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
-
-        // Destination ptr is patched per step by update_step_paged.
-        // At compile time, store kv_cache base ptr as placeholder.
-        let k_copy_idx = instructions.len();
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_output_ptr(1, kv_cache.k.as_ptr());
-        inst.set_ptr(2, act.k_attn.as_ptr());
-        inst.set_int(3, kv_stride as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        let v_copy_idx = instructions.len();
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_output_ptr(1, kv_cache.v.as_ptr());
-        inst.set_ptr(2, act.v_attn.as_ptr());
-        inst.set_int(3, kv_stride as i32);
-        instructions.push(inst);
-        kv_write_indices.push((k_copy_idx, v_copy_idx));
-        kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
-
-        // 6. mRoPE — still needed for Q in activation buffer
-        let mrope_idx = instructions.len();
-        mrope_indices.push(mrope_idx);
-        let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
-        inst.set_output_ptr(1, act.q_attn.as_ptr());
-        inst.set_output_ptr(2, act.k_attn.as_ptr());
-        inst.set_ptr(3, act.inv_freq.as_ptr());
-        inst.set_ptr(4, act.position_ids.as_ptr());
-        inst.set_int(5, nqh as i32);
-        inst.set_int(6, nkh as i32);
-        inst.set_int(7, hd as i32);
-        inst.set_int(8, rd as i32);
-        inst.set_int(9, cfg.mrope_section[0] as i32);
-        inst.set_int(10, cfg.mrope_section[1] as i32);
-        inst.set_int(11, cfg.mrope_section[2] as i32);
-        inst.set_int(12, 1); // batch=1 for decode
-        instructions.push(inst);
-
-        // 7. OP_ATTN_PAGED: page_table_ptr and position_table_ptr are patched per step
-        let paged_idx = instructions.len();
-        attn_paged_indices.push(paged_idx);
-        let mut inst = Instruction::new(OP_ATTN_PAGED, nqh as u32);
-        inst.set_output_ptr(1, act.attn_out.as_ptr());
-        inst.set_ptr(2, act.q_attn.as_ptr());
-        inst.set_int(3, 0); // page_table_ptr — patched per step
-        inst.set_int(4, 0); // position_table_ptr — patched per step
-        inst.set_ptr(5, act.inv_freq.as_ptr());
-        inst.set_int(6, nqh as i32);
-        inst.set_int(7, nkh as i32);
-        inst.set_int(8, hd as i32);
-        inst.set_int(9, 1); // seq_len — patched per step
-        inst.set_int(10, chunk_tokens as i32);
-        inst.set_int(11, rd as i32);
-        inst.words[12] = layer_k_offset_bytes;
-        inst.words[13] = layer_v_offset_bytes;
-        instructions.push(inst);
-
-        // 8. Output gate
-        let gate_size = nqh * hd;
-        let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-        inst.set_output_ptr(1, act.gated_out.as_ptr());
-        inst.set_ptr(2, act.attn_out.as_ptr());
-        inst.set_ptr(3, act.gate_attn.as_ptr());
-        inst.set_int(4, gate_size as i32);
-        instructions.push(inst);
-
-        // 9. Output projection
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-        inst.set_output_ptr(1, act.out_proj.as_ptr());
-        inst.set_ptr(2, w.w_o.as_ptr());
-        inst.set_ptr(3, act.gated_out.as_ptr());
-        inst.set_int(4, hs as i32);
-        inst.set_int(5, (nqh * hd) as i32);
-        instructions.push(inst);
-
-        // 10. Residual
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.residual.as_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_int(3, hs as i32);
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.hidden.as_ptr());
-        inst.set_ptr(2, act.out_proj.as_ptr());
-        inst.set_ptr(3, act.residual.as_ptr());
-        inst.set_int(4, hs as i32);
-        instructions.push(inst);
+        Self::emit_attention_layer(
+            cfg, w, act, None,
+            &AttentionVariant::PagedKv { kv_cache, attn_layer_index },
+            instructions, mrope_indices, &mut Vec::new(), kv_write_indices, kv_base_ptrs,
+            attn_paged_indices,
+        );
     }
 
     fn compile_ffn_batched(
