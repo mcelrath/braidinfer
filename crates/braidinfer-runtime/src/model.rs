@@ -679,6 +679,16 @@ impl Qwen35Model {
         // User override takes priority, otherwise cap at DEFAULT_MAX_SEQ_LEN.
         config.max_seq_len = max_seq_len.unwrap_or(config.max_seq_len.min(Self::DEFAULT_MAX_SEQ_LEN));
         let st = SafeTensorSet::open_directory(model_dir)?;
+
+        // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
+        // Costs ~300ms upfront to fault in pages, but saves ~500ms on weight copies.
+        let shard_ptrs: Vec<(*mut std::ffi::c_void, usize)> = st.shard_mmaps()
+            .map(|m| (m.as_ptr() as *mut std::ffi::c_void, m.len()))
+            .collect();
+        for &(ptr, len) in &shard_ptrs {
+            unsafe { ffi::hipHostRegister(ptr, len, 0) };
+        }
+
         let prefix = "model.language_model.";
 
         let stream = Stream::new(device)?;
@@ -763,6 +773,11 @@ impl Qwen35Model {
                 };
                 layers.push(LayerWeights::Gdn(w));
             }
+        }
+
+        // Unpin mmap'd regions now that all weights are on GPU
+        for &(ptr, _) in &shard_ptrs {
+            unsafe { ffi::hipHostUnregister(ptr) };
         }
 
         // GDN states: [nh * kd * vd] = [16*128*128] = 262144 per GDN layer
