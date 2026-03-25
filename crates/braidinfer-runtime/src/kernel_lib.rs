@@ -43,7 +43,7 @@ impl KernelLibrary {
     }
 
     pub fn load_all_kernels(&mut self) -> HipResult<()> {
-        let kernel_names = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "gdn_recurrent_step", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2"];
+        let kernel_names = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2"];
         for name in &kernel_names {
             self.load_module(name)?;
         }

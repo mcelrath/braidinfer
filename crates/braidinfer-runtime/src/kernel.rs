@@ -17,7 +17,7 @@ pub struct GdnRecurrentStepKernel {
 
 impl GdnRecurrentStepKernel {
     pub fn load(device: DeviceId) -> HipResult<Self> {
-        let path = kernel_dir().join("gdn_recurrent_step.hsaco");
+        let path = kernel_dir().join("gdn_recurrent_step_v2.hsaco");
         let module = Module::load(device, &path)?;
         Ok(Self { module, device })
     }
@@ -46,7 +46,7 @@ impl GdnRecurrentStepKernel {
         assert_eq!(output.device(), self.device);
         assert_eq!(stream.device(), self.device);
 
-        let func = self.module.get_function("gdn_recurrent_step_f32")?;
+        let func = self.module.get_function("gdn_recurrent_step_v2_f32")?;
 
         let mut q_ptr: *const c_void = q.as_ptr().cast();
         let mut k_ptr: *const c_void = k.as_ptr().cast();
@@ -73,7 +73,7 @@ impl GdnRecurrentStepKernel {
         func.launch(
             (num_heads, 1, 1),
             (256, 1, 1),
-            0,
+            256 * 2 * 4, // 2 * block_size * sizeof(float) for q/k norm reductions
             stream,
             &mut args,
         )

@@ -6,12 +6,19 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+fn l2norm(x: &[f32]) -> Vec<f32> {
+    let norm = (x.iter().map(|v| v * v).sum::<f32>() + 1e-6).sqrt();
+    x.iter().map(|v| v / norm).collect()
+}
+
+/// GDN recurrent step v2 reference: Gated Delta Rule with QK L2-norm.
+/// State layout: [num_heads, value_dim, key_dim] (transposed for coalesced access).
 fn gdn_step_reference(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    g: &[f32],
-    b: &[f32],
+    gate: &[f32],   // pre-computed decay in (0,1)
+    b: &[f32],      // beta logits (sigmoid applied here)
     state: &mut [f32],
     num_heads: usize,
     key_dim: usize,
@@ -19,19 +26,38 @@ fn gdn_step_reference(
 ) -> Vec<f32> {
     let mut output = vec![0.0f32; num_heads * value_dim];
     for h in 0..num_heads {
-        let gate = sigmoid(g[h]);
-        let beta_val = sigmoid(b[h]);
+        let decay = gate[h];
+        let beta = sigmoid(b[h]);
+        let q_norm = l2norm(&q[h * key_dim..(h + 1) * key_dim]);
+        let k_norm = l2norm(&k[h * key_dim..(h + 1) * key_dim]);
+        let q_scale = 1.0 / (key_dim as f32).sqrt();
         let s = &mut state[h * key_dim * value_dim..(h + 1) * key_dim * value_dim];
-        for i in 0..key_dim {
-            for j in 0..value_dim {
-                s[i * value_dim + j] = gate * s[i * value_dim + j]
-                    + beta_val * v[h * value_dim + j] * k[h * key_dim + i];
+
+        // state *= decay  (state layout: [value_dim, key_dim])
+        for idx in 0..key_dim * value_dim {
+            s[idx] *= decay;
+        }
+
+        // For each j in value_dim:
+        //   kv_mem[j] = sum_i state[j*key_dim+i] * k_norm[i]
+        //   delta[j] = (v[j] - kv_mem[j]) * beta
+        //   state[j*key_dim+i] += k_norm[i] * delta[j]
+        for j in 0..value_dim {
+            let mut kv_mem = 0.0f32;
+            for i in 0..key_dim {
+                kv_mem += s[j * key_dim + i] * k_norm[i];
+            }
+            let delta = (v[h * value_dim + j] - kv_mem) * beta;
+            for i in 0..key_dim {
+                s[j * key_dim + i] += k_norm[i] * delta;
             }
         }
+
+        // output[j] = sum_i state[j*key_dim+i] * q_norm[i] * q_scale
         for j in 0..value_dim {
             let mut sum = 0.0f32;
             for i in 0..key_dim {
-                sum += s[i * value_dim + j] * q[h * key_dim + i];
+                sum += s[j * key_dim + i] * q_norm[i] * q_scale;
             }
             output[h * value_dim + j] = sum;
         }
@@ -55,7 +81,8 @@ fn test_gdn_recurrent_step_matches_reference() {
     let v_data: Vec<f32> = (0..num_heads * value_dim)
         .map(|i| (i as f32 * 0.013).sin())
         .collect();
-    let g_data: Vec<f32> = (0..num_heads).map(|i| (i as f32 * 0.1) - 0.8).collect();
+    // Gate values are pre-computed decay in (0,1) — apply sigmoid to raw logits
+    let g_data: Vec<f32> = (0..num_heads).map(|i| sigmoid((i as f32 * 0.1) - 0.8)).collect();
     let b_data: Vec<f32> = (0..num_heads).map(|i| (i as f32 * 0.05) - 0.4).collect();
 
     // Initial state: small random-ish values
