@@ -87,6 +87,10 @@ impl PageAllocator {
         self.capacity
     }
 
+    pub fn free_count(&self) -> usize {
+        self.free_list.len()
+    }
+
     pub fn chunk_bytes(&self) -> usize {
         self.chunk_bytes
     }
@@ -135,6 +139,9 @@ impl ChunkHandle {
     ) -> HipResult<ChunkHandle> {
         if Arc::strong_count(&self.inner) == 1 {
             return Ok(self.clone());
+        }
+        if allocator.free_count() < 1 {
+            return Err(HipError(ffi::hipErrorOutOfMemory));
         }
         let (new_slot, new_ptr) = allocator
             .alloc()
