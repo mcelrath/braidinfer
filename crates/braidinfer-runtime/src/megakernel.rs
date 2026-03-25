@@ -1415,11 +1415,9 @@ impl MegakernelProgram {
         assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
 
         let cfg_nkh_hd = self.kv_stride_paged;
-        let mut changed: Vec<usize> = Vec::new();
 
         // Update embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
-        changed.push(self.embedding_inst_idx);
 
         // Update position_ids on device ([temporal, height, width] = all equal position for text)
         let pos_data = [position as i32, position as i32, position as i32];
@@ -1441,33 +1439,28 @@ impl MegakernelProgram {
             let v_ptr = v_base + (pos_offset * std::mem::size_of::<f32>()) as u64;
             self.instructions[k_idx].words[1] = k_ptr;
             self.instructions[v_idx].words[1] = v_ptr;
-            changed.push(k_idx);
-            changed.push(v_idx);
         }
 
         // Update GQA attention seq_len
         let seq_len = position + 1;
         for &idx in &self.gqa_attn_inst_indices {
             self.instructions[idx].set_int(8, seq_len as i32);
-            changed.push(idx);
         }
 
-        // Upload only the changed instructions (each is INST_SIZE u64s = 128 bytes)
+        // Upload entire instruction buffer in one hipMemcpyAsync call.
+        // ~500 instructions × 128 bytes = ~64KB; one 64KB copy is cheaper than 24× 128-byte copies.
+        let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
         let dev_ptr = self.device_program.as_mut_ptr();
-        for inst_idx in changed {
-            let words = &self.instructions[inst_idx].words;
-            let byte_offset = inst_idx * INST_SIZE * std::mem::size_of::<u64>();
-            let size = INST_SIZE * std::mem::size_of::<u64>();
-            braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpyAsync(
-                    (dev_ptr as *mut u8).add(byte_offset).cast(),
-                    words.as_ptr().cast(),
-                    size,
-                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                    stream.raw(),
-                )
-            })?;
-        }
+        let size = flat.len() * std::mem::size_of::<u64>();
+        braidinfer_hip::error::check(unsafe {
+            braidinfer_hip::ffi::hipMemcpyAsync(
+                dev_ptr.cast(),
+                flat.as_ptr().cast(),
+                size,
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                stream.raw(),
+            )
+        })?;
         Ok(())
     }
 
@@ -1484,11 +1477,8 @@ impl MegakernelProgram {
         assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
         assert!(self.paged, "update_step_paged called on non-paged program");
 
-        let mut changed: Vec<usize> = Vec::new();
-
         // 1. Patch embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
-        changed.push(self.embedding_inst_idx);
 
         // 2. Append scalar position to position_table on device at offset [position]
         {
@@ -1539,8 +1529,6 @@ impl MegakernelProgram {
             let v_ptr = chunk_base + layer_v_offset + (chunk_offset * token_byte_stride) as u64;
             self.instructions[k_idx].words[1] = k_ptr;
             self.instructions[v_idx].words[1] = v_ptr;
-            changed.push(k_idx);
-            changed.push(v_idx);
         }
 
         // 4. Patch OP_ATTN_PAGED seq_len and page_table/position_table ptrs
@@ -1551,7 +1539,6 @@ impl MegakernelProgram {
             self.instructions[idx].words[3] = page_table_ptr;
             self.instructions[idx].words[4] = pos_table_ptr;
             self.instructions[idx].set_int(9, seq_len);
-            changed.push(idx);
         }
 
         // 5. Upload page_table if chunk list changed
@@ -1574,22 +1561,19 @@ impl MegakernelProgram {
             self.last_page_table_len = seq.chunks.len();
         }
 
-        // 6. Upload changed instructions
+        // 6. Upload entire instruction buffer in one hipMemcpyAsync call.
+        let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
         let dev_ptr = self.device_program.as_mut_ptr();
-        for inst_idx in changed {
-            let words = &self.instructions[inst_idx].words;
-            let byte_offset = inst_idx * INST_SIZE * std::mem::size_of::<u64>();
-            let size = INST_SIZE * std::mem::size_of::<u64>();
-            braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpyAsync(
-                    (dev_ptr as *mut u8).add(byte_offset).cast(),
-                    words.as_ptr().cast(),
-                    size,
-                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                    stream.raw(),
-                )
-            })?;
-        }
+        let size = flat.len() * std::mem::size_of::<u64>();
+        braidinfer_hip::error::check(unsafe {
+            braidinfer_hip::ffi::hipMemcpyAsync(
+                dev_ptr.cast(),
+                flat.as_ptr().cast(),
+                size,
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                stream.raw(),
+            )
+        })?;
         Ok(())
     }
 
