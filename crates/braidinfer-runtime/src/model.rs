@@ -15,7 +15,7 @@ use crate::kernel::{
     RmsNormKernel,
 };
 use crate::megakernel::{MegakernelProgram, CHUNK_TOKENS};
-use crate::paged_kv::{PageAllocator, SequenceState};
+use crate::paged_kv::{self, PageAllocator, RecurrentCheckpointPool, SequenceState};
 
 // ---- Model config ----
 
@@ -496,6 +496,7 @@ pub struct Qwen35Model {
     megakernel_paged: Option<MegakernelProgram>,
     page_allocator: Option<PageAllocator>,
     paged_seq: Option<SequenceState>,
+    checkpoint_pool: Option<RecurrentCheckpointPool>,
 }
 
 // ---- Error type ----
@@ -828,6 +829,7 @@ impl Qwen35Model {
             megakernel_paged: None,
             page_allocator: None,
             paged_seq: None,
+            checkpoint_pool: None,
         })
     }
 
@@ -1367,6 +1369,46 @@ impl Qwen35Model {
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
         Ok(logits)
+    }
+
+    /// Save the current GDN recurrent states into a checkpoint pool slot.
+    /// Lazy-initializes the pool on first call. Returns the slot index.
+    pub fn save_recurrent_checkpoint(&mut self) -> Result<u32, ModelError> {
+        if self.checkpoint_pool.is_none() {
+            self.checkpoint_pool = Some(RecurrentCheckpointPool::new(
+                self.device,
+                &self.config,
+                4,
+            )?);
+        }
+        let recurrent_bufs: Vec<&DeviceBuffer<f32>> = self.gdn_states.iter().map(|s| &s.recurrent).collect();
+        let pool = self.checkpoint_pool.as_mut().unwrap();
+        let slot = paged_kv::save_checkpoint(pool, &recurrent_bufs, self.stream.raw())?;
+        Ok(slot)
+    }
+
+    /// Read all GDN recurrent state to host (for testing).
+    pub fn read_gdn_state(&self) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.stream.synchronize()?;
+        let mut result = Vec::with_capacity(self.gdn_states.len());
+        for state in &self.gdn_states {
+            let n = state.recurrent.len();
+            let mut buf = vec![0.0f32; n];
+            state.recurrent.copy_to_host(&mut buf)?;
+            result.push(buf);
+        }
+        Ok(result)
+    }
+
+    /// Restore GDN recurrent states from a previously saved checkpoint slot.
+    pub fn restore_recurrent_checkpoint(&mut self, slot: u32) -> Result<(), ModelError> {
+        let pool = self.checkpoint_pool.as_ref()
+            .ok_or_else(|| ModelError::MissingWeight("checkpoint_pool not initialized".into()))?;
+        let mut recurrent_bufs: Vec<&mut DeviceBuffer<f32>> = self.gdn_states.iter_mut().map(|s| &mut s.recurrent).collect();
+        let stream_raw = self.stream.raw();
+        paged_kv::restore_checkpoint(pool, slot, &mut recurrent_bufs, stream_raw)?;
+        self.stream.synchronize()?;
+        Ok(())
     }
 
     fn read_hidden(&self) -> Result<Vec<f32>, ModelError> {

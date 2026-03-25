@@ -304,7 +304,7 @@ impl RecurrentCheckpointPool {
 /// Returns the slot index that was used.
 pub fn save_checkpoint(
     pool: &mut RecurrentCheckpointPool,
-    recurrent_states: &[DeviceBuffer<f32>],
+    recurrent_states: &[&DeviceBuffer<f32>],
     stream: ffi::hipStream_t,
 ) -> HipResult<u32> {
     let (slot, dst_ptr) = pool.alloc().ok_or(HipError(ffi::hipErrorOutOfMemory))?;
@@ -329,7 +329,7 @@ pub fn save_checkpoint(
 pub fn restore_checkpoint(
     pool: &RecurrentCheckpointPool,
     slot: u32,
-    recurrent_states: &mut [DeviceBuffer<f32>],
+    recurrent_states: &mut [&mut DeviceBuffer<f32>],
     stream: ffi::hipStream_t,
 ) -> HipResult<()> {
     let src_ptr = pool.slot_vram_ptr(slot);
