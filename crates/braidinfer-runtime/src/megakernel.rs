@@ -90,9 +90,12 @@ pub struct MegakernelProgram {
     embedding_inst_idx: usize,
     mrope_inst_indices: Vec<usize>,    // one per attention layer
     gqa_attn_inst_indices: Vec<usize>, // seq_len changes each step
-    kv_write_indices: Vec<(usize, usize)>, // (k_copy_idx, v_copy_idx) per attn layer
+    kv_write_indices: Vec<Vec<(usize, usize)>>, // per attn layer, per kv_head: (k_copy_idx, v_copy_idx)
     // Base KV cache pointers (position=0) for computing per-step write offsets
     kv_base_ptrs: Vec<(u64, u64)>, // (k_base, v_base) per attention layer
+    // KV head geometry for [H,T,D] layout pointer computation
+    num_kv_heads_attn: usize, // nkh for attention layers
+    head_dim_attn: usize,     // hd for attention layers
     // mRoPE position_ids device pointer (3 i32s: temporal, height, width)
     position_ids_dev_ptr: u64,
     // Bounds check
@@ -334,6 +337,8 @@ impl MegakernelProgram {
             attn_paged_inst_indices,
             last_page_table_len: 0,
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
+            num_kv_heads_attn: cfg.num_kv_heads,
+            head_dim_attn: cfg.head_dim,
         })
     }
 
@@ -708,6 +713,8 @@ impl MegakernelProgram {
             attn_paged_inst_indices: Vec::new(),
             last_page_table_len: 0,
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
+            num_kv_heads_attn: cfg.num_kv_heads,
+            head_dim_attn: cfg.head_dim,
         })
     }
 
@@ -730,7 +737,7 @@ impl MegakernelProgram {
         instructions: &mut Vec<Instruction>,
         mrope_indices: &mut Vec<usize>,
         gqa_attn_inst_indices: &mut Vec<usize>,
-        kv_write_indices: &mut Vec<(usize, usize)>,
+        kv_write_indices: &mut Vec<Vec<(usize, usize)>>,
         kv_base_ptrs: &mut Vec<(u64, u64)>,
         attn_paged_indices: &mut Vec<usize>,
     ) {
@@ -880,22 +887,30 @@ impl MegakernelProgram {
                     instructions.push(inst);
                 }
 
-                let kv_stride = nkh * hd;
+                // Per-head D2D_COPY for [H,T,D] layout: each head's cache slot
+                // is at base + h * max_seq_len * hd, updated at runtime with position offset.
+                let max_sl = cfg.max_seq_len;
+                let head_stride = max_sl * hd; // elements between consecutive heads
                 {
-                    let k_copy_idx = instructions.len();
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-                    inst.set_output_ptr(1, kv_cache.k.as_ptr());
-                    inst.set_ptr(2, k_attn_ptr);
-                    inst.set_int(3, kv_stride as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                    let v_copy_idx = instructions.len();
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-                    inst.set_output_ptr(1, kv_cache.v.as_ptr());
-                    inst.set_ptr(2, v_attn_ptr);
-                    inst.set_int(3, kv_stride as i32);
-                    instructions.push(inst);
-                    kv_write_indices.push((k_copy_idx, v_copy_idx));
+                    let mut head_indices = Vec::new();
+                    for h in 0..nkh {
+                        let k_copy_idx = instructions.len();
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, unsafe { kv_cache.k.as_ptr().add(h * head_stride) });
+                        inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
+                        inst.set_int(3, hd as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                        let v_copy_idx = instructions.len();
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, unsafe { kv_cache.v.as_ptr().add(h * head_stride) });
+                        inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
+                        inst.set_int(3, hd as i32);
+                        if h < nkh - 1 { inst.set_no_sync(); }
+                        instructions.push(inst);
+                        head_indices.push((k_copy_idx, v_copy_idx));
+                    }
+                    kv_write_indices.push(head_indices);
                     kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
                 }
 
@@ -917,6 +932,7 @@ impl MegakernelProgram {
 
             AttentionVariant::PagedKv { kv_cache, attn_layer_index } => {
                 // KV write BEFORE mRoPE (paged stores pre-RoPE K)
+                // Per-head D2D_COPY for [H,T,D] chunk layout
                 let kv_stride = nkh * hd;
                 let chunk_tokens: usize = 64;
                 let layer_k_offset_bytes =
@@ -924,24 +940,30 @@ impl MegakernelProgram {
                 let layer_v_offset_bytes =
                     layer_k_offset_bytes + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
 
-                let k_copy_idx = instructions.len();
-                {
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-                    inst.set_output_ptr(1, kv_cache.k.as_ptr());
-                    inst.set_ptr(2, k_attn_ptr);
-                    inst.set_int(3, kv_stride as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
+                let chunk_head_stride = chunk_tokens * hd; // elements between heads within chunk
+                let mut head_indices = Vec::new();
+                for h in 0..nkh {
+                    let k_copy_idx = instructions.len();
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, unsafe { kv_cache.k.as_ptr().add(h * chunk_head_stride) });
+                        inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
+                        inst.set_int(3, hd as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    let v_copy_idx = instructions.len();
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, unsafe { kv_cache.v.as_ptr().add(h * chunk_head_stride) });
+                        inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
+                        inst.set_int(3, hd as i32);
+                        if h < nkh - 1 { inst.set_no_sync(); }
+                        instructions.push(inst);
+                    }
+                    head_indices.push((k_copy_idx, v_copy_idx));
                 }
-                let v_copy_idx = instructions.len();
-                {
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-                    inst.set_output_ptr(1, kv_cache.v.as_ptr());
-                    inst.set_ptr(2, v_attn_ptr);
-                    inst.set_int(3, kv_stride as i32);
-                    instructions.push(inst);
-                }
-                kv_write_indices.push((k_copy_idx, v_copy_idx));
+                kv_write_indices.push(head_indices);
                 kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
 
                 // mRoPE after KV write
@@ -1007,26 +1029,39 @@ impl MegakernelProgram {
                     instructions.push(inst);
                 }
 
-                // Bulk KV write for N tokens
-                let kv_stride = nkh * hd;
-                {
-                    let k_dst = unsafe { kv_cache.k.as_ptr().add(*start_pos as usize * kv_stride) };
-                    let total_kv = n * kv_stride;
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
-                    inst.set_output_ptr(1, k_dst);
-                    inst.set_ptr(2, k_attn_ptr);
-                    inst.set_int(3, total_kv as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
-                {
-                    let v_dst = unsafe { kv_cache.v.as_ptr().add(*start_pos as usize * kv_stride) };
-                    let total_kv = n * kv_stride;
-                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total_kv as u32, 256));
-                    inst.set_output_ptr(1, v_dst);
-                    inst.set_ptr(2, v_attn_ptr);
-                    inst.set_int(3, total_kv as i32);
-                    instructions.push(inst);
+                // Per-head KV write for N tokens ([H,T,D] layout)
+                // Source k_attn is [N, nkh, hd], dest is [nkh, max_seq_len, hd]
+                // For each head h, copy N*hd elements from src offset [0,h,0] stride nkh*hd
+                // to dst offset [h, start_pos, 0].
+                // Since source is token-major [N, nkh, hd], we need per-token-per-head copies
+                // OR a new scatter op. For prefill N is small (≤64), so N*nkh copies of hd floats.
+                let max_sl = cfg.max_seq_len;
+                for t in 0..n {
+                    for h in 0..nkh {
+                        let src_off = (t * nkh + h) * hd;
+                        let dst_off = h * max_sl * hd + (*start_pos as usize + t) * hd;
+                        let k_dst = unsafe { kv_cache.k.as_ptr().add(dst_off) };
+                        let k_src = unsafe { k_attn_ptr.add(src_off) };
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, k_dst);
+                        inst.set_ptr(2, k_src);
+                        inst.set_int(3, hd as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+
+                        let v_dst = unsafe { kv_cache.v.as_ptr().add(dst_off) };
+                        let v_src = unsafe { v_attn_ptr.add(src_off) };
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, v_dst);
+                        inst.set_ptr(2, v_src);
+                        inst.set_int(3, hd as i32);
+                        if t == n - 1 && h == nkh - 1 {
+                            // last copy syncs
+                        } else {
+                            inst.set_no_sync();
+                        }
+                        instructions.push(inst);
+                    }
                 }
 
                 // OP_ATTN_PREFILL
@@ -1277,7 +1312,7 @@ impl MegakernelProgram {
         instructions: &mut Vec<Instruction>,
         mrope_indices: &mut Vec<usize>,
         gqa_indices: &mut Vec<usize>,
-        kv_write_indices: &mut Vec<(usize, usize)>,
+        kv_write_indices: &mut Vec<Vec<(usize, usize)>>,
         kv_base_ptrs: &mut Vec<(u64, u64)>,
     ) {
         let w = match layer {
@@ -1301,7 +1336,7 @@ impl MegakernelProgram {
         attn_layer_index: usize,
         instructions: &mut Vec<Instruction>,
         mrope_indices: &mut Vec<usize>,
-        kv_write_indices: &mut Vec<(usize, usize)>,
+        kv_write_indices: &mut Vec<Vec<(usize, usize)>>,
         kv_base_ptrs: &mut Vec<(u64, u64)>,
         attn_paged_indices: &mut Vec<usize>,
     ) {
@@ -1414,7 +1449,6 @@ impl MegakernelProgram {
     pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
         assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
 
-        let cfg_nkh_hd = self.kv_stride_paged;
 
         // Update embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
@@ -1431,14 +1465,18 @@ impl MegakernelProgram {
             )
         })?;
 
-        // Update KV cache write offsets (position-dependent)
-        let pos_offset = position as usize * cfg_nkh_hd;
-        for (layer_i, &(k_idx, v_idx)) in self.kv_write_indices.iter().enumerate() {
+        // Update KV cache write offsets (position-dependent, [H,T,D] layout)
+        let nkh = self.num_kv_heads_attn;
+        let hd = self.head_dim_attn;
+        let max_sl = self.max_seq_len as usize;
+        let head_stride = max_sl * hd; // elements between consecutive heads
+        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
             let (k_base, v_base) = self.kv_base_ptrs[layer_i];
-            let k_ptr = k_base + (pos_offset * std::mem::size_of::<f32>()) as u64;
-            let v_ptr = v_base + (pos_offset * std::mem::size_of::<f32>()) as u64;
-            self.instructions[k_idx].words[1] = k_ptr;
-            self.instructions[v_idx].words[1] = v_ptr;
+            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
+                let offset = (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
+                self.instructions[k_idx].words[1] = k_base + offset as u64;
+                self.instructions[v_idx].words[1] = v_base + offset as u64;
+            }
         }
 
         // Update GQA attention seq_len
@@ -1508,27 +1546,30 @@ impl MegakernelProgram {
             )
         })?;
 
-        // 3. Patch KV write D2D_COPY destinations from paged chunk layout
-        // The write target is: chunk_base + layer_k/v_offset + chunk_offset * kv_stride * sizeof(f32)
+        // 3. Patch KV write D2D_COPY destinations from paged chunk layout [H,T,D]
         // current_chunk_offset() returns len (post-increment from append_token).
         // The write target is len-1 (the slot just reserved).
         let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
         let kv_stride = self.kv_stride_paged;
-        let token_byte_stride = kv_stride * std::mem::size_of::<f32>();
+        let nkh = self.num_kv_heads_attn;
+        let hd = self.head_dim_attn;
+        let chunk_head_stride = CHUNK_TOKENS * hd; // elements between heads within chunk
 
-        for (layer_i, &(k_idx, v_idx)) in self.kv_write_indices.iter().enumerate() {
+        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
             let chunk_slot = if seq.chunks.is_empty() { 0 } else {
                 seq.chunks.last().unwrap().slot_index()
             };
             let chunk_base = allocator.slot_ptr(chunk_slot) as u64;
-            // layer_k_offset_bytes is baked into OP_ATTN_PAGED word[12]
-            // recompute here: layout is [layer0_K, layer0_V, layer1_K, layer1_V, ...]
+            // layout: [layer0_K[nkh, chunk_tokens, hd], layer0_V[...], layer1_K, ...]
             let layer_k_offset = (layer_i * 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
-            let layer_v_offset = layer_k_offset + (CHUNK_TOKENS * token_byte_stride) as u64;
-            let k_ptr = chunk_base + layer_k_offset + (chunk_offset * token_byte_stride) as u64;
-            let v_ptr = chunk_base + layer_v_offset + (chunk_offset * token_byte_stride) as u64;
-            self.instructions[k_idx].words[1] = k_ptr;
-            self.instructions[v_idx].words[1] = v_ptr;
+            let layer_v_offset = layer_k_offset + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
+                let head_byte_off = (h * chunk_head_stride + chunk_offset * hd) * std::mem::size_of::<f32>();
+                let k_ptr = chunk_base + layer_k_offset + head_byte_off as u64;
+                let v_ptr = chunk_base + layer_v_offset + head_byte_off as u64;
+                self.instructions[k_idx].words[1] = k_ptr;
+                self.instructions[v_idx].words[1] = v_ptr;
+            }
         }
 
         // 4. Patch OP_ATTN_PAGED seq_len and page_table/position_table ptrs

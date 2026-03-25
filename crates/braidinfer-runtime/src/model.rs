@@ -384,7 +384,7 @@ pub struct GdnState {
 }
 
 pub struct KvCache {
-    pub k: DeviceBuffer<f32>, // [max_seq_len, num_kv_heads, head_dim]
+    pub k: DeviceBuffer<f32>, // [num_kv_heads, max_seq_len, head_dim]
     pub v: DeviceBuffer<f32>,
 }
 
@@ -1231,12 +1231,15 @@ impl Qwen35Model {
             &self.stream,
         )?;
 
-        // 6. Write K,V to cache at position `position`
-        let kv_stride = nkh as usize * hd as usize; // per position
-        let pos_off = position as usize * kv_stride;
-        unsafe {
-            d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].k, pos_off, &self.activations.k_attn, 0, kv_stride, &self.stream)?;
-            d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].v, pos_off, &self.activations.v_attn, 0, kv_stride, &self.stream)?;
+        // 6. Write K,V to cache at position `position` ([H,T,D] layout)
+        let max_sl = self.config.max_seq_len;
+        for h in 0..nkh as usize {
+            let src_off = h * hd as usize;
+            let dst_off = h * max_sl * hd as usize + position as usize * hd as usize;
+            unsafe {
+                d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].k, dst_off, &self.activations.k_attn, src_off, hd as usize, &self.stream)?;
+                d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].v, dst_off, &self.activations.v_attn, src_off, hd as usize, &self.stream)?;
+            }
         }
 
         // 7. GQA attention
@@ -1250,7 +1253,7 @@ impl Qwen35Model {
             nkh,
             hd,
             seq_len,
-            max_sl,
+            max_sl as u32,
             &self.stream,
         )?;
 

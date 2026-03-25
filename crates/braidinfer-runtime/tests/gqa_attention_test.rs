@@ -9,12 +9,13 @@ const HEAD_DIM: u32 = 256;
 
 fn gqa_attention_reference(
     q: &[f32],          // [num_q_heads, head_dim]
-    k_cache: &[f32],   // [seq_len, num_kv_heads, head_dim]
-    v_cache: &[f32],   // [seq_len, num_kv_heads, head_dim]
+    k_cache: &[f32],   // [num_kv_heads, max_seq_len, head_dim]
+    v_cache: &[f32],   // [num_kv_heads, max_seq_len, head_dim]
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     seq_len: usize,
+    max_seq_len: usize,
 ) -> Vec<f32> {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let gqa_group = num_q_heads / num_kv_heads;
@@ -24,27 +25,24 @@ fn gqa_attention_reference(
         let kv_h = h / gqa_group;
         let q_head = &q[h * head_dim..(h + 1) * head_dim];
 
-        // Compute scores
         let scores: Vec<f32> = (0..seq_len)
             .map(|t| {
-                let k_ptr = &k_cache[(t * num_kv_heads + kv_h) * head_dim
-                    ..(t * num_kv_heads + kv_h + 1) * head_dim];
+                let k_ptr = &k_cache[(kv_h * max_seq_len + t) * head_dim
+                    ..(kv_h * max_seq_len + t + 1) * head_dim];
                 let dot: f32 = q_head.iter().zip(k_ptr.iter()).map(|(a, b)| a * b).sum();
                 dot * scale
             })
             .collect();
 
-        // Softmax
         let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exp_s: Vec<f32> = scores.iter().map(|s| (s - max_s).exp()).collect();
         let sum_exp: f32 = exp_s.iter().sum();
         let attn: Vec<f32> = exp_s.iter().map(|e| e / sum_exp).collect();
 
-        // Weighted sum of values
         let out = &mut output[h * head_dim..(h + 1) * head_dim];
         for t in 0..seq_len {
-            let v_ptr = &v_cache[(t * num_kv_heads + kv_h) * head_dim
-                ..(t * num_kv_heads + kv_h + 1) * head_dim];
+            let v_ptr = &v_cache[(kv_h * max_seq_len + t) * head_dim
+                ..(kv_h * max_seq_len + t + 1) * head_dim];
             for i in 0..head_dim {
                 out[i] += attn[t] * v_ptr[i];
             }
@@ -73,15 +71,16 @@ fn test_gqa_attention_matches_reference() {
         .map(|i| (i as f32 * 0.009).sin() * 0.4)
         .collect();
 
-    // CPU reference (uses only first seq_len positions)
+    // CPU reference ([H,T,D] layout — full buffer, reference reads only first seq_len per head)
     let expected = gqa_attention_reference(
         &q_data,
-        &k_cache_data[..seq_len * nkh * hd],
-        &v_cache_data[..seq_len * nkh * hd],
+        &k_cache_data,
+        &v_cache_data,
         nqh,
         nkh,
         hd,
         seq_len,
+        max_seq_len,
     );
 
     // GPU computation

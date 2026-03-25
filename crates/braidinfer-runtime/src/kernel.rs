@@ -615,8 +615,8 @@ impl GqaAttentionKernel {
     ///
     /// output:  [num_q_heads, head_dim]
     /// q:       [num_q_heads, head_dim]
-    /// k_cache: [max_seq_len, num_kv_heads, head_dim]
-    /// v_cache: [max_seq_len, num_kv_heads, head_dim]
+    /// k_cache: [num_kv_heads, max_seq_len, head_dim]
+    /// v_cache: [num_kv_heads, max_seq_len, head_dim]
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,

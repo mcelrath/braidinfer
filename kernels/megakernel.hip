@@ -728,7 +728,7 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
     float m = -1e30f, d = 0.0f;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int t = 0; t < seq_len; t++) {
-        const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
+        const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
         partial[tid] = dot;
@@ -742,7 +742,7 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
         float correction = expf(m - m_new);
         float w = expf(score - m_new);
         d = d * correction + w;
-        const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
+        const float* v_ptr = v_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         int slot = 0;
         for (int i = tid; i < head_dim; i += block_size) {
             acc[slot] = acc[slot] * correction + w * v_ptr[i];
@@ -853,7 +853,7 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
         }
 
         for (int t = 0; t < tokens_in_chunk; t++) {
-            int token_idx = t * num_kv_heads + kv_head;
+            int token_idx = kv_head * chunk_tokens + t;
 
             // Load K into shared memory (head_dim == block_size == 256, one element per thread)
             if (tid < head_dim) {
@@ -895,7 +895,7 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 
             // V accumulation (no RoPE on V)
             if (tid < head_dim) {
-                float vval = v_base[token_idx * head_dim + tid];
+                float vval = v_base[(kv_head * chunk_tokens + t) * head_dim + tid];
                 v_acc = v_acc * correction + w * vval;
             }
             m = m_new;
@@ -960,7 +960,7 @@ __device__ void op_attn_prefill(const u64* inst, u32 vblock) {
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int t = 0; t < seq_len; t++) {
-        const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
+        const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
         partial[tid] = dot;
@@ -974,7 +974,7 @@ __device__ void op_attn_prefill(const u64* inst, u32 vblock) {
         float correction = expf(m - m_new);
         float w = expf(score - m_new);
         d = d * correction + w;
-        const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
+        const float* v_ptr = v_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         int slot = 0;
         for (int i = tid; i < head_dim; i += block_size) {
             acc[slot] = acc[slot] * correction + w * v_ptr[i];

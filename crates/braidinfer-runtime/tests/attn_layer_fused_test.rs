@@ -84,12 +84,13 @@ fn mrope_reference(
 
 fn gqa_attention_reference(
     q: &[f32],
-    k_cache: &[f32],
+    k_cache: &[f32],   // [num_kv_heads, max_seq_len, head_dim]
     v_cache: &[f32],
     num_q_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
     seq_len: usize,
+    max_seq_len: usize,
 ) -> Vec<f32> {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let gqa_group = num_q_heads / num_kv_heads;
@@ -101,8 +102,8 @@ fn gqa_attention_reference(
 
         let scores: Vec<f32> = (0..seq_len)
             .map(|t| {
-                let k_ptr = &k_cache[(t * num_kv_heads + kv_h) * head_dim
-                    ..(t * num_kv_heads + kv_h + 1) * head_dim];
+                let k_ptr = &k_cache[(kv_h * max_seq_len + t) * head_dim
+                    ..(kv_h * max_seq_len + t + 1) * head_dim];
                 let dot: f32 = q_head.iter().zip(k_ptr.iter()).map(|(a, b)| a * b).sum();
                 dot * scale
             })
@@ -115,8 +116,8 @@ fn gqa_attention_reference(
 
         let out = &mut output[h * head_dim..(h + 1) * head_dim];
         for t in 0..seq_len {
-            let v_ptr = &v_cache[(t * num_kv_heads + kv_h) * head_dim
-                ..(t * num_kv_heads + kv_h + 1) * head_dim];
+            let v_ptr = &v_cache[(kv_h * max_seq_len + t) * head_dim
+                ..(kv_h * max_seq_len + t + 1) * head_dim];
             for i in 0..head_dim {
                 out[i] += attn[t] * v_ptr[i];
             }
@@ -166,25 +167,24 @@ fn attn_layer_reference(
         position_ids,
     );
 
-    // Write K,V to cache at seq_pos
-    let _max_seq_len = k_cache.len() / (NUM_KV_HEADS * HEAD_DIM);
+    // Write K,V to cache at seq_pos ([H,T,D] layout)
+    let max_seq_len = k_cache.len() / (NUM_KV_HEADS * HEAD_DIM);
     for kv_head in 0..NUM_KV_HEADS {
-        let dst_k = (seq_pos * NUM_KV_HEADS + kv_head) * HEAD_DIM;
-        let dst_v = (seq_pos * NUM_KV_HEADS + kv_head) * HEAD_DIM;
-        let src_k = kv_head * HEAD_DIM;
-        let src_v = kv_head * HEAD_DIM;
-        k_cache[dst_k..dst_k + HEAD_DIM].copy_from_slice(&k[src_k..src_k + HEAD_DIM]);
-        v_cache[dst_v..dst_v + HEAD_DIM].copy_from_slice(&v[src_v..src_v + HEAD_DIM]);
+        let dst = (kv_head * max_seq_len + seq_pos) * HEAD_DIM;
+        let src = kv_head * HEAD_DIM;
+        k_cache[dst..dst + HEAD_DIM].copy_from_slice(&k[src..src + HEAD_DIM]);
+        v_cache[dst..dst + HEAD_DIM].copy_from_slice(&v[src..src + HEAD_DIM]);
     }
 
     let attn_out = gqa_attention_reference(
         &q,
-        &k_cache[..seq_len * NUM_KV_HEADS * HEAD_DIM],
-        &v_cache[..seq_len * NUM_KV_HEADS * HEAD_DIM],
+        &k_cache,
+        &v_cache,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
         seq_len,
+        max_seq_len,
     );
 
     let out_proj = linear_proj_reference(w_o, &attn_out, HIDDEN_SIZE, Q_OUT_DIM);

@@ -104,8 +104,8 @@ extern "C" __global__ void attn_fused_proj_f32(
 // ---------------------------------------------------------------------------
 extern "C" __global__ void attn_fused_rope_cache_f32(
     float* __restrict__ scratch,          // Q at 0, K at q_out_dim
-    float* __restrict__ k_cache,          // [max_seq_len, num_kv_heads, head_dim]
-    float* __restrict__ v_cache,          // [max_seq_len, num_kv_heads, head_dim]
+    float* __restrict__ k_cache,          // [num_kv_heads, max_seq_len, head_dim]
+    float* __restrict__ v_cache,          // [num_kv_heads, max_seq_len, head_dim]
     const float* __restrict__ inv_freq,   // [rope_dim/2]
     const int* __restrict__ position_ids, // [3]: temporal, height, width
     const int num_q_heads,
@@ -161,8 +161,8 @@ extern "C" __global__ void attn_fused_rope_cache_f32(
         const float* k_ptr = scratch + q_out_dim + kv_head * head_dim;
         const float* v_ptr = scratch + q_out_dim + kv_out_dim + kv_head * head_dim;
 
-        float* k_cache_slot = k_cache + ((long)seq_pos * num_kv_heads + kv_head) * head_dim;
-        float* v_cache_slot = v_cache + ((long)seq_pos * num_kv_heads + kv_head) * head_dim;
+        float* k_cache_slot = k_cache + ((long)kv_head * max_seq_len + seq_pos) * head_dim;
+        float* v_cache_slot = v_cache + ((long)kv_head * max_seq_len + seq_pos) * head_dim;
 
         for (int i = tid; i < head_dim; i += blockDim.x) {
             k_cache_slot[i] = k_ptr[i];
@@ -180,8 +180,8 @@ extern "C" __global__ void attn_fused_rope_cache_f32(
 // ---------------------------------------------------------------------------
 extern "C" __global__ void attn_fused_attention_f32(
     float* __restrict__ scratch,          // q at 0; writes attn_out at offset 3072
-    const float* __restrict__ k_cache,   // [max_seq_len, num_kv_heads, head_dim]
-    const float* __restrict__ v_cache,   // [max_seq_len, num_kv_heads, head_dim]
+    const float* __restrict__ k_cache,   // [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ v_cache,   // [num_kv_heads, max_seq_len, head_dim]
     const int num_q_heads,
     const int num_kv_heads,
     const int head_dim,
@@ -209,7 +209,7 @@ extern "C" __global__ void attn_fused_attention_f32(
     float d = 0.0f;
 
     for (int t = 0; t < seq_len; t++) {
-        const float* k_ptr = k_cache + ((long)t * num_kv_heads + kv_head) * head_dim;
+        const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) {
             dot += q_ptr[i] * k_ptr[i];
@@ -242,8 +242,8 @@ extern "C" __global__ void attn_fused_attention_f32(
 
     // Pass 2: accumulate weighted values
     for (int t = 0; t < seq_len; t++) {
-        const float* k_ptr = k_cache + ((long)t * num_kv_heads + kv_head) * head_dim;
-        const float* v_ptr = v_cache + ((long)t * num_kv_heads + kv_head) * head_dim;
+        const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
+        const float* v_ptr = v_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) {
             dot += q_ptr[i] * k_ptr[i];

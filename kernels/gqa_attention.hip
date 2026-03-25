@@ -15,8 +15,8 @@
 extern "C" __global__ void gqa_attention_decode_f32(
     float* __restrict__ output,        // [num_q_heads, head_dim]
     const float* __restrict__ q,       // [num_q_heads, head_dim]
-    const float* __restrict__ k_cache, // [max_seq_len, num_kv_heads, head_dim]
-    const float* __restrict__ v_cache, // [max_seq_len, num_kv_heads, head_dim]
+    const float* __restrict__ k_cache, // [num_kv_heads, max_seq_len, head_dim]
+    const float* __restrict__ v_cache, // [num_kv_heads, max_seq_len, head_dim]
     const int num_q_heads,
     const int num_kv_heads,
     const int head_dim,
@@ -46,8 +46,8 @@ extern "C" __global__ void gqa_attention_decode_f32(
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int t = 0; t < seq_len; t++) {
-        const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
-        const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
+        const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
+        const float* v_ptr = v_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) {
             dot += q_ptr[i] * k_ptr[i];
