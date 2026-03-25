@@ -498,6 +498,7 @@ pub struct Qwen35Model {
     // Paged KV path (lazy-init)
     megakernel_paged: Option<MegakernelProgram>,
     page_allocator: Option<PageAllocator>,
+    quant_allocator: Option<PageAllocator>,
     paged_seq: Option<SequenceState>,
     checkpoint_pool: Option<RecurrentCheckpointPool>,
 }
@@ -893,6 +894,7 @@ impl Qwen35Model {
             megakernel: None,
             megakernel_paged: None,
             page_allocator: None,
+            quant_allocator: None,
             paged_seq: None,
             checkpoint_pool: None,
         })
@@ -1396,30 +1398,44 @@ impl Qwen35Model {
     /// Run a single decode step using the paged KV cache path.
     /// Returns logits [vocab_size].
     pub fn decode_step_paged(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        self.decode_step_paged_inner(token_id, position, false)
+    }
+
+    /// Run a single decode step with quantized KV cache (4-bit residual_pc).
+    /// Sealed chunks are quantized to int4; active chunk stays f32.
+    pub fn decode_step_paged_quantized(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        self.decode_step_paged_inner(token_id, position, true)
+    }
+
+    fn decode_step_paged_inner(&mut self, token_id: u32, position: u32, quantized: bool) -> Result<Vec<f32>, ModelError> {
+        let max_chunks = (self.config.max_seq_len + CHUNK_TOKENS - 1) / CHUNK_TOKENS;
+
         // Lazy-init: compile paged megakernel
         if self.megakernel_paged.is_none() {
             let mut mk = MegakernelProgram::compile_paged(self)?;
-            // max_chunks: enough for max_seq_len tokens in CHUNK_TOKENS-sized chunks
-            let max_chunks = (self.config.max_seq_len + CHUNK_TOKENS - 1) / CHUNK_TOKENS;
             mk.init_paged_buffers(max_chunks)?;
+            if quantized {
+                mk.enable_quantized_kv(max_chunks, &self.config)?;
+            }
             self.megakernel_paged = Some(mk);
         }
 
-        // Lazy-init: PageAllocator and SequenceState
+        // Lazy-init: f32 PageAllocator (staging) and SequenceState
         if self.page_allocator.is_none() {
-            let max_chunks = (self.config.max_seq_len + CHUNK_TOKENS - 1) / CHUNK_TOKENS;
             self.page_allocator = Some(PageAllocator::new(
-                self.device,
-                &self.config,
-                CHUNK_TOKENS,
-                max_chunks as u32,
+                self.device, &self.config, CHUNK_TOKENS, max_chunks as u32,
             )?);
-            let seq = SequenceState::new(CHUNK_TOKENS as u32);
-            self.paged_seq = Some(seq);
+            self.paged_seq = Some(SequenceState::new(CHUNK_TOKENS as u32));
         }
 
-        // append_token: allocates new chunk if needed + increments chunk len.
-        // Must happen BEFORE update_step_paged so current_chunk_offset() is correct.
+        // Lazy-init: quantized PageAllocator
+        if quantized && self.quant_allocator.is_none() {
+            self.quant_allocator = Some(PageAllocator::new_quantized(
+                self.device, &self.config, CHUNK_TOKENS, max_chunks as u32,
+            )?);
+        }
+
+        // append_token
         {
             let seq_mut = self.paged_seq.as_mut().unwrap();
             let alloc_mut = self.page_allocator.as_mut().unwrap();
@@ -1434,6 +1450,15 @@ impl Qwen35Model {
         mk.update_step_paged(token_id, position, seq, allocator, stream)?;
         mk.execute(stream)?;
         stream.synchronize()?;
+
+        // Post-step: handle chunk seal + quantization
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let seq_mut = self.paged_seq.as_mut().unwrap();
+            let alloc_mut = self.page_allocator.as_mut().unwrap();
+            let q_alloc = self.quant_allocator.as_mut();
+            mk.post_step_paged(position, seq_mut, alloc_mut, q_alloc, &self.config, &self.stream)?;
+        }
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;

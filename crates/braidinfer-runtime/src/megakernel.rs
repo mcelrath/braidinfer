@@ -1633,14 +1633,58 @@ impl MegakernelProgram {
             }
         }
 
-        // 4. Patch OP_ATTN_PAGED seq_len and page_table/position_table ptrs
-        let seq_len = (position + 1) as i32;
+        // 4. Patch attention instructions
+        let total_seq_len = (position + 1) as i32;
         let page_table_ptr = self.page_table.as_ref().expect("page_table not allocated").as_ptr() as u64;
         let pos_table_ptr = self.position_table.as_ref().expect("position_table not allocated").as_ptr() as u64;
-        for &idx in &self.attn_paged_inst_indices {
-            self.instructions[idx].words[3] = page_table_ptr;
-            self.instructions[idx].words[4] = pos_table_ptr;
-            self.instructions[idx].set_int(9, seq_len);
+
+        if self.quantized_kv && seq.chunks.len() > 1 {
+            // Two-phase: quantized sealed chunks + f32 active chunk
+            let num_sealed = seq.chunks.len() - 1;
+            let sealed_tokens = (num_sealed * CHUNK_TOKENS) as i32;
+            let active_tokens = total_seq_len - sealed_tokens;
+            let nqh = self.instructions[self.attn_paged_inst_indices[0]].words[6] as u32;
+
+            let quant_pt_ptr = self.quant_page_table.as_ref()
+                .expect("quant_page_table not allocated").as_ptr() as u64;
+
+            // Patch OP_ATTN_PAGED_Q: enable (grid_x=nqh), quant page table, sealed seq_len
+            for &idx in &self.attn_quant_inst_indices {
+                self.instructions[idx].words[0] =
+                    (OP_ATTN_PAGED_Q as u64) | ((nqh as u64) << 32);
+                self.instructions[idx].words[3] = quant_pt_ptr;
+                self.instructions[idx].words[4] = pos_table_ptr;
+                self.instructions[idx].set_int(9, sealed_tokens);
+            }
+
+            // Patch OP_ATTN_PAGED: f32 page table (only active chunk), active seq_len
+            // The active chunk is the last one in seq.chunks. We put its pointer
+            // at offset `sealed_tokens/CHUNK_TOKENS` in the f32 page table, but simpler:
+            // point to a single-entry table with just the active chunk.
+            // We reuse the main page_table — the active chunk ptr is at index `num_sealed`.
+            for &idx in &self.attn_paged_inst_indices {
+                // Point page_table at the last entry (active chunk)
+                let active_pt_ptr = page_table_ptr + (num_sealed * std::mem::size_of::<u64>()) as u64;
+                self.instructions[idx].words[3] = active_pt_ptr;
+                self.instructions[idx].words[4] = pos_table_ptr
+                    + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
+                self.instructions[idx].set_int(9, active_tokens);
+            }
+        } else {
+            // No quantized chunks yet (or quantized_kv not enabled): all f32
+            // Disable OP_ATTN_PAGED_Q (grid_x=0)
+            for &idx in &self.attn_quant_inst_indices {
+                self.instructions[idx].words[0] = OP_ATTN_PAGED_Q as u64; // grid_x=0
+            }
+            // OP_ATTN_PAGED sees all chunks, no partial_state
+            for &idx in &self.attn_paged_inst_indices {
+                self.instructions[idx].words[3] = page_table_ptr;
+                self.instructions[idx].words[4] = pos_table_ptr;
+                self.instructions[idx].set_int(9, total_seq_len);
+                if !self.quantized_kv {
+                    self.instructions[idx].words[14] = 0; // no partial_state
+                }
+            }
         }
 
         // 5. Upload page_table if chunk list changed
@@ -1680,15 +1724,54 @@ impl MegakernelProgram {
     }
 
     /// Allocate the next chunk if the current one just filled up.
+    /// If quantized_kv is enabled, quantizes the sealed chunk.
     /// Call after execute() + stream sync, before next update_step_paged().
     pub fn post_step_paged(
-        &self,
+        &mut self,
         position: u32,
         seq: &mut SequenceState,
         allocator: &mut PageAllocator,
+        quant_allocator: Option<&mut PageAllocator>,
+        cfg: &crate::model::ModelConfig,
+        stream: &Stream,
     ) -> HipResult<()> {
-        // If we just wrote the last token slot in this chunk, pre-allocate the next chunk.
         if (position as usize + 1) % CHUNK_TOKENS == 0 {
+            // Chunk just sealed
+            if self.quantized_kv {
+                if let Some(q_alloc) = quant_allocator {
+                    // Get the f32 chunk that just sealed (last chunk before we append new one)
+                    let sealed_chunk = seq.chunks.last().unwrap();
+                    let f32_ptr = allocator.slot_ptr(sealed_chunk.slot_index());
+
+                    // Allocate quantized chunk slot
+                    let (q_slot, q_ptr) = q_alloc.alloc()
+                        .ok_or(braidinfer_hip::HipError(braidinfer_hip::ffi::hipErrorOutOfMemory))?;
+
+                    // Run quantize kernel
+                    self.quantize_sealed_chunk(f32_ptr, q_ptr, cfg, stream)?;
+                    stream.synchronize()?;
+
+                    // Upload quantized page table
+                    let num_sealed = seq.chunks.len(); // current chunk count = sealed count (before append)
+                    let quant_pt = self.quant_page_table.as_mut()
+                        .expect("quant_page_table not allocated");
+                    // Build host array of quantized chunk pointers
+                    // We need to track quantized slot indices somewhere.
+                    // For now, write the pointer directly at index num_sealed-1.
+                    let q_ptr_val = q_ptr as u64;
+                    let offset = (num_sealed - 1) * std::mem::size_of::<u64>();
+                    braidinfer_hip::error::check(unsafe {
+                        braidinfer_hip::ffi::hipMemcpy(
+                            (quant_pt.as_mut_ptr() as *mut u8).add(offset).cast(),
+                            std::ptr::addr_of!(q_ptr_val).cast(),
+                            std::mem::size_of::<u64>(),
+                            braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                        )
+                    })?;
+                    self.last_quant_page_table_len = num_sealed;
+                }
+            }
+            // Allocate next f32 chunk for continued writing
             seq.append_token(allocator)?;
         }
         Ok(())
@@ -1704,6 +1787,91 @@ impl MegakernelProgram {
             self.position_table = Some(DeviceBuffer::alloc(self.device, self.max_seq_len as usize)?);
         }
         Ok(())
+    }
+
+    /// Enable quantized KV cache. Allocates scratch buffer and quantized page table.
+    /// Call after init_paged_buffers, before first decode step.
+    pub fn enable_quantized_kv(&mut self, max_chunks: usize, cfg: &crate::model::ModelConfig) -> HipResult<()> {
+        let nqh = cfg.num_q_heads;
+        let hd = cfg.head_dim;
+        let num_attn_layers = cfg.layer_is_attention.iter().filter(|&&a| a).count();
+        // Scratch: [nqh × (2+hd)] per attention layer (each layer gets its own scratch region)
+        let scratch_per_layer = nqh * (2 + hd);
+        let total_scratch = num_attn_layers * scratch_per_layer;
+        self.quant_scratch = Some(DeviceBuffer::alloc(self.device, total_scratch)?);
+        self.quant_page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
+
+        // Patch OP_ATTN_PAGED_Q scratch pointers and OP_ATTN_PAGED partial_state pointers
+        let scratch_base = self.quant_scratch.as_ref().unwrap().as_ptr() as u64;
+        for (layer_i, &q_idx) in self.attn_quant_inst_indices.iter().enumerate() {
+            let scratch_ptr = scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
+            self.instructions[q_idx].words[1] = scratch_ptr;
+        }
+        for (layer_i, &p_idx) in self.attn_paged_inst_indices.iter().enumerate() {
+            let scratch_ptr = scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
+            self.instructions[p_idx].words[14] = scratch_ptr;
+        }
+        self.quantized_kv = true;
+        Ok(())
+    }
+
+    /// Quantize a sealed f32 chunk. Call from post_step_paged when a chunk fills up.
+    /// Launches OP_KV_QUANTIZE for each layer's K and V via the megakernel.
+    pub fn quantize_sealed_chunk(
+        &self,
+        f32_chunk_ptr: *const u8,
+        quant_chunk_ptr: *mut u8,
+        cfg: &crate::model::ModelConfig,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        use crate::paged_kv::quantized_kv_offsets;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let num_attn_layers = cfg.layer_is_attention.iter().filter(|&&a| a).count();
+        let kv_stride = nkh * hd;
+        let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();
+
+        let mut instructions: Vec<Instruction> = Vec::new();
+        for layer_i in 0..num_attn_layers {
+            let f32_base = f32_chunk_ptr as u64 + (layer_i * f32_layer_bytes) as u64;
+            let f32_k = f32_base;
+            let f32_v = f32_base + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+
+            for (is_v, f32_src) in [(false, f32_k), (true, f32_v)] {
+                let (q1d, q1s, rd, rs) = quantized_kv_offsets(cfg, CHUNK_TOKENS, layer_i, is_v);
+                let mut inst = Instruction::new(OP_KV_QUANTIZE, (nkh * hd) as u32);
+                inst.words[1] = f32_src;
+                inst.words[2] = quant_chunk_ptr as u64 + q1d as u64;
+                inst.words[3] = quant_chunk_ptr as u64 + q1s as u64;
+                inst.words[4] = quant_chunk_ptr as u64 + rd as u64;
+                inst.words[5] = quant_chunk_ptr as u64 + rs as u64;
+                inst.set_int(6, nkh as i32);
+                inst.set_int(7, hd as i32);
+                inst.set_int(8, CHUNK_TOKENS as i32);
+                instructions.push(inst);
+            }
+        }
+        instructions.push(Instruction::new(OP_HALT, 0));
+
+        // Upload and execute
+        let flat: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
+        let mut prog_buf = DeviceBuffer::<u64>::alloc(self.device, flat.len())?;
+        prog_buf.copy_from_host(&flat)?;
+
+        let func = self.module.get_function("megakernel_f32")?;
+        let mut prog_ptr: *const c_void = prog_buf.as_ptr().cast();
+        let mut num_inst = instructions.len() as i32;
+        let mut args: [*mut c_void; 2] = [
+            std::ptr::addr_of_mut!(prog_ptr).cast(),
+            std::ptr::addr_of_mut!(num_inst).cast(),
+        ];
+        func.launch_cooperative(
+            (self.num_blocks, 1, 1),
+            (256, 1, 1),
+            256 * 4 * 2,
+            stream,
+            &mut args,
+        )
     }
 
     /// Execute the megakernel program.

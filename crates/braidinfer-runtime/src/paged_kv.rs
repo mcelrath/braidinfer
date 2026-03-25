@@ -86,8 +86,7 @@ pub struct PageAllocator {
 }
 
 impl PageAllocator {
-    /// Allocate a pool of `max_chunks` slots on `device`.
-    /// `chunk_tokens`: tokens per chunk (e.g. 64).
+    /// Allocate a pool of `max_chunks` f32 KV chunk slots.
     pub fn new(
         device: DeviceId,
         config: &ModelConfig,
@@ -95,6 +94,27 @@ impl PageAllocator {
         max_chunks: u32,
     ) -> HipResult<Self> {
         let chunk_bytes = chunk_kv_bytes(config, chunk_tokens);
+        Self::new_with_chunk_bytes(device, chunk_tokens, max_chunks, chunk_bytes)
+    }
+
+    /// Allocate a pool for quantized (residual_pc int4) KV chunk slots.
+    pub fn new_quantized(
+        device: DeviceId,
+        config: &ModelConfig,
+        chunk_tokens: usize,
+        max_chunks: u32,
+    ) -> HipResult<Self> {
+        let chunk_bytes = quantized_chunk_kv_bytes(config, chunk_tokens);
+        Self::new_with_chunk_bytes(device, chunk_tokens, max_chunks, chunk_bytes)
+    }
+
+    fn new_with_chunk_bytes(
+        device: DeviceId,
+        chunk_tokens: usize,
+        max_chunks: u32,
+        chunk_bytes: usize,
+    ) -> HipResult<Self> {
+        let chunk_bytes = chunk_bytes;
         let pool_bytes = max_chunks as usize * chunk_bytes;
         let pool = DeviceBuffer::alloc(device, pool_bytes)?;
         let free_list = (0..max_chunks).rev().collect();
