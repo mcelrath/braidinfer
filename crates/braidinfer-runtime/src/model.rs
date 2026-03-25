@@ -92,6 +92,7 @@ struct TextConfig {
     head_dim: usize,
     rms_norm_eps: Option<f64>,
     layer_norm_epsilon: Option<f64>,
+    max_position_embeddings: Option<usize>,
     rope_parameters: Option<RopeParameters>,
     layer_types: Option<Vec<String>>,
     linear_num_key_heads: Option<usize>,
@@ -121,6 +122,7 @@ struct RawConfig {
     mamba_num_heads: Option<usize>,
     mamba_head_dim: Option<usize>,
     conv_kernel: Option<usize>,
+    max_position_embeddings: Option<usize>,
 }
 
 impl ModelConfig {
@@ -230,7 +232,7 @@ impl ModelConfig {
             linear_value_head_dim,
             linear_conv_kernel_dim,
             layer_is_attention,
-            max_seq_len: 2048,
+            max_seq_len: tc.max_position_embeddings.unwrap_or(2048),
             recurrent_kind: RecurrentLayerKind::Gdn {
                 num_heads: linear_num_heads,
                 key_value_dim: linear_key_head_dim,
@@ -291,7 +293,7 @@ impl ModelConfig {
             linear_value_head_dim: mamba_head_dim,
             linear_conv_kernel_dim: conv_kernel,
             layer_is_attention,
-            max_seq_len: 2048,
+            max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
             recurrent_kind: RecurrentLayerKind::Mamba2 {
                 state_dim: ssm_state_dim,
                 num_heads: mamba_num_heads,

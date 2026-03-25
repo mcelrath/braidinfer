@@ -37,6 +37,7 @@ pub struct PageAllocator {
     free_list: Vec<u32>,
     device: DeviceId,
     chunk_bytes: usize,
+    chunk_tokens: usize,
 }
 
 impl PageAllocator {
@@ -58,6 +59,7 @@ impl PageAllocator {
             free_list,
             device,
             chunk_bytes,
+            chunk_tokens,
         })
     }
 
@@ -139,9 +141,11 @@ impl ChunkHandle {
             .ok_or(HipError(ffi::hipErrorOutOfMemory))?;
         let old_ptr = allocator.slot_ptr(self.inner.slot_index);
         let len = self.inner.len.load(Ordering::Acquire) as usize;
-        // Copy only the written portion. We need to know bytes per token to be precise;
-        // conservatively copy the whole slot (chunk_bytes) since len=0 case is rare.
-        let copy_bytes = if len == 0 { 0 } else { allocator.chunk_bytes() };
+        let copy_bytes = if len == 0 {
+            0
+        } else {
+            (len * allocator.chunk_bytes()) / allocator.chunk_tokens
+        };
         if copy_bytes > 0 {
             hip_check(unsafe {
                 ffi::hipMemcpyAsync(

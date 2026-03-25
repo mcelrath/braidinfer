@@ -72,9 +72,10 @@ __device__ __forceinline__ int inst_int(const u64* inst, int idx) {
     return (int)(inst[idx]);
 }
 __device__ __forceinline__ float inst_float(const u64* inst, int idx) {
-    union { u64 u; float f; } conv;
-    conv.u = inst[idx];
-    return conv.f;
+    u32 bits = (u32)inst[idx];
+    float f;
+    __builtin_memcpy(&f, &bits, sizeof(float));
+    return f;
 }
 
 // ============================================================
@@ -125,6 +126,7 @@ __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
 // grid_x = out_dim. Each block handles one weight row for ALL batch elements.
 // Weight loaded once (from L2 cache), dot products accumulated per batch element in registers.
 #define MAX_PREFILL_BATCH 64
+#define B_TILE 8
 __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     float* output_base = inst_fptr(inst, 1);
     const unsigned short* weight = inst_u16ptr(inst, 2);
@@ -170,46 +172,51 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
         return;
     }
 
-    // Batched path: accumulate per-batch dot products, weight loaded once from L2 cache
-    float acc[MAX_PREFILL_BATCH];
-    for (int b = 0; b < batch; b++) acc[b] = 0.0f;
-
+    // Batched path: tile batch dimension to keep register pressure low (B_TILE accumulators)
     const int vec_elements = 8;
     const int vec_count = in_dim / vec_elements;
     const ull2* w_vec = (const ull2*)w;
-
-    for (int vi = tid; vi < vec_count; vi += stride) {
-        ull2 wv = w_vec[vi];
-        unsigned short ws[8];
-        __builtin_memcpy(ws, &wv, 16);
-        float wf[8];
-        #pragma unroll
-        for (int j = 0; j < 8; j++) wf[j] = bf16_to_f32(ws[j]);
-
-        int base = vi * vec_elements;
-        for (int b = 0; b < batch; b++) {
-            const float* inp = input_base + (long long)b * in_dim + base;
-            #pragma unroll
-            for (int j = 0; j < 8; j++) acc[b] += wf[j] * inp[j];
-        }
-    }
-    int rem = vec_count * vec_elements;
-    for (int i = rem + tid; i < in_dim; i += stride) {
-        float wf = bf16_to_f32(w[i]);
-        for (int b = 0; b < batch; b++) acc[b] += wf * input_base[(long long)b * in_dim + i];
-    }
-
-    // Reduce each batch element (shared memory reduction)
     extern __shared__ float shared[];
-    for (int b = 0; b < batch; b++) {
-        shared[tid] = acc[b];
-        __syncthreads();
-        for (int s = stride / 2; s > 0; s >>= 1) {
-            if (tid < s) shared[tid] += shared[tid + s];
+
+    for (int b0 = 0; b0 < batch; b0 += B_TILE) {
+        int tile_end = (b0 + B_TILE < batch) ? b0 + B_TILE : batch;
+        int tile_size = tile_end - b0;
+
+        float acc[B_TILE];
+        #pragma unroll
+        for (int t = 0; t < B_TILE; t++) acc[t] = 0.0f;
+
+        for (int vi = tid; vi < vec_count; vi += stride) {
+            ull2 wv = w_vec[vi];
+            unsigned short ws[8];
+            __builtin_memcpy(ws, &wv, 16);
+            float wf[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) wf[j] = bf16_to_f32(ws[j]);
+
+            int base = vi * vec_elements;
+            for (int t = 0; t < tile_size; t++) {
+                const float* inp = input_base + (long long)(b0 + t) * in_dim + base;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[t] += wf[j] * inp[j];
+            }
+        }
+        int rem = vec_count * vec_elements;
+        for (int i = rem + tid; i < in_dim; i += stride) {
+            float wf = bf16_to_f32(w[i]);
+            for (int t = 0; t < tile_size; t++) acc[t] += wf * input_base[(long long)(b0 + t) * in_dim + i];
+        }
+
+        for (int t = 0; t < tile_size; t++) {
+            shared[tid] = acc[t];
+            __syncthreads();
+            for (int s = stride / 2; s > 0; s >>= 1) {
+                if (tid < s) shared[tid] += shared[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
             __syncthreads();
         }
-        if (tid == 0) output_base[(long long)b * out_dim + row] = shared[0];
-        __syncthreads();
     }
 }
 
@@ -999,7 +1006,7 @@ __device__ void op_deinterleave(const u64* inst, u32 vblock) {
 
 #define INST_SIZE 16  // 16 u64s per instruction = 128 bytes
 
-extern "C" __global__ void megakernel_f32(
+extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
     const u64* __restrict__ program,
     int num_instructions
 ) {
