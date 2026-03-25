@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::generate::{greedy_generate, load_tokenizer};
+use braidinfer_runtime::generate::{chat_generate, greedy_generate, load_tokenizer, TokenConfig};
 use braidinfer_runtime::model::Qwen35Model;
 
 const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
@@ -19,6 +19,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
 
+    let raw_mode = std::env::var("RAW").is_ok();
+
     let model_dir = Path::new(MODEL_DIR);
     if !model_dir.exists() {
         eprintln!("Model not found at {}", MODEL_DIR);
@@ -26,12 +28,19 @@ fn main() {
     }
 
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
+    let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
     let mut model = Qwen35Model::load(model_dir, device).expect("load model");
 
+    eprintln!("max_seq_len: {}", model.config().max_seq_len);
+    eprintln!("stop tokens: {:?}", token_config.eos_token_ids);
+
     let start = Instant::now();
-    let result = greedy_generate(&mut model, &tokenizer, &prompt, max_tokens)
-        .expect("greedy_generate");
+    let result = if raw_mode {
+        greedy_generate(&mut model, &tokenizer, &token_config, &prompt, max_tokens)
+    } else {
+        chat_generate(&mut model, &tokenizer, &token_config, &prompt, None, max_tokens)
+    }.expect("generate");
 
     let elapsed = start.elapsed().as_secs_f64();
     let n_tokens = result.tokens.len();

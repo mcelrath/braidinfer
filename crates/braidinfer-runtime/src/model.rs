@@ -151,7 +151,7 @@ impl ModelConfig {
             linear_value_head_dim: 128,
             linear_conv_kernel_dim: 4,
             layer_is_attention,
-            max_seq_len: 2048,
+            max_seq_len: 2048, // fallback for tests; load() reads from config.json
             recurrent_kind: RecurrentLayerKind::Gdn {
                 num_heads: 16,
                 key_value_dim: 128,
@@ -637,8 +637,25 @@ fn compute_inv_freq(rope_dim: usize, rope_theta: f32) -> Vec<f32> {
 // ---- Model impl ----
 
 impl Qwen35Model {
+    /// Default max_seq_len cap for flat KV cache (limits VRAM usage).
+    /// Override with `load_with_max_seq_len`. Paged KV grows dynamically.
+    const DEFAULT_MAX_SEQ_LEN: usize = 8192;
+
     pub fn load(model_dir: &Path, device: DeviceId) -> Result<Self, ModelError> {
-        let config = ModelConfig::qwen35_0_8b();
+        Self::load_with_max_seq_len(model_dir, device, None)
+    }
+
+    pub fn load_with_max_seq_len(model_dir: &Path, device: DeviceId, max_seq_len: Option<usize>) -> Result<Self, ModelError> {
+        let config_path = model_dir.join("config.json");
+        let mut config = if config_path.exists() {
+            ModelConfig::from_config_json(&config_path)
+                .map_err(|e| ModelError::MissingWeight(format!("config.json: {e}")))?
+        } else {
+            ModelConfig::qwen35_0_8b()
+        };
+        // Cap max_seq_len: model may claim 262144 but flat KV can't afford that.
+        // User override takes priority, otherwise cap at DEFAULT_MAX_SEQ_LEN.
+        config.max_seq_len = max_seq_len.unwrap_or(config.max_seq_len.min(Self::DEFAULT_MAX_SEQ_LEN));
         let st = SafeTensorSet::open_directory(model_dir)?;
         let prefix = "model.language_model.";
 

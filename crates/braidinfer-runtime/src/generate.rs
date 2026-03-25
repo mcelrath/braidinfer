@@ -3,11 +3,65 @@ use tokenizers::Tokenizer;
 
 use crate::model::{ModelError, Qwen35Model};
 
-const EOS_TOKEN_ID: u32 = 151643;
+pub struct ChatMessage<'a> {
+    pub role: &'a str,
+    pub content: &'a str,
+}
 
 pub struct GenerateResult {
     pub tokens: Vec<u32>,
     pub text_pieces: Vec<String>,
+}
+
+/// Runtime-loaded token configuration from model files.
+pub struct TokenConfig {
+    pub im_start_id: Option<u32>,
+    pub im_end_id: Option<u32>,
+    pub eos_token_ids: Vec<u32>,
+    chat_template: Option<String>,
+}
+
+impl TokenConfig {
+    /// Load token config from model directory. Reads tokenizer_config.json for
+    /// eos_token, and chat_template.jinja for the chat template.
+    /// Falls back gracefully if files are missing.
+    pub fn from_model_dir(model_dir: &Path, tokenizer: &Tokenizer) -> Self {
+        let im_start_id = tokenizer.token_to_id("<|im_start|>");
+        let im_end_id = tokenizer.token_to_id("<|im_end|>");
+        let endoftext_id = tokenizer.token_to_id("<|endoftext|>");
+
+        // Collect all stop token IDs
+        let mut eos_token_ids = Vec::new();
+        if let Some(id) = im_end_id { eos_token_ids.push(id); }
+        if let Some(id) = endoftext_id { eos_token_ids.push(id); }
+
+        // Also check config.json text_config.eos_token_id
+        if let Ok(data) = std::fs::read_to_string(model_dir.join("config.json")) {
+            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(eos) = cfg.pointer("/text_config/eos_token_id").and_then(|v| v.as_u64()) {
+                    let eos = eos as u32;
+                    if !eos_token_ids.contains(&eos) {
+                        eos_token_ids.push(eos);
+                    }
+                }
+            }
+        }
+
+        // Load chat template from jinja file
+        let chat_template = std::fs::read_to_string(model_dir.join("chat_template.jinja")).ok()
+            .or_else(|| {
+                // Fallback: check tokenizer_config.json chat_template field
+                let data = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
+                let cfg: serde_json::Value = serde_json::from_str(&data).ok()?;
+                cfg.get("chat_template").and_then(|v| v.as_str()).map(|s| s.to_string())
+            });
+
+        TokenConfig { im_start_id, im_end_id, eos_token_ids, chat_template }
+    }
+
+    pub fn is_stop_token(&self, token: u32) -> bool {
+        self.eos_token_ids.contains(&token)
+    }
 }
 
 pub fn load_tokenizer(model_dir: &Path) -> Result<Tokenizer, Box<dyn std::error::Error>> {
@@ -17,36 +71,62 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Tokenizer, Box<dyn std::error:
     Ok(tokenizer)
 }
 
-pub fn greedy_generate(
+/// Apply chat template using the model's Jinja2 template.
+pub fn apply_chat_template(
+    tokenizer: &Tokenizer,
+    token_config: &TokenConfig,
+    messages: &[ChatMessage<'_>],
+) -> Result<Vec<u32>, ModelError> {
+    let template_src = token_config.chat_template.as_deref()
+        .ok_or_else(|| ModelError::MissingWeight("no chat_template found in model files".into()))?;
+
+    let mut env = minijinja::Environment::new();
+    env.add_template("chat", template_src)
+        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad chat template: {e}"))))?;
+
+    let tmpl = env.get_template("chat")
+        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+
+    let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
+        serde_json::json!({ "role": m.role, "content": m.content })
+    }).collect();
+
+    let rendered = tmpl.render(minijinja::context! {
+        messages => msgs,
+        add_generation_prompt => true,
+        enable_thinking => false,
+    }).map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("template render: {e}"))))?;
+
+    let encoding = tokenizer.encode(rendered.as_str(), false)
+        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+    Ok(encoding.get_ids().to_vec())
+}
+
+/// Generate from pre-tokenized prompt IDs (no chat template applied).
+pub fn generate_from_ids(
     model: &mut Qwen35Model,
     tokenizer: &Tokenizer,
-    prompt: &str,
+    token_config: &TokenConfig,
+    prompt_ids: &[u32],
     max_tokens: usize,
 ) -> Result<GenerateResult, ModelError> {
-    let encoding = tokenizer
-        .encode(prompt, false)
-        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-
-    let mut all_tokens: Vec<u32> = prompt_ids.clone();
-    let mut text_pieces: Vec<String> = Vec::new();
-
     let n_prompt = prompt_ids.len();
     let last_logits = if n_prompt == 0 {
         return Ok(GenerateResult { tokens: vec![], text_pieces: vec![] });
     } else if n_prompt == 1 {
         model.decode_step(prompt_ids[0], 0)?
     } else {
-        model.prefill(&prompt_ids)?
+        model.prefill(prompt_ids)?
     };
 
-    // Greedy decode from the last prompt token's logits
+    let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
+    let mut text_pieces: Vec<String> = Vec::new();
     let mut logits = last_logits;
     let mut position = n_prompt as u32;
 
     for _ in 0..max_tokens {
         let next_token = argmax(&logits);
-        if next_token == EOS_TOKEN_ID {
+        if token_config.is_stop_token(next_token) {
             break;
         }
         all_tokens.push(next_token);
@@ -62,6 +142,39 @@ pub fn greedy_generate(
         tokens: all_tokens[n_prompt..].to_vec(),
         text_pieces,
     })
+}
+
+/// Generate with chat template applied.
+pub fn chat_generate(
+    model: &mut Qwen35Model,
+    tokenizer: &Tokenizer,
+    token_config: &TokenConfig,
+    user_message: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+) -> Result<GenerateResult, ModelError> {
+    let mut messages = Vec::new();
+    if let Some(sys) = system_prompt {
+        messages.push(ChatMessage { role: "system", content: sys });
+    }
+    messages.push(ChatMessage { role: "user", content: user_message });
+    let prompt_ids = apply_chat_template(tokenizer, token_config, &messages)?;
+    generate_from_ids(model, tokenizer, token_config, &prompt_ids, max_tokens)
+}
+
+/// Legacy: generate from raw text (no chat template).
+pub fn greedy_generate(
+    model: &mut Qwen35Model,
+    tokenizer: &Tokenizer,
+    token_config: &TokenConfig,
+    prompt: &str,
+    max_tokens: usize,
+) -> Result<GenerateResult, ModelError> {
+    let encoding = tokenizer
+        .encode(prompt, false)
+        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    generate_from_ids(model, tokenizer, token_config, &prompt_ids, max_tokens)
 }
 
 fn argmax(logits: &[f32]) -> u32 {

@@ -3,7 +3,6 @@ use rand::rngs::StdRng;
 
 use crate::model::{ModelError, Qwen35Model};
 
-const EOS_TOKEN_ID: u32 = 151643;
 
 pub struct SamplingParams {
     pub temperature: f32,
@@ -138,6 +137,7 @@ pub fn generate(
     model: &mut Qwen35Model,
     prompt_tokens: &[u32],
     params: &SamplingParams,
+    stop_tokens: &[u32],
     max_new_tokens: usize,
 ) -> Result<Vec<u32>, ModelError> {
     let mut rng: StdRng = match params.seed {
@@ -166,7 +166,7 @@ pub fn generate(
         let next = sample(&mut logits, params, &tokens, &mut rng);
         tokens.push(next);
         generated.push(next);
-        if next == EOS_TOKEN_ID {
+        if stop_tokens.contains(&next) {
             break;
         }
     }
