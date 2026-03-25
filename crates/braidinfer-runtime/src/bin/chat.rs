@@ -1,6 +1,8 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Instant;
+
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{
@@ -10,7 +12,8 @@ use braidinfer_runtime::model::Qwen35Model;
 
 const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let max_tokens: usize = std::env::var("MAX_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -30,22 +33,22 @@ fn main() {
     }
 
     let mut history: Vec<(String, String)> = Vec::new();
-    let stdin = io::stdin();
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
 
     loop {
         eprint!("> ");
         io::stderr().flush().unwrap();
 
-        let mut line = String::new();
-        if stdin.lock().read_line(&mut line).unwrap() == 0 {
-            break;
-        }
-        let user_input = line.trim();
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            _ => break,
+        };
+        let user_input = line.trim().to_string();
         if user_input.is_empty() {
             continue;
         }
 
-        // Build full message list
         let mut messages: Vec<ChatMessage<'_>> = Vec::new();
         if let Some(sys) = &system_prompt {
             messages.push(ChatMessage { role: "system", content: sys });
@@ -54,7 +57,7 @@ fn main() {
             messages.push(ChatMessage { role: "user", content: u });
             messages.push(ChatMessage { role: "assistant", content: a });
         }
-        messages.push(ChatMessage { role: "user", content: user_input });
+        messages.push(ChatMessage { role: "user", content: &user_input });
 
         let prompt_ids = match apply_chat_template(&tokenizer, &token_config, &messages) {
             Ok(ids) => ids,
@@ -64,7 +67,6 @@ fn main() {
             }
         };
 
-        // Reset and re-prefill full conversation each turn
         model.reset_state().expect("reset");
 
         let start = Instant::now();
@@ -82,6 +84,6 @@ fn main() {
         println!("{response}");
         eprintln!("[{n} tokens in {elapsed:.2}s = {:.1} tok/s]", n as f64 / elapsed);
 
-        history.push((user_input.to_string(), response));
+        history.push((user_input, response));
     }
 }
