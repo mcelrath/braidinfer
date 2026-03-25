@@ -32,7 +32,7 @@ fn rmsnorm_reference(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = input.len();
     let sum_sq: f32 = input.iter().map(|v| v * v).sum();
     let rms = (sum_sq / n as f32 + eps).sqrt().recip();
-    input.iter().zip(weight.iter()).map(|(x, w)| x * rms * w).collect()
+    input.iter().zip(weight.iter()).map(|(x, w)| x * rms * (1.0 + w)).collect()
 }
 
 fn linear_proj_reference(weight: &[f32], input: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
