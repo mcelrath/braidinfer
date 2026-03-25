@@ -47,6 +47,7 @@
 #define OP_ATTN_PREFILL 19
 #define OP_DEINTERLEAVE 20
 #define OP_KV_QUANTIZE  21
+#define OP_ATTN_PAGED_Q 22
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -922,6 +923,204 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_ATTN_PAGED_Q: Paged GQA attention with residual_pc int4 quantized KV cache.
+// Same as OP_ATTN_PAGED but reads quantized chunks and dequantizes K/V on the fly.
+// args: [1]=output, [2]=q (post-RoPE), [3]=page_table (u64*),
+//       [4]=position_table (int*), [5]=inv_freq (float*),
+//       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len,
+//       [10]=chunk_tokens(64), [11]=rope_dim,
+//       [12]=layer_k_q1data_off, [13]=layer_k_q1scale_off,
+//       [14]=layer_k_rdata_off, [15]=layer_k_rscale_off
+// V offsets are K offsets + per_kv stride (passed as separate instruction or computed).
+// For simplicity: V offsets = K offsets + per_kv_bytes, passed in a second instruction.
+// REVISED: Use two instructions — first for K offsets, second for V offsets.
+// Actually, pack both: args [12-15] = K offsets, V data and scale follow at known stride.
+// The stride per_kv = 2 * (data_bytes + scale_bytes) where data_bytes = nkh * ct * hd / 2,
+// scale_bytes = nkh * hd * 4.
+__device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
+    float* output          = inst_fptr(inst, 1);
+    const float* q         = inst_fptr(inst, 2);
+    const u64* page_table  = (const u64*)(inst[3]);
+    const int* position_table = (const int*)(inst[4]);
+    const float* inv_freq  = inst_fptr(inst, 5);
+    int num_q_heads        = inst_int(inst, 6);
+    int num_kv_heads       = inst_int(inst, 7);
+    int head_dim           = inst_int(inst, 8);
+    int seq_len            = inst_int(inst, 9);
+    int chunk_tokens       = inst_int(inst, 10);
+    int rope_dim           = inst_int(inst, 11);
+    // Byte offsets within each chunk for this layer's K quantized data
+    long long k_q1data_off  = (long long)(u64)(inst[12]);
+    long long k_q1scale_off = (long long)(u64)(inst[13]);
+    long long k_rdata_off   = (long long)(u64)(inst[14]);
+    long long k_rscale_off  = (long long)(u64)(inst[15]);
+
+    // V offsets: per_kv bytes after K offsets
+    int data_bytes = num_kv_heads * chunk_tokens * head_dim / 2;
+    int scale_bytes = num_kv_heads * head_dim * 4;
+    int per_kv = 2 * (data_bytes + scale_bytes);
+    long long v_q1data_off  = k_q1data_off + per_kv;
+    long long v_q1scale_off = k_q1scale_off + per_kv;
+    long long v_rdata_off   = k_rdata_off + per_kv;
+    long long v_rscale_off  = k_rscale_off + per_kv;
+
+    int q_head = vblock;
+    if (q_head >= num_q_heads) return;
+
+    int gqa_group = num_q_heads / num_kv_heads;
+    int kv_head = q_head / gqa_group;
+    float attn_scale = rsqrtf((float)head_dim);
+    const float* q_ptr = q + q_head * head_dim;
+
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    extern __shared__ float shmem[];
+    float* sh_k = shmem;       // [head_dim]
+    float* partial = shmem;    // reused for reduction
+
+    int rope_pairs = rope_dim / 2;
+
+    float cos_freq = 0.0f, sin_freq = 0.0f;
+    if (tid < rope_pairs) {
+        float freq = inv_freq[tid];
+        cos_freq = cosf(freq);
+        sin_freq = sinf(freq);
+    }
+
+    float m = -1e30f, d_softmax = 0.0f;
+    float v_acc = 0.0f;
+
+    int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
+    float cos_state = 0.0f, sin_state = 0.0f;
+
+    for (int c = 0; c < num_chunks; c++) {
+        const char* chunk_base = (const char*)(page_table[c]);
+        int tokens_in_chunk = chunk_tokens;
+        if (c == num_chunks - 1) {
+            tokens_in_chunk = seq_len - c * chunk_tokens;
+        }
+
+        // Load K scales for this head into registers (once per chunk)
+        // K q1_scale layout: [nkh, hd] f32 at chunk_base + k_q1scale_off
+        const float* k_q1s = (const float*)(chunk_base + k_q1scale_off);
+        const float* k_rs  = (const float*)(chunk_base + k_rscale_off);
+        float k_s1 = 0.0f, k_s2 = 0.0f;
+        if (tid < head_dim) {
+            k_s1 = k_q1s[kv_head * head_dim + tid];
+            k_s2 = k_rs[kv_head * head_dim + tid];
+        }
+
+        // Load V scales
+        const float* v_q1s = (const float*)(chunk_base + v_q1scale_off);
+        const float* v_rs  = (const float*)(chunk_base + v_rscale_off);
+        float v_s1 = 0.0f, v_s2 = 0.0f;
+        if (tid < head_dim) {
+            v_s1 = v_q1s[kv_head * head_dim + tid];
+            v_s2 = v_rs[kv_head * head_dim + tid];
+        }
+
+        // K/V packed data pointers
+        const unsigned char* k_q1d = (const unsigned char*)(chunk_base + k_q1data_off);
+        const unsigned char* k_rd  = (const unsigned char*)(chunk_base + k_rdata_off);
+        const unsigned char* v_q1d = (const unsigned char*)(chunk_base + v_q1data_off);
+        const unsigned char* v_rd  = (const unsigned char*)(chunk_base + v_rdata_off);
+
+        // Seed trig recurrence
+        if (tid < rope_pairs) {
+            int pos0 = position_table[c * chunk_tokens];
+            float theta0 = (float)pos0 * inv_freq[tid];
+            cos_state = cosf(theta0);
+            sin_state = sinf(theta0);
+        }
+
+        for (int t = 0; t < tokens_in_chunk; t++) {
+            // Dequantize K for this token into shared memory
+            if (tid < head_dim) {
+                int pair = t / 2;
+                int idx = (kv_head * (chunk_tokens / 2) + pair) * head_dim + tid;
+                unsigned char q1_byte = k_q1d[idx];
+                unsigned char r_byte = k_rd[idx];
+                int q1_nibble, r_nibble;
+                if (t % 2 == 0) {
+                    q1_nibble = (int)(q1_byte & 0xF);
+                    r_nibble = (int)(r_byte & 0xF);
+                } else {
+                    q1_nibble = (int)((q1_byte >> 4) & 0xF);
+                    r_nibble = (int)((r_byte >> 4) & 0xF);
+                }
+                // Sign extend from 4-bit
+                if (q1_nibble > 7) q1_nibble -= 16;
+                if (r_nibble > 7) r_nibble -= 16;
+                sh_k[tid] = (float)q1_nibble * k_s1 + (float)r_nibble * k_s2;
+            }
+            __syncthreads();
+
+            // Apply lazy RoPE
+            if (tid < rope_pairs) {
+                int i0 = tid * 2;
+                int i1 = tid * 2 + 1;
+                float x0 = sh_k[i0];
+                float x1 = sh_k[i1];
+                sh_k[i0] = x0 * cos_state - x1 * sin_state;
+                sh_k[i1] = x0 * sin_state + x1 * cos_state;
+            }
+            __syncthreads();
+
+            // Q·K dot product
+            float dot = 0.0f;
+            if (tid < head_dim) dot = q_ptr[tid] * sh_k[tid];
+            partial[tid] = dot;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) partial[tid] += partial[tid + s];
+                __syncthreads();
+            }
+            float score = partial[0] * attn_scale;
+
+            // Online softmax
+            float m_new = fmaxf(m, score);
+            float correction = expf(m - m_new);
+            float w = expf(score - m_new);
+            d_softmax = d_softmax * correction + w;
+
+            // Dequantize V and accumulate (no RoPE on V)
+            if (tid < head_dim) {
+                int pair = t / 2;
+                int idx = (kv_head * (chunk_tokens / 2) + pair) * head_dim + tid;
+                unsigned char vq1_byte = v_q1d[idx];
+                unsigned char vr_byte = v_rd[idx];
+                int vq1, vr;
+                if (t % 2 == 0) {
+                    vq1 = (int)(vq1_byte & 0xF);
+                    vr = (int)(vr_byte & 0xF);
+                } else {
+                    vq1 = (int)((vq1_byte >> 4) & 0xF);
+                    vr = (int)((vr_byte >> 4) & 0xF);
+                }
+                if (vq1 > 7) vq1 -= 16;
+                if (vr > 7) vr -= 16;
+                float vval = (float)vq1 * v_s1 + (float)vr * v_s2;
+                v_acc = v_acc * correction + w * vval;
+            }
+            m = m_new;
+
+            // Advance trig recurrence
+            if (tid < rope_pairs) {
+                float cos_new = cos_state * cos_freq - sin_state * sin_freq;
+                float sin_new = sin_state * cos_freq + cos_state * sin_freq;
+                cos_state = cos_new;
+                sin_state = sin_new;
+            }
+        }
+    }
+
+    float* out_ptr = output + q_head * head_dim;
+    if (tid < head_dim) {
+        out_ptr[tid] = v_acc / d_softmax;
+    }
+}
+
 // OP_ATTN_PREFILL: Batched causal GQA attention for prefill.
 // N queries attend to flat KV cache with causal masking (query t sees KV 0..start_pos+t).
 // One virtual block per (token, q_head) pair: vblock = token_idx * num_q_heads + q_head.
@@ -1180,6 +1379,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
                 case OP_ATTN_PREFILL: op_attn_prefill(inst, vb); break;
                 case OP_DEINTERLEAVE: op_deinterleave(inst, vb); break;
                 case OP_KV_QUANTIZE:  op_kv_quantize(inst, vb); break;
+                case OP_ATTN_PAGED_Q: op_attn_paged_quant(inst, vb); break;
                 default: break;
             }
         }
