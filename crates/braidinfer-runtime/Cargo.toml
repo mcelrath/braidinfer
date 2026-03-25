@@ -10,4 +10,5 @@ tokenizers = { version = "0.21", default-features = false, features = ["fancy-re
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 minijinja = { version = "2", features = ["builtins"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 rand = "0.8"

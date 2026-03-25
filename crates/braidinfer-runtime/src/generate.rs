@@ -81,6 +81,10 @@ pub fn apply_chat_template(
         .ok_or_else(|| ModelError::MissingWeight("no chat_template found in model files".into()))?;
 
     let mut env = minijinja::Environment::new();
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
+        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+    });
     env.add_template("chat", template_src)
         .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad chat template: {e}"))))?;
 
