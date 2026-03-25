@@ -30,6 +30,8 @@ const OP_LM_HEAD: u32 = 15;
 const OP_HALT: u32 = 16;
 const OP_D2D_COPY: u32 = 17;
 
+const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
+
 const INST_SIZE: usize = 16; // 16 u64s per instruction = 128 bytes
 const NUM_CUS: u32 = 96;
 
@@ -60,6 +62,10 @@ impl Instruction {
 
     fn set_float(&mut self, idx: usize, val: f32) {
         self.words[idx] = val.to_bits() as u64;
+    }
+
+    fn set_no_sync(&mut self) {
+        self.words[0] |= FLAG_NO_SYNC as u64;
     }
 }
 
@@ -236,21 +242,24 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         // 2. QKV projection [6144, 1024] @ [1024] → [6144]
+        // NO_SYNC: next 3 instructions (a/b/z proj) read normed, not qkv
         let mut inst = Instruction::new(OP_LINEAR_PROJ, qkv_dim as u32);
         inst.set_mut_ptr(1, act.qkv.as_ptr());
         inst.set_ptr(2, w.w_qkv.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, qkv_dim as i32);
         inst.set_int(5, hs as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
-        // 3. Project a [nh], b [nh], z [nh*vd]
+        // 3. Project a [nh], b [nh], z [nh*vd] — all read normed, write disjoint buffers
         let mut inst = Instruction::new(OP_LINEAR_PROJ, nh as u32);
         inst.set_mut_ptr(1, act.a_proj.as_ptr());
         inst.set_ptr(2, w.w_a.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, nh as i32);
         inst.set_int(5, hs as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_LINEAR_PROJ, nh as u32);
@@ -259,8 +268,10 @@ impl MegakernelProgram {
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, nh as i32);
         inst.set_int(5, hs as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
+        // z proj: SYNC here ensures QKV+a+b+z all complete before conv1d reads qkv
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nh * vd) as u32);
         inst.set_mut_ptr(1, act.z_proj.as_ptr());
         inst.set_ptr(2, w.w_z.as_ptr());
@@ -274,17 +285,18 @@ impl MegakernelProgram {
         let k_dim = nh * kd; // 2048
         let v_dim = nh * vd; // 2048
 
-        // Conv on Q portion: state[0..q_dim*(ck-1)], input=qkv[0..q_dim], weight=conv1d_weight[0..q_dim*ck], output=q_gdn
+        // Conv on Q portion — NO_SYNC: conv_k reads different qkv slice, writes different state/output
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
-        inst.set_mut_ptr(1, conv_state.as_ptr()); // state offset 0
-        inst.set_ptr(2, act.qkv.as_ptr()); // input offset 0
-        inst.set_ptr(3, w.conv1d_weight.as_ptr()); // weight offset 0
+        inst.set_mut_ptr(1, conv_state.as_ptr());
+        inst.set_ptr(2, act.qkv.as_ptr());
+        inst.set_ptr(3, w.conv1d_weight.as_ptr());
         inst.set_mut_ptr(4, act.q_gdn.as_ptr());
         inst.set_int(5, q_dim as i32);
         inst.set_int(6, ck as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
-        // Conv on K portion
+        // Conv on K portion — NO_SYNC: conv_v reads different slice
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
         inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim) });
@@ -292,6 +304,7 @@ impl MegakernelProgram {
         inst.set_mut_ptr(4, act.k_gdn.as_ptr());
         inst.set_int(5, k_dim as i32);
         inst.set_int(6, ck as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
         // Conv on V portion
@@ -391,13 +404,14 @@ impl MegakernelProgram {
         inst.set_float(5, eps);
         instructions.push(inst);
 
-        // 2. Q+gate [4096], K [512], V [512] projections
+        // 2. Q+gate [4096], K [512], V [512] projections — all read normed, write disjoint
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
         inst.set_mut_ptr(1, act.q_gate_attn.as_ptr());
         inst.set_ptr(2, w.w_q_gate.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nqh * hd * 2) as i32);
         inst.set_int(5, hs as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
@@ -406,8 +420,10 @@ impl MegakernelProgram {
         inst.set_ptr(3, act.normed.as_ptr());
         inst.set_int(4, (nkh * hd) as i32);
         inst.set_int(5, hs as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
+        // V proj: SYNC here ensures Q+gate, K, V all complete before deinterleave
         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
         inst.set_mut_ptr(1, act.v_attn.as_ptr());
         inst.set_ptr(2, w.w_v.as_ptr());
@@ -417,21 +433,25 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         // 3. Q/gate deinterleave: 8 heads × 2 copies each = 16 d2d copies
+        // All write to non-overlapping regions — skip sync on all but last
         for h in 0..nqh {
             let src_q_offset = h * hd * 2;
             let src_g_offset = h * hd * 2 + hd;
             let dst_offset = h * hd;
+            let is_last = h == nqh - 1;
 
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
             inst.set_mut_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
             inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
             inst.set_int(3, hd as i32);
+            inst.set_no_sync();
             instructions.push(inst);
 
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
             inst.set_mut_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
             inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
             inst.set_int(3, hd as i32);
+            if !is_last { inst.set_no_sync(); }
             instructions.push(inst);
         }
 
@@ -464,18 +484,19 @@ impl MegakernelProgram {
         inst.set_int(11, cfg.mrope_section[2] as i32);
         instructions.push(inst);
 
-        // 6. Write K,V to cache (position-dependent offset — updated per step)
+        // 6. Write K,V to cache — k_copy NO_SYNC (v_copy writes different buffer)
         let kv_stride = nkh * hd;
         let k_copy_idx = instructions.len();
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_mut_ptr(1, kv_cache.k.as_ptr()); // offset updated per step
+        inst.set_mut_ptr(1, kv_cache.k.as_ptr());
         inst.set_ptr(2, act.k_attn.as_ptr());
         inst.set_int(3, kv_stride as i32);
+        inst.set_no_sync();
         instructions.push(inst);
 
         let v_copy_idx = instructions.len();
         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
-        inst.set_mut_ptr(1, kv_cache.v.as_ptr()); // offset updated per step
+        inst.set_mut_ptr(1, kv_cache.v.as_ptr());
         inst.set_ptr(2, act.v_attn.as_ptr());
         inst.set_int(3, kv_stride as i32);
         instructions.push(inst);

@@ -36,12 +36,17 @@
 #define OP_HALT        16
 #define OP_D2D_COPY    17
 
+#define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
+
 typedef unsigned long long u64;
 typedef unsigned int u32;
 
 // Helper to extract fields from instruction
 __device__ __forceinline__ u32 inst_opcode(const u64* inst) {
-    return (u32)(inst[0] & 0xFFFFFFFF);
+    return (u32)(inst[0] & 0x7FFFFFFF);  // mask out FLAG_NO_SYNC
+}
+__device__ __forceinline__ bool inst_no_sync(const u64* inst) {
+    return (inst[0] & FLAG_NO_SYNC) != 0;
 }
 __device__ __forceinline__ u32 inst_grid_x(const u64* inst) {
     return (u32)(inst[0] >> 32);
@@ -678,6 +683,7 @@ extern "C" __global__ void megakernel_f32(
         const u64* inst = program + pc * INST_SIZE;
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
+        bool no_sync = inst_no_sync(inst);
 
         if (opcode == OP_HALT) break;
 
@@ -704,6 +710,6 @@ extern "C" __global__ void megakernel_f32(
             }
         }
 
-        grid.sync();
+        if (!no_sync) grid.sync();
     }
 }
