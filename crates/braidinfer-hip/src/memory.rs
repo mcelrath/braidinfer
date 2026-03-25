@@ -89,7 +89,15 @@ impl<T> Drop for DeviceBuffer<T> {
                 );
                 return;
             }
-            unsafe { ffi::hipFree(self.ptr.cast()) };
+            let err = unsafe { ffi::hipFree(self.ptr.cast()) };
+            if err != 0 {
+                eprintln!(
+                    "braidinfer: hipFree failed (error {}) for {}B on {:?}",
+                    err,
+                    self.size_bytes(),
+                    self.device
+                );
+            }
         }
     }
 }
@@ -140,8 +148,10 @@ impl<T> PinnedBuffer<T> {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    /// # Safety
+    /// Caller must ensure no other references to this buffer exist.
+    pub unsafe fn as_mut_slice(&mut self) -> &mut [T] {
+        std::slice::from_raw_parts_mut(self.ptr, self.len)
     }
 }
 

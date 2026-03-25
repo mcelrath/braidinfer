@@ -108,6 +108,8 @@ pub struct MegakernelProgram {
     last_page_table_len: usize,                 // track when a new chunk was added
     // kv_stride for paged KV write offset computation (nkh * hd)
     kv_stride_paged: usize,
+    // Prevent Send — contains raw GPU device pointers as u64
+    _not_send: std::marker::PhantomData<*mut ()>,
 }
 
 /// Activation buffers sized for N-token prefill chunks.
@@ -198,7 +200,16 @@ impl MegakernelProgram {
         let device = model.device;
         let act = &model.activations;
 
+        // Guard: only GDN recurrent layers are supported by the megakernel
+        if matches!(cfg.recurrent_kind, crate::model::RecurrentLayerKind::Mamba2 { .. }) {
+            panic!("Mamba2 recurrent layers not yet supported by megakernel");
+        }
+
         let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
+
+        // Note: hipDeviceAttributeCooperativeLaunch (95) returns 0 on ROCm/RDNA3 even though
+        // cooperative launch works. Skipping capability check — hipModuleLaunchCooperativeKernel
+        // will return an error if unsupported.
 
         // Query max blocks for cooperative launch
         let func = module.get_function("megakernel_f32")?;
@@ -339,6 +350,7 @@ impl MegakernelProgram {
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
+            _not_send: std::marker::PhantomData,
         })
     }
 
@@ -715,6 +727,7 @@ impl MegakernelProgram {
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
+            _not_send: std::marker::PhantomData,
         })
     }
 

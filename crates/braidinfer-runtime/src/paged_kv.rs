@@ -320,9 +320,12 @@ pub fn save_checkpoint(
 ) -> HipResult<u32> {
     let (slot, dst_ptr) = pool.alloc().ok_or(HipError(ffi::hipErrorOutOfMemory))?;
     debug_assert_eq!(
-        pool.state_bytes() % (recurrent_states.len() * std::mem::size_of::<f32>()),
-        0,
-        "state_bytes not evenly divisible by num_layers * sizeof(f32)"
+        pool.state_bytes(),
+        recurrent_states.len() * recurrent_states.first().map_or(0, |s| s.size_bytes()),
+        "state_bytes mismatch: pool expects {} but got {} layers * {} bytes/layer",
+        pool.state_bytes(),
+        recurrent_states.len(),
+        recurrent_states.first().map_or(0, |s| s.size_bytes()),
     );
     let floats_per_layer = pool.state_bytes() / recurrent_states.len() / std::mem::size_of::<f32>();
     for (i, state) in recurrent_states.iter().enumerate() {

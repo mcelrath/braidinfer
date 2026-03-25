@@ -62,5 +62,6 @@ fn main() {
     // Link to HIP runtime
     println!("cargo:rustc-link-search=native={rocm_path}/lib");
     println!("cargo:rustc-link-lib=dylib=amdhip64");
+    println!("cargo:rerun-if-changed={}", kernel_dir.join("bf16_utils.h").display());
     println!("cargo:rerun-if-changed=build.rs");
 }
