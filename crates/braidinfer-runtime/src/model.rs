@@ -1421,6 +1421,10 @@ impl Qwen35Model {
                 mk.enable_quantized_kv(max_chunks, &self.config)?;
             }
             self.megakernel_paged = Some(mk);
+        } else {
+            let mk = self.megakernel_paged.as_ref().unwrap();
+            assert_eq!(mk.quantized_kv, quantized,
+                "cannot mix decode_step_paged and decode_step_paged_quantized on the same model");
         }
 
         // Lazy-init: f32 PageAllocator (staging) and SequenceState

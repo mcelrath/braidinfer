@@ -115,7 +115,7 @@ pub struct MegakernelProgram {
     quant_scratch: Option<DeviceBuffer<f32>>,   // partial state: [nqh × (2+hd)] per attn layer
     quant_page_table: Option<DeviceBuffer<u64>>,// page table for sealed quantized chunks
     last_quant_page_table_len: usize,
-    quantized_kv: bool,                         // whether this program uses quantized KV
+    pub quantized_kv: bool,                      // whether this program uses quantized KV
     // Prevent Send — contains raw GPU device pointers as u64
     _not_send: std::marker::PhantomData<*mut ()>,
 }
