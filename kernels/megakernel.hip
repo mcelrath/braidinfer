@@ -45,6 +45,7 @@
 #define OP_D2D_COPY    17
 #define OP_ATTN_PAGED  18
 #define OP_ATTN_PREFILL 19
+#define OP_DEINTERLEAVE 20
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -962,6 +963,36 @@ __device__ void op_attn_prefill(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_DEINTERLEAVE: Split [batch * num_heads * 2*hd] interleaved → two [batch * num_heads * hd] outputs.
+// For each head h, copies src[h*2*hd .. h*2*hd+hd] → dst_even[h*hd], src[h*2*hd+hd .. h*2*hd+2*hd] → dst_odd[h*hd].
+// args: [1]=dst_even, [2]=dst_odd, [3]=src, [4]=num_heads, [5]=head_dim, [6]=batch
+// grid_x = total elements / blockDim.x
+__device__ void op_deinterleave(const u64* inst, u32 vblock) {
+    float* dst_even = inst_fptr(inst, 1);
+    float* dst_odd = inst_fptr(inst, 2);
+    const float* src = inst_fptr(inst, 3);
+    int num_heads = inst_int(inst, 4);
+    int head_dim = inst_int(inst, 5);
+    int batch = inst_int(inst, 6);
+    if (batch <= 0) batch = 1;
+
+    int total = batch * num_heads * head_dim;
+    int idx = vblock * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    // idx maps to (batch_idx, head, element)
+    int elem = idx % head_dim;
+    int rest = idx / head_dim;
+    int head = rest % num_heads;
+    int batch_idx = rest / num_heads;
+
+    int src_offset = (batch_idx * num_heads + head) * 2 * head_dim;
+    int dst_offset = (batch_idx * num_heads + head) * head_dim + elem;
+
+    dst_even[dst_offset] = src[src_offset + elem];
+    dst_odd[dst_offset] = src[src_offset + head_dim + elem];
+}
+
 // ============================================================
 // Main megakernel entry point
 // ============================================================
@@ -1004,6 +1035,7 @@ extern "C" __global__ void megakernel_f32(
                 case OP_D2D_COPY:     op_d2d_copy(inst, vb); break;
                 case OP_ATTN_PAGED:   op_attn_paged(inst, vb); break;
                 case OP_ATTN_PREFILL: op_attn_prefill(inst, vb); break;
+                case OP_DEINTERLEAVE: op_deinterleave(inst, vb); break;
                 default: break;
             }
         }
