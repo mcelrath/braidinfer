@@ -102,6 +102,41 @@ pub struct MegakernelProgram {
     kv_stride_paged: usize,
 }
 
+/// Activation buffers sized for N-token prefill chunks.
+/// All buffers are [batch × dim] where batch = chunk_tokens.
+pub struct PrefillBuffers {
+    pub hidden: DeviceBuffer<f32>,       // [N × hidden_size] — main hidden state
+    pub normed: DeviceBuffer<f32>,       // [N × hidden_size]
+    pub qkv: DeviceBuffer<f32>,          // [N × conv_dim] (6144 for Qwen3.5)
+    pub a_proj: DeviceBuffer<f32>,       // [N × num_heads]
+    pub b_proj: DeviceBuffer<f32>,       // [N × num_heads]
+    pub z_proj: DeviceBuffer<f32>,       // [N × num_heads * value_dim]
+    pub ffn_act: DeviceBuffer<f32>,      // [N × intermediate_size]
+    pub residual: DeviceBuffer<f32>,     // [N × hidden_size]
+}
+
+impl PrefillBuffers {
+    pub fn alloc(device: DeviceId, cfg: &ModelConfig, chunk_tokens: usize) -> HipResult<Self> {
+        let n = chunk_tokens;
+        let hs = cfg.hidden_size;
+        let nh = cfg.linear_num_heads;
+        let kd = cfg.linear_key_head_dim;
+        let vd = cfg.linear_value_head_dim;
+        let conv_dim = nh * kd * 2 + nh * vd;
+        let is = cfg.intermediate_size;
+        Ok(PrefillBuffers {
+            hidden: DeviceBuffer::alloc(device, n * hs)?,
+            normed: DeviceBuffer::alloc(device, n * hs)?,
+            qkv: DeviceBuffer::alloc(device, n * conv_dim)?,
+            a_proj: DeviceBuffer::alloc(device, n * nh)?,
+            b_proj: DeviceBuffer::alloc(device, n * nh)?,
+            z_proj: DeviceBuffer::alloc(device, n * nh * vd)?,
+            ffn_act: DeviceBuffer::alloc(device, n * is)?,
+            residual: DeviceBuffer::alloc(device, n * hs)?,
+        })
+    }
+}
+
 fn div_ceil(a: u32, b: u32) -> u32 {
     (a + b - 1) / b
 }

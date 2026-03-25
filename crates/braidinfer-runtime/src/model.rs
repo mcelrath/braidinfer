@@ -1387,6 +1387,23 @@ impl Qwen35Model {
         Ok(slot)
     }
 
+    /// Process a sequence of tokens (prefill). Returns logits for the last token.
+    /// Saves GDN checkpoints at each 64-token chunk boundary.
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        if tokens.is_empty() {
+            return Err(ModelError::MissingWeight("empty token sequence".into()));
+        }
+        let mut logits = vec![];
+        for (i, &tok) in tokens.iter().enumerate() {
+            logits = self.decode_step_paged(tok, i as u32)?;
+            // Save GDN checkpoint at chunk boundaries
+            if (i + 1) % CHUNK_TOKENS == 0 && i + 1 < tokens.len() {
+                let _slot = self.save_recurrent_checkpoint()?;
+            }
+        }
+        Ok(logits)
+    }
+
     /// Read all GDN recurrent state to host (for testing).
     pub fn read_gdn_state(&self) -> Result<Vec<Vec<f32>>, ModelError> {
         self.stream.synchronize()?;

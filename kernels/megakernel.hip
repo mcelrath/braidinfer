@@ -120,7 +120,9 @@ __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
 // OP_LINEAR_PROJ: y = W @ x  (one virtual block per output row)
 // args: [1]=output, [2]=weight, [3]=input, [4]=out_dim, [5]=in_dim, [6]=batch_size (0 or 1 = single token)
 // When batch > 1: input is [batch × in_dim], output is [batch × out_dim].
-// vblock encodes (batch_idx * out_dim + row).
+// grid_x = out_dim. Each block handles one weight row for ALL batch elements.
+// Weight loaded once (from L2 cache), dot products accumulated per batch element in registers.
+#define MAX_PREFILL_BATCH 64
 __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     float* output_base = inst_fptr(inst, 1);
     const unsigned short* weight = inst_u16ptr(inst, 2);
@@ -130,48 +132,83 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     int batch = inst_int(inst, 6);
     if (batch <= 1) batch = 1;
 
-    int row = vblock % out_dim;
-    int batch_idx = vblock / out_dim;
-    if (batch_idx >= batch) return;
-
-    const float* input = input_base + (long long)batch_idx * in_dim;
-    float* output = output_base + (long long)batch_idx * out_dim;
+    int row = vblock;
+    if (row >= out_dim) return;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
     const unsigned short* w = weight + (long long)row * in_dim;
 
-    float acc = 0.0f;
+    // Single-token fast path (no register array overhead)
+    if (batch == 1) {
+        float acc = 0.0f;
+        const int vec_elements = 8;
+        const int vec_count = in_dim / vec_elements;
+        const ull2* w_vec = (const ull2*)w;
+
+        for (int vi = tid; vi < vec_count; vi += stride) {
+            ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
+            unsigned short ws[8];
+            __builtin_memcpy(ws, &wv, 16);
+            int base = vi * vec_elements;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) acc += bf16_to_f32(ws[j]) * input_base[base + j];
+        }
+        int rem = vec_count * vec_elements;
+        for (int i = rem + tid; i < in_dim; i += stride) acc += bf16_to_f32(w[i]) * input_base[i];
+
+        extern __shared__ float shared[];
+        shared[tid] = acc;
+        __syncthreads();
+        for (int s = stride / 2; s > 0; s >>= 1) {
+            if (tid < s) shared[tid] += shared[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) output_base[row] = shared[0];
+        return;
+    }
+
+    // Batched path: accumulate per-batch dot products, weight loaded once from L2 cache
+    float acc[MAX_PREFILL_BATCH];
+    for (int b = 0; b < batch; b++) acc[b] = 0.0f;
 
     const int vec_elements = 8;
     const int vec_count = in_dim / vec_elements;
     const ull2* w_vec = (const ull2*)w;
 
     for (int vi = tid; vi < vec_count; vi += stride) {
-        ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
+        ull2 wv = w_vec[vi];
         unsigned short ws[8];
         __builtin_memcpy(ws, &wv, 16);
+        float wf[8];
+        #pragma unroll
+        for (int j = 0; j < 8; j++) wf[j] = bf16_to_f32(ws[j]);
 
         int base = vi * vec_elements;
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            acc += bf16_to_f32(ws[j]) * input[base + j];
+        for (int b = 0; b < batch; b++) {
+            const float* inp = input_base + (long long)b * in_dim + base;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) acc[b] += wf[j] * inp[j];
         }
     }
-
-    int remainder_start = vec_count * vec_elements;
-    for (int i = remainder_start + tid; i < in_dim; i += stride) {
-        acc += bf16_to_f32(w[i]) * input[i];
+    int rem = vec_count * vec_elements;
+    for (int i = rem + tid; i < in_dim; i += stride) {
+        float wf = bf16_to_f32(w[i]);
+        for (int b = 0; b < batch; b++) acc[b] += wf * input_base[(long long)b * in_dim + i];
     }
 
+    // Reduce each batch element (shared memory reduction)
     extern __shared__ float shared[];
-    shared[tid] = acc;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
+    for (int b = 0; b < batch; b++) {
+        shared[tid] = acc[b];
+        __syncthreads();
+        for (int s = stride / 2; s > 0; s >>= 1) {
+            if (tid < s) shared[tid] += shared[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) output_base[(long long)b * out_dim + row] = shared[0];
         __syncthreads();
     }
-    if (tid == 0) output[row] = shared[0];
 }
 
 // OP_CONV1D: causal conv1d update (one virtual block per channel)
