@@ -151,6 +151,16 @@ pub struct ActivationBuffers {
     pub inv_freq: DeviceBuffer<f32>,  // [rope_dim/2]
     pub position_ids: DeviceBuffer<i32>, // [3]
     // conv states per GDN layer (allocated separately)
+    // Pre-allocated GDN conv temp buffers (reused each gdn_forward call)
+    pub gdn_conv_w_q: DeviceBuffer<u16>,  // [nh*kd*ck]
+    pub gdn_conv_w_k: DeviceBuffer<u16>,  // [nh*kd*ck]
+    pub gdn_conv_w_v: DeviceBuffer<u16>,  // [nh*vd*ck]
+    pub gdn_cs_q: DeviceBuffer<f32>,      // [nh*kd*(ck-1)]
+    pub gdn_cs_k: DeviceBuffer<f32>,      // [nh*kd*(ck-1)]
+    pub gdn_cs_v: DeviceBuffer<f32>,      // [nh*vd*(ck-1)]
+    pub gdn_conv_out_q: DeviceBuffer<f32>, // [nh*kd]
+    pub gdn_conv_out_k: DeviceBuffer<f32>, // [nh*kd]
+    pub gdn_conv_out_v: DeviceBuffer<f32>, // [nh*vd]
 }
 
 // ---- All kernels ----
@@ -496,6 +506,15 @@ impl Qwen35Model {
             logits: DeviceBuffer::<f32>::alloc(device, vs)?,
             inv_freq: inv_freq_buf,
             position_ids: pos_buf,
+            gdn_conv_w_q: DeviceBuffer::<u16>::alloc(device, nh * kd * ck)?,
+            gdn_conv_w_k: DeviceBuffer::<u16>::alloc(device, nh * kd * ck)?,
+            gdn_conv_w_v: DeviceBuffer::<u16>::alloc(device, nh * vd * ck)?,
+            gdn_cs_q: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,
+            gdn_cs_k: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,
+            gdn_cs_v: DeviceBuffer::<f32>::alloc(device, nh * vd * (ck - 1))?,
+            gdn_conv_out_q: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
+            gdn_conv_out_k: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
+            gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
         };
 
         Ok(Qwen35Model {
@@ -638,10 +657,6 @@ impl Qwen35Model {
         let conv_v_out_len = nh as usize * vd as usize;
         let ck_usize = ck as usize;
 
-        let mut conv_w_q = DeviceBuffer::<u16>::alloc(self.device, conv_q_out_len * ck_usize)?;
-        let mut conv_w_k = DeviceBuffer::<u16>::alloc(self.device, conv_k_out_len * ck_usize)?;
-        let mut conv_w_v = DeviceBuffer::<u16>::alloc(self.device, conv_v_out_len * ck_usize)?;
-
         // NOTE: conv1d_weight layout is [6144, ck] row-major. Each row is one channel's kernel.
         // We need rows 0..2048 for q, 2048..4096 for k, 4096..6144 for v.
         unsafe {
@@ -649,9 +664,9 @@ impl Qwen35Model {
                 LayerWeights::Gdn(w) => w,
                 _ => unreachable!(),
             };
-            d2d_copy_u16(&mut conv_w_q, 0, &weights_gdn.conv1d_weight, 0, conv_q_out_len * ck_usize)?;
-            d2d_copy_u16(&mut conv_w_k, 0, &weights_gdn.conv1d_weight, conv_q_out_len * ck_usize, conv_k_out_len * ck_usize)?;
-            d2d_copy_u16(&mut conv_w_v, 0, &weights_gdn.conv1d_weight, (conv_q_out_len + conv_k_out_len) * ck_usize, conv_v_out_len * ck_usize)?;
+            d2d_copy_u16(&mut self.activations.gdn_conv_w_q, 0, &weights_gdn.conv1d_weight, 0, conv_q_out_len * ck_usize)?;
+            d2d_copy_u16(&mut self.activations.gdn_conv_w_k, 0, &weights_gdn.conv1d_weight, conv_q_out_len * ck_usize, conv_k_out_len * ck_usize)?;
+            d2d_copy_u16(&mut self.activations.gdn_conv_w_v, 0, &weights_gdn.conv1d_weight, (conv_q_out_len + conv_k_out_len) * ck_usize, conv_v_out_len * ck_usize)?;
         }
 
         // For the conv state, we need sub-views too.
@@ -661,43 +676,36 @@ impl Qwen35Model {
         let conv_state_k_len = conv_k_out_len * (ck_usize - 1);
         let conv_state_v_len = conv_v_out_len * (ck_usize - 1);
 
-        let mut cs_q = DeviceBuffer::<f32>::alloc(self.device, conv_state_q_len)?;
-        let mut cs_k = DeviceBuffer::<f32>::alloc(self.device, conv_state_k_len)?;
-        let mut cs_v = DeviceBuffer::<f32>::alloc(self.device, conv_state_v_len)?;
         unsafe {
-            d2d_copy_f32(&mut cs_q, 0, &self.gdn_conv_states[gdn_idx], 0, conv_state_q_len)?;
-            d2d_copy_f32(&mut cs_k, 0, &self.gdn_conv_states[gdn_idx], conv_state_q_len, conv_state_k_len)?;
-            d2d_copy_f32(&mut cs_v, 0, &self.gdn_conv_states[gdn_idx], conv_state_q_len + conv_state_k_len, conv_state_v_len)?;
+            d2d_copy_f32(&mut self.activations.gdn_cs_q, 0, &self.gdn_conv_states[gdn_idx], 0, conv_state_q_len)?;
+            d2d_copy_f32(&mut self.activations.gdn_cs_k, 0, &self.gdn_conv_states[gdn_idx], conv_state_q_len, conv_state_k_len)?;
+            d2d_copy_f32(&mut self.activations.gdn_cs_v, 0, &self.gdn_conv_states[gdn_idx], conv_state_q_len + conv_state_k_len, conv_state_v_len)?;
         }
 
-        // Run 3 conv1d operations
-        let mut conv_out_q = DeviceBuffer::<f32>::alloc(self.device, conv_q_out_len)?;
-        let mut conv_out_k = DeviceBuffer::<f32>::alloc(self.device, conv_k_out_len)?;
-        let mut conv_out_v = DeviceBuffer::<f32>::alloc(self.device, conv_v_out_len)?;
-
+        // Run 3 conv1d operations using pre-allocated buffers
         self.kernels.causal_conv1d.forward(
-            &mut cs_q,
+            &mut self.activations.gdn_cs_q,
             &self.activations.q_gdn,
-            &conv_w_q,
-            &mut conv_out_q,
+            &self.activations.gdn_conv_w_q,
+            &mut self.activations.gdn_conv_out_q,
             conv_q_out_len as u32,
             ck,
             &self.stream,
         )?;
         self.kernels.causal_conv1d.forward(
-            &mut cs_k,
+            &mut self.activations.gdn_cs_k,
             &self.activations.k_gdn,
-            &conv_w_k,
-            &mut conv_out_k,
+            &self.activations.gdn_conv_w_k,
+            &mut self.activations.gdn_conv_out_k,
             conv_k_out_len as u32,
             ck,
             &self.stream,
         )?;
         self.kernels.causal_conv1d.forward(
-            &mut cs_v,
+            &mut self.activations.gdn_cs_v,
             &self.activations.v_gdn,
-            &conv_w_v,
-            &mut conv_out_v,
+            &self.activations.gdn_conv_w_v,
+            &mut self.activations.gdn_conv_out_v,
             conv_v_out_len as u32,
             ck,
             &self.stream,
@@ -705,17 +713,17 @@ impl Qwen35Model {
 
         // Write back updated conv states
         unsafe {
-            d2d_copy_f32(&mut self.gdn_conv_states[gdn_idx], 0, &cs_q, 0, conv_state_q_len)?;
-            d2d_copy_f32(&mut self.gdn_conv_states[gdn_idx], conv_state_q_len, &cs_k, 0, conv_state_k_len)?;
-            d2d_copy_f32(&mut self.gdn_conv_states[gdn_idx], conv_state_q_len + conv_state_k_len, &cs_v, 0, conv_state_v_len)?;
+            d2d_copy_f32(&mut self.gdn_conv_states[gdn_idx], 0, &self.activations.gdn_cs_q, 0, conv_state_q_len)?;
+            d2d_copy_f32(&mut self.gdn_conv_states[gdn_idx], conv_state_q_len, &self.activations.gdn_cs_k, 0, conv_state_k_len)?;
+            d2d_copy_f32(&mut self.gdn_conv_states[gdn_idx], conv_state_q_len + conv_state_k_len, &self.activations.gdn_cs_v, 0, conv_state_v_len)?;
         }
 
         // conv_out_q/k/v now hold the post-conv Q,K,V (with SiLU applied inside the kernel)
         // Copy them back to q_gdn, k_gdn, v_gdn
         unsafe {
-            d2d_copy_f32(&mut self.activations.q_gdn, 0, &conv_out_q, 0, conv_q_out_len)?;
-            d2d_copy_f32(&mut self.activations.k_gdn, 0, &conv_out_k, 0, conv_k_out_len)?;
-            d2d_copy_f32(&mut self.activations.v_gdn, 0, &conv_out_v, 0, conv_v_out_len)?;
+            d2d_copy_f32(&mut self.activations.q_gdn, 0, &self.activations.gdn_conv_out_q, 0, conv_q_out_len)?;
+            d2d_copy_f32(&mut self.activations.k_gdn, 0, &self.activations.gdn_conv_out_k, 0, conv_k_out_len)?;
+            d2d_copy_f32(&mut self.activations.v_gdn, 0, &self.activations.gdn_conv_out_v, 0, conv_v_out_len)?;
         }
 
         // 5. Compute GDN gate

@@ -11,7 +11,7 @@ extern "C" __global__ void rmsnorm_gated_f32(
     float* __restrict__ output,
     const float* __restrict__ x,
     const float* __restrict__ z,
-    const float* __restrict__ weight,
+    const float* __restrict__ weight,  // f32 weight (not BF16) — output_norm/linear_attn.norm are the only f32 weights in the model
     const int num_heads,
     const int value_dim,
     const float eps

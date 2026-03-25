@@ -7,15 +7,23 @@
 // Each instruction specifies an operation and how many "virtual blocks" it needs.
 // Physical blocks loop over virtual blocks: for (vb = blockIdx.x; vb < grid_x; vb += gridDim.x)
 
-// Instruction layout (64 bytes, 8 uint64s):
-//   [0]: opcode (low 32) | grid_x (high 32)  — grid_x = number of virtual blocks
-//   [1]: arg0 (pointer or scalar)
-//   [2]: arg1
-//   [3]: arg2
-//   [4]: arg3
-//   [5]: arg4
-//   [6]: arg5
-//   [7]: arg6
+// Instruction layout (128 bytes, 16 uint64s):
+//   [0]:  opcode (low 32) | grid_x (high 32)  — grid_x = number of virtual blocks
+//   [1]:  arg0 (pointer or scalar)
+//   [2]:  arg1
+//   [3]:  arg2
+//   [4]:  arg3
+//   [5]:  arg4
+//   [6]:  arg5
+//   [7]:  arg6
+//   [8]:  arg7
+//   [9]:  arg8
+//   [10]: arg9
+//   [11]: arg10
+//   [12]: arg11
+//   [13]: arg12
+//   [14]: arg13
+//   [15]: arg14
 
 #define OP_NOP          0
 #define OP_RMSNORM      1

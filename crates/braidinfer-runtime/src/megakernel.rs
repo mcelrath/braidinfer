@@ -81,6 +81,8 @@ pub struct MegakernelProgram {
     mrope_inst_indices: Vec<usize>,    // one per attention layer
     gqa_attn_inst_indices: Vec<usize>, // seq_len changes each step
     kv_write_indices: Vec<(usize, usize)>, // (k_copy_idx, v_copy_idx) per attn layer
+    // Base KV cache pointers (position=0) for computing per-step write offsets
+    kv_base_ptrs: Vec<(u64, u64)>, // (k_base, v_base) per attention layer
 }
 
 fn div_ceil(a: u32, b: u32) -> u32 {
@@ -107,6 +109,7 @@ impl MegakernelProgram {
         let mut mrope_inst_indices = Vec::new();
         let mut gqa_attn_inst_indices = Vec::new();
         let mut kv_write_indices = Vec::new();
+        let mut kv_base_ptrs = Vec::new();
 
         let hs = cfg.hidden_size;
         let nh_gdn = cfg.linear_num_heads;
@@ -142,6 +145,7 @@ impl MegakernelProgram {
                     &model.kv_caches[kv_idx],
                     &mut instructions, &mut mrope_inst_indices,
                     &mut gqa_attn_inst_indices, &mut kv_write_indices,
+                    &mut kv_base_ptrs,
                 );
                 kv_idx += 1;
             } else {
@@ -209,6 +213,7 @@ impl MegakernelProgram {
             mrope_inst_indices,
             gqa_attn_inst_indices,
             kv_write_indices,
+            kv_base_ptrs,
         })
     }
 
@@ -383,6 +388,7 @@ impl MegakernelProgram {
         mrope_indices: &mut Vec<usize>,
         gqa_indices: &mut Vec<usize>,
         kv_write_indices: &mut Vec<(usize, usize)>,
+        kv_base_ptrs: &mut Vec<(u64, u64)>,
     ) {
         let w = match layer {
             LayerWeights::Attention(w) => w,
@@ -501,6 +507,7 @@ impl MegakernelProgram {
         inst.set_int(3, kv_stride as i32);
         instructions.push(inst);
         kv_write_indices.push((k_copy_idx, v_copy_idx));
+        kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
 
         // 7. GQA attention (seq_len updated per step)
         let gqa_idx = instructions.len();
@@ -595,44 +602,49 @@ impl MegakernelProgram {
         instructions.push(inst);
     }
 
-    /// Update per-step fields (token_id, position) and re-upload changed instructions.
+    /// Update per-step fields (token_id, position) and upload only changed instructions.
     pub fn update_step(&mut self, token_id: u32, position: u32) -> HipResult<()> {
         let cfg_nkh_hd = 512usize; // nkh * hd = 2 * 256
+        let mut changed: Vec<usize> = Vec::new();
 
         // Update embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
+        changed.push(self.embedding_inst_idx);
 
         // Update KV cache write offsets (position-dependent)
         let pos_offset = position as usize * cfg_nkh_hd;
-        for &(k_idx, v_idx) in &self.kv_write_indices {
-            // The dst pointer needs to be base + pos_offset
-            // We stored the base pointer at compile time. We need to reconstruct.
-            // Actually the base ptr is in the kv_cache which we don't have here.
-            // Let's store the base pointers and update.
-            let k_base = self.instructions[k_idx].words[1]; // original base
-            let v_base = self.instructions[v_idx].words[1];
-            // This won't work if we already offset it. We need to store bases separately.
-            // For now: the first call has position=0, so base is correct.
-            // Subsequent calls: we'd need to track base pointers.
-            // TODO: store base pointers at compile time
+        for (layer_i, &(k_idx, v_idx)) in self.kv_write_indices.iter().enumerate() {
+            let (k_base, v_base) = self.kv_base_ptrs[layer_i];
+            let k_ptr = k_base + (pos_offset * std::mem::size_of::<f32>()) as u64;
+            let v_ptr = v_base + (pos_offset * std::mem::size_of::<f32>()) as u64;
+            self.instructions[k_idx].words[1] = k_ptr;
+            self.instructions[v_idx].words[1] = v_ptr;
+            changed.push(k_idx);
+            changed.push(v_idx);
         }
 
         // Update GQA attention seq_len
         let seq_len = position + 1;
         for &idx in &self.gqa_attn_inst_indices {
             self.instructions[idx].set_int(8, seq_len as i32);
+            changed.push(idx);
         }
 
-        // Update position_ids on device (mRoPE reads from device memory)
-        // The position_ids buffer is already on device; we update it via the model's
-        // activations. The caller must update activations.position_ids before calling execute().
-
-        // Re-upload the full program (simple approach; could optimize to partial updates)
-        let mut flat: Vec<u64> = Vec::with_capacity(self.instructions.len() * INST_SIZE);
-        for inst in &self.instructions {
-            flat.extend_from_slice(&inst.words);
+        // Upload only the changed instructions (each is INST_SIZE u64s = 128 bytes)
+        let dev_ptr = self.device_program.as_mut_ptr();
+        for inst_idx in changed {
+            let words = &self.instructions[inst_idx].words;
+            let byte_offset = inst_idx * INST_SIZE * std::mem::size_of::<u64>();
+            let size = INST_SIZE * std::mem::size_of::<u64>();
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpy(
+                    (dev_ptr as *mut u8).add(byte_offset).cast(),
+                    words.as_ptr().cast(),
+                    size,
+                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                )
+            })?;
         }
-        self.device_program.copy_from_host(&flat)?;
         Ok(())
     }
 
