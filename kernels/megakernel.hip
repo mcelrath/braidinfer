@@ -83,13 +83,16 @@ __device__ __forceinline__ float inst_float(const u64* inst, int idx) {
 
 // OP_RMSNORM: y = x * rsqrt(mean(x²)+eps) * (1+weight)
 // args: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
-// grid_x = 1 (single row for decode)
+// grid_x = batch (default 1). vblock = batch index. Each block normalizes one row.
 __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
+    float* output_base = inst_fptr(inst, 1);
+    const float* input_base = inst_fptr(inst, 2);
     const unsigned short* weight = inst_u16ptr(inst, 3);
     int hidden_size = inst_int(inst, 4);
     float eps = inst_float(inst, 5);
+
+    const float* input = input_base + (long long)vblock * hidden_size;
+    float* output = output_base + (long long)vblock * hidden_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -115,16 +118,24 @@ __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
 }
 
 // OP_LINEAR_PROJ: y = W @ x  (one virtual block per output row)
-// args: [1]=output, [2]=weight, [3]=input, [4]=out_dim, [5]=in_dim
+// args: [1]=output, [2]=weight, [3]=input, [4]=out_dim, [5]=in_dim, [6]=batch_size (0 or 1 = single token)
+// When batch > 1: input is [batch × in_dim], output is [batch × out_dim].
+// vblock encodes (batch_idx * out_dim + row).
 __device__ void op_linear_proj(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
+    float* output_base = inst_fptr(inst, 1);
     const unsigned short* weight = inst_u16ptr(inst, 2);
-    const float* input = inst_fptr(inst, 3);
+    const float* input_base = inst_fptr(inst, 3);
     int out_dim = inst_int(inst, 4);
     int in_dim = inst_int(inst, 5);
+    int batch = inst_int(inst, 6);
+    if (batch <= 1) batch = 1;
 
-    int row = vblock;
-    if (row >= out_dim) return;
+    int row = vblock % out_dim;
+    int batch_idx = vblock / out_dim;
+    if (batch_idx >= batch) return;
+
+    const float* input = input_base + (long long)batch_idx * in_dim;
+    float* output = output_base + (long long)batch_idx * out_dim;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -132,7 +143,6 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
 
     float acc = 0.0f;
 
-    // 128-bit vectorized loads: 8 bf16 values per load
     const int vec_elements = 8;
     const int vec_count = in_dim / vec_elements;
     const ull2* w_vec = (const ull2*)w;
@@ -352,19 +362,27 @@ __device__ void op_residual_add(const u64* inst, u32 vblock) {
 
 // OP_FFN_GATE_UP: fused RMSNorm + gate_proj + up_proj + SiLU*up
 // args: [1]=scratch, [2]=input, [3]=rms_weight, [4]=w_gate, [5]=w_up,
-//       [6]=hidden_size, [7]=intermediate_size, [8]=eps
+//       [6]=hidden_size, [7]=intermediate_size, [8]=eps, [9]=batch_size (0/1=single)
+// When batch > 1: input is [batch × hidden_size], scratch is [batch × intermediate_size].
+// vblock = batch_idx * intermediate_size + row.
 __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
-    float* scratch = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
+    float* scratch_base = inst_fptr(inst, 1);
+    const float* input_base = inst_fptr(inst, 2);
     const unsigned short* rms_weight = inst_u16ptr(inst, 3);
     const unsigned short* w_gate = inst_u16ptr(inst, 4);
     const unsigned short* w_up = inst_u16ptr(inst, 5);
     int hidden_size = inst_int(inst, 6);
     int intermediate_size = inst_int(inst, 7);
     float eps = inst_float(inst, 8);
+    int batch = inst_int(inst, 9);
+    if (batch <= 1) batch = 1;
 
-    int row = vblock;
-    if (row >= intermediate_size) return;
+    int row = vblock % intermediate_size;
+    int batch_idx = vblock / intermediate_size;
+    if (batch_idx >= batch) return;
+
+    const float* input = input_base + (long long)batch_idx * hidden_size;
+    float* scratch = scratch_base + (long long)batch_idx * intermediate_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -436,17 +454,26 @@ __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
 }
 
 // OP_FFN_DOWN_RES: down_proj(scratch) + residual
-// args: [1]=output, [2]=residual, [3]=w_down, [4]=scratch, [5]=hidden_size, [6]=intermediate_size
+// args: [1]=output, [2]=residual, [3]=w_down, [4]=scratch, [5]=hidden_size, [6]=intermediate_size, [7]=batch_size
+// When batch > 1: output/residual are [batch × hidden_size], scratch is [batch × intermediate_size].
+// vblock = batch_idx * hidden_size + row.
 __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* residual = inst_fptr(inst, 2);
+    float* output_base = inst_fptr(inst, 1);
+    const float* residual_base = inst_fptr(inst, 2);
     const unsigned short* w_down = inst_u16ptr(inst, 3);
-    const float* scratch = inst_fptr(inst, 4);
+    const float* scratch_base = inst_fptr(inst, 4);
     int hidden_size = inst_int(inst, 5);
     int intermediate_size = inst_int(inst, 6);
+    int batch = inst_int(inst, 7);
+    if (batch <= 1) batch = 1;
 
-    int row = vblock;
-    if (row >= hidden_size) return;
+    int row = vblock % hidden_size;
+    int batch_idx = vblock / hidden_size;
+    if (batch_idx >= batch) return;
+
+    float* output = output_base + (long long)batch_idx * hidden_size;
+    const float* residual = residual_base + (long long)batch_idx * hidden_size;
+    const float* scratch = scratch_base + (long long)batch_idx * intermediate_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
