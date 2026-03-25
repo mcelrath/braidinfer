@@ -38,10 +38,18 @@ impl TokenConfig {
         // Also check config.json text_config.eos_token_id
         if let Ok(data) = std::fs::read_to_string(model_dir.join("config.json")) {
             if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(eos) = cfg.pointer("/text_config/eos_token_id").and_then(|v| v.as_u64()) {
-                    let eos = eos as u32;
-                    if !eos_token_ids.contains(&eos) {
-                        eos_token_ids.push(eos);
+                if let Some(val) = cfg.pointer("/text_config/eos_token_id") {
+                    let ids: Vec<u32> = if let Some(n) = val.as_u64() {
+                        vec![n as u32]
+                    } else if let Some(arr) = val.as_array() {
+                        arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect()
+                    } else {
+                        vec![]
+                    };
+                    for eos in ids {
+                        if !eos_token_ids.contains(&eos) {
+                            eos_token_ids.push(eos);
+                        }
                     }
                 }
             }
