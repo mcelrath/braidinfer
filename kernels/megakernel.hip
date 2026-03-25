@@ -784,7 +784,8 @@ __device__ void op_output_gate(const u64* inst, u32 vblock) {
 // args: [1]=output, [2]=q (post-RoPE), [3]=page_table (u64* chunk base ptrs),
 //       [4]=position_table (int* per-token positions), [5]=inv_freq (float*, rope_dim/2 freqs),
 //       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len,
-//       [10]=chunk_tokens(64), [11]=rope_dim, [12]=layer_k_offset_bytes, [13]=layer_v_offset_bytes
+//       [10]=chunk_tokens(64), [11]=rope_dim, [12]=layer_k_offset_bytes, [13]=layer_v_offset_bytes,
+//       [14]=partial_state (float* or 0; if non-null, init (m,d,v_acc) from quantized pass scratch)
 __device__ void op_attn_paged(const u64* inst, u32 vblock) {
     float* output          = inst_fptr(inst, 1);
     const float* q         = inst_fptr(inst, 2);
@@ -799,6 +800,7 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
     int rope_dim           = inst_int(inst, 11);
     long long layer_k_offset = (long long)(u64)(inst[12]);
     long long layer_v_offset = (long long)(u64)(inst[13]);
+    const float* partial_state = (const float*)(inst[14]); // 0 = none
 
     int q_head = vblock;
     if (q_head >= num_q_heads) return;
@@ -817,9 +819,6 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 
     int rope_pairs = rope_dim / 2;
 
-    // Precompute per-step trig increments (model-constant inv_freq).
-    // Thread tid < rope_pairs computes cos_freq[tid] = cos(inv_freq[tid])
-    // These are the same for every chunk so compute once.
     float cos_freq = 0.0f, sin_freq = 0.0f;
     if (tid < rope_pairs) {
         float freq = inv_freq[tid];
@@ -827,10 +826,18 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
         sin_freq = sinf(freq);
     }
 
-    // Online softmax state
+    // Online softmax state — init from quantized pass if available
     float m = -1e30f, d = 0.0f;
-    // V accumulation: head_dim=256, block_size=256, so exactly 1 element per thread
     float v_acc = 0.0f;
+    if (partial_state != nullptr) {
+        int stride_per_head = 2 + head_dim;
+        const float* ps = partial_state + q_head * stride_per_head;
+        m = ps[0];
+        d = ps[1];
+        if (tid < head_dim) {
+            v_acc = ps[2 + tid];
+        }
+    }
 
     int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
 
@@ -924,21 +931,18 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 }
 
 // OP_ATTN_PAGED_Q: Paged GQA attention with residual_pc int4 quantized KV cache.
-// Same as OP_ATTN_PAGED but reads quantized chunks and dequantizes K/V on the fly.
-// args: [1]=output, [2]=q (post-RoPE), [3]=page_table (u64*),
+// Writes PARTIAL softmax state to scratch buffer (not final output).
+// OP_ATTN_PAGED reads the scratch and merges with f32 active chunk.
+// args: [1]=scratch (float*, layout [nqh × (2+head_dim)]: m, d, v_acc per head),
+//       [2]=q (post-RoPE), [3]=page_table (u64*, quantized chunks only),
 //       [4]=position_table (int*), [5]=inv_freq (float*),
-//       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len,
+//       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len (of quantized chunks),
 //       [10]=chunk_tokens(64), [11]=rope_dim,
 //       [12]=layer_k_q1data_off, [13]=layer_k_q1scale_off,
 //       [14]=layer_k_rdata_off, [15]=layer_k_rscale_off
-// V offsets are K offsets + per_kv stride (passed as separate instruction or computed).
-// For simplicity: V offsets = K offsets + per_kv_bytes, passed in a second instruction.
-// REVISED: Use two instructions — first for K offsets, second for V offsets.
-// Actually, pack both: args [12-15] = K offsets, V data and scale follow at known stride.
-// The stride per_kv = 2 * (data_bytes + scale_bytes) where data_bytes = nkh * ct * hd / 2,
-// scale_bytes = nkh * hd * 4.
+// V offsets = K offsets + per_kv stride, computed from nkh/ct/hd.
 __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
-    float* output          = inst_fptr(inst, 1);
+    float* scratch         = inst_fptr(inst, 1);
     const float* q         = inst_fptr(inst, 2);
     const u64* page_table  = (const u64*)(inst[3]);
     const int* position_table = (const int*)(inst[4]);
@@ -1115,9 +1119,15 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
         }
     }
 
-    float* out_ptr = output + q_head * head_dim;
+    // Write partial state: [m, d, v_acc[0..head_dim]] per head
+    int stride_per_head = 2 + head_dim;
+    float* head_scratch = scratch + q_head * stride_per_head;
+    if (tid == 0) {
+        head_scratch[0] = m;
+        head_scratch[1] = d_softmax;
+    }
     if (tid < head_dim) {
-        out_ptr[tid] = v_acc / d_softmax;
+        head_scratch[2 + tid] = v_acc;
     }
 }
 

@@ -278,37 +278,62 @@ fn test_attn_paged_quant_vs_f32() {
         (6, nkh as u64), (7, hd as u64), (8, ct as u64),
     ]);
 
-    // Run quantized attention
+    // --- Two-phase quantized attention ---
+    // Phase 1: OP_ATTN_PAGED_Q over quantized chunk → scratch
+    // Phase 2: OP_ATTN_PAGED with partial_state=scratch, seq_len=0 → normalize only
+
     let quant_chunk_ptr = quant_chunk_buf.as_ptr() as u64;
     page_table_data[0] = quant_chunk_ptr;
     page_table_buf.copy_from_host(&page_table_data).expect("update pt");
 
-    let mut output_q_buf = DeviceBuffer::<f32>::alloc(device, nqh * hd).expect("alloc out_q");
+    // Scratch buffer: [nqh × (2 + head_dim)] floats
+    let scratch_elems = nqh * (2 + hd);
+    let mut scratch_buf = DeviceBuffer::<f32>::alloc(device, scratch_elems).expect("alloc scratch");
+
     let attn_q_inst = build_instruction(OP_ATTN_PAGED_Q, nqh as u32, &[
-        (1, output_q_buf.as_mut_ptr() as u64),
+        (1, scratch_buf.as_mut_ptr() as u64),  // scratch (not final output)
         (2, q_buf.as_ptr() as u64),
         (3, page_table_buf.as_ptr() as u64),
         (4, pos_buf.as_ptr() as u64),
         (5, inv_freq_buf.as_ptr() as u64),
         (6, nqh as u64), (7, nkh as u64), (8, hd as u64),
         (9, seq_len as u64), (10, ct as u64), (11, rope_dim as u64),
-        (12, 0u64),                          // k_q1data_off
-        (13, data_bytes as u64),             // k_q1scale_off
-        (14, (data_bytes + scale_bytes) as u64), // k_rdata_off
-        (15, (2 * data_bytes + scale_bytes) as u64), // k_rscale_off
+        (12, 0u64),
+        (13, data_bytes as u64),
+        (14, (data_bytes + scale_bytes) as u64),
+        (15, (2 * data_bytes + scale_bytes) as u64),
     ]);
 
-    // Build program: quantize K, quantize V, attention, halt
+    // Phase 2: OP_ATTN_PAGED with partial_state, seq_len=0 (no f32 chunks to process)
+    // This just normalizes v_acc/d from the scratch buffer
+    let mut output_q_buf = DeviceBuffer::<f32>::alloc(device, nqh * hd).expect("alloc out_q");
+    let mut empty_pt_buf = DeviceBuffer::<u64>::alloc(device, 1).expect("alloc empty pt");
+    empty_pt_buf.copy_from_host(&[0u64]).expect("copy empty pt");
+    let merge_inst = build_instruction(OP_ATTN_PAGED, nqh as u32, &[
+        (1, output_q_buf.as_mut_ptr() as u64),
+        (2, q_buf.as_ptr() as u64),
+        (3, empty_pt_buf.as_ptr() as u64),
+        (4, pos_buf.as_ptr() as u64),
+        (5, inv_freq_buf.as_ptr() as u64),
+        (6, nqh as u64), (7, nkh as u64), (8, hd as u64),
+        (9, 0u64),   // seq_len=0: no f32 chunks
+        (10, ct as u64), (11, rope_dim as u64),
+        (12, 0u64), (13, 0u64),
+        (14, scratch_buf.as_ptr() as u64),  // partial_state from quantized pass
+    ]);
+
+    // Build program: quantize K, quantize V, quant attention, merge, halt
     let mut prog2: Vec<u64> = Vec::new();
     prog2.extend_from_slice(&quant_k_inst);
     prog2.extend_from_slice(&quant_v_inst);
     prog2.extend_from_slice(&attn_q_inst);
+    prog2.extend_from_slice(&merge_inst);
     prog2.extend_from_slice(&halt);
 
     let mut prog2_buf = DeviceBuffer::<u64>::alloc(device, prog2.len()).expect("alloc prog2");
     prog2_buf.copy_from_host(&prog2).expect("copy prog2");
 
-    let num_inst2: i32 = 4;
+    let num_inst2: i32 = 5;
     let prog2_ptr = prog2_buf.as_ptr();
     let mut args2: Vec<*mut std::ffi::c_void> = vec![
         &prog2_ptr as *const _ as *mut std::ffi::c_void,
