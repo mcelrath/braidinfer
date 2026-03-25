@@ -39,6 +39,8 @@ extern "C" __global__ void gqa_attention_decode_f32(
     float* partial = shmem;
 
     // Single-pass online softmax with register V accumulation
+    // acc[] holds one element per strided position; head_dim/block_size must be <= 4
+    if (head_dim > 4 * block_size) __builtin_trap();
     float m = -1e30f;
     float d = 0.0f;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};

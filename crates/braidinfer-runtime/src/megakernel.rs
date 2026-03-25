@@ -609,7 +609,7 @@ impl MegakernelProgram {
     }
 
     /// Update per-step fields (token_id, position) and upload only changed instructions.
-    pub fn update_step(&mut self, token_id: u32, position: u32) -> HipResult<()> {
+    pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
         assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
 
         let cfg_nkh_hd = 512usize; // nkh * hd = 2 * 256
@@ -622,11 +622,12 @@ impl MegakernelProgram {
         // Update position_ids on device ([temporal, height, width] = all equal position for text)
         let pos_data = [position as i32, position as i32, position as i32];
         braidinfer_hip::error::check(unsafe {
-            braidinfer_hip::ffi::hipMemcpy(
+            braidinfer_hip::ffi::hipMemcpyAsync(
                 self.position_ids_dev_ptr as *mut std::ffi::c_void,
                 pos_data.as_ptr().cast(),
                 3 * std::mem::size_of::<i32>(),
                 braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                stream.raw(),
             )
         })?;
 
@@ -656,11 +657,12 @@ impl MegakernelProgram {
             let byte_offset = inst_idx * INST_SIZE * std::mem::size_of::<u64>();
             let size = INST_SIZE * std::mem::size_of::<u64>();
             braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
+                braidinfer_hip::ffi::hipMemcpyAsync(
                     (dev_ptr as *mut u8).add(byte_offset).cast(),
                     words.as_ptr().cast(),
                     size,
                     braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                    stream.raw(),
                 )
             })?;
         }

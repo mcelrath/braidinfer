@@ -613,6 +613,8 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
     int block_size = blockDim.x;
 
     // Single-pass online softmax with register V accumulation
+    // acc[] holds one element per strided position; head_dim/block_size must be <= 4
+    if (head_dim > 4 * block_size) __builtin_trap();
     float m = -1e30f, d = 0.0f;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int t = 0; t < seq_len; t++) {

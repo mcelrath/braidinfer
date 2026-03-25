@@ -1036,7 +1036,7 @@ impl Qwen35Model {
             self.megakernel = Some(MegakernelProgram::compile(self)?);
         }
         let mk = self.megakernel.as_mut().unwrap();
-        mk.update_step(token_id, position)?;
+        mk.update_step(token_id, position, &self.stream)?;
         mk.execute(&self.stream)?;
 
         self.stream.synchronize()?;
