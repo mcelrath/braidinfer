@@ -306,7 +306,7 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
     int key_dim = inst_int(inst, 8);
     int value_dim = inst_int(inst, 9);
 
-    const int h = vblock;  // one block per head
+    const int h = vblock;
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
@@ -319,10 +319,12 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
     float* sh = state + h * key_dim * value_dim;
     float* oh = output + h * value_dim;
 
+    // Shared memory: [0..block_size) for reductions, [block_size..block_size+key_dim) for k_norm cache
     extern __shared__ float shared[];
     float* sq = shared;
     float* sk = shared + block_size;
 
+    // Q/K norm reduction
     float sq_acc = 0.0f, sk_acc = 0.0f;
     for (int i = tid; i < key_dim; i += block_size) {
         sq_acc += qh[i] * qh[i];
@@ -339,18 +341,38 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
     float k_inv_norm = rsqrtf(sk[0] + 1e-6f);
     float q_scale = q_inv_norm * rsqrtf((float)key_dim);
 
+    // Pre-normalize k into shared memory (avoids redundant k[i]*k_inv_norm in inner loops)
+    float* k_sh = shared + block_size;
+    for (int i = tid; i < key_dim; i += block_size) k_sh[i] = kh[i] * k_inv_norm;
+    __syncthreads();
+
+    // Decay state: all 256 threads participate
     int total = key_dim * value_dim;
     for (int idx = tid; idx < total; idx += block_size) sh[idx] *= decay;
     __syncthreads();
 
+    // Delta rule: compute kv_mem[j] = S[j,:] . k_norm, then delta[j] = beta*(v[j] - kv_mem[j])
+    // Use shared memory to store kv_mem results (reuse sq region)
+    float* kv_mem_sh = shared; // shared[0..value_dim)
+
+    // Step 1: kv_mem[j] = dot(S[j,:], k_norm) — threads 0..value_dim-1
     for (int j = tid; j < value_dim; j += block_size) {
         float kv_mem = 0.0f;
-        for (int i = 0; i < key_dim; i++) kv_mem += sh[j * key_dim + i] * (kh[i] * k_inv_norm);
-        float delta = (vh[j] - kv_mem) * beta;
-        for (int i = 0; i < key_dim; i++) sh[j * key_dim + i] += (kh[i] * k_inv_norm) * delta;
+        for (int i = 0; i < key_dim; i++) kv_mem += sh[j * key_dim + i] * k_sh[i];
+        kv_mem_sh[j] = (vh[j] - kv_mem) * beta; // store delta directly
     }
     __syncthreads();
 
+    // Step 2: S[j,i] += k_norm[i] * delta[j] — i-major loop, ALL threads participate
+    // Each thread handles a stripe of the (j,i) space
+    for (int idx = tid; idx < total; idx += block_size) {
+        int j = idx / key_dim;
+        int i = idx % key_dim;
+        sh[idx] += k_sh[i] * kv_mem_sh[j];
+    }
+    __syncthreads();
+
+    // Q readout: output[j] = S[j,:] . q_scaled
     for (int j = tid; j < value_dim; j += block_size) {
         float sum = 0.0f;
         for (int i = 0; i < key_dim; i++) sum += sh[j * key_dim + i] * (qh[i] * q_scale);
