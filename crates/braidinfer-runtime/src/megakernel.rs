@@ -107,9 +107,15 @@ pub struct MegakernelProgram {
     page_table: Option<DeviceBuffer<u64>>,     // array of chunk base pointers, uploaded per step
     position_table: Option<DeviceBuffer<i32>>, // position per token, uploaded per step
     attn_paged_inst_indices: Vec<usize>,        // indices of OP_ATTN_PAGED instructions
+    attn_quant_inst_indices: Vec<usize>,        // indices of OP_ATTN_PAGED_Q instructions (quantized KV)
     last_page_table_len: usize,                 // track when a new chunk was added
     // kv_stride for paged KV write offset computation (nkh * hd)
     kv_stride_paged: usize,
+    // Quantized KV support
+    quant_scratch: Option<DeviceBuffer<f32>>,   // partial state: [nqh × (2+hd)] per attn layer
+    quant_page_table: Option<DeviceBuffer<u64>>,// page table for sealed quantized chunks
+    last_quant_page_table_len: usize,
+    quantized_kv: bool,                         // whether this program uses quantized KV
     // Prevent Send — contains raw GPU device pointers as u64
     _not_send: std::marker::PhantomData<*mut ()>,
 }
@@ -250,6 +256,7 @@ impl MegakernelProgram {
 
         // Layers
         let mut attn_paged_inst_indices = Vec::new();
+        let mut attn_quant_inst_indices = Vec::new();
         let mut attn_layer_count = 0usize;
 
         let mut gdn_idx = 0usize;
@@ -264,6 +271,7 @@ impl MegakernelProgram {
                         &mut instructions, &mut mrope_inst_indices,
                         &mut kv_write_indices, &mut kv_base_ptrs,
                         &mut attn_paged_inst_indices,
+                        &mut attn_quant_inst_indices,
                     );
                 } else {
                     Self::compile_attention_layer(
@@ -348,8 +356,13 @@ impl MegakernelProgram {
             page_table: None,
             position_table: None,
             attn_paged_inst_indices,
+            attn_quant_inst_indices,
             last_page_table_len: 0,
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
+            quant_scratch: None,
+            quant_page_table: None,
+            last_quant_page_table_len: 0,
+            quantized_kv: false,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
             _not_send: std::marker::PhantomData,
@@ -434,7 +447,7 @@ impl MegakernelProgram {
                     &AttentionVariant::Prefill { kv_cache, start_pos },
                     &mut instructions,
                     &mut Vec::new(), &mut Vec::new(), &mut Vec::new(), &mut Vec::new(),
-                    &mut Vec::new(),
+                    &mut Vec::new(), &mut Vec::new(),
                 );
 
                 // Batched FFN
@@ -725,8 +738,13 @@ impl MegakernelProgram {
             page_table: None,
             position_table: None,
             attn_paged_inst_indices: Vec::new(),
+            attn_quant_inst_indices: Vec::new(),
             last_page_table_len: 0,
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
+            quant_scratch: None,
+            quant_page_table: None,
+            last_quant_page_table_len: 0,
+            quantized_kv: false,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
             _not_send: std::marker::PhantomData,
@@ -746,7 +764,6 @@ impl MegakernelProgram {
         cfg: &ModelConfig,
         w: &AttentionLayerWeights,
         act: &ActivationBuffers,
-        // Prefill overrides: if Some, use prefill pointers and batch=n; else batch=1 and act.*
         prefill: Option<(&PrefillBuffers, usize)>,
         variant: &AttentionVariant,
         instructions: &mut Vec<Instruction>,
@@ -755,6 +772,7 @@ impl MegakernelProgram {
         kv_write_indices: &mut Vec<Vec<(usize, usize)>>,
         kv_base_ptrs: &mut Vec<(u64, u64)>,
         attn_paged_indices: &mut Vec<usize>,
+        attn_quant_indices: &mut Vec<usize>,
     ) {
         let hs = cfg.hidden_size;
         let nqh = cfg.num_q_heads;
@@ -1001,7 +1019,33 @@ impl MegakernelProgram {
                     instructions.push(inst);
                 }
 
-                // OP_ATTN_PAGED
+                // OP_ATTN_PAGED_Q: quantized attention (grid_x=0 initially, patched when chunks seal)
+                let quant_idx = instructions.len();
+                attn_quant_indices.push(quant_idx);
+                {
+                    use crate::paged_kv::quantized_kv_offsets;
+                    let (q1d, q1s, rd_off, rs) = quantized_kv_offsets(cfg, chunk_tokens, *attn_layer_index, false);
+                    let mut inst = Instruction::new(OP_ATTN_PAGED_Q, 0); // grid_x=0: skip until chunks are quantized
+                    inst.set_int(1, 0);  // scratch ptr — patched when quantized KV is enabled
+                    inst.set_ptr(2, q_attn_ptr);
+                    inst.set_int(3, 0);  // quant page_table — patched per step
+                    inst.set_int(4, 0);  // position_table — patched per step
+                    inst.set_ptr(5, act.inv_freq.as_ptr());
+                    inst.set_int(6, nqh as i32);
+                    inst.set_int(7, nkh as i32);
+                    inst.set_int(8, hd as i32);
+                    inst.set_int(9, 0);  // quant_seq_len — patched per step
+                    inst.set_int(10, chunk_tokens as i32);
+                    inst.set_int(11, rd as i32);
+                    inst.words[12] = q1d as u64;
+                    inst.words[13] = q1s as u64;
+                    inst.words[14] = rd_off as u64;
+                    inst.words[15] = rs as u64;
+                    inst.set_no_sync(); // no sync between quant and f32 attention
+                    instructions.push(inst);
+                }
+
+                // OP_ATTN_PAGED: f32 attention on active chunk + merge from scratch
                 let paged_idx = instructions.len();
                 attn_paged_indices.push(paged_idx);
                 {
@@ -1019,6 +1063,7 @@ impl MegakernelProgram {
                     inst.set_int(11, rd as i32);
                     inst.words[12] = layer_k_offset_bytes;
                     inst.words[13] = layer_v_offset_bytes;
+                    inst.words[14] = 0; // partial_state — patched when quantized KV enabled
                     instructions.push(inst);
                 }
             }
@@ -1338,7 +1383,7 @@ impl MegakernelProgram {
             cfg, w, act, None,
             &AttentionVariant::FlatKv { kv_cache },
             instructions, mrope_indices, gqa_indices, kv_write_indices, kv_base_ptrs,
-            &mut Vec::new(),
+            &mut Vec::new(), &mut Vec::new(),
         );
     }
 
@@ -1354,6 +1399,7 @@ impl MegakernelProgram {
         kv_write_indices: &mut Vec<Vec<(usize, usize)>>,
         kv_base_ptrs: &mut Vec<(u64, u64)>,
         attn_paged_indices: &mut Vec<usize>,
+        attn_quant_indices: &mut Vec<usize>,
     ) {
         let w = match layer {
             LayerWeights::Attention(w) => w,
@@ -1363,7 +1409,7 @@ impl MegakernelProgram {
             cfg, w, act, None,
             &AttentionVariant::PagedKv { kv_cache, attn_layer_index },
             instructions, mrope_indices, &mut Vec::new(), kv_write_indices, kv_base_ptrs,
-            attn_paged_indices,
+            attn_paged_indices, attn_quant_indices,
         );
     }
 
