@@ -1753,6 +1753,10 @@ impl Qwen35Model {
             cache.v.copy_from_host(&zeros_kv)?;
         }
         self.seq_len = 0;
+        // Free quantized KV slots back to pool
+        if let (Some(seq), Some(q_alloc)) = (self.paged_seq.as_mut(), self.quant_allocator.as_mut()) {
+            seq.free_quant_slots(q_alloc);
+        }
         Ok(())
     }
 }

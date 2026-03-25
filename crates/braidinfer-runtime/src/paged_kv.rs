@@ -268,6 +268,8 @@ pub struct SequenceState {
     /// reads from this buffer and writes to a quantized chunk slot.
     /// None when using unquantized (f32) paged KV.
     pub staging_buffer: Option<DeviceBuffer<u8>>,
+    /// Quantized chunk slot indices, parallel to `chunks`. Freed on reset/drop.
+    pub quant_slots: Vec<u32>,
 }
 
 impl SequenceState {
@@ -278,6 +280,7 @@ impl SequenceState {
             kv_version: 0,
             chunk_tokens,
             staging_buffer: None,
+            quant_slots: Vec::new(),
         }
     }
 
@@ -291,7 +294,15 @@ impl SequenceState {
             kv_version: 0,
             chunk_tokens,
             staging_buffer: Some(staging),
+            quant_slots: Vec::new(),
         })
+    }
+
+    /// Free all quantized slots back to the allocator. Call on sequence reset/drop.
+    pub fn free_quant_slots(&mut self, quant_allocator: &mut PageAllocator) {
+        for slot in self.quant_slots.drain(..) {
+            quant_allocator.free(slot);
+        }
     }
 
     /// Append a token slot. Allocates a new chunk when the current one is full.

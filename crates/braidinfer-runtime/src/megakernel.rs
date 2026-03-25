@@ -1744,20 +1744,20 @@ impl MegakernelProgram {
                     let f32_ptr = allocator.slot_ptr(sealed_chunk.slot_index());
 
                     // Allocate quantized chunk slot
-                    let (_q_slot, q_ptr) = q_alloc.alloc()
+                    let (q_slot, q_ptr) = q_alloc.alloc()
                         .ok_or(braidinfer_hip::HipError(braidinfer_hip::ffi::hipErrorOutOfMemory))?;
 
                     // Run quantize kernel
                     self.quantize_sealed_chunk(f32_ptr, q_ptr, cfg, stream)?;
                     stream.synchronize()?;
 
+                    // Track slot for cleanup
+                    seq.quant_slots.push(q_slot);
+
                     // Upload quantized page table
-                    let num_sealed = seq.chunks.len(); // current chunk count = sealed count (before append)
+                    let num_sealed = seq.chunks.len();
                     let quant_pt = self.quant_page_table.as_mut()
                         .expect("quant_page_table not allocated");
-                    // Build host array of quantized chunk pointers
-                    // We need to track quantized slot indices somewhere.
-                    // For now, write the pointer directly at index num_sealed-1.
                     let q_ptr_val = q_ptr as u64;
                     let offset = (num_sealed - 1) * std::mem::size_of::<u64>();
                     braidinfer_hip::error::check(unsafe {
