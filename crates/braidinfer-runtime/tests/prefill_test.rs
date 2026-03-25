@@ -141,6 +141,29 @@ fn test_prefill_benchmark() {
     let elapsed = start.elapsed();
     let per_token_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
     let tokens_per_sec = n as f64 / elapsed.as_secs_f64();
-    println!("Prefill {n} tokens: {:.3}s = {per_token_ms:.2} ms/token = {tokens_per_sec:.1} tok/s",
+    println!("Sequential prefill {n} tokens: {:.3}s = {per_token_ms:.2} ms/token = {tokens_per_sec:.1} tok/s",
+        elapsed.as_secs_f64());
+
+    // Batched prefill benchmark (64 tokens = 1 chunk)
+    let nb = 64;
+    let batch_tokens: Vec<u32> = (0..nb).map(|i| 9707 + (i % 10) as u32).collect();
+    let mut model2 = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut prefill_bufs = PrefillBuffers::alloc(device, model2.config(), nb).expect("alloc");
+    let program = MegakernelProgram::compile_prefill(&model2, &batch_tokens, 0, &mut prefill_bufs).expect("compile");
+    println!("Batched program: {} instructions", program.instruction_count());
+    // Warmup
+    program.execute(model2.stream()).expect("warmup");
+    model2.stream().synchronize().expect("sync");
+
+    let mut model3 = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut prefill_bufs2 = PrefillBuffers::alloc(device, model3.config(), nb).expect("alloc");
+    let program2 = MegakernelProgram::compile_prefill(&model3, &batch_tokens, 0, &mut prefill_bufs2).expect("compile");
+    let start = Instant::now();
+    program2.execute(model3.stream()).expect("execute");
+    model3.stream().synchronize().expect("sync");
+    let elapsed = start.elapsed();
+    let per_token_ms = elapsed.as_secs_f64() * 1000.0 / nb as f64;
+    let tokens_per_sec = nb as f64 / elapsed.as_secs_f64();
+    println!("Batched prefill {nb} tokens: {:.3}s = {per_token_ms:.2} ms/token = {tokens_per_sec:.1} tok/s",
         elapsed.as_secs_f64());
 }
