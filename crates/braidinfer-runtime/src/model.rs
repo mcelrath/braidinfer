@@ -539,9 +539,42 @@ impl std::error::Error for ModelError {}
 
 // ---- Helper: load a tensor by name, convert to f32, upload to GPU ----
 
-/// Load a tensor as f32 from safetensors. For f32 on disk, zero-copy reinterpret.
-/// For bf16 on disk, converts to f32 on the CPU.
-fn load_weight(
+/// Load a tensor's raw bytes from safetensors directly to GPU. Zero-copy from mmap.
+/// Returns DeviceBuffer<u8> containing the on-disk representation.
+fn load_tensor_raw(
+    st: &SafeTensorSet,
+    name: &str,
+    device: DeviceId,
+) -> Result<DeviceBuffer<u8>, ModelError> {
+    let raw = st.tensor_data(name)
+        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
+    let mut buf = DeviceBuffer::<u8>::alloc(device, raw.len())?;
+    buf.copy_from_host(raw)?;
+    Ok(buf)
+}
+
+/// Load a bf16 tensor, returning a typed DeviceBuffer<u16>.
+/// The underlying data is copied directly from mmap — zero conversion.
+fn load_weight_bf16(
+    st: &SafeTensorSet,
+    name: &str,
+    device: DeviceId,
+    expected_len: usize,
+) -> Result<DeviceBuffer<u16>, ModelError> {
+    let raw = st.tensor_data(name)
+        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
+    assert_eq!(raw.len(), expected_len * 2, "weight {name}: expected {} bytes, got {}", expected_len * 2, raw.len());
+    let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
+    let data: &[u16] = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
+    };
+    buf.copy_from_host(data)?;
+    Ok(buf)
+}
+
+/// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
+/// Only used for the few tensors that need f32 on the GPU (A_log, output_norm).
+fn load_weight_f32(
     st: &SafeTensorSet,
     name: &str,
     device: DeviceId,
@@ -567,36 +600,10 @@ fn load_weight(
                 })
                 .collect()
         }
-        other => panic!("load_weight: unsupported dtype {other:?} for {name}"),
+        other => panic!("load_weight_f32: unsupported dtype {other:?} for {name}"),
     };
     let mut buf = DeviceBuffer::<f32>::alloc(device, expected_len)?;
     buf.copy_from_host(&data)?;
-    Ok(buf)
-}
-
-/// Load a tensor as bf16 (u16) from safetensors. For bf16 on disk, zero-copy
-/// reinterpret of the mmap'd bytes — no allocation, direct hipMemcpy from mmap.
-fn load_weight_bf16(
-    st: &SafeTensorSet,
-    name: &str,
-    device: DeviceId,
-    expected_len: usize,
-) -> Result<DeviceBuffer<u16>, ModelError> {
-    let raw = st.tensor_data(name)
-        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
-    assert_eq!(
-        raw.len(),
-        expected_len * 2,
-        "weight {name}: expected {} bytes, got {}",
-        expected_len * 2,
-        raw.len()
-    );
-    let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
-    // raw is &[u8] from mmap, reinterpret as &[u16] for copy_from_host
-    let data: &[u16] = unsafe {
-        std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
-    };
-    buf.copy_from_host(data)?;
     Ok(buf)
 }
 
@@ -762,9 +769,9 @@ impl Qwen35Model {
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
                     conv1d_weight_v: conv_w_v_buf,
-                    a_log: load_weight(&st, &format!("{p}linear_attn.A_log"), device, nh)?,  // f32
+                    a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nh)?,  // f32
                     dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nh)?,
-                    output_norm: load_weight(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,  // f32
+                    output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,  // f32
                     w_out: load_weight_bf16(&st, &format!("{p}linear_attn.out_proj.weight"), device, config.hidden_size * z_out)?,
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
                     w_gate: load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
