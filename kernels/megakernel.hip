@@ -604,6 +604,7 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
     int tid = threadIdx.x;
     int block_size = blockDim.x;
 
+    // Pass 1: Online softmax — compute max and denominator
     float m = -1e30f, d = 0.0f;
     for (int t = 0; t < seq_len; t++) {
         const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
@@ -615,26 +616,24 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
             if (tid < s) partial[tid] += partial[tid + s];
             __syncthreads();
         }
-        if (tid == 0) {
-            float score = partial[0] * scale;
-            float m_new = fmaxf(score, m);
-            d = d * expf(m - m_new) + expf(score - m_new);
-            m = m_new;
-            partial[0] = m;
-            partial[1] = d;
-        }
-        __syncthreads();
-        m = partial[0]; d = partial[1];
+        float score = partial[0] * scale;
+        float m_new = fmaxf(score, m);
+        d = d * expf(m - m_new) + expf(score - m_new);
+        m = m_new;
         __syncthreads();
     }
 
-    float* out_ptr = output + q_head * head_dim;
-    for (int i = tid; i < head_dim; i += block_size) out_ptr[i] = 0.0f;
+    // Broadcast m, d to all threads
+    if (tid == 0) { partial[0] = m; partial[1] = d; }
+    __syncthreads();
+    m = partial[0]; d = partial[1];
     __syncthreads();
 
+    // Pass 2: Weighted V accumulation (register-based, single global write)
+    // Each thread accumulates its strided elements in registers
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // head_dim=256, block_size=256 → 1 element per thread, but handle up to 4
     for (int t = 0; t < seq_len; t++) {
         const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
-        const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
         partial[tid] = dot;
@@ -643,11 +642,22 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
             if (tid < s) partial[tid] += partial[tid + s];
             __syncthreads();
         }
-        if (tid == 0) partial[0] = partial[0] * scale;
+        float weight = expf(partial[0] * scale - m) / d;
+        const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
+        int slot = 0;
+        for (int i = tid; i < head_dim; i += block_size) {
+            acc[slot] += weight * v_ptr[i];
+            slot++;
+        }
         __syncthreads();
-        float weight = expf(partial[0] - m) / d;
-        for (int i = tid; i < head_dim; i += block_size) out_ptr[i] += weight * v_ptr[i];
-        __syncthreads();
+    }
+
+    // Write output once
+    float* out_ptr = output + q_head * head_dim;
+    int slot = 0;
+    for (int i = tid; i < head_dim; i += block_size) {
+        out_ptr[i] = acc[slot];
+        slot++;
     }
 }
 
