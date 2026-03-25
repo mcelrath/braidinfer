@@ -10,12 +10,57 @@ use crate::model::ModelConfig;
 
 // ---- Derived geometry (computed from ModelConfig at runtime) ----
 
-/// KV bytes per chunk slot, computed from ModelConfig:
+/// KV bytes per unquantized (f32) chunk slot, computed from ModelConfig:
 /// num_attn_layers * 2(K+V) * chunk_tokens * num_kv_heads * head_dim * sizeof(f32)
+/// Used for staging buffers and flat KV cache.
 pub fn chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
     let num_attn_layers = config.layer_is_attention.iter().filter(|&&a| a).count();
-    let kv_stride = config.num_kv_heads * config.head_dim; // elements per token per K or V
+    let kv_stride = config.num_kv_heads * config.head_dim;
     num_attn_layers * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()
+}
+
+/// KV bytes per quantized chunk slot using residual_pc int4.
+/// Layout per K or V per layer (chunk-interleaved):
+///   q1_data:  [num_kv_heads * chunk_tokens * head_dim / 2] bytes (int4 packed, 2 values/byte)
+///   q1_scale: [num_kv_heads * head_dim] f32 (per-channel, shared across tokens in chunk)
+///   r_data:   same as q1_data
+///   r_scale:  same as q1_scale
+pub fn quantized_chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
+    debug_assert_eq!(chunk_tokens, 64, "quantized chunk_tokens must equal group_size (64)");
+    let num_attn_layers = config.layer_is_attention.iter().filter(|&&a| a).count();
+    let nkh = config.num_kv_heads;
+    let hd = config.head_dim;
+    // Per K or V per layer:
+    let data_bytes = nkh * chunk_tokens * hd / 2; // int4 packed
+    let scale_bytes = nkh * hd * std::mem::size_of::<f32>(); // per-channel f32
+    let per_kv = 2 * (data_bytes + scale_bytes); // q1 + residual
+    let per_layer = 2 * per_kv; // K + V
+    num_attn_layers * per_layer
+}
+
+/// Byte offset within a quantized chunk for a specific layer's K or V data region.
+/// `layer_attn_idx`: 0-based index among attention layers only.
+/// `is_value`: false=K, true=V.
+/// Returns (data_offset, scale_offset, residual_data_offset, residual_scale_offset).
+pub fn quantized_kv_offsets(
+    config: &ModelConfig,
+    chunk_tokens: usize,
+    layer_attn_idx: usize,
+    is_value: bool,
+) -> (usize, usize, usize, usize) {
+    let nkh = config.num_kv_heads;
+    let hd = config.head_dim;
+    let data_bytes = nkh * chunk_tokens * hd / 2;
+    let scale_bytes = nkh * hd * std::mem::size_of::<f32>();
+    let per_kv = 2 * (data_bytes + scale_bytes);
+    let per_layer = 2 * per_kv;
+
+    let base = layer_attn_idx * per_layer + if is_value { per_kv } else { 0 };
+    let q1_data = base;
+    let q1_scale = base + data_bytes;
+    let r_data = base + data_bytes + scale_bytes;
+    let r_scale = base + 2 * data_bytes + scale_bytes;
+    (q1_data, q1_scale, r_data, r_scale)
 }
 
 /// Recurrent (GDN) state bytes per checkpoint slot, from ModelConfig:
@@ -197,6 +242,11 @@ pub struct SequenceState {
     pub kv_version: u32,
     /// Tokens per chunk (immutable; set at construction).
     chunk_tokens: u32,
+    /// f32 staging buffer for the current incomplete chunk (quantized mode only).
+    /// KV values are written here during decode; on chunk seal, the quantize kernel
+    /// reads from this buffer and writes to a quantized chunk slot.
+    /// None when using unquantized (f32) paged KV.
+    pub staging_buffer: Option<DeviceBuffer<u8>>,
 }
 
 impl SequenceState {
@@ -206,7 +256,21 @@ impl SequenceState {
             seq_len: 0,
             kv_version: 0,
             chunk_tokens,
+            staging_buffer: None,
         }
+    }
+
+    /// Create with a staging buffer for quantized KV cache.
+    pub fn new_quantized(chunk_tokens: u32, device: DeviceId, config: &ModelConfig) -> HipResult<Self> {
+        let staging_bytes = chunk_kv_bytes(config, chunk_tokens as usize);
+        let staging = DeviceBuffer::alloc(device, staging_bytes)?;
+        Ok(SequenceState {
+            chunks: Vec::new(),
+            seq_len: 0,
+            kv_version: 0,
+            chunk_tokens,
+            staging_buffer: Some(staging),
+        })
     }
 
     /// Append a token slot. Allocates a new chunk when the current one is full.
@@ -385,6 +449,35 @@ mod tests {
         // 6 attn layers * 2 * 64 tokens * 2 kv_heads * 256 head_dim * 4 bytes
         let expected = 6 * 2 * 64 * 2 * 256 * 4;
         assert_eq!(bytes, expected, "chunk_kv_bytes mismatch");
+    }
+
+    #[test]
+    fn test_quantized_chunk_kv_bytes() {
+        let config = make_test_config();
+        let q_bytes = quantized_chunk_kv_bytes(&config, 64);
+        // Per K or V per layer:
+        //   data = 2 * (2 kv_heads * 64 tokens * 256 dim / 2) = 2 * 16384 = 32768 bytes
+        //   scale = 2 * (2 kv_heads * 256 dim * 4) = 2 * 2048 = 4096 bytes
+        //   per_kv = 32768 + 4096 = 36864
+        //   per_layer = 2 * 36864 = 73728
+        //   total = 6 layers * 73728 = 442368
+        let expected = 6 * 2 * 2 * (2 * 64 * 256 / 2 + 2 * 256 * 4);
+        assert_eq!(q_bytes, expected, "quantized_chunk_kv_bytes mismatch");
+        let f32_bytes = chunk_kv_bytes(&config, 64);
+        let ratio = f32_bytes as f64 / q_bytes as f64;
+        assert!((ratio - 3.56).abs() < 0.01, "expected ~3.56x reduction, got {ratio:.2}x");
+    }
+
+    #[test]
+    fn test_quantized_kv_offsets() {
+        let config = make_test_config();
+        let (q1d, q1s, rd, rs) = quantized_kv_offsets(&config, 64, 0, false);
+        assert_eq!(q1d, 0);
+        let data_bytes = 2 * 64 * 256 / 2;
+        let scale_bytes = 2 * 256 * 4;
+        assert_eq!(q1s, data_bytes);
+        assert_eq!(rd, data_bytes + scale_bytes);
+        assert_eq!(rs, 2 * data_bytes + scale_bytes);
     }
 
     #[test]
