@@ -121,10 +121,10 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     // 128-bit vectorized loads: 8 bf16 values per load
     const int vec_elements = 8;
     const int vec_count = in_dim / vec_elements;
-    const ulong2* w_vec = (const ulong2*)w;
+    const ull2* w_vec = (const ull2*)w;
 
     for (int vi = tid; vi < vec_count; vi += stride) {
-        ulong2 wv = w_vec[vi];
+        ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
         unsigned short ws[8];
         __builtin_memcpy(ws, &wv, 16);
 
@@ -374,12 +374,12 @@ __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
 
     const int vec_elements = 8;
     const int vec_count = hidden_size / vec_elements;
-    const ulong2* wg_vec = (const ulong2*)wg;
-    const ulong2* wu_vec = (const ulong2*)wu;
+    const ull2* wg_vec = (const ull2*)wg;
+    const ull2* wu_vec = (const ull2*)wu;
 
     for (int vi = tid; vi < vec_count; vi += stride) {
-        ulong2 gv = wg_vec[vi];
-        ulong2 uv = wu_vec[vi];
+        ull2 gv = __builtin_nontemporal_load(&wg_vec[vi]);
+        ull2 uv = __builtin_nontemporal_load(&wu_vec[vi]);
         unsigned short gs[8], us[8];
         __builtin_memcpy(gs, &gv, 16);
         __builtin_memcpy(us, &uv, 16);
@@ -442,10 +442,10 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
 
     const int vec_elements = 8;
     const int vec_count = intermediate_size / vec_elements;
-    const ulong2* w_vec = (const ulong2*)w;
+    const ull2* w_vec = (const ull2*)w;
 
     for (int vi = tid; vi < vec_count; vi += stride) {
-        ulong2 wv = w_vec[vi];
+        ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
         unsigned short ws[8];
         __builtin_memcpy(ws, &wv, 16);
         int base = vi * vec_elements;

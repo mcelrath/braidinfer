@@ -26,10 +26,10 @@ extern "C" __global__ void linear_proj_f32(
     // 128-bit vectorized loads: 8 bf16 values per load (hits peak BW ~960 GB/s)
     const int vec_elements = 8;
     const int vec_count = in_dim / vec_elements;
-    const ulong2* w_vec = (const ulong2*)w;
+    const ull2* w_vec = (const ull2*)w;
 
     for (int vi = tid; vi < vec_count; vi += stride) {
-        ulong2 wv = w_vec[vi];
+        ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
         unsigned short ws[8];
         __builtin_memcpy(ws, &wv, 16);
 
