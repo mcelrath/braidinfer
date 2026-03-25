@@ -114,10 +114,29 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
-    const unsigned short* w = weight + row * in_dim;
+    const unsigned short* w = weight + (long long)row * in_dim;
 
     float acc = 0.0f;
-    for (int i = tid; i < in_dim; i += stride) {
+
+    // 128-bit vectorized loads: 8 bf16 values per load
+    const int vec_elements = 8;
+    const int vec_count = in_dim / vec_elements;
+    const ulong2* w_vec = (const ulong2*)w;
+
+    for (int vi = tid; vi < vec_count; vi += stride) {
+        ulong2 wv = w_vec[vi];
+        unsigned short ws[8];
+        __builtin_memcpy(ws, &wv, 16);
+
+        int base = vi * vec_elements;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc += bf16_to_f32(ws[j]) * input[base + j];
+        }
+    }
+
+    int remainder_start = vec_count * vec_elements;
+    for (int i = remainder_start + tid; i < in_dim; i += stride) {
         acc += bf16_to_f32(w[i]) * input[i];
     }
 
@@ -349,10 +368,31 @@ __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
     float rms_scale = rsqrtf(shared[0] / (float)hidden_size + eps);
     __syncthreads();
 
-    const unsigned short* wg = w_gate + row * hidden_size;
-    const unsigned short* wu = w_up + row * hidden_size;
+    const unsigned short* wg = w_gate + (long long)row * hidden_size;
+    const unsigned short* wu = w_up + (long long)row * hidden_size;
     float acc_gate = 0.0f, acc_up = 0.0f;
-    for (int i = tid; i < hidden_size; i += stride) {
+
+    const int vec_elements = 8;
+    const int vec_count = hidden_size / vec_elements;
+    const ulong2* wg_vec = (const ulong2*)wg;
+    const ulong2* wu_vec = (const ulong2*)wu;
+
+    for (int vi = tid; vi < vec_count; vi += stride) {
+        ulong2 gv = wg_vec[vi];
+        ulong2 uv = wu_vec[vi];
+        unsigned short gs[8], us[8];
+        __builtin_memcpy(gs, &gv, 16);
+        __builtin_memcpy(us, &uv, 16);
+        int base = vi * vec_elements;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float normed = input[base + j] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + j]));
+            acc_gate += bf16_to_f32(gs[j]) * normed;
+            acc_up += bf16_to_f32(us[j]) * normed;
+        }
+    }
+    int rem = vec_count * vec_elements;
+    for (int i = rem + tid; i < hidden_size; i += stride) {
         float normed = input[i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[i]));
         acc_gate += bf16_to_f32(wg[i]) * normed;
         acc_up += bf16_to_f32(wu[i]) * normed;
@@ -396,10 +436,24 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
-    const unsigned short* w = w_down + row * intermediate_size;
+    const unsigned short* w = w_down + (long long)row * intermediate_size;
 
     float acc = 0.0f;
-    for (int i = tid; i < intermediate_size; i += stride) acc += bf16_to_f32(w[i]) * scratch[i];
+
+    const int vec_elements = 8;
+    const int vec_count = intermediate_size / vec_elements;
+    const ulong2* w_vec = (const ulong2*)w;
+
+    for (int vi = tid; vi < vec_count; vi += stride) {
+        ulong2 wv = w_vec[vi];
+        unsigned short ws[8];
+        __builtin_memcpy(ws, &wv, 16);
+        int base = vi * vec_elements;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc += bf16_to_f32(ws[j]) * scratch[base + j];
+    }
+    int rem = vec_count * vec_elements;
+    for (int i = rem + tid; i < intermediate_size; i += stride) acc += bf16_to_f32(w[i]) * scratch[i];
 
     extern __shared__ float shared[];
     shared[tid] = acc;

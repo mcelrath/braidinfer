@@ -21,7 +21,23 @@ extern "C" __global__ void lm_head_f32(
     const unsigned short* w = weight + (long long)row * hidden_size;
 
     float acc = 0.0f;
-    for (int i = tid; i < hidden_size; i += stride) {
+
+    const int vec_elements = 8;
+    const int vec_count = hidden_size / vec_elements;
+    const ulong2* w_vec = (const ulong2*)w;
+
+    for (int vi = tid; vi < vec_count; vi += stride) {
+        ulong2 wv = w_vec[vi];
+        unsigned short ws[8];
+        __builtin_memcpy(ws, &wv, 16);
+        int base = vi * vec_elements;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc += bf16_to_f32(ws[j]) * input[base + j];
+        }
+    }
+    int rem = vec_count * vec_elements;
+    for (int i = rem + tid; i < hidden_size; i += stride) {
         acc += bf16_to_f32(w[i]) * input[i];
     }
 

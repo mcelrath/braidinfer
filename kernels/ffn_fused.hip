@@ -48,12 +48,33 @@ extern "C" __global__ void ffn_fused_gate_up_f32(
     __syncthreads();
 
     // Step 2: gate dot product and up dot product in the same loop
-    const unsigned short* wg = w_gate + row * hidden_size;
-    const unsigned short* wu = w_up   + row * hidden_size;
+    const unsigned short* wg = w_gate + (long long)row * hidden_size;
+    const unsigned short* wu = w_up   + (long long)row * hidden_size;
 
     float acc_gate = 0.0f;
     float acc_up   = 0.0f;
-    for (int i = tid; i < hidden_size; i += stride) {
+
+    const int vec_elements = 8;
+    const int vec_count = hidden_size / vec_elements;
+    const ulong2* wg_vec = (const ulong2*)wg;
+    const ulong2* wu_vec = (const ulong2*)wu;
+
+    for (int vi = tid; vi < vec_count; vi += stride) {
+        ulong2 gv = wg_vec[vi];
+        ulong2 uv = wu_vec[vi];
+        unsigned short gs[8], us[8];
+        __builtin_memcpy(gs, &gv, 16);
+        __builtin_memcpy(us, &uv, 16);
+        int base = vi * vec_elements;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float normed = input[base + j] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + j]));
+            acc_gate += bf16_to_f32(gs[j]) * normed;
+            acc_up   += bf16_to_f32(us[j]) * normed;
+        }
+    }
+    int rem = vec_count * vec_elements;
+    for (int i = rem + tid; i < hidden_size; i += stride) {
         float normed = input[i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[i]));
         acc_gate += bf16_to_f32(wg[i]) * normed;
         acc_up   += bf16_to_f32(wu[i]) * normed;
@@ -103,10 +124,26 @@ extern "C" __global__ void ffn_fused_down_residual_f32(
 
     if (row >= hidden_size) return;
 
-    const unsigned short* w = w_down + row * intermediate_size;
+    const unsigned short* w = w_down + (long long)row * intermediate_size;
 
     float acc = 0.0f;
-    for (int i = tid; i < intermediate_size; i += stride) {
+
+    const int vec_elements = 8;
+    const int vec_count = intermediate_size / vec_elements;
+    const ulong2* w_vec = (const ulong2*)w;
+
+    for (int vi = tid; vi < vec_count; vi += stride) {
+        ulong2 wv = w_vec[vi];
+        unsigned short ws[8];
+        __builtin_memcpy(ws, &wv, 16);
+        int base = vi * vec_elements;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc += bf16_to_f32(ws[j]) * scratch[base + j];
+        }
+    }
+    int rem = vec_count * vec_elements;
+    for (int i = rem + tid; i < intermediate_size; i += stride) {
         acc += bf16_to_f32(w[i]) * scratch[i];
     }
 
