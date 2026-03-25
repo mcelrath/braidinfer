@@ -1,5 +1,6 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::megakernel::{MegakernelProgram, PrefillBuffers};
 use std::path::Path;
 use std::time::Instant;
 
@@ -40,6 +41,80 @@ fn test_prefill_correctness() {
         .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
     println!("Max logit diff: {diff:.6}");
     assert!(diff < 0.001, "prefill vs sequential max_diff={diff}");
+}
+
+#[test]
+fn test_prefill_batched_multi_token() {
+    let device = DeviceId(0);
+    let model_dir = Path::new(MODEL_DIR);
+    if !model_dir.exists() {
+        eprintln!("Model not found, skipping");
+        return;
+    }
+
+    let tokens = [9707u32, 13, 220, 5120, 374];
+
+    // Sequential decode (using flat megakernel, not paged)
+    let mut model_seq = Qwen35Model::load(model_dir, device).expect("load");
+    let mut seq_logits = vec![];
+    for (i, &tok) in tokens.iter().enumerate() {
+        seq_logits = model_seq.decode_step(tok, i as u32).expect("decode");
+    }
+    let seq_argmax = argmax(&seq_logits);
+    println!("Sequential: argmax={seq_argmax}");
+
+    // Batched prefill
+    let mut model_pre = Qwen35Model::load(model_dir, device).expect("load");
+    let mut prefill_bufs = PrefillBuffers::alloc(device, model_pre.config(), tokens.len()).expect("alloc");
+    let program = MegakernelProgram::compile_prefill(&model_pre, &tokens, 0, &mut prefill_bufs).expect("compile");
+    println!("Prefill program: {} instructions", program.instruction_count());
+    program.execute(model_pre.stream()).expect("execute");
+    model_pre.stream().synchronize().expect("sync");
+    let pre_logits = model_pre.read_logits().expect("read logits");
+    let pre_argmax = argmax(&pre_logits);
+    println!("Batched prefill: argmax={pre_argmax}");
+
+    assert_eq!(seq_argmax, pre_argmax, "batched prefill should match sequential");
+    let diff: f32 = seq_logits.iter().zip(pre_logits.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("Max diff: {diff:.6}");
+    assert!(diff < 0.01, "batched prefill vs sequential diff={diff}");
+}
+
+#[test]
+fn test_prefill_batched_single_token() {
+    let device = DeviceId(0);
+    let model_dir = Path::new(MODEL_DIR);
+    if !model_dir.exists() {
+        eprintln!("Model not found, skipping");
+        return;
+    }
+
+    let mut model = Qwen35Model::load(model_dir, device).expect("load");
+
+    // Compile prefill program for single token (should match decode exactly)
+    let mut prefill_bufs = PrefillBuffers::alloc(device, &model.config(), 1).expect("alloc prefill");
+    let program = MegakernelProgram::compile_prefill(&model, &[9707], 0, &mut prefill_bufs).expect("compile prefill");
+    println!("Prefill program: {} instructions", program.instruction_count());
+
+    // Execute prefill
+    program.execute(model.stream()).expect("execute");
+    model.stream().synchronize().expect("sync");
+    let prefill_logits = model.read_logits().expect("read logits");
+    let prefill_argmax = argmax(&prefill_logits);
+    println!("Prefill single token: argmax={prefill_argmax}");
+
+    // Compare with decode
+    let mut model2 = Qwen35Model::load(model_dir, device).expect("load");
+    let decode_logits = model2.decode_step(9707, 0).expect("decode");
+    let decode_argmax = argmax(&decode_logits);
+    println!("Decode single token: argmax={decode_argmax}");
+
+    assert_eq!(prefill_argmax, decode_argmax, "prefill single token should match decode");
+    let diff: f32 = prefill_logits.iter().zip(decode_logits.iter())
+        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("Max diff: {diff:.6}");
+    assert!(diff < 0.001, "prefill vs decode diff={diff}");
 }
 
 #[test]

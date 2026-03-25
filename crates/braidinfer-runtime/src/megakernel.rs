@@ -113,6 +113,7 @@ pub struct PrefillBuffers {
     pub z_proj: DeviceBuffer<f32>,       // [N × num_heads * value_dim]
     pub ffn_act: DeviceBuffer<f32>,      // [N × intermediate_size]
     pub residual: DeviceBuffer<f32>,     // [N × hidden_size]
+    pub position_ids: DeviceBuffer<i32>, // [N × 3] — mRoPE positions per token
 }
 
 impl PrefillBuffers {
@@ -133,6 +134,7 @@ impl PrefillBuffers {
             z_proj: DeviceBuffer::alloc(device, n * nh * vd)?,
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
+            position_ids: DeviceBuffer::alloc(device, n * 3)?,
         })
     }
 }
@@ -295,6 +297,564 @@ impl MegakernelProgram {
             page_table: None,
             position_table: None,
             attn_paged_inst_indices,
+            last_page_table_len: 0,
+            kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
+        })
+    }
+
+    /// Compile a one-shot prefill program for `tokens` starting at `start_pos`.
+    /// GDN layers use batched projections (weight reuse across all N tokens).
+    /// Attention layers run sequentially (one token at a time).
+    /// Returns a program + list of per-token attention instruction indices for paged KV updates.
+    pub fn compile_prefill(
+        model: &Qwen35Model,
+        tokens: &[u32],
+        start_pos: u32,
+        prefill_bufs: &mut PrefillBuffers,
+    ) -> HipResult<Self> {
+        let n = tokens.len();
+        assert!(n > 0 && n <= CHUNK_TOKENS);
+        let cfg = &model.config;
+        let device = model.device;
+        let act = &model.activations;
+
+        let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
+        let func = module.get_function("megakernel_f32")?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(384);
+
+        let mut instructions: Vec<Instruction> = Vec::new();
+
+        let hs = cfg.hidden_size;
+        let nh_gdn = cfg.linear_num_heads;
+        let kd = cfg.linear_key_head_dim;
+        let vd = cfg.linear_value_head_dim;
+        let conv_dim = nh_gdn * kd * 2 + nh_gdn * vd;
+        let ck = cfg.linear_conv_kernel_dim;
+        let nqh = cfg.num_q_heads;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let is = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+
+        // === Embedding: N lookups into prefill_bufs.hidden ===
+        let embedding_inst_idx = instructions.len();
+        for t in 0..n {
+            let mut inst = Instruction::new(OP_EMBEDDING, div_ceil(hs as u32, 256));
+            inst.set_mut_ptr(1, unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) });
+            inst.set_ptr(2, model.embed_weight.as_ptr());
+            inst.set_int(3, tokens[t] as i32);
+            inst.set_int(4, hs as i32);
+            if t + 1 < n { inst.set_no_sync(); }
+            instructions.push(inst);
+        }
+
+        // Upload positions into prefill_bufs.position_ids: [N × 3] i32
+        {
+            let mut pos_data = vec![0i32; n * 3];
+            for t in 0..n {
+                let pos = (start_pos + t as u32) as i32;
+                pos_data[t * 3] = pos;
+                pos_data[t * 3 + 1] = pos;
+                pos_data[t * 3 + 2] = pos;
+            }
+            prefill_bufs.position_ids.copy_from_host(&pos_data)?;
+        }
+
+        // === Layers ===
+        let mut gdn_idx = 0usize;
+        let mut kv_idx = 0usize;
+        let mut attn_layer_count = 0usize;
+
+        for layer_i in 0..cfg.num_layers {
+            if cfg.layer_is_attention[layer_i] {
+                let w = match &model.layers[layer_i] {
+                    LayerWeights::Attention(w) => w,
+                    _ => panic!("expected attention layer"),
+                };
+                let kv_cache = &model.kv_caches[kv_idx];
+                let rd = cfg.rope_dim;
+                let kv_stride = nkh * hd;
+
+                // Attention layers: fully sequential per token, with per-token position/KV offsets
+                for t in 0..n {
+                    let pos = start_pos + t as u32;
+
+                    // Copy prefill_hidden[t] → act.hidden
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+                        inst.set_mut_ptr(1, act.hidden.as_ptr());
+                        inst.set_ptr(2, unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) });
+                        inst.set_int(3, hs as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 1. RMSNorm
+                    {
+                        let mut inst = Instruction::new(OP_RMSNORM, 1);
+                        inst.set_mut_ptr(1, act.normed.as_ptr());
+                        inst.set_ptr(2, act.hidden.as_ptr());
+                        inst.set_ptr(3, w.input_norm.as_ptr());
+                        inst.set_int(4, hs as i32);
+                        inst.set_float(5, eps);
+                        instructions.push(inst);
+                    }
+
+                    // 2. Q+gate, K, V projections
+                    {
+                        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
+                        inst.set_mut_ptr(1, act.q_gate_attn.as_ptr());
+                        inst.set_ptr(2, w.w_q_gate.as_ptr());
+                        inst.set_ptr(3, act.normed.as_ptr());
+                        inst.set_int(4, (nqh * hd * 2) as i32);
+                        inst.set_int(5, hs as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    {
+                        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
+                        inst.set_mut_ptr(1, act.k_attn.as_ptr());
+                        inst.set_ptr(2, w.w_k.as_ptr());
+                        inst.set_ptr(3, act.normed.as_ptr());
+                        inst.set_int(4, (nkh * hd) as i32);
+                        inst.set_int(5, hs as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    {
+                        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
+                        inst.set_mut_ptr(1, act.v_attn.as_ptr());
+                        inst.set_ptr(2, w.w_v.as_ptr());
+                        inst.set_ptr(3, act.normed.as_ptr());
+                        inst.set_int(4, (nkh * hd) as i32);
+                        inst.set_int(5, hs as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 3. Q/gate deinterleave
+                    for h in 0..nqh {
+                        let src_q_offset = h * hd * 2;
+                        let src_g_offset = h * hd * 2 + hd;
+                        let dst_offset = h * hd;
+                        let is_last = h == nqh - 1;
+
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { act.q_attn.as_ptr().add(dst_offset) });
+                        inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_q_offset) });
+                        inst.set_int(3, hd as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { act.gate_attn.as_ptr().add(dst_offset) });
+                        inst.set_ptr(2, unsafe { act.q_gate_attn.as_ptr().add(src_g_offset) });
+                        inst.set_int(3, hd as i32);
+                        if !is_last { inst.set_no_sync(); }
+                        instructions.push(inst);
+                    }
+
+                    // 4. QK norm
+                    {
+                        let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
+                        inst.set_mut_ptr(1, act.q_attn.as_ptr());
+                        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+                        inst.set_ptr(3, w.q_norm.as_ptr());
+                        inst.set_ptr(4, w.k_norm.as_ptr());
+                        inst.set_int(5, nqh as i32);
+                        inst.set_int(6, nkh as i32);
+                        inst.set_int(7, hd as i32);
+                        inst.set_float(8, eps);
+                        instructions.push(inst);
+                    }
+
+                    // 5. mRoPE (position from prefill_bufs.position_ids[t*3])
+                    {
+                        let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
+                        inst.set_mut_ptr(1, act.q_attn.as_ptr());
+                        inst.set_mut_ptr(2, act.k_attn.as_ptr());
+                        inst.set_ptr(3, act.inv_freq.as_ptr());
+                        inst.set_ptr(4, unsafe { prefill_bufs.position_ids.as_ptr().add(t * 3) });
+                        inst.set_int(5, nqh as i32);
+                        inst.set_int(6, nkh as i32);
+                        inst.set_int(7, hd as i32);
+                        inst.set_int(8, rd as i32);
+                        inst.set_int(9, cfg.mrope_section[0] as i32);
+                        inst.set_int(10, cfg.mrope_section[1] as i32);
+                        inst.set_int(11, cfg.mrope_section[2] as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 6. Write K,V to cache at correct position offset
+                    {
+                        let k_dst = unsafe { kv_cache.k.as_ptr().add(pos as usize * kv_stride) };
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+                        inst.set_mut_ptr(1, k_dst);
+                        inst.set_ptr(2, act.k_attn.as_ptr());
+                        inst.set_int(3, kv_stride as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    {
+                        let v_dst = unsafe { kv_cache.v.as_ptr().add(pos as usize * kv_stride) };
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
+                        inst.set_mut_ptr(1, v_dst);
+                        inst.set_ptr(2, act.v_attn.as_ptr());
+                        inst.set_int(3, kv_stride as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 7. GQA attention with correct seq_len
+                    {
+                        let mut inst = Instruction::new(OP_GQA_ATTN, nqh as u32);
+                        inst.set_mut_ptr(1, act.attn_out.as_ptr());
+                        inst.set_ptr(2, act.q_attn.as_ptr());
+                        inst.set_ptr(3, kv_cache.k.as_ptr());
+                        inst.set_ptr(4, kv_cache.v.as_ptr());
+                        inst.set_int(5, nqh as i32);
+                        inst.set_int(6, nkh as i32);
+                        inst.set_int(7, hd as i32);
+                        inst.set_int(8, (pos + 1) as i32);
+                        inst.set_int(9, cfg.max_seq_len as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 8. Output gate
+                    {
+                        let gate_size = nqh * hd;
+                        let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
+                        inst.set_mut_ptr(1, act.gated_out.as_ptr());
+                        inst.set_ptr(2, act.attn_out.as_ptr());
+                        inst.set_ptr(3, act.gate_attn.as_ptr());
+                        inst.set_int(4, gate_size as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 9. Output projection
+                    {
+                        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+                        inst.set_ptr(2, w.w_o.as_ptr());
+                        inst.set_ptr(3, act.gated_out.as_ptr());
+                        inst.set_int(4, hs as i32);
+                        inst.set_int(5, (nqh * hd) as i32);
+                        instructions.push(inst);
+                    }
+
+                    // 10. Residual
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+                        inst.set_mut_ptr(1, act.residual.as_ptr());
+                        inst.set_ptr(2, act.hidden.as_ptr());
+                        inst.set_int(3, hs as i32);
+                        instructions.push(inst);
+                    }
+                    {
+                        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+                        inst.set_mut_ptr(1, act.hidden.as_ptr());
+                        inst.set_ptr(2, act.out_proj.as_ptr());
+                        inst.set_ptr(3, act.residual.as_ptr());
+                        inst.set_int(4, hs as i32);
+                        instructions.push(inst);
+                    }
+
+                    // FFN (single token on act.hidden)
+                    Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
+
+                    // Copy act.hidden → prefill_hidden[t]
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) });
+                        inst.set_ptr(2, act.hidden.as_ptr());
+                        inst.set_int(3, hs as i32);
+                        instructions.push(inst);
+                    }
+                }
+                attn_layer_count += 1;
+                kv_idx += 1;
+            } else {
+                // GDN layers: batched projections + sequential recurrence
+                let w = match &model.layers[layer_i] {
+                    LayerWeights::Gdn(w) => w,
+                    _ => panic!("expected GDN layer"),
+                };
+                let conv_state = &model.gdn_conv_states[gdn_idx];
+                let gdn_state = &model.gdn_states[gdn_idx];
+
+                // --- Batched projections ---
+                // RMSNorm (grid_x=N, one block per token)
+                {
+                    let mut inst = Instruction::new(OP_RMSNORM, n as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.normed.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
+                    inst.set_ptr(3, w.input_norm.as_ptr());
+                    inst.set_int(4, hs as i32);
+                    inst.set_float(5, eps);
+                    instructions.push(inst);
+                }
+
+                // QKV projection (batch=N)
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, conv_dim as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.qkv.as_ptr());
+                    inst.set_ptr(2, w.w_qkv.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
+                    inst.set_int(4, conv_dim as i32);
+                    inst.set_int(5, hs as i32);
+                    inst.set_int(6, n as i32);
+                    inst.set_no_sync();
+                    instructions.push(inst);
+                }
+
+                // a projection (batch=N)
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nh_gdn as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.a_proj.as_ptr());
+                    inst.set_ptr(2, w.w_a.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
+                    inst.set_int(4, nh_gdn as i32);
+                    inst.set_int(5, hs as i32);
+                    inst.set_int(6, n as i32);
+                    inst.set_no_sync();
+                    instructions.push(inst);
+                }
+
+                // b projection (batch=N)
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nh_gdn as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.b_proj.as_ptr());
+                    inst.set_ptr(2, w.w_b.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
+                    inst.set_int(4, nh_gdn as i32);
+                    inst.set_int(5, hs as i32);
+                    inst.set_int(6, n as i32);
+                    inst.set_no_sync();
+                    instructions.push(inst);
+                }
+
+                // z projection (batch=N) — SYNC before sequential part
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nh_gdn * vd) as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.z_proj.as_ptr());
+                    inst.set_ptr(2, w.w_z.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
+                    inst.set_int(4, (nh_gdn * vd) as i32);
+                    inst.set_int(5, hs as i32);
+                    inst.set_int(6, n as i32);
+                    instructions.push(inst);
+                }
+
+                // --- Sequential per-token: conv1d, gate, recurrence, norm, output, residual ---
+                let q_dim = nh_gdn * kd;
+                let k_dim = nh_gdn * kd;
+                let v_dim = nh_gdn * vd;
+
+                for t in 0..n {
+                    // Conv1d on Q (from batched qkv[t])
+                    {
+                        let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
+                        inst.set_mut_ptr(1, conv_state.as_ptr());
+                        inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim) });
+                        inst.set_ptr(3, w.conv1d_weight_q.as_ptr());
+                        inst.set_mut_ptr(4, act.q_gdn.as_ptr());
+                        inst.set_int(5, q_dim as i32);
+                        inst.set_int(6, ck as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    // Conv1d on K
+                    {
+                        let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add(q_dim * (ck - 1)) });
+                        inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim) });
+                        inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
+                        inst.set_mut_ptr(4, act.k_gdn.as_ptr());
+                        inst.set_int(5, k_dim as i32);
+                        inst.set_int(6, ck as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    // Conv1d on V
+                    {
+                        let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { conv_state.as_ptr().add((q_dim + k_dim) * (ck - 1)) });
+                        inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim) });
+                        inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
+                        inst.set_mut_ptr(4, act.v_gdn.as_ptr());
+                        inst.set_int(5, v_dim as i32);
+                        inst.set_int(6, ck as i32);
+                        instructions.push(inst);
+                    }
+
+                    // GDN gate (from batched a_proj[t])
+                    {
+                        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nh_gdn as u32, 256));
+                        inst.set_mut_ptr(1, act.gate_gdn.as_ptr());
+                        inst.set_ptr(2, unsafe { prefill_bufs.a_proj.as_ptr().add(t * nh_gdn) });
+                        inst.set_ptr(3, w.a_log.as_ptr());
+                        inst.set_ptr(4, w.dt_bias.as_ptr());
+                        inst.set_int(5, nh_gdn as i32);
+                        instructions.push(inst);
+                    }
+
+                    // GDN recurrence
+                    {
+                        let mut inst = Instruction::new(OP_GDN_RECUR, nh_gdn as u32);
+                        inst.set_ptr(1, act.q_gdn.as_ptr());
+                        inst.set_ptr(2, act.k_gdn.as_ptr());
+                        inst.set_ptr(3, act.v_gdn.as_ptr());
+                        inst.set_ptr(4, act.gate_gdn.as_ptr());
+                        inst.set_ptr(5, unsafe { prefill_bufs.b_proj.as_ptr().add(t * nh_gdn) });
+                        inst.set_mut_ptr(6, gdn_state.recurrent.as_ptr());
+                        inst.set_mut_ptr(7, act.recurrent_out.as_ptr());
+                        inst.set_int(8, kd as i32);
+                        inst.set_int(9, vd as i32);
+                        instructions.push(inst);
+                    }
+
+                    // RMSNorm gated (z from batched z_proj[t])
+                    {
+                        let mut inst = Instruction::new(OP_RMSNORM_GATE, nh_gdn as u32);
+                        inst.set_mut_ptr(1, act.normed_gated.as_ptr());
+                        inst.set_ptr(2, act.recurrent_out.as_ptr());
+                        inst.set_ptr(3, unsafe { prefill_bufs.z_proj.as_ptr().add(t * nh_gdn * vd) });
+                        inst.set_ptr(4, w.output_norm.as_ptr());
+                        inst.set_int(5, nh_gdn as i32);
+                        inst.set_int(6, vd as i32);
+                        inst.set_float(7, eps);
+                        instructions.push(inst);
+                    }
+
+                    // Output projection
+                    {
+                        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                        inst.set_mut_ptr(1, act.out_proj.as_ptr());
+                        inst.set_ptr(2, w.w_out.as_ptr());
+                        inst.set_ptr(3, act.normed_gated.as_ptr());
+                        inst.set_int(4, hs as i32);
+                        inst.set_int(5, (nh_gdn * vd) as i32);
+                        instructions.push(inst);
+                    }
+
+                    // Residual: hidden[t] = out_proj + hidden[t]
+                    {
+                        let hidden_t = unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) };
+                        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+                        inst.set_mut_ptr(1, hidden_t);
+                        inst.set_ptr(2, act.out_proj.as_ptr());
+                        inst.set_ptr(3, hidden_t);
+                        inst.set_int(4, hs as i32);
+                        instructions.push(inst);
+                    }
+                }
+
+                // --- Batched FFN ---
+                let (post_norm, w_gate, w_up, w_down) = (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down);
+
+                // FFN gate+up (batch=N)
+                {
+                    let mut inst = Instruction::new(OP_FFN_GATE_UP, (is * n) as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.ffn_act.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
+                    inst.set_ptr(3, post_norm.as_ptr());
+                    inst.set_ptr(4, w_gate.as_ptr());
+                    inst.set_ptr(5, w_up.as_ptr());
+                    inst.set_int(6, hs as i32);
+                    inst.set_int(7, is as i32);
+                    inst.set_float(8, eps);
+                    inst.set_int(9, n as i32);
+                    instructions.push(inst);
+                }
+
+                // Save residual (N hidden states)
+                {
+                    let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((n * hs) as u32, 256));
+                    inst.set_mut_ptr(1, prefill_bufs.residual.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
+                    inst.set_int(3, (n * hs) as i32);
+                    instructions.push(inst);
+                }
+
+                // FFN down + residual (batch=N)
+                {
+                    let mut inst = Instruction::new(OP_FFN_DOWN_RES, (hs * n) as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.hidden.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.residual.as_ptr());
+                    inst.set_ptr(3, w_down.as_ptr());
+                    inst.set_ptr(4, prefill_bufs.ffn_act.as_ptr());
+                    inst.set_int(5, hs as i32);
+                    inst.set_int(6, is as i32);
+                    inst.set_int(7, n as i32);
+                    instructions.push(inst);
+                }
+
+                gdn_idx += 1;
+            }
+        }
+
+        // === Final norm + LM head (last token only) ===
+        // Copy last token's hidden to act.hidden
+        {
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_mut_ptr(1, act.hidden.as_ptr());
+            inst.set_ptr(2, unsafe { prefill_bufs.hidden.as_ptr().add((n - 1) * hs) });
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+        }
+        // RMSNorm
+        {
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_mut_ptr(1, act.normed.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+        }
+        {
+            let mut inst = Instruction::new(OP_RMSNORM, 1);
+            inst.set_mut_ptr(1, act.hidden.as_ptr());
+            inst.set_ptr(2, act.normed.as_ptr());
+            inst.set_ptr(3, model.final_norm_weight.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_float(5, eps);
+            instructions.push(inst);
+        }
+        // LM head
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, cfg.vocab_size as u32);
+            inst.set_mut_ptr(1, act.logits.as_ptr());
+            inst.set_ptr(2, model.embed_weight.as_ptr());
+            inst.set_ptr(3, act.hidden.as_ptr());
+            inst.set_int(4, cfg.vocab_size as i32);
+            inst.set_int(5, hs as i32);
+            instructions.push(inst);
+        }
+        instructions.push(Instruction::new(OP_HALT, 0));
+
+        // Upload
+        let total_words = instructions.len() * INST_SIZE;
+        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
+        for inst in &instructions {
+            flat.extend_from_slice(&inst.words);
+        }
+        let mut device_program = DeviceBuffer::alloc(device, total_words)?;
+        device_program.copy_from_host(&flat)?;
+
+        Ok(MegakernelProgram {
+            instructions,
+            device_program,
+            module,
+            num_blocks,
+            device,
+            embedding_inst_idx,
+            mrope_inst_indices: Vec::new(),
+            gqa_attn_inst_indices: Vec::new(),
+            kv_write_indices: Vec::new(),
+            kv_base_ptrs: Vec::new(),
+            position_ids_dev_ptr: act.position_ids.as_ptr() as u64,
+            max_seq_len: cfg.max_seq_len as u32,
+            paged: false,
+            page_table: None,
+            position_table: None,
+            attn_paged_inst_indices: Vec::new(),
             last_page_table_len: 0,
             kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
         })

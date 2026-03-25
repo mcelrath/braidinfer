@@ -1291,6 +1291,7 @@ impl Qwen35Model {
         }
     }
 
+    pub fn config(&self) -> &ModelConfig { &self.config }
     pub fn stream(&self) -> &Stream { &self.stream }
     pub fn vocab_size(&self) -> usize { self.config.vocab_size }
 
