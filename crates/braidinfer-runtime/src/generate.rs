@@ -31,17 +31,13 @@ pub fn greedy_generate(
     let mut all_tokens: Vec<u32> = prompt_ids.clone();
     let mut text_pieces: Vec<String> = Vec::new();
 
-    // Prefill: run each prompt token through decode_step to populate KV/GDN state
-    // We discard logits for all but the last prompt token
     let n_prompt = prompt_ids.len();
     let last_logits = if n_prompt == 0 {
         return Ok(GenerateResult { tokens: vec![], text_pieces: vec![] });
+    } else if n_prompt == 1 {
+        model.decode_step(prompt_ids[0], 0)?
     } else {
-        let mut last_logits = Vec::new();
-        for (i, &tok) in prompt_ids.iter().enumerate() {
-            last_logits = model.decode_step(tok, i as u32)?;
-        }
-        last_logits
+        model.prefill(&prompt_ids)?
     };
 
     // Greedy decode from the last prompt token's logits
