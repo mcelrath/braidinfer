@@ -38,79 +38,14 @@ extern "C" __global__ void gqa_attention_decode_f32(
     extern __shared__ float shmem[];
     float* partial = shmem;
 
-    // Online softmax state (per-thread, then reduced)
-    float m = -1e30f;  // running max
-    float d = 0.0f;    // running denominator
-    // Running accumulator for output: stored as head_dim values — too large for
-    // registers per thread if head_dim=128 and block=128. Instead, we do two
-    // passes: first compute online softmax to get m,d; second compute output.
-    // But that requires re-reading KV cache twice — acceptable for correctness.
-    //
-    // Pass 1: compute m and d via online softmax over all seq positions
+    // Single-pass online softmax with register V accumulation
+    float m = -1e30f;
+    float d = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Each thread computes a partial dot product for a subset of seq positions
-    // and maintains its own (m, d) state.
-    // We use a strided loop: thread tid processes positions tid, tid+block_size, ...
-    // Then we reduce (m, d) across threads.
-
-    // For simplicity: each thread owns a contiguous chunk of the head_dim dot product.
-    // For a given seq position t, all threads collaborate on the dot product.
-    // Then one thread (tid=0) updates (m, d).
-    // This serializes seq positions but parallelizes the dot product.
-
-    // Pass 1: online softmax
-    m = -1e30f;
-    d = 0.0f;
-
-    // We'll store per-position scores to reuse in pass 2 — but seq_len can be
-    // large. Instead, do two full passes over KV cache.
-
-    for (int t = 0; t < seq_len; t++) {
-        const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
-        float dot = 0.0f;
-        for (int i = tid; i < head_dim; i += block_size) {
-            dot += q_ptr[i] * k_ptr[i];
-        }
-        // Reduce dot across threads
-        partial[tid] = dot;
-        __syncthreads();
-        for (int s = block_size / 2; s > 0; s >>= 1) {
-            if (tid < s) partial[tid] += partial[tid + s];
-            __syncthreads();
-        }
-        // tid=0 updates m, d and broadcasts via shared mem
-        if (tid == 0) {
-            float score = partial[0] * scale;
-            float m_new = (score > m) ? score : m;
-            d = d * expf(m - m_new) + expf(score - m_new);
-            m = m_new;
-            partial[0] = m;  // broadcast m
-            partial[1] = d;  // broadcast d
-        }
-        __syncthreads();
-        m = partial[0];
-        d = partial[1];
-        __syncthreads();
-    }
-
-    // Pass 2: compute output with known (m, d)
-    float* out_ptr = output + q_head * head_dim;
-    // Initialize output accumulators per-thread
-    // Each thread accumulates its subset of head_dim dims
-    // Use partial2 for the running softmax denominator recheck
-    // Zero out output
-    for (int i = tid; i < head_dim; i += block_size) {
-        out_ptr[i] = 0.0f;
-    }
-    __syncthreads();
-
-    // Recompute running max for pass 2 (same m we ended with)
-    // We need to recompute scores. m is stable (final value).
     for (int t = 0; t < seq_len; t++) {
         const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
         const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
-
-        // Compute dot(q, k[t])
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) {
             dot += q_ptr[i] * k_ptr[i];
@@ -121,18 +56,25 @@ extern "C" __global__ void gqa_attention_decode_f32(
             if (tid < s) partial[tid] += partial[tid + s];
             __syncthreads();
         }
-        // Broadcast score
-        if (tid == 0) {
-            partial[0] = partial[0] * scale;
-        }
-        __syncthreads();
-        float score = partial[0];
-        float weight = expf(score - m) / d;
-
-        // Accumulate weight * v[t] into output
+        float score = partial[0] * scale;
+        float m_new = fmaxf(m, score);
+        float correction = expf(m - m_new);
+        float w = expf(score - m_new);
+        d = d * correction + w;
+        int slot = 0;
         for (int i = tid; i < head_dim; i += block_size) {
-            out_ptr[i] += weight * v_ptr[i];
+            acc[slot] = acc[slot] * correction + w * v_ptr[i];
+            slot++;
         }
+        m = m_new;
         __syncthreads();
+    }
+
+    // Write output once (normalize by d)
+    float* out_ptr = output + q_head * head_dim;
+    int slot = 0;
+    for (int i = tid; i < head_dim; i += block_size) {
+        out_ptr[i] = acc[slot] / d;
+        slot++;
     }
 }

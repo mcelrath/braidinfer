@@ -12,6 +12,7 @@ use crate::kernel::{
     MRoPEKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel,
     RmsNormKernel,
 };
+use crate::megakernel::MegakernelProgram;
 
 // ---- Model config ----
 
@@ -223,6 +224,7 @@ pub struct Qwen35Model {
     pub(crate) kv_caches: Vec<KvCache>,
     pub(crate) gdn_states: Vec<GdnState>,
     pub(crate) seq_len: u32,
+    megakernel: Option<MegakernelProgram>,
 }
 
 // ---- Error type ----
@@ -551,6 +553,7 @@ impl Qwen35Model {
             kv_caches,
             gdn_states,
             seq_len: 0,
+            megakernel: None,
         })
     }
 
@@ -1028,57 +1031,14 @@ impl Qwen35Model {
 
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        let hs = self.config.hidden_size as u32;
-        let vs = self.config.vocab_size as u32;
-
-        // 1. Embedding lookup
-        self.kernels.embedding.forward(
-            &mut self.activations.hidden,
-            &self.embed_weight,
-            token_id as i32,
-            hs,
-            &self.stream,
-        )?;
-
-        // 2. Run each layer
-        let mut gdn_idx = 0usize;
-        let mut kv_idx = 0usize;
-        for i in 0..self.config.num_layers {
-            if self.config.layer_is_attention[i] {
-                self.attention_forward(i, kv_idx, position)?;
-                kv_idx += 1;
-            } else {
-                self.gdn_forward(i, gdn_idx)?;
-                gdn_idx += 1;
-            }
+        // Lazy-init megakernel on first call
+        if self.megakernel.is_none() {
+            self.megakernel = Some(MegakernelProgram::compile(self)?);
         }
+        let mk = self.megakernel.as_mut().unwrap();
+        mk.update_step(token_id, position)?;
+        mk.execute(&self.stream)?;
 
-        // 3. Final RMSNorm
-        // Need to copy hidden to normed, then norm into hidden
-        unsafe {
-            d2d_copy_f32(&mut self.activations.normed, 0, &self.activations.hidden, 0, hs as usize, &self.stream)?;
-        }
-        self.kernels.rmsnorm.forward(
-            &mut self.activations.hidden,
-            &self.activations.normed,
-            &self.final_norm_weight,
-            1,
-            hs,
-            self.config.rms_norm_eps,
-            &self.stream,
-        )?;
-
-        // 4. LM head (tied to embed_weight)
-        self.kernels.lm_head.forward(
-            &mut self.activations.logits,
-            &self.embed_weight,
-            &self.activations.hidden,
-            vs,
-            hs,
-            &self.stream,
-        )?;
-
-        // 5. Sync and copy logits to host
         self.stream.synchronize()?;
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
