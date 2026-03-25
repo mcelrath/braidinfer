@@ -44,6 +44,7 @@
 #define OP_HALT        16
 #define OP_D2D_COPY    17
 #define OP_ATTN_PAGED  18
+#define OP_ATTN_PREFILL 19
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -574,15 +575,20 @@ __device__ void op_qk_norm(const u64* inst, u32 vblock) {
     int num_kv_heads = inst_int(inst, 6);
     int head_dim = inst_int(inst, 7);
     float eps = inst_float(inst, 8);
+    int batch = inst_int(inst, 9);
+    if (batch <= 0) batch = 1;
 
-    int head_idx = vblock;
+    int heads_per_token = num_q_heads + num_kv_heads;
+    int token_idx = vblock / heads_per_token;
+    int head_idx = vblock % heads_per_token;
+
     float* head_ptr;
     const unsigned short* weight_ptr;
     if (head_idx < num_q_heads) {
-        head_ptr = q + head_idx * head_dim;
+        head_ptr = q + (token_idx * num_q_heads + head_idx) * head_dim;
         weight_ptr = q_weight;
     } else {
-        head_ptr = k + (head_idx - num_q_heads) * head_dim;
+        head_ptr = k + (token_idx * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
         weight_ptr = k_weight;
     }
 
@@ -626,23 +632,32 @@ __device__ void op_mrope(const u64* inst, u32 vblock) {
     const float* inv_freq = inst_fptr(inst, 3);
     const int* position_ids = (const int*)(inst[4]);
     int num_q_heads = inst_int(inst, 5);
+    int num_kv_heads = inst_int(inst, 6);
     int head_dim = inst_int(inst, 7);
+    int rope_dim = inst_int(inst, 8);
     int section0_pairs = inst_int(inst, 9);
     int section1_pairs = inst_int(inst, 10);
-    int rope_dim = inst_int(inst, 8);
+    int batch = inst_int(inst, 12);
+    if (batch <= 0) batch = 1;
 
-    int head_idx = vblock;
+    int heads_per_token = num_q_heads + num_kv_heads;
+    int token_idx = vblock / heads_per_token;
+    int head_idx = vblock % heads_per_token;
+
     float* head_ptr;
     if (head_idx < num_q_heads) {
-        head_ptr = q + head_idx * head_dim;
+        head_ptr = q + (token_idx * num_q_heads + head_idx) * head_dim;
     } else {
-        head_ptr = k + (head_idx - num_q_heads) * head_dim;
+        head_ptr = k + (token_idx * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
     }
+
+    // Per-token position_ids: 3 ints per token (temporal, height, width)
+    const int* tok_pos = position_ids + token_idx * 3;
 
     int total_pairs = rope_dim / 2;
     for (int pair = threadIdx.x; pair < total_pairs; pair += blockDim.x) {
         int section = (pair < section0_pairs) ? 0 : (pair < section0_pairs + section1_pairs) ? 1 : 2;
-        int pos = position_ids[section];
+        int pos = tok_pos[section];
         float theta = (float)pos * inv_freq[pair];
         float cos_t = cosf(theta), sin_t = sinf(theta);
         int i0 = pair * 2, i1 = pair * 2 + 1;
@@ -874,6 +889,79 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_ATTN_PREFILL: Batched causal GQA attention for prefill.
+// N queries attend to flat KV cache with causal masking (query t sees KV 0..start_pos+t).
+// One virtual block per (token, q_head) pair: vblock = token_idx * num_q_heads + q_head.
+// args: [1]=output([N*nqh*hd]), [2]=q([N*nqh*hd]), [3]=k_cache, [4]=v_cache,
+//       [5]=num_q_heads, [6]=num_kv_heads, [7]=head_dim, [8]=start_pos,
+//       [9]=num_tokens(N), [10]=max_seq_len
+__device__ void op_attn_prefill(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* q = inst_fptr(inst, 2);
+    const float* k_cache = inst_fptr(inst, 3);
+    const float* v_cache = inst_fptr(inst, 4);
+    int num_q_heads = inst_int(inst, 5);
+    int num_kv_heads = inst_int(inst, 6);
+    int head_dim = inst_int(inst, 7);
+    int start_pos = inst_int(inst, 8);
+    int num_tokens = inst_int(inst, 9);
+    int max_seq_len = inst_int(inst, 10);
+
+    int token_idx = vblock / num_q_heads;
+    int q_head = vblock % num_q_heads;
+    if (token_idx >= num_tokens) return;
+
+    int gqa_group = num_q_heads / num_kv_heads;
+    int kv_head = q_head / gqa_group;
+    float scale = rsqrtf((float)head_dim);
+    const float* q_ptr = q + (token_idx * num_q_heads + q_head) * head_dim;
+
+    // Causal: this query at position start_pos+token_idx sees KV 0..start_pos+token_idx
+    int seq_len = start_pos + token_idx + 1;
+
+    extern __shared__ float shmem[];
+    float* partial = shmem;
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+
+    // Online softmax with register V accumulation (same as op_gqa_attn)
+    if (head_dim > 4 * block_size) __builtin_trap();
+    float m = -1e30f, d = 0.0f;
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int t = 0; t < seq_len; t++) {
+        const float* k_ptr = k_cache + (t * num_kv_heads + kv_head) * head_dim;
+        float dot = 0.0f;
+        for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
+        partial[tid] = dot;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) partial[tid] += partial[tid + s];
+            __syncthreads();
+        }
+        float score = partial[0] * scale;
+        float m_new = fmaxf(m, score);
+        float correction = expf(m - m_new);
+        float w = expf(score - m_new);
+        d = d * correction + w;
+        const float* v_ptr = v_cache + (t * num_kv_heads + kv_head) * head_dim;
+        int slot = 0;
+        for (int i = tid; i < head_dim; i += block_size) {
+            acc[slot] = acc[slot] * correction + w * v_ptr[i];
+            slot++;
+        }
+        m = m_new;
+        __syncthreads();
+    }
+
+    float* out_ptr = output + (token_idx * num_q_heads + q_head) * head_dim;
+    int slot = 0;
+    for (int i = tid; i < head_dim; i += block_size) {
+        out_ptr[i] = acc[slot] / d;
+        slot++;
+    }
+}
+
 // ============================================================
 // Main megakernel entry point
 // ============================================================
@@ -915,6 +1003,7 @@ extern "C" __global__ void megakernel_f32(
                 case OP_LM_HEAD:      op_lm_head(inst, vb); break;
                 case OP_D2D_COPY:     op_d2d_copy(inst, vb); break;
                 case OP_ATTN_PAGED:   op_attn_paged(inst, vb); break;
+                case OP_ATTN_PREFILL: op_attn_prefill(inst, vb); break;
                 default: break;
             }
         }

@@ -34,6 +34,7 @@ const OP_LM_HEAD: u32 = 15;
 const OP_HALT: u32 = 16;
 const OP_D2D_COPY: u32 = 17;
 const OP_ATTN_PAGED: u32 = 18;
+const OP_ATTN_PREFILL: u32 = 19;
 
 const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
@@ -114,6 +115,15 @@ pub struct PrefillBuffers {
     pub ffn_act: DeviceBuffer<f32>,      // [N × intermediate_size]
     pub residual: DeviceBuffer<f32>,     // [N × hidden_size]
     pub position_ids: DeviceBuffer<i32>, // [N × 3] — mRoPE positions per token
+    // Attention layer intermediates
+    pub q_gate_attn: DeviceBuffer<f32>,  // [N × nqh × hd × 2]
+    pub q_attn: DeviceBuffer<f32>,       // [N × nqh × hd]
+    pub k_attn: DeviceBuffer<f32>,       // [N × nkh × hd]
+    pub v_attn: DeviceBuffer<f32>,       // [N × nkh × hd]
+    pub gate_attn: DeviceBuffer<f32>,    // [N × nqh × hd]
+    pub attn_out: DeviceBuffer<f32>,     // [N × nqh × hd]
+    pub gated_out: DeviceBuffer<f32>,    // [N × nqh × hd]
+    pub out_proj: DeviceBuffer<f32>,     // [N × hidden_size]
 }
 
 impl PrefillBuffers {
@@ -125,6 +135,9 @@ impl PrefillBuffers {
         let vd = cfg.linear_value_head_dim;
         let conv_dim = nh * kd * 2 + nh * vd;
         let is = cfg.intermediate_size;
+        let nqh = cfg.num_q_heads;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
         Ok(PrefillBuffers {
             hidden: DeviceBuffer::alloc(device, n * hs)?,
             normed: DeviceBuffer::alloc(device, n * hs)?,
@@ -135,6 +148,14 @@ impl PrefillBuffers {
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
             position_ids: DeviceBuffer::alloc(device, n * 3)?,
+            q_gate_attn: DeviceBuffer::alloc(device, n * nqh * hd * 2)?,
+            q_attn: DeviceBuffer::alloc(device, n * nqh * hd)?,
+            k_attn: DeviceBuffer::alloc(device, n * nkh * hd)?,
+            v_attn: DeviceBuffer::alloc(device, n * nkh * hd)?,
+            gate_attn: DeviceBuffer::alloc(device, n * nqh * hd)?,
+            attn_out: DeviceBuffer::alloc(device, n * nqh * hd)?,
+            gated_out: DeviceBuffer::alloc(device, n * nqh * hd)?,
+            out_proj: DeviceBuffer::alloc(device, n * hs)?,
         })
     }
 }
@@ -376,7 +397,11 @@ impl MegakernelProgram {
                 let rd = cfg.rope_dim;
                 let kv_stride = nkh * hd;
 
-                // Attention layers: fully sequential per token, with per-token position/KV offsets
+                // --- Phase A: Per-token QKV projection + norm + RoPE + KV write ---
+                // Also copies Q and gate into prefill buffers for batched attention.
+                let q_head_size = nqh * hd;
+                let k_head_size = nkh * hd;
+
                 for t in 0..n {
                     let pos = start_pos + t as u32;
 
@@ -389,7 +414,7 @@ impl MegakernelProgram {
                         instructions.push(inst);
                     }
 
-                    // 1. RMSNorm
+                    // RMSNorm
                     {
                         let mut inst = Instruction::new(OP_RMSNORM, 1);
                         inst.set_mut_ptr(1, act.normed.as_ptr());
@@ -400,7 +425,7 @@ impl MegakernelProgram {
                         instructions.push(inst);
                     }
 
-                    // 2. Q+gate, K, V projections
+                    // Q+gate, K, V projections
                     {
                         let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
                         inst.set_mut_ptr(1, act.q_gate_attn.as_ptr());
@@ -431,7 +456,7 @@ impl MegakernelProgram {
                         instructions.push(inst);
                     }
 
-                    // 3. Q/gate deinterleave
+                    // Q/gate deinterleave
                     for h in 0..nqh {
                         let src_q_offset = h * hd * 2;
                         let src_g_offset = h * hd * 2 + hd;
@@ -453,7 +478,7 @@ impl MegakernelProgram {
                         instructions.push(inst);
                     }
 
-                    // 4. QK norm
+                    // QK norm
                     {
                         let mut inst = Instruction::new(OP_QK_NORM, (nqh + nkh) as u32);
                         inst.set_mut_ptr(1, act.q_attn.as_ptr());
@@ -467,7 +492,7 @@ impl MegakernelProgram {
                         instructions.push(inst);
                     }
 
-                    // 5. mRoPE (position from prefill_bufs.position_ids[t*3])
+                    // mRoPE
                     {
                         let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
                         inst.set_mut_ptr(1, act.q_attn.as_ptr());
@@ -484,7 +509,7 @@ impl MegakernelProgram {
                         instructions.push(inst);
                     }
 
-                    // 6. Write K,V to cache at correct position offset
+                    // Write K,V to cache
                     {
                         let k_dst = unsafe { kv_cache.k.as_ptr().add(pos as usize * kv_stride) };
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(kv_stride as u32, 256));
@@ -500,75 +525,82 @@ impl MegakernelProgram {
                         inst.set_mut_ptr(1, v_dst);
                         inst.set_ptr(2, act.v_attn.as_ptr());
                         inst.set_int(3, kv_stride as i32);
+                        inst.set_no_sync();
                         instructions.push(inst);
                     }
 
-                    // 7. GQA attention with correct seq_len
+                    // Copy Q → prefill_bufs.q_attn[t], gate → prefill_bufs.gate_attn[t]
                     {
-                        let mut inst = Instruction::new(OP_GQA_ATTN, nqh as u32);
-                        inst.set_mut_ptr(1, act.attn_out.as_ptr());
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(q_head_size as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { prefill_bufs.q_attn.as_ptr().add(t * q_head_size) });
                         inst.set_ptr(2, act.q_attn.as_ptr());
-                        inst.set_ptr(3, kv_cache.k.as_ptr());
-                        inst.set_ptr(4, kv_cache.v.as_ptr());
-                        inst.set_int(5, nqh as i32);
-                        inst.set_int(6, nkh as i32);
-                        inst.set_int(7, hd as i32);
-                        inst.set_int(8, (pos + 1) as i32);
-                        inst.set_int(9, cfg.max_seq_len as i32);
-                        instructions.push(inst);
-                    }
-
-                    // 8. Output gate
-                    {
-                        let gate_size = nqh * hd;
-                        let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-                        inst.set_mut_ptr(1, act.gated_out.as_ptr());
-                        inst.set_ptr(2, act.attn_out.as_ptr());
-                        inst.set_ptr(3, act.gate_attn.as_ptr());
-                        inst.set_int(4, gate_size as i32);
-                        instructions.push(inst);
-                    }
-
-                    // 9. Output projection
-                    {
-                        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                        inst.set_mut_ptr(1, act.out_proj.as_ptr());
-                        inst.set_ptr(2, w.w_o.as_ptr());
-                        inst.set_ptr(3, act.gated_out.as_ptr());
-                        inst.set_int(4, hs as i32);
-                        inst.set_int(5, (nqh * hd) as i32);
-                        instructions.push(inst);
-                    }
-
-                    // 10. Residual
-                    {
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-                        inst.set_mut_ptr(1, act.residual.as_ptr());
-                        inst.set_ptr(2, act.hidden.as_ptr());
-                        inst.set_int(3, hs as i32);
+                        inst.set_int(3, q_head_size as i32);
+                        inst.set_no_sync();
                         instructions.push(inst);
                     }
                     {
-                        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                        inst.set_mut_ptr(1, act.hidden.as_ptr());
-                        inst.set_ptr(2, act.out_proj.as_ptr());
-                        inst.set_ptr(3, act.residual.as_ptr());
-                        inst.set_int(4, hs as i32);
-                        instructions.push(inst);
-                    }
-
-                    // FFN (single token on act.hidden)
-                    Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
-
-                    // Copy act.hidden → prefill_hidden[t]
-                    {
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-                        inst.set_mut_ptr(1, unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) });
-                        inst.set_ptr(2, act.hidden.as_ptr());
-                        inst.set_int(3, hs as i32);
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(q_head_size as u32, 256));
+                        inst.set_mut_ptr(1, unsafe { prefill_bufs.gate_attn.as_ptr().add(t * q_head_size) });
+                        inst.set_ptr(2, act.gate_attn.as_ptr());
+                        inst.set_int(3, q_head_size as i32);
                         instructions.push(inst);
                     }
                 }
+
+                // --- Phase B: Batched attention + post-processing ---
+
+                // OP_ATTN_PREFILL: all N queries with causal mask
+                {
+                    let mut inst = Instruction::new(OP_ATTN_PREFILL, (n * nqh) as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.attn_out.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.q_attn.as_ptr());
+                    inst.set_ptr(3, kv_cache.k.as_ptr());
+                    inst.set_ptr(4, kv_cache.v.as_ptr());
+                    inst.set_int(5, nqh as i32);
+                    inst.set_int(6, nkh as i32);
+                    inst.set_int(7, hd as i32);
+                    inst.set_int(8, start_pos as i32);
+                    inst.set_int(9, n as i32);
+                    inst.set_int(10, cfg.max_seq_len as i32);
+                    instructions.push(inst);
+                }
+
+                // Batched output gate: size = N * nqh * hd
+                {
+                    let total_gate_size = n * q_head_size;
+                    let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(total_gate_size as u32, 256));
+                    inst.set_mut_ptr(1, prefill_bufs.gated_out.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.attn_out.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.gate_attn.as_ptr());
+                    inst.set_int(4, total_gate_size as i32);
+                    instructions.push(inst);
+                }
+
+                // Batched output projection (batch=N)
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                    inst.set_mut_ptr(1, prefill_bufs.out_proj.as_ptr());
+                    inst.set_ptr(2, w.w_o.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.gated_out.as_ptr());
+                    inst.set_int(4, hs as i32);
+                    inst.set_int(5, (nqh * hd) as i32);
+                    inst.set_int(6, n as i32);
+                    instructions.push(inst);
+                }
+
+                // Batched residual: hidden = hidden + out_proj (N tokens)
+                {
+                    let total = n * hs;
+                    let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
+                    inst.set_mut_ptr(1, prefill_bufs.hidden.as_ptr());
+                    inst.set_ptr(2, prefill_bufs.out_proj.as_ptr());
+                    inst.set_ptr(3, prefill_bufs.hidden.as_ptr());
+                    inst.set_int(4, total as i32);
+                    instructions.push(inst);
+                }
+
+                // Batched FFN
+                Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
                 attn_layer_count += 1;
                 kv_idx += 1;
             } else {
@@ -1389,6 +1421,54 @@ impl MegakernelProgram {
         inst.set_ptr(2, act.out_proj.as_ptr());
         inst.set_ptr(3, act.residual.as_ptr());
         inst.set_int(4, hs as i32);
+        instructions.push(inst);
+    }
+
+    fn compile_ffn_batched(
+        cfg: &ModelConfig,
+        layer: &LayerWeights,
+        bufs: &PrefillBuffers,
+        n: usize,
+        instructions: &mut Vec<Instruction>,
+    ) {
+        let hs = cfg.hidden_size;
+        let is = cfg.intermediate_size;
+        let eps = cfg.rms_norm_eps;
+
+        let (post_norm, w_gate, w_up, w_down) = match layer {
+            LayerWeights::Gdn(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+            LayerWeights::Attention(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+        };
+
+        // FFN gate+up (batch=N)
+        let mut inst = Instruction::new(OP_FFN_GATE_UP, (is * n) as u32);
+        inst.set_mut_ptr(1, bufs.ffn_act.as_ptr());
+        inst.set_ptr(2, bufs.hidden.as_ptr());
+        inst.set_ptr(3, post_norm.as_ptr());
+        inst.set_ptr(4, w_gate.as_ptr());
+        inst.set_ptr(5, w_up.as_ptr());
+        inst.set_int(6, hs as i32);
+        inst.set_int(7, is as i32);
+        inst.set_float(8, eps);
+        inst.set_int(9, n as i32);
+        instructions.push(inst);
+
+        // Save residual
+        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((n * hs) as u32, 256));
+        inst.set_mut_ptr(1, bufs.residual.as_ptr());
+        inst.set_ptr(2, bufs.hidden.as_ptr());
+        inst.set_int(3, (n * hs) as i32);
+        instructions.push(inst);
+
+        // FFN down + residual (batch=N)
+        let mut inst = Instruction::new(OP_FFN_DOWN_RES, (hs * n) as u32);
+        inst.set_mut_ptr(1, bufs.hidden.as_ptr());
+        inst.set_ptr(2, bufs.residual.as_ptr());
+        inst.set_ptr(3, w_down.as_ptr());
+        inst.set_ptr(4, bufs.ffn_act.as_ptr());
+        inst.set_int(5, hs as i32);
+        inst.set_int(6, is as i32);
+        inst.set_int(7, n as i32);
         instructions.push(inst);
     }
 
