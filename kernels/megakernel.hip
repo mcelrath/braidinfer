@@ -900,7 +900,9 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
             }
             m = m_new;
 
-            // Advance trig recurrence to next token:
+            // Advance trig recurrence to next token (assumes contiguous positions within chunk).
+            // TODO(braidinfer-lcl): For prefix caching with non-contiguous positions,
+            // recompute cos/sin from position_table[c*chunk_tokens+t] instead.
             // cos(θ+Δ) = cosθ·cosΔ - sinθ·sinΔ
             // sin(θ+Δ) = sinθ·cosΔ + cosθ·sinΔ
             if (tid < rope_pairs) {

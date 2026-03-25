@@ -56,3 +56,25 @@ Kernels are in `kernels/*.hip`, compiled by `crates/braidinfer-hip/build.rs` wit
 Single persistent cooperative kernel (384 blocks × 256 threads) replacing ~345 individual launches.
 128-byte instructions, virtual block loop, grid.sync() between instructions.
 2.1x speedup over naive dispatch (6.4ms vs 13.4ms per token).
+
+## Expert Code Review Process
+
+Run full codebase reviews using the `expert-review` agent with a 6-reviewer panel:
+Tri Dao (kernels/SSM), Horace He (roofline/fusion), Woosuk Kwon (KV cache/serving),
+Jon Gjengset (Rust safety), Software Architect (modularity), Claude (anti-patterns).
+
+**Key technique**: Include a "Known Planned Work — DO NOT flag" section in the review
+prompt listing all tracked-but-unimplemented features with their beads issue IDs. This
+prevents reviewers from re-flagging intentional incompleteness (no batching, no quantization,
+no multi-GPU, etc.) as findings. Also list recent fixes so they verify correctness rather
+than re-report.
+
+```
+bd list --status=open -n 50   # gather all planned work
+# Include in review prompt as numbered list with issue IDs
+# Include recent fixes as "verify these, don't re-flag" section
+```
+
+Review history:
+- 2026-03-25 round 1: 21 findings → epic braidinfer-ji9, 13 fixed, 8 deferred to braidinfer-9ip/l4d
+- 2026-03-25 round 2: 3 P1 + 2 P2 (much cleaner), APPROVED 6/6

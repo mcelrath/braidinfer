@@ -148,11 +148,10 @@ impl ChunkHandle {
             .ok_or(HipError(ffi::hipErrorOutOfMemory))?;
         let old_ptr = allocator.slot_ptr(self.inner.slot_index);
         let len = self.inner.len.load(Ordering::Acquire) as usize;
-        let copy_bytes = if len == 0 {
-            0
-        } else {
-            (len * allocator.chunk_bytes()) / allocator.chunk_tokens
-        };
+        // Copy entire chunk regardless of fill level. With [H,T,D] layout, valid
+        // tokens for each head are at stride offsets, not a contiguous prefix.
+        // Copying only a prefix would miss valid data for heads > 0.
+        let copy_bytes = if len == 0 { 0 } else { allocator.chunk_bytes() };
         if copy_bytes > 0 {
             hip_check(unsafe {
                 ffi::hipMemcpyAsync(

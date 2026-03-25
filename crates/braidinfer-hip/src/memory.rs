@@ -158,7 +158,14 @@ impl<T> PinnedBuffer<T> {
 impl<T> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::hipHostFree(self.ptr.cast()) };
+            let err = unsafe { ffi::hipHostFree(self.ptr.cast()) };
+            if err != 0 {
+                eprintln!(
+                    "braidinfer: hipHostFree failed (error {}) for {}B pinned buffer",
+                    err,
+                    self.len * std::mem::size_of::<T>()
+                );
+            }
         }
     }
 }

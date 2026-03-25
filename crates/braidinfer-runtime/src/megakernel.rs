@@ -1467,14 +1467,14 @@ impl MegakernelProgram {
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
 
         // Update position_ids on device ([temporal, height, width] = all equal position for text)
+        // Use synchronous hipMemcpy because pos_data is a stack local
         let pos_data = [position as i32, position as i32, position as i32];
         braidinfer_hip::error::check(unsafe {
-            braidinfer_hip::ffi::hipMemcpyAsync(
+            braidinfer_hip::ffi::hipMemcpy(
                 self.position_ids_dev_ptr as *mut std::ffi::c_void,
                 pos_data.as_ptr().cast(),
                 3 * std::mem::size_of::<i32>(),
                 braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                stream.raw(),
             )
         })?;
 
@@ -1532,30 +1532,30 @@ impl MegakernelProgram {
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
 
         // 2. Append scalar position to position_table on device at offset [position]
+        // Use synchronous hipMemcpy (not Async) because source is a stack local
         {
             let pos_scalar = position as i32;
             let pos_table_ptr = self.position_table.as_ref().expect("position_table not allocated").as_ptr();
             let dst = unsafe { (pos_table_ptr as *mut u8).add(position as usize * std::mem::size_of::<i32>()) };
             braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpyAsync(
+                braidinfer_hip::ffi::hipMemcpy(
                     dst.cast(),
                     std::ptr::addr_of!(pos_scalar).cast(),
                     std::mem::size_of::<i32>(),
                     braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                    stream.raw(),
                 )
             })?;
         }
 
         // Also update position_ids for mRoPE (same as flat path)
+        // Use synchronous hipMemcpy because pos_data is a stack local
         let pos_data = [position as i32, position as i32, position as i32];
         braidinfer_hip::error::check(unsafe {
-            braidinfer_hip::ffi::hipMemcpyAsync(
+            braidinfer_hip::ffi::hipMemcpy(
                 self.position_ids_dev_ptr as *mut std::ffi::c_void,
                 pos_data.as_ptr().cast(),
                 3 * std::mem::size_of::<i32>(),
                 braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                stream.raw(),
             )
         })?;
 
