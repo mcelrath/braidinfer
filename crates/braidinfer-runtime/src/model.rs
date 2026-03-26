@@ -1825,6 +1825,148 @@ impl Model {
         )
     }
 
+    /// MoE FFN forward: route to top-k experts, run expert FFNs, combine.
+    /// Uses individual kernel launches (no megakernel).
+    fn moe_ffn_forward(&mut self, layer_idx: usize) -> HipResult<()> {
+        let moe = self.moe_weights[layer_idx].as_ref()
+            .expect("moe_ffn_forward called on non-MoE layer");
+        let hs = self.config.hidden_size;
+        let eis = moe.expert_intermediate_size;
+        let ne = moe.num_experts;
+        let eps = self.config.rms_norm_eps;
+
+        // Get post_norm weight from the layer
+        let post_norm_ptr = match &self.layers[layer_idx] {
+            LayerWeights::Attention(w) => w.post_norm.as_ptr(),
+            LayerWeights::Gdn(w) => w.post_norm.as_ptr(),
+        };
+
+        // 1. RMSNorm(hidden) → normed
+        self.kernels.rmsnorm.forward(
+            &mut self.activations.normed,
+            &self.activations.hidden,
+            // SAFETY: post_norm_ptr is valid for the lifetime of this call
+            unsafe { &*(post_norm_ptr as *const DeviceBuffer<u16>) },
+            1, hs as u32, eps, &self.stream,
+        )?;
+
+        // Save residual
+        unsafe {
+            d2d_copy_f32(&mut self.activations.residual, 0, &self.activations.hidden, 0, hs, &self.stream)?;
+        }
+
+        // 2. Gate projection: normed → scores[num_experts]
+        // We need a temporary buffer for scores
+        let mut scores_buf = DeviceBuffer::<f32>::alloc(self.device, ne)?;
+        self.kernels.linear_proj.forward(
+            &mut scores_buf,
+            &moe.gate,
+            &self.activations.normed,
+            ne as u32, hs as u32, &self.stream,
+        )?;
+        self.stream.synchronize()?;
+
+        // 3. Read scores to CPU and do top-k selection
+        let mut scores = vec![0.0f32; ne];
+        scores_buf.copy_to_host(&mut scores)?;
+
+        let k = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { num_active, .. } => *num_active,
+            _ => unreachable!(),
+        };
+
+        // Top-k selection
+        let mut indexed: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
+
+        // Softmax over selected
+        let max_s = topk.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+        let exp_sum: f32 = topk.iter().map(|(_, s)| (s - max_s).exp()).sum();
+        let weights: Vec<f32> = topk.iter().map(|(_, s)| (s - max_s).exp() / exp_sum).collect();
+
+        let scaling = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { gate_type: GateType::NormTopK { routed_scaling_factor }, .. } => *routed_scaling_factor,
+            _ => 1.0,
+        };
+
+        // 4. Zero output buffer (reuse ffn_down for accumulation)
+        let zeros = vec![0.0f32; hs];
+        self.activations.ffn_down.copy_from_host(&zeros)?;
+
+        // 5. For each selected expert: run FFN and accumulate
+        let mut expert_scratch_gate = DeviceBuffer::<f32>::alloc(self.device, eis)?;
+        let mut expert_scratch_up = DeviceBuffer::<f32>::alloc(self.device, eis)?;
+        let mut expert_output = DeviceBuffer::<f32>::alloc(self.device, hs)?;
+
+        for (j, &(expert_id, _)) in topk.iter().enumerate() {
+            let w = weights[j] * scaling;
+
+            // Expert weight pointers into contiguous buffer
+            let gate_w_ptr = unsafe { moe.expert_gate_up.as_ptr().add(expert_id * 2 * eis * hs) };
+            let up_w_ptr = unsafe { moe.expert_gate_up.as_ptr().add(expert_id * 2 * eis * hs + eis * hs) };
+            let down_w_ptr = unsafe { moe.expert_down.as_ptr().add(expert_id * hs * eis) };
+
+            // Gate projection: bf16_weights[eis, hs] × f32_normed[hs] → f32_gate[eis]
+            self.kernels.linear_proj.forward_ptr(
+                expert_scratch_gate.as_mut_ptr(),
+                gate_w_ptr,
+                self.activations.normed.as_ptr(),
+                eis as u32, hs as u32, &self.stream,
+            )?;
+
+            // Up projection
+            self.kernels.linear_proj.forward_ptr(
+                expert_scratch_up.as_mut_ptr(),
+                up_w_ptr,
+                self.activations.normed.as_ptr(),
+                eis as u32, hs as u32, &self.stream,
+            )?;
+
+            // SiLU(gate) * up → scratch_act
+            let mut expert_scratch_act = DeviceBuffer::<f32>::alloc(self.device, eis)?;
+            self.kernels.silu_mul.forward(
+                &mut expert_scratch_act,
+                &expert_scratch_gate,
+                &expert_scratch_up,
+                eis as u32, &self.stream,
+            )?;
+
+            // Down projection: bf16_weights[hs, eis] × f32_act[eis] → f32_output[hs]
+            self.kernels.linear_proj.forward_ptr(
+                expert_output.as_mut_ptr(),
+                down_w_ptr,
+                expert_scratch_act.as_ptr(),
+                hs as u32, eis as u32, &self.stream,
+            )?;
+
+            // Weighted accumulate: ffn_down[h] += w * expert_output[h]
+            // Use a simple kernel or CPU-side scaling
+            // For now: scale expert_output by w, then add to ffn_down
+            // We can do this with residual_add if we pre-scale
+            // Actually, just accumulate on host for v1 correctness
+            self.stream.synchronize()?;
+            let mut exp_out = vec![0.0f32; hs];
+            expert_output.copy_to_host(&mut exp_out)?;
+            let mut accum = vec![0.0f32; hs];
+            self.activations.ffn_down.copy_to_host(&mut accum)?;
+            for h in 0..hs {
+                accum[h] += w * exp_out[h];
+            }
+            self.activations.ffn_down.copy_from_host(&accum)?;
+        }
+
+        // 6. Residual add: hidden = residual + ffn_down
+        self.kernels.residual_add.forward(
+            &mut self.activations.hidden,
+            &self.activations.residual,
+            &self.activations.ffn_down,
+            hs as u32, &self.stream,
+        )?;
+
+        Ok(())
+    }
+
     fn attention_forward(
         &mut self,
         layer_idx: usize,
@@ -2035,13 +2177,92 @@ impl Model {
 
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        // Lazy-init megakernel on first call
+        let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+        if has_moe {
+            return self.decode_step_moe(token_id, position);
+        }
+
+        // Dense models: use megakernel
         if self.megakernel.is_none() {
             self.megakernel = Some(MegakernelProgram::compile(self)?);
         }
         let mk = self.megakernel.as_mut().unwrap();
         mk.update_step(token_id, position, &self.stream)?;
         mk.execute(&self.stream)?;
+
+        self.stream.synchronize()?;
+
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
+
+        self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// MoE decode step: kernel-by-kernel execution with MoE FFN dispatch.
+    fn decode_step_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        let hs = self.config.hidden_size as u32;
+        let eps = self.config.rms_norm_eps;
+
+        // Embedding
+        self.kernels.embedding.forward(
+            &mut self.activations.hidden,
+            &self.embed_weight,
+            token_id as i32, hs, &self.stream,
+        )?;
+
+        // Process each layer
+        let mut gdn_idx = 0usize;
+        let mut kv_idx = 0usize;
+        for layer_i in 0..self.config.num_layers {
+            match self.config.layers[layer_i].layer_type {
+                LayerType::Attention => {
+                    self.attention_forward(layer_i, kv_idx, position)?;
+                    kv_idx += 1;
+                }
+                LayerType::Gdn => {
+                    self.gdn_forward(layer_i, gdn_idx)?;
+                    gdn_idx += 1;
+                }
+                _ => panic!("unsupported layer type for MoE decode"),
+            }
+
+            // FFN: dense or MoE
+            if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. }) {
+                self.moe_ffn_forward(layer_i)?;
+            } else {
+                let (post_norm, w_gate, w_up, w_down) = match &self.layers[layer_i] {
+                    LayerWeights::Attention(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+                    LayerWeights::Gdn(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+                };
+                let post_norm = post_norm as *const DeviceBuffer<u16>;
+                let w_gate = w_gate as *const DeviceBuffer<u16>;
+                let w_up = w_up as *const DeviceBuffer<u16>;
+                let w_down = w_down as *const DeviceBuffer<u16>;
+                unsafe { self.ffn_forward(&*post_norm, &*w_gate, &*w_up, &*w_down)?; }
+            }
+        }
+
+        // Final RMSNorm
+        self.kernels.rmsnorm.forward(
+            &mut self.activations.normed,
+            &self.activations.hidden,
+            &self.final_norm_weight,
+            1, hs, eps, &self.stream,
+        )?;
+
+        // LM head
+        let lm_head_w = if self.config.tie_word_embeddings {
+            &self.embed_weight
+        } else {
+            &self.lm_head_weight
+        };
+        self.kernels.linear_proj.forward(
+            &mut self.activations.logits,
+            lm_head_w,
+            &self.activations.normed,
+            self.config.vocab_size as u32, hs, &self.stream,
+        )?;
 
         self.stream.synchronize()?;
 

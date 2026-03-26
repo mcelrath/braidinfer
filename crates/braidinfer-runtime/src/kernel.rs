@@ -188,6 +188,39 @@ impl LinearProjKernel {
             &mut args,
         )
     }
+
+    /// Raw pointer version for MoE expert sub-buffer access.
+    pub fn forward_ptr(
+        &self,
+        output: *mut f32,
+        weight: *const u16,
+        input: *const f32,
+        out_dim: u32,
+        in_dim: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("linear_proj_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut w_ptr: *const c_void = weight.cast();
+        let mut in_ptr: *const c_void = input.cast();
+        let mut od = out_dim as i32;
+        let mut id = in_dim as i32;
+        let mut args: [*mut c_void; 5] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(od).cast(),
+            std::ptr::addr_of_mut!(id).cast(),
+        ];
+        let block_size = 256u32.min(in_dim);
+        func.launch(
+            (out_dim, 1, 1),
+            (block_size, 1, 1),
+            256 * 4,
+            stream,
+            &mut args,
+        )
+    }
 }
 
 pub struct SiluMulKernel {
