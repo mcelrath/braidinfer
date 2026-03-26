@@ -49,6 +49,7 @@
 #define OP_KV_QUANTIZE  21
 #define OP_ATTN_PAGED_Q 22
 #define OP_MOE_GATE     23
+#define OP_MOE_FFN      24
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -1423,6 +1424,10 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
         }
     }
 }
+
+// MoE FFN: Reuse OP_FFN_GATE_UP + OP_FFN_DOWN_RES per expert.
+// The megakernel compiler emits k iterations with per-expert weight ptrs.
+// No dedicated OP_MOE_FFN kernel needed for single-GPU.
 
 // ============================================================
 // Main megakernel entry point
