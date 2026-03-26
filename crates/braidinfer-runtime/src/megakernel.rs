@@ -148,9 +148,10 @@ impl PrefillBuffers {
         let n = chunk_tokens;
         let hs = cfg.hidden_size;
         let nh = cfg.linear_num_heads;
+        let nvh = cfg.linear_num_value_heads;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
-        let conv_dim = nh * kd * 2 + nh * vd;
+        let conv_dim = nh * kd * 2 + nvh * vd;
         let is = cfg.intermediate_size;
         let nqh = cfg.num_q_heads;
         let nkh = cfg.num_kv_heads;
@@ -161,7 +162,7 @@ impl PrefillBuffers {
             qkv: DeviceBuffer::alloc(device, n * conv_dim)?,
             a_proj: DeviceBuffer::alloc(device, n * nh)?,
             b_proj: DeviceBuffer::alloc(device, n * nh)?,
-            z_proj: DeviceBuffer::alloc(device, n * nh * vd)?,
+            z_proj: DeviceBuffer::alloc(device, n * nvh * vd)?,
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
             position_ids: DeviceBuffer::alloc(device, n * 3)?,
@@ -232,9 +233,10 @@ impl MegakernelProgram {
 
         let hs = cfg.hidden_size;
         let nh_gdn = cfg.linear_num_heads;
+        let nvh_gdn = cfg.linear_num_value_heads;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
-        let _conv_dim = nh_gdn * kd * 2 + nh_gdn * vd; // 6144
+        let _conv_dim = nh_gdn * kd * 2 + nvh_gdn * vd;
         let _ck = cfg.linear_conv_kernel_dim;
         let _nqh = cfg.num_q_heads;
         let _nkh = cfg.num_kv_heads;
@@ -394,9 +396,10 @@ impl MegakernelProgram {
 
         let hs = cfg.hidden_size;
         let nh_gdn = cfg.linear_num_heads;
+        let nvh_gdn = cfg.linear_num_value_heads;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
-        let conv_dim = nh_gdn * kd * 2 + nh_gdn * vd;
+        let conv_dim = nh_gdn * kd * 2 + nvh_gdn * vd;
         let ck = cfg.linear_conv_kernel_dim;
         let _nqh = cfg.num_q_heads;
         let _nkh = cfg.num_kv_heads;
@@ -516,11 +519,11 @@ impl MegakernelProgram {
 
                 // z projection (batch=N) — SYNC before sequential part
                 {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nh_gdn * vd) as u32);
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nvh_gdn * vd) as u32);
                     inst.set_output_ptr(1, prefill_bufs.z_proj.as_ptr());
                     inst.set_ptr(2, w.w_z.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, (nh_gdn * vd) as i32);
+                    inst.set_int(4, (nvh_gdn * vd) as i32);
                     inst.set_int(5, hs as i32);
                     inst.set_int(6, n as i32);
                     instructions.push(inst);
@@ -529,7 +532,7 @@ impl MegakernelProgram {
                 // --- Sequential per-token: conv1d, gate, recurrence, norm, output, residual ---
                 let q_dim = nh_gdn * kd;
                 let k_dim = nh_gdn * kd;
-                let v_dim = nh_gdn * vd;
+                let v_dim = nvh_gdn * vd;
 
                 for t in 0..n {
                     // Conv1d on Q (from batched qkv[t])
@@ -599,7 +602,7 @@ impl MegakernelProgram {
                         let mut inst = Instruction::new(OP_RMSNORM_GATE, nh_gdn as u32);
                         inst.set_output_ptr(1, act.normed_gated.as_ptr());
                         inst.set_ptr(2, act.recurrent_out.as_ptr());
-                        inst.set_ptr(3, unsafe { prefill_bufs.z_proj.as_ptr().add(t * nh_gdn * vd) });
+                        inst.set_ptr(3, unsafe { prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd) });
                         inst.set_ptr(4, w.output_norm.as_ptr());
                         inst.set_int(5, nh_gdn as i32);
                         inst.set_int(6, vd as i32);
@@ -614,7 +617,7 @@ impl MegakernelProgram {
                         inst.set_ptr(2, w.w_out.as_ptr());
                         inst.set_ptr(3, act.normed_gated.as_ptr());
                         inst.set_int(4, hs as i32);
-                        inst.set_int(5, (nh_gdn * vd) as i32);
+                        inst.set_int(5, (nvh_gdn * vd) as i32);
                         instructions.push(inst);
                     }
 
@@ -1216,10 +1219,11 @@ impl MegakernelProgram {
         };
         let hs = cfg.hidden_size;
         let nh = cfg.linear_num_heads;
+        let nvh = cfg.linear_num_value_heads;
         let kd = cfg.linear_key_head_dim;
         let vd = cfg.linear_value_head_dim;
         let ck = cfg.linear_conv_kernel_dim;
-        let qkv_dim = nh * kd * 2 + nh * vd; // 6144
+        let qkv_dim = nh * kd * 2 + nvh * vd;
         let eps = cfg.rms_norm_eps;
 
         // 1. RMSNorm
@@ -1262,18 +1266,18 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         // z proj: SYNC here ensures QKV+a+b+z all complete before conv1d reads qkv
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nh * vd) as u32);
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nvh * vd) as u32);
         inst.set_output_ptr(1, act.z_proj.as_ptr());
         inst.set_ptr(2, w.w_z.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nh * vd) as i32);
+        inst.set_int(4, (nvh * vd) as i32);
         inst.set_int(5, hs as i32);
         instructions.push(inst);
 
         // 4. Causal conv1d on QKV (3 separate calls for q, k, v slices)
         let q_dim = nh * kd; // 2048
         let k_dim = nh * kd; // 2048
-        let v_dim = nh * vd; // 2048
+        let v_dim = nvh * vd; // 2048
 
         // Conv on Q portion — NO_SYNC: conv_k reads different qkv slice, writes different state/output
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
@@ -1346,7 +1350,7 @@ impl MegakernelProgram {
         inst.set_ptr(2, w.w_out.as_ptr());
         inst.set_ptr(3, act.normed_gated.as_ptr());
         inst.set_int(4, hs as i32);
-        inst.set_int(5, (nh * vd) as i32);
+        inst.set_int(5, (nvh * vd) as i32);
         instructions.push(inst);
 
         // 9. Residual: copy hidden→residual, then add
