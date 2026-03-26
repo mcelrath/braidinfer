@@ -763,11 +763,17 @@ impl Model {
 
         // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
         // Costs ~300ms upfront to fault in pages, but saves ~500ms on weight copies.
+        // Some models have mmap regions that fail hipHostRegister (non-page-aligned etc.);
+        // track which succeeded so we only unregister those.
         let shard_ptrs: Vec<(*mut std::ffi::c_void, usize)> = st.shard_mmaps()
             .map(|m| (m.as_ptr() as *mut std::ffi::c_void, m.len()))
             .collect();
+        let mut pinned: Vec<*mut std::ffi::c_void> = Vec::new();
         for &(ptr, len) in &shard_ptrs {
-            unsafe { ffi::hipHostRegister(ptr, len, 0) };
+            let rc = unsafe { ffi::hipHostRegister(ptr, len, 0) };
+            if rc == 0 {
+                pinned.push(ptr);
+            }
         }
 
         // Discover tensor name prefix by finding "layers.0." in tensor names.
@@ -1099,8 +1105,8 @@ impl Model {
         }
 
         // Unpin mmap'd regions now that all weights are on GPU
-        for &(ptr, _) in &shard_ptrs {
-            unsafe { ffi::hipHostUnregister(ptr) };
+        for ptr in &pinned {
+            unsafe { ffi::hipHostUnregister(*ptr) };
         }
 
         // GDN states: [nh * kd * vd] per GDN layer
@@ -1437,16 +1443,7 @@ impl Model {
         )?;
 
         // 10. FFN — extract raw pointers to avoid borrow conflict with &mut self
-        let (post_norm_p, w_gate_p, w_up_p, w_down_p) = match &self.layers[layer_idx] {
-            LayerWeights::Gdn(w) => (
-                &w.post_norm as *const DeviceBuffer<u16>,
-                &w.w_gate as *const DeviceBuffer<u16>,
-                &w.w_up as *const DeviceBuffer<u16>,
-                &w.w_down as *const DeviceBuffer<u16>,
-            ),
-            _ => unreachable!(),
-        };
-        unsafe { self.ffn_forward(&*post_norm_p, &*w_gate_p, &*w_up_p, &*w_down_p) }
+        Ok(())
     }
 
     fn ffn_forward(
@@ -1489,13 +1486,7 @@ impl Model {
 
     /// MoE FFN forward: route to top-k experts, run expert FFNs, combine.
     /// Uses individual kernel launches (no megakernel).
-    fn moe_ffn_forward(&mut self, _layer_idx: usize) -> HipResult<()> {
-        // TEMPORARY: skip MoE FFN to isolate crash
-        return Ok(());
-    }
-
-    #[allow(dead_code)]
-    fn moe_ffn_forward_real(&mut self, layer_idx: usize) -> HipResult<()> {
+    fn moe_ffn_forward(&mut self, layer_idx: usize) -> HipResult<()> {
         let moe = self.moe_weights[layer_idx].as_ref()
             .expect("moe_ffn_forward called on non-MoE layer");
         let hs = self.config.hidden_size;
@@ -1504,19 +1495,20 @@ impl Model {
         let eps = self.config.rms_norm_eps;
 
         // Get post_norm weight from the layer
-        let post_norm_ptr = match &self.layers[layer_idx] {
-            LayerWeights::Attention(w) => w.post_norm.as_ptr(),
-            LayerWeights::Gdn(w) => w.post_norm.as_ptr(),
+        let post_norm = match &self.layers[layer_idx] {
+            LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
+            LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
         };
 
         // 1. RMSNorm(hidden) → normed
-        self.kernels.rmsnorm.forward(
-            &mut self.activations.normed,
-            &self.activations.hidden,
-            // SAFETY: post_norm_ptr is valid for the lifetime of this call
-            unsafe { &*(post_norm_ptr as *const DeviceBuffer<u16>) },
-            1, hs as u32, eps, &self.stream,
-        )?;
+        unsafe {
+            self.kernels.rmsnorm.forward(
+                &mut self.activations.normed,
+                &self.activations.hidden,
+                &*post_norm,
+                1, hs as u32, eps, &self.stream,
+            )?;
+        }
 
         // Save residual
         unsafe {
@@ -1565,6 +1557,7 @@ impl Model {
         // 5. For each selected expert: run FFN and accumulate
         let mut expert_scratch_gate = DeviceBuffer::<f32>::alloc(self.device, eis)?;
         let mut expert_scratch_up = DeviceBuffer::<f32>::alloc(self.device, eis)?;
+        let mut expert_scratch_act = DeviceBuffer::<f32>::alloc(self.device, eis)?;
         let mut expert_output = DeviceBuffer::<f32>::alloc(self.device, hs)?;
 
         for (j, &(expert_id, _)) in topk.iter().enumerate() {
@@ -1592,7 +1585,6 @@ impl Model {
             )?;
 
             // SiLU(gate) * up → scratch_act
-            let mut expert_scratch_act = DeviceBuffer::<f32>::alloc(self.device, eis)?;
             self.kernels.silu_mul.forward(
                 &mut expert_scratch_act,
                 &expert_scratch_gate,
@@ -1670,8 +1662,9 @@ impl Model {
             )?;
         }
 
+
         // 2. Project Q+gate [4096], K [512], V [512]
-        let (w_q_gate, w_k, w_v, w_o_ptr, q_norm_w, k_norm_w, post_norm_w, w_gate_w, w_up_w, w_down_w) =
+        let (w_q_gate, w_k, w_v, w_o_ptr, q_norm_w, k_norm_w) =
             match &self.layers[layer_idx] {
                 LayerWeights::Attention(w) => (
                     &w.w_q_gate as *const DeviceBuffer<u16>,
@@ -1680,10 +1673,6 @@ impl Model {
                     &w.w_o as *const DeviceBuffer<u16>,
                     &w.q_norm as *const DeviceBuffer<u16>,
                     &w.k_norm as *const DeviceBuffer<u16>,
-                    &w.post_norm as *const DeviceBuffer<u16>,
-                    &w.w_gate as *const DeviceBuffer<u16>,
-                    &w.w_up as *const DeviceBuffer<u16>,
-                    &w.w_down as *const DeviceBuffer<u16>,
                 ),
                 _ => unreachable!(),
             };
@@ -1716,6 +1705,7 @@ impl Model {
             )?;
         }
 
+
         // 3. Split q_gate_attn → q, gate (gated) or just copy (non-gated)
         let hd_usize = hd as usize;
         if cfg.has_output_gate {
@@ -1736,6 +1726,7 @@ impl Model {
             }
         }
 
+
         // 4. QK norm (in-place on q_attn, k_attn)
         unsafe {
             self.kernels.qk_norm.forward(
@@ -1750,6 +1741,7 @@ impl Model {
                 &self.stream,
             )?;
         }
+
 
         // 5. Update position IDs and apply mRoPE
         let pos_data = [position as i32, position as i32, position as i32];
@@ -1770,6 +1762,7 @@ impl Model {
             &self.stream,
         )?;
 
+
         // 6. Write K,V to cache at position `position` ([H,T,D] layout)
         let max_sl = self.config.max_seq_len;
         for h in 0..nkh as usize {
@@ -1780,6 +1773,7 @@ impl Model {
                 d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].v, dst_off, &self.activations.v_attn, src_off, hd as usize, &self.stream)?;
             }
         }
+
 
         // 7. GQA attention
         let seq_len = position + 1;
@@ -1796,6 +1790,7 @@ impl Model {
             &self.stream,
         )?;
 
+
         // 8. Output gate (Qwen3.5 only) or pass-through
         let final_attn = if cfg.has_output_gate {
             self.kernels.output_gate.forward(
@@ -1810,6 +1805,7 @@ impl Model {
             &self.activations.attn_out as *const DeviceBuffer<f32>
         };
 
+
         // 9. Output projection
         unsafe {
             self.kernels.linear_proj.forward(
@@ -1821,6 +1817,7 @@ impl Model {
                 &self.stream,
             )?;
         }
+
 
         // 10. Residual add
         unsafe {
@@ -1834,10 +1831,7 @@ impl Model {
             &self.stream,
         )?;
 
-        // 11. FFN
-        unsafe {
-            self.ffn_forward(&*post_norm_w, &*w_gate_w, &*w_up_w, &*w_down_w)
-        }
+        Ok(())
     }
 
     pub fn config(&self) -> &ModelConfig { &self.config }
@@ -2053,6 +2047,18 @@ impl Model {
         if tokens.is_empty() {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
+
+        // MoE models can't use megakernel prefill (FFN weights not compiled in).
+        // Fall back to sequential decode_step_moe.
+        let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+        if has_moe {
+            let mut logits = vec![];
+            for (i, &tok) in tokens.iter().enumerate() {
+                logits = self.decode_step_moe(tok, i as u32)?;
+            }
+            return Ok(logits);
+        }
+
         let mut pos = 0u32;
         for chunk in tokens.chunks(CHUNK_TOKENS) {
             let mut bufs = PrefillBuffers::alloc(self.device, &self.config, chunk.len())?;
