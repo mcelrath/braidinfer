@@ -170,6 +170,7 @@ struct RawConfig {
     mamba_head_dim: Option<usize>,
     conv_kernel: Option<usize>,
     max_position_embeddings: Option<usize>,
+    layers_block_type: Option<Vec<String>>,
     // MoE fields
     num_experts: Option<usize>,
     n_routed_experts: Option<usize>,
@@ -386,7 +387,10 @@ impl ModelConfig {
     }
 
     fn from_nemotron_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let num_layers = raw.num_hidden_layers
+            .or_else(|| raw.layers_block_type.as_ref().map(|l| l.len()))
+            .or_else(|| raw.hybrid_override_pattern.as_ref().map(|p| p.len()))
+            .ok_or("missing num_hidden_layers")?;
         let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
         let head_dim = raw.head_dim.ok_or("missing head_dim")?;
         let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
@@ -398,8 +402,24 @@ impl ModelConfig {
         let rope_dim = ((head_dim as f64) * partial_rotary_factor) as usize;
         let rms_norm_eps = raw.norm_eps.unwrap_or(1e-5) as f32;
 
-        // Parse hybrid_override_pattern: M=Mamba2, E=MoE FFN, *=Attention
+        // Parse layer pattern: hybrid_override_pattern (string) or layers_block_type (array)
         let pattern = raw.hybrid_override_pattern.unwrap_or_default();
+        // If layers_block_type exists, convert to pattern string
+        let pattern = if pattern.is_empty() {
+            if let Some(lbt) = &raw.layers_block_type {
+                lbt.iter().map(|t| match t.as_str() {
+                    "mamba" => 'M',
+                    "moe" => 'E',
+                    "attention" => '*',
+                    _ => '?',
+                }).collect::<String>()
+            } else {
+                pattern
+            }
+        } else {
+            pattern
+        };
+        let num_layers = if pattern.is_empty() { num_layers } else { pattern.len() };
         let num_experts = raw.n_routed_experts.unwrap_or(raw.num_experts.unwrap_or(0));
         let num_active = raw.num_experts_per_tok.unwrap_or(raw.num_selected_experts.unwrap_or(0));
         let num_shared = raw.n_shared_experts.unwrap_or(0);
