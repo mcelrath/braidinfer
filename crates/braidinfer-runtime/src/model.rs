@@ -240,7 +240,7 @@ impl ModelConfig {
             has_qk_norm: true,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
-            tie_word_embeddings: true,
+            tie_word_embeddings: true, // 0.8B fallback for tests
         }
     }
 
@@ -259,6 +259,7 @@ impl ModelConfig {
     }
 
     fn from_qwen35_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let tie_word_embeddings = raw.tie_word_embeddings.unwrap_or(true);
         // Some Qwen variants (qwen3_next) put fields at top level, not in text_config
         let tc = if let Some(tc) = raw.text_config { tc } else {
             // Synthesize TextConfig from top-level fields
@@ -390,7 +391,7 @@ impl ModelConfig {
             has_qk_norm: true,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
-            tie_word_embeddings: true,
+            tie_word_embeddings,
         })
     }
 
