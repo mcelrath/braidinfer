@@ -846,10 +846,14 @@ impl Model {
                     w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
                     w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * config.num_q_heads * config.head_dim)?,
                     q_norm: if has_qk_norm {
-                        load_weight_bf16(&st, &format!("{p}self_attn.q_norm.weight"), device, config.head_dim)?
+                        let name = format!("{p}self_attn.q_norm.weight");
+                        let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
+                        load_weight_bf16(&st, &name, device, raw.len() / 2)?
                     } else { DeviceBuffer::<u16>::alloc(device, 0)? },
                     k_norm: if has_qk_norm {
-                        load_weight_bf16(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?
+                        let name = format!("{p}self_attn.k_norm.weight");
+                        let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
+                        load_weight_bf16(&st, &name, device, raw.len() / 2)?
                     } else { DeviceBuffer::<u16>::alloc(device, 0)? },
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
                     w_gate: if !is_moe {
@@ -1485,7 +1489,13 @@ impl Model {
 
     /// MoE FFN forward: route to top-k experts, run expert FFNs, combine.
     /// Uses individual kernel launches (no megakernel).
-    fn moe_ffn_forward(&mut self, layer_idx: usize) -> HipResult<()> {
+    fn moe_ffn_forward(&mut self, _layer_idx: usize) -> HipResult<()> {
+        // TEMPORARY: skip MoE FFN to isolate crash
+        return Ok(());
+    }
+
+    #[allow(dead_code)]
+    fn moe_ffn_forward_real(&mut self, layer_idx: usize) -> HipResult<()> {
         let moe = self.moe_weights[layer_idx].as_ref()
             .expect("moe_ffn_forward called on non-MoE layer");
         let hs = self.config.hidden_size;
@@ -1678,12 +1688,13 @@ impl Model {
                 _ => unreachable!(),
             };
 
+        let q_mult = if cfg.has_output_gate { 2u32 } else { 1 };
         unsafe {
             self.kernels.linear_proj.forward(
                 &mut self.activations.q_gate_attn,
                 &*w_q_gate,
                 &self.activations.normed,
-                nqh * hd * 2,
+                nqh * hd * q_mult,
                 hs,
                 &self.stream,
             )?;
@@ -1705,17 +1716,23 @@ impl Model {
             )?;
         }
 
-        // 3. Split q_gate_attn: interleaved [q0_hd, gate0_hd, q1_hd, gate1_hd, ...]
-        //    → q=[nqh*hd], gate=[nqh*hd]
-        let _q_size = nqh as usize * hd as usize;
+        // 3. Split q_gate_attn → q, gate (gated) or just copy (non-gated)
         let hd_usize = hd as usize;
-        unsafe {
-            for h in 0..nqh as usize {
-                let src_q = h * hd_usize * 2;
-                let src_g = h * hd_usize * 2 + hd_usize;
-                let dst = h * hd_usize;
-                d2d_copy_f32(&mut self.activations.q_attn, dst, &self.activations.q_gate_attn, src_q, hd_usize, &self.stream)?;
-                d2d_copy_f32(&mut self.activations.gate_attn, dst, &self.activations.q_gate_attn, src_g, hd_usize, &self.stream)?;
+        if cfg.has_output_gate {
+            unsafe {
+                for h in 0..nqh as usize {
+                    let src_q = h * hd_usize * 2;
+                    let src_g = h * hd_usize * 2 + hd_usize;
+                    let dst = h * hd_usize;
+                    d2d_copy_f32(&mut self.activations.q_attn, dst, &self.activations.q_gate_attn, src_q, hd_usize, &self.stream)?;
+                    d2d_copy_f32(&mut self.activations.gate_attn, dst, &self.activations.q_gate_attn, src_g, hd_usize, &self.stream)?;
+                }
+            }
+        } else {
+            // Non-gated: q_gate_attn IS q_attn, just copy
+            let total = nqh as usize * hd_usize;
+            unsafe {
+                d2d_copy_f32(&mut self.activations.q_attn, 0, &self.activations.q_gate_attn, 0, total, &self.stream)?;
             }
         }
 
@@ -1779,21 +1796,26 @@ impl Model {
             &self.stream,
         )?;
 
-        // 8. Output gate: gated_out = attn_out * sigmoid(gate)
-        self.kernels.output_gate.forward(
-            &mut self.activations.gated_out,
-            &self.activations.attn_out,
-            &self.activations.gate_attn,
-            nqh * hd,
-            &self.stream,
-        )?;
+        // 8. Output gate (Qwen3.5 only) or pass-through
+        let final_attn = if cfg.has_output_gate {
+            self.kernels.output_gate.forward(
+                &mut self.activations.gated_out,
+                &self.activations.attn_out,
+                &self.activations.gate_attn,
+                nqh * hd,
+                &self.stream,
+            )?;
+            &self.activations.gated_out as *const DeviceBuffer<f32>
+        } else {
+            &self.activations.attn_out as *const DeviceBuffer<f32>
+        };
 
-        // 9. Output projection [1024, 2048]
+        // 9. Output projection
         unsafe {
             self.kernels.linear_proj.forward(
                 &mut self.activations.out_proj,
                 &*w_o_ptr,
-                &self.activations.gated_out,
+                &*final_attn,
                 hs,
                 nqh * hd,
                 &self.stream,
@@ -1861,6 +1883,10 @@ impl Model {
     fn decode_step_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let hs = self.config.hidden_size as u32;
         let eps = self.config.rms_norm_eps;
+
+        // Set position_ids for mRoPE/RoPE
+        let pos_data = [position as i32, position as i32, position as i32];
+        self.activations.position_ids.copy_from_host(&pos_data)?;
 
         // Embedding
         self.kernels.embedding.forward(
