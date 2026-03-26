@@ -4,7 +4,7 @@ use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{chat_generate, greedy_generate, load_tokenizer, TokenConfig};
 use braidinfer_runtime::model::Model;
 
-const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
+const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -21,9 +21,11 @@ fn main() {
 
     let raw_mode = std::env::var("RAW").is_ok();
 
-    let model_dir = Path::new(MODEL_DIR);
+    let model_path = std::env::var("MODEL").ok()
+        .unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+    let model_dir = Path::new(&model_path);
     if !model_dir.exists() {
-        eprintln!("Model not found at {}", MODEL_DIR);
+        eprintln!("Model not found at {}", model_path);
         std::process::exit(1);
     }
 
