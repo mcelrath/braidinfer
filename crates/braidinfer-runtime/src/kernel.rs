@@ -1147,6 +1147,7 @@ impl GdnRecurrentStepV2Kernel {
         num_heads: u32,
         key_dim: u32,
         value_dim: u32,
+        gqa_group: u32,
         stream: &Stream,
     ) -> HipResult<()> {
         assert_eq!(q.device(), self.device);
@@ -1169,8 +1170,9 @@ impl GdnRecurrentStepV2Kernel {
         let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
         let mut kd = key_dim as i32;
         let mut vd = value_dim as i32;
+        let mut gqa = gqa_group as i32;
 
-        let mut args: [*mut c_void; 9] = [
+        let mut args: [*mut c_void; 10] = [
             std::ptr::addr_of_mut!(q_ptr).cast(),
             std::ptr::addr_of_mut!(k_ptr).cast(),
             std::ptr::addr_of_mut!(v_ptr).cast(),
@@ -1180,6 +1182,7 @@ impl GdnRecurrentStepV2Kernel {
             std::ptr::addr_of_mut!(out_ptr).cast(),
             std::ptr::addr_of_mut!(kd).cast(),
             std::ptr::addr_of_mut!(vd).cast(),
+            std::ptr::addr_of_mut!(gqa).cast(),
         ];
 
         // Shared memory: 2 * block_size floats for q/k norm reductions

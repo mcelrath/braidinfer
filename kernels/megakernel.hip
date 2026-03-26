@@ -307,6 +307,8 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
     float* output = inst_fptr(inst, 7);
     int key_dim = inst_int(inst, 8);
     int value_dim = inst_int(inst, 9);
+    int gqa_group = inst_int(inst, 10);
+    if (gqa_group <= 0) gqa_group = 1;
 
     const int h = vblock;
     const int tid = threadIdx.x;
@@ -315,8 +317,9 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
     const float decay = gate[h];
     const float beta = 1.0f / (1.0f + expf(-b[h]));
 
-    const float* qh = q + h * key_dim;
-    const float* kh = k + h * key_dim;
+    const int kh_idx = h / gqa_group;
+    const float* qh = q + kh_idx * key_dim;
+    const float* kh = k + kh_idx * key_dim;
     const float* vh = v + h * value_dim;
     float* sh = state + h * key_dim * value_dim;
     float* oh = output + h * value_dim;

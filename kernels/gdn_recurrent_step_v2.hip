@@ -29,7 +29,8 @@ extern "C" __global__ void gdn_recurrent_step_v2_f32(
     float* __restrict__ state,
     float* __restrict__ output,
     const int key_dim,
-    const int value_dim
+    const int value_dim,
+    const int gqa_group  // num_value_heads / num_key_heads (1 when equal)
 ) {
     const int h = blockIdx.x;
     const int tid = threadIdx.x;
@@ -38,8 +39,10 @@ extern "C" __global__ void gdn_recurrent_step_v2_f32(
     const float decay = gate[h];
     const float beta = 1.0f / (1.0f + expf(-b[h]));
 
-    const float* qh = q + h * key_dim;
-    const float* kh = k + h * key_dim;
+    // GQA-like key sharing: multiple value heads share one key head
+    const int kh_idx = h / gqa_group;
+    const float* qh = q + kh_idx * key_dim;
+    const float* kh = k + kh_idx * key_dim;
     const float* vh = v + h * value_dim;
     float* sh = state + h * key_dim * value_dim;
     float* oh = output + h * value_dim;

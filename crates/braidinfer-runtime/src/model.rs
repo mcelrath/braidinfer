@@ -1158,9 +1158,8 @@ impl Model {
         let mut gdn_conv_states = Vec::new();
         for i in 0..config.num_layers {
             if !config.layer_is_attention[i] {
-                let mut recurrent = DeviceBuffer::<f32>::alloc(device, nh * kd * vd)?;
-                // zero-init
-                let zeros = vec![0.0f32; nh * kd * vd];
+                let mut recurrent = DeviceBuffer::<f32>::alloc(device, nvh * kd * vd)?;
+                let zeros = vec![0.0f32; nvh * kd * vd];
                 recurrent.copy_from_host(&zeros)?;
                 gdn_states.push(GdnState { recurrent });
 
@@ -1207,10 +1206,10 @@ impl Model {
             q_gdn: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             k_gdn: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             v_gdn: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
-            a_proj: DeviceBuffer::<f32>::alloc(device, nh)?,
-            b_proj: DeviceBuffer::<f32>::alloc(device, nh)?,
+            a_proj: DeviceBuffer::<f32>::alloc(device, nvh)?,
+            b_proj: DeviceBuffer::<f32>::alloc(device, nvh)?,
             z_proj: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
-            gate_gdn: DeviceBuffer::<f32>::alloc(device, nh)?,
+            gate_gdn: DeviceBuffer::<f32>::alloc(device, nvh)?,
             recurrent_out: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             normed_gated: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             out_proj: DeviceBuffer::<f32>::alloc(device, hs)?,
@@ -1299,12 +1298,12 @@ impl Model {
             &self.stream,
         )?;
 
-        // 3. Project a [nh], b [nh], z [nvh*vd]
+        // 3. Project a [nvh], b [nvh], z [nvh*vd]
         self.kernels.linear_proj.forward(
             &mut self.activations.a_proj,
             &weights.w_a,
             &self.activations.normed,
-            nh,
+            nvh,
             hs,
             &self.stream,
         )?;
@@ -1312,7 +1311,7 @@ impl Model {
             &mut self.activations.b_proj,
             &weights.w_b,
             &self.activations.normed,
-            nh,
+            nvh,
             hs,
             &self.stream,
         )?;
@@ -1414,11 +1413,12 @@ impl Model {
             &weights_gdn.a_log,
             &self.activations.a_proj,
             &weights_gdn.dt_bias,
-            nh,
+            nvh,
             &self.stream,
         )?;
 
-        // 6. GDN recurrent step v2
+        // 6. GDN recurrent step v2 (nvh heads, GQA group = nvh/nh)
+        let gqa_group = nvh / nh;
         self.kernels.gdn_recurrent_v2.forward(
             &self.activations.q_gdn,
             &self.activations.k_gdn,
@@ -1427,9 +1427,10 @@ impl Model {
             &self.activations.b_proj,
             &mut self.gdn_states[gdn_idx].recurrent,
             &mut self.activations.recurrent_out,
-            nh,
+            nvh,
             kd,
             vd,
+            gqa_group,
             &self.stream,
         )?;
 
@@ -1973,10 +1974,13 @@ impl Model {
         )?;
         traces.push(("normed".into(), self.read_buf(&self.activations.normed)?));
 
+        let nvh_traced = self.config.linear_num_value_heads as u32;
+        let gqa_traced = nvh_traced / nh;
+
         // QKV projection
         self.kernels.linear_proj.forward(
             &mut self.activations.qkv, &w.w_qkv, &self.activations.normed,
-            nh * kd * 2 + nh * vd, hs, &self.stream,
+            nh * kd * 2 + nvh_traced * vd, hs, &self.stream,
         )?;
         traces.push(("qkv_pre_conv".into(), self.read_buf(&self.activations.qkv)?));
 
@@ -2062,7 +2066,7 @@ impl Model {
             &self.activations.q_gdn, &self.activations.k_gdn, &self.activations.v_gdn,
             &self.activations.gate_gdn, &self.activations.b_proj,
             &mut self.gdn_states[0].recurrent, &mut self.activations.recurrent_out,
-            nh, kd, vd, &self.stream,
+            nvh_traced, kd, vd, gqa_traced, &self.stream,
         )?;
         traces.push(("recurrent_out".into(), self.read_buf(&self.activations.recurrent_out)?));
 
@@ -2096,7 +2100,8 @@ impl Model {
         let kd = self.config.linear_key_head_dim;
         let vd = self.config.linear_value_head_dim;
         let ck = self.config.linear_conv_kernel_dim;
-        let qkv_out = nh * kd * 2 + nh * vd;
+        let nvh_r = self.config.linear_num_value_heads;
+        let qkv_out = nh * kd * 2 + nvh_r * vd;
 
         for state in &mut self.gdn_states {
             let zeros = vec![0.0f32; nh * kd * vd];

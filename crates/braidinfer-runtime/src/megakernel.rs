@@ -448,7 +448,8 @@ impl MegakernelProgram {
         let mut _attn_layer_count = 0usize;
 
         for layer_i in 0..cfg.num_layers {
-            if cfg.layer_is_attention[layer_i] {
+            use crate::model::LayerType;
+            if cfg.layers[layer_i].layer_type == LayerType::Attention {
                 let w = match &model.layers[layer_i] {
                     LayerWeights::Attention(w) => w,
                     _ => panic!("expected attention layer"),
@@ -502,13 +503,13 @@ impl MegakernelProgram {
                     instructions.push(inst);
                 }
 
-                // a projection (batch=N)
+                // a projection (batch=N) — nvh_gdn outputs (per value head)
                 {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nh_gdn as u32);
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh_gdn as u32);
                     inst.set_output_ptr(1, prefill_bufs.a_proj.as_ptr());
                     inst.set_ptr(2, w.w_a.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, nh_gdn as i32);
+                    inst.set_int(4, nvh_gdn as i32);
                     inst.set_int(5, hs as i32);
                     inst.set_int(6, n as i32);
                     inst.set_no_sync();
@@ -517,11 +518,11 @@ impl MegakernelProgram {
 
                 // b projection (batch=N)
                 {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nh_gdn as u32);
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh_gdn as u32);
                     inst.set_output_ptr(1, prefill_bufs.b_proj.as_ptr());
                     inst.set_ptr(2, w.w_b.as_ptr());
                     inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, nh_gdn as i32);
+                    inst.set_int(4, nvh_gdn as i32);
                     inst.set_int(5, hs as i32);
                     inst.set_int(6, n as i32);
                     inst.set_no_sync();
@@ -584,38 +585,40 @@ impl MegakernelProgram {
 
                     // GDN gate (from batched a_proj[t])
                     {
-                        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nh_gdn as u32, 256));
+                        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nvh_gdn as u32, 256));
                         inst.set_output_ptr(1, act.gate_gdn.as_ptr());
-                        inst.set_ptr(2, unsafe { prefill_bufs.a_proj.as_ptr().add(t * nh_gdn) });
+                        inst.set_ptr(2, unsafe { prefill_bufs.a_proj.as_ptr().add(t * nvh_gdn) });
                         inst.set_ptr(3, w.a_log.as_ptr());
                         inst.set_ptr(4, w.dt_bias.as_ptr());
-                        inst.set_int(5, nh_gdn as i32);
+                        inst.set_int(5, nvh_gdn as i32);
                         instructions.push(inst);
                     }
 
-                    // GDN recurrence
+                    // GDN recurrence (nvh heads with GQA key sharing)
                     {
-                        let mut inst = Instruction::new(OP_GDN_RECUR, nh_gdn as u32);
+                        let gqa_group = nvh_gdn / nh_gdn;
+                        let mut inst = Instruction::new(OP_GDN_RECUR, nvh_gdn as u32);
                         inst.set_ptr(1, act.q_gdn.as_ptr());
                         inst.set_ptr(2, act.k_gdn.as_ptr());
                         inst.set_ptr(3, act.v_gdn.as_ptr());
                         inst.set_ptr(4, act.gate_gdn.as_ptr());
-                        inst.set_ptr(5, unsafe { prefill_bufs.b_proj.as_ptr().add(t * nh_gdn) });
+                        inst.set_ptr(5, unsafe { prefill_bufs.b_proj.as_ptr().add(t * nvh_gdn) });
                         inst.set_output_ptr(6, gdn_state.recurrent.as_ptr());
                         inst.set_output_ptr(7, act.recurrent_out.as_ptr());
                         inst.set_int(8, kd as i32);
                         inst.set_int(9, vd as i32);
+                        inst.set_int(10, gqa_group as i32);
                         instructions.push(inst);
                     }
 
                     // RMSNorm gated (z from batched z_proj[t])
                     {
-                        let mut inst = Instruction::new(OP_RMSNORM_GATE, nh_gdn as u32);
+                        let mut inst = Instruction::new(OP_RMSNORM_GATE, nvh_gdn as u32);
                         inst.set_output_ptr(1, act.normed_gated.as_ptr());
                         inst.set_ptr(2, act.recurrent_out.as_ptr());
                         inst.set_ptr(3, unsafe { prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd) });
                         inst.set_ptr(4, w.output_norm.as_ptr());
-                        inst.set_int(5, nh_gdn as i32);
+                        inst.set_int(5, nvh_gdn as i32);
                         inst.set_int(6, vd as i32);
                         inst.set_float(7, eps);
                         instructions.push(inst);
@@ -1257,21 +1260,21 @@ impl MegakernelProgram {
         inst.set_no_sync();
         instructions.push(inst);
 
-        // 3. Project a [nh], b [nh], z [nh*vd] — all read normed, write disjoint buffers
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, nh as u32);
+        // 3. Project a [nvh], b [nvh], z [nvh*vd]
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh as u32);
         inst.set_output_ptr(1, act.a_proj.as_ptr());
         inst.set_ptr(2, w.w_a.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, nh as i32);
+        inst.set_int(4, nvh as i32);
         inst.set_int(5, hs as i32);
         inst.set_no_sync();
         instructions.push(inst);
 
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, nh as u32);
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh as u32);
         inst.set_output_ptr(1, act.b_proj.as_ptr());
         inst.set_ptr(2, w.w_b.as_ptr());
         inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, nh as i32);
+        inst.set_int(4, nvh as i32);
         inst.set_int(5, hs as i32);
         inst.set_no_sync();
         instructions.push(inst);
@@ -1322,17 +1325,18 @@ impl MegakernelProgram {
         inst.set_int(6, ck as i32);
         instructions.push(inst);
 
-        // 5. GDN gate
-        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nh as u32, 256));
+        // 5. GDN gate (nvh heads — per value head)
+        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nvh as u32, 256));
         inst.set_output_ptr(1, act.gate_gdn.as_ptr());
         inst.set_ptr(2, act.a_proj.as_ptr());
         inst.set_ptr(3, w.a_log.as_ptr());
         inst.set_ptr(4, w.dt_bias.as_ptr());
-        inst.set_int(5, nh as i32);
+        inst.set_int(5, nvh as i32);
         instructions.push(inst);
 
-        // 6. GDN recurrent (one block per head)
-        let mut inst = Instruction::new(OP_GDN_RECUR, nh as u32);
+        // 6. GDN recurrent (nvh heads, GQA key sharing)
+        let gqa_group = nvh / nh;
+        let mut inst = Instruction::new(OP_GDN_RECUR, nvh as u32);
         inst.set_ptr(1, act.q_gdn.as_ptr());
         inst.set_ptr(2, act.k_gdn.as_ptr());
         inst.set_ptr(3, act.v_gdn.as_ptr());
@@ -1342,15 +1346,16 @@ impl MegakernelProgram {
         inst.set_output_ptr(7, act.recurrent_out.as_ptr());
         inst.set_int(8, kd as i32);
         inst.set_int(9, vd as i32);
+        inst.set_int(10, gqa_group as i32);
         instructions.push(inst);
 
         // 7. RMSNorm gated
-        let mut inst = Instruction::new(OP_RMSNORM_GATE, nh as u32);
+        let mut inst = Instruction::new(OP_RMSNORM_GATE, nvh as u32);
         inst.set_output_ptr(1, act.normed_gated.as_ptr());
         inst.set_ptr(2, act.recurrent_out.as_ptr());
         inst.set_ptr(3, act.z_proj.as_ptr());
         inst.set_ptr(4, w.output_norm.as_ptr());
-        inst.set_int(5, nh as i32);
+        inst.set_int(5, nvh as i32);
         inst.set_int(6, vd as i32);
         inst.set_float(7, eps);
         instructions.push(inst);
@@ -1809,7 +1814,7 @@ impl MegakernelProgram {
     pub fn enable_quantized_kv(&mut self, max_chunks: usize, cfg: &crate::model::ModelConfig) -> HipResult<()> {
         let nqh = cfg.num_q_heads;
         let hd = cfg.head_dim;
-        let num_attn_layers = cfg.layer_is_attention.iter().filter(|&&a| a).count();
+        let num_attn_layers = cfg.layers.iter().filter(|l| l.layer_type == crate::model::LayerType::Attention).count();
         // Scratch: [nqh × (2+hd)] per attention layer (each layer gets its own scratch region)
         let scratch_per_layer = nqh * (2 + hd);
         let total_scratch = num_attn_layers * scratch_per_layer;
@@ -1842,7 +1847,7 @@ impl MegakernelProgram {
         use crate::paged_kv::quantized_kv_offsets;
         let nkh = cfg.num_kv_heads;
         let hd = cfg.head_dim;
-        let num_attn_layers = cfg.layer_is_attention.iter().filter(|&&a| a).count();
+        let num_attn_layers = cfg.layers.iter().filter(|l| l.layer_type == crate::model::LayerType::Attention).count();
         let kv_stride = nkh * hd;
         let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();
 
