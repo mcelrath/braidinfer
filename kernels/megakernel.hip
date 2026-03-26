@@ -48,6 +48,7 @@
 #define OP_DEINTERLEAVE 20
 #define OP_KV_QUANTIZE  21
 #define OP_ATTN_PAGED_Q 22
+#define OP_MOE_GATE     23
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -1348,6 +1349,81 @@ __device__ void op_kv_quantize(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_MOE_GATE: Router top-k expert selection from pre-computed scores.
+// Assumes scores already computed via OP_LINEAR_PROJ (hidden @ gate^T → [num_experts]).
+// This kernel does: top-k selection + softmax/norm_topk + write expert_ids and weights.
+// args: [1]=scores (float*, [num_experts] — output of linear_proj)
+//       [2]=expert_ids (int*, [k] — output)
+//       [3]=expert_weights (float*, [k] — output)
+//       [4]=num_experts, [5]=k (top-k count)
+//       [6]=gate_mode (0=softmax, 1=norm_topk)
+//       [7]=routed_scaling_factor (float, used for norm_topk)
+// grid_x = 1 (single block processes one token's routing)
+__device__ void op_moe_gate(const u64* inst, u32 vblock) {
+    if (vblock > 0) return;
+    const float* scores = inst_fptr(inst, 1);
+    int* expert_ids = (int*)(inst[2]);
+    float* expert_weights = inst_fptr(inst, 3);
+    int num_experts = inst_int(inst, 4);
+    int k = inst_int(inst, 5);
+    int gate_mode = inst_int(inst, 6);
+    float scaling = inst_float(inst, 7);
+
+    int tid = threadIdx.x;
+    int stride = blockDim.x;
+
+    extern __shared__ float shmem[];
+    float* sh_scores = shmem;           // [num_experts]
+    int* sh_ids = (int*)(shmem + 256);  // [k] — top-k indices
+
+    // Load scores into shared memory
+    for (int i = tid; i < num_experts; i += stride) {
+        sh_scores[i] = scores[i];
+    }
+    __syncthreads();
+
+    // Top-k selection (thread 0 does sequential selection — k is small, typically 2-22)
+    if (tid == 0) {
+        for (int j = 0; j < k; j++) {
+            float best = -1e30f;
+            int best_idx = 0;
+            for (int i = 0; i < num_experts; i++) {
+                if (sh_scores[i] > best) {
+                    best = sh_scores[i];
+                    best_idx = i;
+                }
+            }
+            sh_ids[j] = best_idx;
+            expert_ids[j] = best_idx;
+            sh_scores[best_idx] = -1e30f; // mask selected
+        }
+    }
+    __syncthreads();
+
+    // Compute weights: softmax over selected experts
+    if (tid == 0) {
+        // Reload original scores for selected experts
+        float selected[32]; // max k=32 (largest is Nemotron top-22)
+        float max_score = -1e30f;
+        for (int j = 0; j < k; j++) {
+            selected[j] = scores[expert_ids[j]];
+            if (selected[j] > max_score) max_score = selected[j];
+        }
+
+        // Softmax
+        float sum = 0.0f;
+        for (int j = 0; j < k; j++) {
+            selected[j] = expf(selected[j] - max_score);
+            sum += selected[j];
+        }
+        for (int j = 0; j < k; j++) {
+            float w = selected[j] / sum;
+            if (gate_mode == 1) w *= scaling; // norm_topk: multiply by routed_scaling_factor
+            expert_weights[j] = w;
+        }
+    }
+}
+
 // ============================================================
 // Main megakernel entry point
 // ============================================================
@@ -1393,6 +1469,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
                 case OP_DEINTERLEAVE: op_deinterleave(inst, vb); break;
                 case OP_KV_QUANTIZE:  op_kv_quantize(inst, vb); break;
                 case OP_ATTN_PAGED_Q: op_attn_paged_quant(inst, vb); break;
+                case OP_MOE_GATE:    op_moe_gate(inst, vb); break;
                 default: break;
             }
         }

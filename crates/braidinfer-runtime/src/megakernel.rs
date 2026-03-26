@@ -38,6 +38,7 @@ const OP_ATTN_PREFILL: u32 = 19;
 const OP_DEINTERLEAVE: u32 = 20;
 const OP_KV_QUANTIZE: u32 = 21;
 const OP_ATTN_PAGED_Q: u32 = 22;
+const OP_MOE_GATE: u32 = 23;
 
 const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
