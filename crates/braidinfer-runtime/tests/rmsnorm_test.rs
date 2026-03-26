@@ -48,7 +48,7 @@ fn test_rmsnorm_matches_reference() {
     d_weight.copy_from_host(&weight_data).expect("copy weight");
 
     kernel
-        .forward(&mut d_output, &d_input, &d_weight, num_rows, hidden_size, eps, &stream)
+        .forward(&mut d_output, &d_input, &d_weight, num_rows, hidden_size, eps, true, &stream)
         .expect("kernel launch");
 
     stream.synchronize().expect("sync");

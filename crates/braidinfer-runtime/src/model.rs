@@ -109,6 +109,7 @@ pub struct ModelConfig {
     pub rope_type: RopeType,
     pub has_qk_norm: bool,
     pub has_output_gate: bool,  // Qwen3.5 interleaves Q+gate; others don't
+    pub rms_norm_one_plus_w: bool, // true: (1+w)*x (Qwen3.5), false: w*x (Llama, OLMoE)
     pub attention_layer_indices: Vec<usize>,
     pub model_type: String,
     pub tie_word_embeddings: bool,
@@ -157,6 +158,7 @@ impl ModelConfig {
             rope_type: RopeType::MRope { sections: [11, 11, 10] },
             has_qk_norm: false,
             has_output_gate: false,
+            rms_norm_one_plus_w: true,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings: true, // 0.8B fallback for tests
@@ -343,6 +345,7 @@ impl ModelConfig {
             expert_intermediate_size, shared_expert_intermediate_size,
             recurrent_kind, rope_type,
             has_qk_norm: false, has_output_gate: false, // auto-detected from tensor names at load time
+            rms_norm_one_plus_w: model_type == "qwen3_5",
             attention_layer_indices, model_type, tie_word_embeddings,
         })
     }
@@ -895,9 +898,9 @@ impl Model {
                         let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
                             load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
                         } else {
-                            // Per-expert: try gate_proj/up_proj (Qwen) or w1/w3 (Mixtral)
-                            // Also try mlp.experts.N or block_sparse_moe.experts.N
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * 2 * eis * hs)?;
+                            // Per-expert: fuse gate_proj + up_proj on host, then copy to GPU
+                            let expert_elems = 2 * eis * hs; // per expert
+                            let mut host_buf = vec![0u16; ne * expert_elems];
                             for e in 0..ne {
                                 let (gp, up) = [
                                     (format!("{p}mlp.experts.{e}.gate_proj.weight"), format!("{p}mlp.experts.{e}.up_proj.weight")),
@@ -906,15 +909,14 @@ impl Model {
                                     .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.experts.{e}.gate_proj.weight (or variants)")))?;
                                 let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
                                 let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
-                                // gate_proj and up_proj are each [expert_is, hidden_size]
-                                // Fuse into [2*expert_is, hidden_size] per expert
-                                let offset = e * 2 * eis * hs * 2; // bytes
-                                unsafe {
-                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
-                                    std::ptr::copy_nonoverlapping(g_raw.as_ptr(), dst, eis * hs * 2);
-                                    std::ptr::copy_nonoverlapping(u_raw.as_ptr(), dst.add(eis * hs * 2), eis * hs * 2);
-                                }
+                                let dst_off = e * expert_elems;
+                                let g_slice = unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
+                                let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
+                                host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
+                                host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
                             }
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
+                            buf.copy_from_host(&host_buf)?;
                             buf
                         };
 
@@ -922,7 +924,8 @@ impl Model {
                         let expert_down = if st.tensor_data(&down_name).is_ok() {
                             load_weight_bf16(&st, &down_name, device, ne * hs * eis)?
                         } else {
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * hs * eis)?;
+                            let expert_elems_d = hs * eis;
+                            let mut host_buf_d = vec![0u16; ne * expert_elems_d];
                             for e in 0..ne {
                                 let dp = [
                                     format!("{p}mlp.experts.{e}.down_proj.weight"),
@@ -930,12 +933,12 @@ impl Model {
                                 ].into_iter().find(|n| st.tensor_data(n).is_ok())
                                     .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.down_proj (or variants)")))?;
                                 let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
-                                let offset = e * hs * eis * 2;
-                                unsafe {
-                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
-                                    std::ptr::copy_nonoverlapping(d_raw.as_ptr(), dst, hs * eis * 2);
-                                }
+                                let d_slice = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d) };
+                                let dst_off = e * expert_elems_d;
+                                host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
                             }
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
+                            buf.copy_from_host(&host_buf_d)?;
                             buf
                         };
 
@@ -1039,7 +1042,8 @@ impl Model {
                         let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
                             load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
                         } else {
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * 2 * eis * hs)?;
+                            let expert_elems = 2 * eis * hs;
+                            let mut host_buf = vec![0u16; ne * expert_elems];
                             for e in 0..ne {
                                 let (gp, up) = [
                                     (format!("{p}mlp.experts.{e}.gate_proj.weight"), format!("{p}mlp.experts.{e}.up_proj.weight")),
@@ -1048,13 +1052,14 @@ impl Model {
                                     .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.gate_proj (GDN MoE)")))?;
                                 let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
                                 let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
-                                let offset = e * 2 * eis * hs * 2;
-                                unsafe {
-                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
-                                    std::ptr::copy_nonoverlapping(g_raw.as_ptr(), dst, eis * hs * 2);
-                                    std::ptr::copy_nonoverlapping(u_raw.as_ptr(), dst.add(eis * hs * 2), eis * hs * 2);
-                                }
+                                let dst_off = e * expert_elems;
+                                let g_slice = unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
+                                let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
+                                host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
+                                host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
                             }
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
+                            buf.copy_from_host(&host_buf)?;
                             buf
                         };
 
@@ -1062,7 +1067,8 @@ impl Model {
                         let expert_down = if st.tensor_data(&down_name).is_ok() {
                             load_weight_bf16(&st, &down_name, device, ne * hs * eis)?
                         } else {
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * hs * eis)?;
+                            let expert_elems_d = hs * eis;
+                            let mut host_buf_d = vec![0u16; ne * expert_elems_d];
                             for e in 0..ne {
                                 let dp = [
                                     format!("{p}mlp.experts.{e}.down_proj.weight"),
@@ -1070,12 +1076,12 @@ impl Model {
                                 ].into_iter().find(|n| st.tensor_data(n).is_ok())
                                     .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.down_proj (or variants)")))?;
                                 let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
-                                let offset = e * hs * eis * 2;
-                                unsafe {
-                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
-                                    std::ptr::copy_nonoverlapping(d_raw.as_ptr(), dst, hs * eis * 2);
-                                }
+                                let d_slice = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d) };
+                                let dst_off = e * expert_elems_d;
+                                host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
                             }
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
+                            buf.copy_from_host(&host_buf_d)?;
                             buf
                         };
 
@@ -1250,6 +1256,7 @@ impl Model {
             1,
             hs,
             eps,
+            self.config.rms_norm_one_plus_w,
             &self.stream,
         )?;
 
@@ -1506,7 +1513,7 @@ impl Model {
                 &mut self.activations.normed,
                 &self.activations.hidden,
                 &*post_norm,
-                1, hs as u32, eps, &self.stream,
+                1, hs as u32, eps, self.config.rms_norm_one_plus_w, &self.stream,
             )?;
         }
 
@@ -1535,19 +1542,29 @@ impl Model {
             _ => unreachable!(),
         };
 
-        // Top-k selection
-        let mut indexed: Vec<(usize, f32)> = scores.iter().enumerate().map(|(i, &s)| (i, s)).collect();
+        // Softmax over ALL experts first (standard MoE routing)
+        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+        let probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp() / exp_sum).collect();
+
+        // Top-k selection from softmax probabilities
+        let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
 
-        // Softmax over selected
-        let max_s = topk.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = topk.iter().map(|(_, s)| (s - max_s).exp()).sum();
-        let weights: Vec<f32> = topk.iter().map(|(_, s)| (s - max_s).exp() / exp_sum).collect();
-
-        let scaling = match &self.config.layers[layer_idx].ffn_type {
-            FfnType::MoE { gate_type: GateType::NormTopK { routed_scaling_factor }, .. } => *routed_scaling_factor,
-            _ => 1.0,
+        let (weights, scaling) = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { gate_type: GateType::NormTopK { routed_scaling_factor }, .. } => {
+                // NormTopK: renormalize selected weights to sum to 1, then scale
+                let sum: f32 = topk.iter().map(|(_, w)| w).sum();
+                let w: Vec<f32> = topk.iter().map(|(_, w)| w / sum).collect();
+                (w, *routed_scaling_factor)
+            }
+            FfnType::MoE { gate_type: GateType::Softmax, .. } => {
+                // Standard softmax: use raw probabilities (don't renormalize)
+                let w: Vec<f32> = topk.iter().map(|(_, w)| *w).collect();
+                (w, 1.0)
+            }
+            _ => unreachable!(),
         };
 
         // 4. Zero output buffer (reuse ffn_down for accumulation)
@@ -1658,6 +1675,7 @@ impl Model {
                 1,
                 hs,
                 eps,
+                cfg.rms_norm_one_plus_w,
                 &self.stream,
             )?;
         }
@@ -1728,18 +1746,43 @@ impl Model {
 
 
         // 4. QK norm (in-place on q_attn, k_attn)
-        unsafe {
-            self.kernels.qk_norm.forward(
-                &mut self.activations.q_attn,
-                &mut self.activations.k_attn,
-                &*q_norm_w,
-                &*k_norm_w,
-                nqh,
-                nkh,
-                hd,
-                eps,
-                &self.stream,
-            )?;
+        if cfg.has_qk_norm {
+            let q_norm_len = unsafe { (*q_norm_w).len() };
+            if q_norm_len == hd as usize {
+                // Per-head QK norm (Qwen3.5 style): weight is [head_dim]
+                unsafe {
+                    self.kernels.qk_norm.forward(
+                        &mut self.activations.q_attn,
+                        &mut self.activations.k_attn,
+                        &*q_norm_w,
+                        &*k_norm_w,
+                        nqh,
+                        nkh,
+                        hd,
+                        eps,
+                        &self.stream,
+                    )?;
+                }
+            } else {
+                // Full-hidden QK norm (OLMoE style): weight is [hidden_size], apply as RMSNorm
+                // Use normed buffer as temp to avoid aliasing
+                unsafe {
+                    self.kernels.rmsnorm.forward(
+                        &mut self.activations.normed,
+                        &self.activations.q_attn,
+                        &*q_norm_w,
+                        1, nqh * hd, eps, cfg.rms_norm_one_plus_w, &self.stream,
+                    )?;
+                    d2d_copy_f32(&mut self.activations.q_attn, 0, &self.activations.normed, 0, (nqh * hd) as usize, &self.stream)?;
+                    self.kernels.rmsnorm.forward(
+                        &mut self.activations.normed,
+                        &self.activations.k_attn,
+                        &*k_norm_w,
+                        1, nkh * hd, eps, cfg.rms_norm_one_plus_w, &self.stream,
+                    )?;
+                    d2d_copy_f32(&mut self.activations.k_attn, 0, &self.activations.normed, 0, (nkh * hd) as usize, &self.stream)?;
+                }
+            }
         }
 
 
@@ -1926,7 +1969,7 @@ impl Model {
             &mut self.activations.normed,
             &self.activations.hidden,
             &self.final_norm_weight,
-            1, hs, eps, &self.stream,
+            1, hs, eps, self.config.rms_norm_one_plus_w, &self.stream,
         )?;
 
         // LM head
@@ -2131,7 +2174,7 @@ impl Model {
         unsafe { d2d_copy_f32(&mut self.activations.normed, 0, &self.activations.hidden, 0, hs as usize, &self.stream)?; }
         self.kernels.rmsnorm.forward(
             &mut self.activations.hidden, &self.activations.normed,
-            &self.final_norm_weight, 1, hs, self.config.rms_norm_eps, &self.stream,
+            &self.final_norm_weight, 1, hs, self.config.rms_norm_eps, self.config.rms_norm_one_plus_w, &self.stream,
         )?;
         traces.push(("final_norm".into(), self.read_hidden()?));
 
@@ -2178,7 +2221,7 @@ impl Model {
         // RMSNorm
         self.kernels.rmsnorm.forward(
             &mut self.activations.normed, &self.activations.hidden,
-            &w.input_norm, 1, hs, eps, &self.stream,
+            &w.input_norm, 1, hs, eps, self.config.rms_norm_one_plus_w, &self.stream,
         )?;
         traces.push(("normed".into(), self.read_buf(&self.activations.normed)?));
 

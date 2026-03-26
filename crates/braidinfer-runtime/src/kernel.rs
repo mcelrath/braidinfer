@@ -100,6 +100,7 @@ impl RmsNormKernel {
         num_rows: u32,
         hidden_size: u32,
         eps: f32,
+        one_plus_w: bool,
         stream: &Stream,
     ) -> HipResult<()> {
         assert_eq!(input.device(), self.device);
@@ -109,21 +110,20 @@ impl RmsNormKernel {
 
         let func = self.module.get_function("rmsnorm_f32")?;
 
-        // kernel_params are pointers-to-arg-values. The GPU reads through these
-        // indirections; the const→mut cast at the FFI boundary is required by
-        // hipModuleLaunchKernel's signature but does not cause writes.
         let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
         let mut in_ptr: *const c_void = input.as_ptr().cast();
         let mut w_ptr: *const c_void = weight.as_ptr().cast();
         let mut hs = hidden_size as i32;
         let mut ep = eps;
+        let mut opw = if one_plus_w { 1i32 } else { 0i32 };
 
-        let mut args: [*mut c_void; 5] = [
+        let mut args: [*mut c_void; 6] = [
             std::ptr::addr_of_mut!(out_ptr).cast(),
             std::ptr::addr_of_mut!(in_ptr).cast(),
             std::ptr::addr_of_mut!(w_ptr).cast(),
             std::ptr::addr_of_mut!(hs).cast(),
             std::ptr::addr_of_mut!(ep).cast(),
+            std::ptr::addr_of_mut!(opw).cast(),
         ];
 
         let block_size = 256u32.min(hidden_size);

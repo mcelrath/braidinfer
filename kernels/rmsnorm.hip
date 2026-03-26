@@ -10,7 +10,8 @@ extern "C" __global__ void rmsnorm_f32(
     const float* __restrict__ input,
     const unsigned short* __restrict__ weight,
     const int hidden_size,
-    const float eps
+    const float eps,
+    const int one_plus_w  // 1: use (1+w)*x pattern, 0: use w*x pattern
 ) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -42,6 +43,7 @@ extern "C" __global__ void rmsnorm_f32(
 
     // Normalize and scale
     for (int i = tid; i < hidden_size; i += stride) {
-        y[i] = x[i] * rms * (1.0f + bf16_to_f32(weight[i]));
+        float w = bf16_to_f32(weight[i]);
+        y[i] = x[i] * rms * (one_plus_w ? (1.0f + w) : w);
     }
 }

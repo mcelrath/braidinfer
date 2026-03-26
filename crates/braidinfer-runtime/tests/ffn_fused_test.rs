@@ -173,7 +173,7 @@ fn test_ffn_fused_matches_unfused_kernels() {
     let mut d_ref_output = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc ref_output");
 
     rms_kernel
-        .forward(&mut d_normed, &d_input, &d_rms_w, 1, HIDDEN_SIZE as u32, EPS, &stream)
+        .forward(&mut d_normed, &d_input, &d_rms_w, 1, HIDDEN_SIZE as u32, EPS, true, &stream)
         .expect("rmsnorm");
     lp_kernel
         .forward(&mut d_gate_out, &d_wgate, &d_normed, INTERMEDIATE_SIZE as u32, HIDDEN_SIZE as u32, &stream)
