@@ -29,6 +29,12 @@ pub enum LayerType {
 }
 
 #[derive(Debug, Clone)]
+pub enum GateType {
+    Softmax,
+    NormTopK { routed_scaling_factor: f32 },
+}
+
+#[derive(Debug, Clone)]
 pub enum FfnType {
     Dense,
     MoE {
@@ -37,6 +43,7 @@ pub enum FfnType {
         num_shared: usize,
         expert_intermediate_size: usize,
         shared_intermediate_size: usize,
+        gate_type: GateType,
     },
 }
 
@@ -187,6 +194,8 @@ struct RawConfig {
     // Qwen3-Next style
     full_attention_interval: Option<usize>,
     tie_word_embeddings: Option<bool>,
+    norm_topk_prob: Option<bool>,
+    routed_scaling_factor: Option<f64>,
     #[allow(dead_code)]
     decoder_sparse_step: Option<usize>,
     #[allow(dead_code)]
@@ -194,6 +203,16 @@ struct RawConfig {
     conv_l_cache: Option<usize>,
     layer_types: Option<Vec<String>>,
     full_attn_idxs: Option<Vec<usize>>,
+}
+
+fn detect_gate_type(raw: &RawConfig) -> GateType {
+    if raw.norm_topk_prob.unwrap_or(false) {
+        GateType::NormTopK {
+            routed_scaling_factor: raw.routed_scaling_factor.unwrap_or(1.0) as f32,
+        }
+    } else {
+        GateType::Softmax
+    }
 }
 
 impl ModelConfig {
@@ -260,6 +279,7 @@ impl ModelConfig {
 
     fn from_qwen35_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let tie_word_embeddings = raw.tie_word_embeddings.unwrap_or(true);
+        let gate_type = detect_gate_type(&raw);
         // Some Qwen variants (qwen3_next) put fields at top level, not in text_config
         let tc = if let Some(tc) = raw.text_config { tc } else {
             // Synthesize TextConfig from top-level fields
@@ -313,6 +333,7 @@ impl ModelConfig {
                 num_experts, num_active, num_shared,
                 expert_intermediate_size: expert_is,
                 shared_intermediate_size: shared_is,
+                gate_type: gate_type.clone(),
             }
         } else {
             FfnType::Dense
@@ -396,6 +417,7 @@ impl ModelConfig {
     }
 
     fn from_nemotron_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let gate_type = detect_gate_type(&raw);
         let num_layers = raw.num_hidden_layers
             .or_else(|| raw.layers_block_type.as_ref().map(|l| l.len()))
             .or_else(|| raw.hybrid_override_pattern.as_ref().map(|p| p.len()))
@@ -441,6 +463,7 @@ impl ModelConfig {
             num_experts, num_active, num_shared,
             expert_intermediate_size: expert_is,
             shared_intermediate_size: shared_is,
+                gate_type: gate_type.clone(),
         };
         let dense_ffn = FfnType::Dense;
 
@@ -541,6 +564,7 @@ impl ModelConfig {
     /// GLM-4 MoE: all attention + MoE FFN.
     fn from_glm_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let gate_type = detect_gate_type(&raw);
         let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
         let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
         let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_q_heads);
@@ -561,6 +585,7 @@ impl ModelConfig {
             num_experts, num_active, num_shared,
             expert_intermediate_size: expert_is,
             shared_intermediate_size: shared_is,
+                gate_type: gate_type.clone(),
         };
         let layers: Vec<LayerConfig> = (0..num_layers).map(|_| LayerConfig {
             layer_type: LayerType::Attention,
@@ -589,6 +614,7 @@ impl ModelConfig {
     /// LFM-2: gated conv + attention layers.
     fn from_lfm2_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let gate_type = detect_gate_type(&raw);
         let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
         let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
         let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_q_heads);
@@ -611,6 +637,7 @@ impl ModelConfig {
                 num_experts, num_active, num_shared: 0,
                 expert_intermediate_size: raw.moe_intermediate_size.unwrap_or(intermediate_size),
                 shared_intermediate_size: 0,
+                gate_type: gate_type.clone(),
             }
         } else {
             FfnType::Dense
