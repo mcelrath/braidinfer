@@ -113,6 +113,7 @@ pub struct ModelConfig {
     pub attention_layer_indices: Vec<usize>,
     pub model_type: String,
     pub tie_word_embeddings: bool,
+    pub weight_quant: WeightQuantMode,
 }
 
 impl ModelConfig {
@@ -162,6 +163,7 @@ impl ModelConfig {
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings: true, // 0.8B fallback for tests
+            weight_quant: WeightQuantMode::Bf16,
         }
     }
 
@@ -347,6 +349,7 @@ impl ModelConfig {
             has_qk_norm: false, has_output_gate: false, // auto-detected from tensor names at load time
             rms_norm_one_plus_w: model_type == "qwen3_5",
             attention_layer_indices, model_type, tie_word_embeddings,
+            weight_quant: WeightQuantMode::Bf16,
         })
     }
 
@@ -666,6 +669,125 @@ pub struct PackedWeights {
     pub in_dim: usize,
 }
 
+/// Weight quantization mode for the model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeightQuantMode {
+    Bf16,    // No quantization (default)
+    Rnf4,    // All linear weights at rnf4_g128 (8.25 bits, lossless)
+    Mixed,   // MLP at PcG32Q4 (5 bits), rest at rnf4_g128
+}
+
+/// A linear projection weight that can be either bf16 or quantized.
+pub enum LinearWeight {
+    Bf16(DeviceBuffer<u16>),
+    Packed(PackedWeights),
+}
+
+impl LinearWeight {
+    /// Get raw bf16 pointer for megakernel instruction packing.
+    /// Panics if weight is quantized — megakernel only supports bf16.
+    pub fn as_bf16_ptr(&self) -> *const u16 {
+        match self {
+            LinearWeight::Bf16(buf) => buf.as_ptr(),
+            LinearWeight::Packed(_) => panic!("Cannot use quantized weights with megakernel — use WEIGHT_QUANT=bf16 for dense models"),
+        }
+    }
+
+    /// Get bf16 DeviceBuffer reference for megakernel.
+    pub fn as_bf16(&self) -> &DeviceBuffer<u16> {
+        match self {
+            LinearWeight::Bf16(buf) => buf,
+            LinearWeight::Packed(_) => panic!("Cannot use quantized weights with megakernel"),
+        }
+    }
+
+    /// Number of logical elements (out_dim * in_dim).
+    pub fn num_elements(&self) -> usize {
+        match self {
+            LinearWeight::Bf16(buf) => buf.len(),
+            LinearWeight::Packed(pw) => pw.out_dim * pw.in_dim,
+        }
+    }
+
+    /// Device this weight resides on.
+    pub fn device(&self) -> DeviceId {
+        match self {
+            LinearWeight::Bf16(buf) => buf.device(),
+            LinearWeight::Packed(pw) => pw.data.device(),
+        }
+    }
+
+    /// Dispatch linear projection through the appropriate kernel.
+    pub fn forward(
+        &self,
+        kernel: &crate::kernel::LinearProjKernel,
+        output: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        out_dim: u32,
+        in_dim: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        match self {
+            LinearWeight::Bf16(buf) => {
+                kernel.forward(output, buf, input, out_dim, in_dim, stream)
+            }
+            LinearWeight::Packed(pw) => {
+                kernel.forward_packed(output, pw, input, stream)
+            }
+        }
+    }
+
+    /// Dispatch with raw output/input pointers for MoE expert sub-buffer access.
+    /// `byte_offset`: offset in bytes into the underlying buffer for this expert's weights.
+    pub fn forward_sub(
+        &self,
+        kernel: &crate::kernel::LinearProjKernel,
+        output: *mut f32,
+        input: *const f32,
+        out_dim: u32,
+        in_dim: u32,
+        byte_offset: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        match self {
+            LinearWeight::Bf16(buf) => {
+                let w_ptr = unsafe { (buf.as_ptr() as *const u8).add(byte_offset) as *const u16 };
+                kernel.forward_ptr(output, w_ptr, input, out_dim, in_dim, stream)
+            }
+            LinearWeight::Packed(pw) => {
+                let func_name = match pw.format {
+                    WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
+                    WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
+                    WeightFormat::Bf16 => "linear_proj_f32",
+                };
+                kernel.forward_packed_ptr(output, unsafe { pw.data.as_ptr().add(byte_offset) }, input, out_dim, in_dim, func_name, stream)
+            }
+        }
+    }
+
+    /// Compute byte offset for expert `expert_id` in a fused expert buffer.
+    /// For bf16: expert_id * elements_per_expert * 2.
+    /// For packed: expert_id * packed_bytes_per_expert.
+    pub fn expert_byte_offset(&self, expert_id: usize, elements_per_expert: usize) -> usize {
+        match self {
+            LinearWeight::Bf16(_) => expert_id * elements_per_expert * 2,
+            LinearWeight::Packed(pw) => {
+                match pw.format {
+                    WeightFormat::Bf16 => expert_id * elements_per_expert * 2,
+                    WeightFormat::Rnf4G128 => {
+                        let groups_per_expert = (elements_per_expert + 127) / 128;
+                        expert_id * groups_per_expert * 132
+                    }
+                    WeightFormat::PcG32Q4 => {
+                        let groups_per_expert = (elements_per_expert + 31) / 32;
+                        expert_id * groups_per_expert * 20
+                    }
+                }
+            }
+        }
+    }
+}
+
 const NF4_TABLE: [f32; 16] = [
     -1.0, -0.6961928, -0.5250731, -0.3949175,
     -0.2844414, -0.1847734, -0.0910500,  0.0,
@@ -852,6 +974,49 @@ fn load_weight_quantized(
     }
 }
 
+/// Determine weight format for a given weight name under a quantization mode.
+fn weight_format_for(name: &str, mode: WeightQuantMode) -> WeightFormat {
+    match mode {
+        WeightQuantMode::Bf16 => WeightFormat::Bf16,
+        WeightQuantMode::Rnf4 => WeightFormat::Rnf4G128,
+        WeightQuantMode::Mixed => {
+            // MLP weights at PcG32Q4, everything else at Rnf4G128
+            if name.contains("mlp.") || name.contains("gate_proj") || name.contains("up_proj") || name.contains("down_proj") {
+                // But NOT the MoE router gate
+                if name.contains("mlp.gate.weight") || name.contains("block_sparse_moe.gate") || name.contains("mlp.router") {
+                    WeightFormat::Bf16  // router stays bf16
+                } else {
+                    WeightFormat::PcG32Q4
+                }
+            } else {
+                WeightFormat::Rnf4G128
+            }
+        }
+    }
+}
+
+/// Load a linear weight, quantizing at load time based on format.
+fn load_linear_weight(
+    st: &SafeTensorSet,
+    name: &str,
+    device: DeviceId,
+    out_dim: usize,
+    in_dim: usize,
+    mode: WeightQuantMode,
+) -> Result<LinearWeight, ModelError> {
+    let format = weight_format_for(name, mode);
+    match format {
+        WeightFormat::Bf16 => {
+            let buf = load_weight_bf16(st, name, device, out_dim * in_dim)?;
+            Ok(LinearWeight::Bf16(buf))
+        }
+        _ => {
+            let pw = load_weight_quantized(st, name, device, out_dim, in_dim, format)?;
+            Ok(LinearWeight::Packed(pw))
+        }
+    }
+}
+
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
 /// Only used for the few tensors that need f32 on the GPU (A_log, output_norm).
 fn load_weight_f32(
@@ -965,6 +1130,22 @@ impl Model {
         // Cap max_seq_len: model may claim 262144 but flat KV can't afford that.
         // User override takes priority, otherwise cap at DEFAULT_MAX_SEQ_LEN.
         config.max_seq_len = max_seq_len.unwrap_or(config.max_seq_len.min(Self::DEFAULT_MAX_SEQ_LEN));
+
+        // Weight quantization mode from env var
+        config.weight_quant = match std::env::var("WEIGHT_QUANT").as_deref() {
+            Ok("rnf4") => WeightQuantMode::Rnf4,
+            Ok("mixed") => WeightQuantMode::Mixed,
+            _ => WeightQuantMode::Bf16,
+        };
+
+        // Early check: quantized weights + megakernel = error
+        let has_moe = config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+        if config.weight_quant != WeightQuantMode::Bf16 && !has_moe {
+            return Err(ModelError::MissingWeight(
+                "WEIGHT_QUANT requires MoE model (kernel-by-kernel path). Dense models use megakernel which only supports bf16. Set WEIGHT_QUANT=bf16 or unset it.".into()
+            ));
+        }
+
         let st = SafeTensorSet::open_directory(model_dir)?;
 
         // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
