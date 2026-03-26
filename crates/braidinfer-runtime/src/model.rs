@@ -703,7 +703,7 @@ fn bf16_to_f32_cpu(x: u16) -> f32 {
 /// Quantize bf16 weights to rnf4_g128 format on CPU.
 /// Input: &[u16] bf16 weights, row-major [out_dim, in_dim].
 /// Output: packed bytes, groups of 132 bytes per 128 elements.
-fn quantize_rnf4_g128(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
+pub fn quantize_rnf4_g128(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
     let group_size = 128;
     let group_bytes = 132; // 64 + 2 + 64 + 2
     let num_groups_per_row = (in_dim + group_size - 1) / group_size;
@@ -770,7 +770,7 @@ fn quantize_rnf4_g128(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u
 
 /// Quantize bf16 weights to PcG32Q4 format on CPU.
 /// Per-channel-group asymmetric 4-bit, group_size=32.
-fn quantize_pc_g32_q4(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
+pub fn quantize_pc_g32_q4(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
     let group_size = 32;
     let group_bytes = 20; // 16 + 2 + 2
     let num_groups_per_row = (in_dim + group_size - 1) / group_size;
