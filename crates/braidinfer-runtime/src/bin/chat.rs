@@ -28,7 +28,8 @@ async fn main() {
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
-    let mut model = Model::load(model_dir, device).expect("load model");
+    let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN").ok().and_then(|v| v.parse().ok());
+    let mut model = Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
     eprintln!("braidinfer chat (max_tokens={max_tokens}, ^D to quit)");
     if let Some(sys) = &system_prompt {
