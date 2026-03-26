@@ -1155,8 +1155,10 @@ impl Model {
 
         // Per-layer weights
         let mut layers = Vec::with_capacity(config.num_layers);
+        let mut moe_weights_vec: Vec<Option<MoeWeights>> = (0..config.num_layers).map(|_| None).collect();
         for i in 0..config.num_layers {
             let p = format!("{prefix}layers.{i}.");
+            let is_moe = matches!(config.layers[i].ffn_type, FfnType::MoE { .. });
             if config.layer_is_attention[i] {
                 let w = AttentionLayerWeights {
                     input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
@@ -1171,11 +1173,98 @@ impl Model {
                         load_weight_bf16(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?
                     } else { DeviceBuffer::<u16>::alloc(device, 0)? },
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
-                    w_gate: load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_up: load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_down: load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?,
+                    w_gate: if !is_moe {
+                        load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                    w_up: if !is_moe {
+                        load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                    w_down: if !is_moe {
+                        load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
                 };
                 layers.push(LayerWeights::Attention(w));
+
+                // Load MoE weights if this layer uses MoE FFN
+                if is_moe {
+                    if let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = &config.layers[i].ffn_type {
+                        let ne = *num_experts;
+                        let eis = *expert_intermediate_size;
+                        let hs = config.hidden_size;
+
+                        // Router gate
+                        let gate = load_weight_bf16(&st, &format!("{p}mlp.gate.weight"), device, ne * hs)?;
+
+                        // Expert weights: try fused format first, then per-expert
+                        let fused_name = format!("{p}mlp.experts.gate_up_proj");
+                        let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
+                            // Fused: [num_experts, 2*expert_is, hidden_size]
+                            load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
+                        } else {
+                            // Per-expert: load individually and concatenate
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * 2 * eis * hs)?;
+                            for e in 0..ne {
+                                let gp = format!("{p}mlp.experts.{e}.gate_proj.weight");
+                                let up = format!("{p}mlp.experts.{e}.up_proj.weight");
+                                let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
+                                let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
+                                // gate_proj and up_proj are each [expert_is, hidden_size]
+                                // Fuse into [2*expert_is, hidden_size] per expert
+                                let offset = e * 2 * eis * hs * 2; // bytes
+                                unsafe {
+                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
+                                    std::ptr::copy_nonoverlapping(g_raw.as_ptr(), dst, eis * hs * 2);
+                                    std::ptr::copy_nonoverlapping(u_raw.as_ptr(), dst.add(eis * hs * 2), eis * hs * 2);
+                                }
+                            }
+                            buf
+                        };
+
+                        let down_name = format!("{p}mlp.experts.down_proj");
+                        let expert_down = if st.tensor_data(&down_name).is_ok() {
+                            load_weight_bf16(&st, &down_name, device, ne * hs * eis)?
+                        } else {
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * hs * eis)?;
+                            for e in 0..ne {
+                                let dp = format!("{p}mlp.experts.{e}.down_proj.weight");
+                                let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
+                                let offset = e * hs * eis * 2;
+                                unsafe {
+                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
+                                    std::ptr::copy_nonoverlapping(d_raw.as_ptr(), dst, hs * eis * 2);
+                                }
+                            }
+                            buf
+                        };
+
+                        // Shared expert
+                        let shared_expert = if *num_shared > 0 {
+                            let sis = *shared_intermediate_size;
+                            let sis = if sis == 0 { eis } else { sis };
+                            Some(DenseFfnWeights {
+                                gate_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis * hs)?,
+                                up_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis * hs)?,
+                                down_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs * sis)?,
+                            })
+                        } else { None };
+
+                        // Shared expert gate (optional, e.g. Qwen3.5-122B has shared_expert_gate)
+                        let shared_gate_name = format!("{p}mlp.shared_expert_gate.weight");
+                        let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
+                            Some(load_weight_bf16(&st, &shared_gate_name, device, hs)?)
+                        } else { None };
+
+                        moe_weights_vec[i] = Some(MoeWeights {
+                            gate,
+                            expert_gate_up,
+                            expert_down,
+                            shared_expert,
+                            shared_expert_gate,
+                            num_experts: ne,
+                            expert_intermediate_size: eis,
+                        });
+                    }
+                }
             } else {
                 let nh = config.linear_num_heads;
                 let nvh = config.linear_num_value_heads;
@@ -1217,11 +1306,86 @@ impl Model {
                     output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,  // f32
                     w_out: load_weight_bf16(&st, &format!("{p}linear_attn.out_proj.weight"), device, config.hidden_size * z_out)?,
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
-                    w_gate: load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_up: load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
-                    w_down: load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?,
+                    w_gate: if !is_moe {
+                        load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                    w_up: if !is_moe {
+                        load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                    w_down: if !is_moe {
+                        load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
                 };
                 layers.push(LayerWeights::Gdn(w));
+
+                // Load MoE weights for GDN layers with MoE FFN (e.g. Qwen3.5-122B)
+                if is_moe {
+                    if let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = &config.layers[i].ffn_type {
+                        let ne = *num_experts;
+                        let eis = *expert_intermediate_size;
+                        let hs = config.hidden_size;
+
+                        let gate = load_weight_bf16(&st, &format!("{p}mlp.gate.weight"), device, ne * hs)?;
+
+                        let fused_name = format!("{p}mlp.experts.gate_up_proj");
+                        let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
+                            load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
+                        } else {
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * 2 * eis * hs)?;
+                            for e in 0..ne {
+                                let gp = format!("{p}mlp.experts.{e}.gate_proj.weight");
+                                let up = format!("{p}mlp.experts.{e}.up_proj.weight");
+                                let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
+                                let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
+                                let offset = e * 2 * eis * hs * 2;
+                                unsafe {
+                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
+                                    std::ptr::copy_nonoverlapping(g_raw.as_ptr(), dst, eis * hs * 2);
+                                    std::ptr::copy_nonoverlapping(u_raw.as_ptr(), dst.add(eis * hs * 2), eis * hs * 2);
+                                }
+                            }
+                            buf
+                        };
+
+                        let down_name = format!("{p}mlp.experts.down_proj");
+                        let expert_down = if st.tensor_data(&down_name).is_ok() {
+                            load_weight_bf16(&st, &down_name, device, ne * hs * eis)?
+                        } else {
+                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * hs * eis)?;
+                            for e in 0..ne {
+                                let dp = format!("{p}mlp.experts.{e}.down_proj.weight");
+                                let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
+                                let offset = e * hs * eis * 2;
+                                unsafe {
+                                    let dst = (buf.as_mut_ptr() as *mut u8).add(offset);
+                                    std::ptr::copy_nonoverlapping(d_raw.as_ptr(), dst, hs * eis * 2);
+                                }
+                            }
+                            buf
+                        };
+
+                        let shared_expert = if *num_shared > 0 {
+                            let sis = *shared_intermediate_size;
+                            let sis = if sis == 0 { eis } else { sis };
+                            Some(DenseFfnWeights {
+                                gate_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis * hs)?,
+                                up_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis * hs)?,
+                                down_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs * sis)?,
+                            })
+                        } else { None };
+
+                        let shared_gate_name = format!("{p}mlp.shared_expert_gate.weight");
+                        let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
+                            Some(load_weight_bf16(&st, &shared_gate_name, device, hs)?)
+                        } else { None };
+
+                        moe_weights_vec[i] = Some(MoeWeights {
+                            gate, expert_gate_up, expert_down,
+                            shared_expert, shared_expert_gate,
+                            num_experts: ne, expert_intermediate_size: eis,
+                        });
+                    }
+                }
             }
         }
 
@@ -1320,7 +1484,6 @@ impl Model {
             gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
         };
 
-        let n_layers = config.num_layers;
         Ok(Model {
             config,
             device,
@@ -1330,7 +1493,7 @@ impl Model {
             lm_head_weight,
             final_norm_weight,
             layers,
-            moe_weights: (0..n_layers).map(|_| None).collect(),
+            moe_weights: moe_weights_vec,
             activations,
             gdn_conv_states,
             kv_caches,
