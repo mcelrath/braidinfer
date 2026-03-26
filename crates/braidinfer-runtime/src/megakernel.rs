@@ -264,39 +264,50 @@ impl MegakernelProgram {
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
         for layer_i in 0..cfg.num_layers {
-            if cfg.layer_is_attention[layer_i] {
-                if paged {
-                    Self::compile_attention_layer_paged(
-                        cfg, &model.layers[layer_i], act,
-                        &model.kv_caches[kv_idx],
-                        attn_layer_count,
-                        &mut instructions, &mut mrope_inst_indices,
-                        &mut kv_write_indices, &mut kv_base_ptrs,
-                        &mut attn_paged_inst_indices,
-                        &mut attn_quant_inst_indices,
-                    );
-                } else {
-                    Self::compile_attention_layer(
-                        cfg, &model.layers[layer_i], act,
-                        &model.kv_caches[kv_idx],
-                        &mut instructions, &mut mrope_inst_indices,
-                        &mut gqa_attn_inst_indices, &mut kv_write_indices,
-                        &mut kv_base_ptrs,
-                    );
+            use crate::model::LayerType;
+            match cfg.layers[layer_i].layer_type {
+                LayerType::Attention => {
+                    if paged {
+                        Self::compile_attention_layer_paged(
+                            cfg, &model.layers[layer_i], act,
+                            &model.kv_caches[kv_idx],
+                            attn_layer_count,
+                            &mut instructions, &mut mrope_inst_indices,
+                            &mut kv_write_indices, &mut kv_base_ptrs,
+                            &mut attn_paged_inst_indices,
+                            &mut attn_quant_inst_indices,
+                        );
+                    } else {
+                        Self::compile_attention_layer(
+                            cfg, &model.layers[layer_i], act,
+                            &model.kv_caches[kv_idx],
+                            &mut instructions, &mut mrope_inst_indices,
+                            &mut gqa_attn_inst_indices, &mut kv_write_indices,
+                            &mut kv_base_ptrs,
+                        );
+                    }
+                    attn_layer_count += 1;
+                    kv_idx += 1;
                 }
-                attn_layer_count += 1;
-                kv_idx += 1;
-            } else {
-                Self::compile_gdn_layer(
-                    cfg, &model.layers[layer_i], act,
-                    &model.gdn_conv_states[gdn_idx],
-                    &model.gdn_states[gdn_idx],
-                    &mut instructions,
-                );
-                gdn_idx += 1;
+                LayerType::Gdn => {
+                    Self::compile_gdn_layer(
+                        cfg, &model.layers[layer_i], act,
+                        &model.gdn_conv_states[gdn_idx],
+                        &model.gdn_states[gdn_idx],
+                        &mut instructions,
+                    );
+                    gdn_idx += 1;
+                }
+                LayerType::Mamba2 => {
+                    panic!("Mamba2 layers not yet implemented in megakernel (braidinfer-ce9)");
+                }
+                LayerType::LfmConv => {
+                    panic!("LfmConv layers not yet implemented in megakernel (braidinfer-aes.4)");
+                }
             }
 
-            // FFN (same for both layer types)
+            // FFN: Dense for now (MoE dispatch not yet implemented)
+            // TODO: match cfg.layers[layer_i].ffn_type for MoE (braidinfer-cea)
             Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
         }
 
