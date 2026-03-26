@@ -167,7 +167,7 @@ impl PrefillBuffers {
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
             position_ids: DeviceBuffer::alloc(device, n * 3)?,
-            q_gate_attn: DeviceBuffer::alloc(device, n * nqh * hd * 2)?,
+            q_gate_attn: DeviceBuffer::alloc(device, n * nqh * hd * if cfg.has_output_gate { 2 } else { 1 })?,
             q_attn: DeviceBuffer::alloc(device, n * nqh * hd)?,
             k_attn: DeviceBuffer::alloc(device, n * nkh * hd)?,
             v_attn: DeviceBuffer::alloc(device, n * nkh * hd)?,
@@ -307,9 +307,11 @@ impl MegakernelProgram {
                 }
             }
 
-            // FFN: Dense for now (MoE dispatch not yet implemented)
-            // TODO: match cfg.layers[layer_i].ffn_type for MoE (braidinfer-cea)
-            Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
+            // FFN: skip MoE layers (handled by separate kernel launch)
+            if matches!(cfg.layers[layer_i].ffn_type, crate::model::FfnType::Dense) {
+                Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
+            }
+            // MoE FFN: TODO (cea.2) — needs megakernel breakout pattern
         }
 
         // Final RMSNorm: copy hidden→normed, then norm normed→hidden
@@ -829,13 +831,14 @@ impl MegakernelProgram {
             instructions.push(inst);
         }
 
-        // 2. Q+gate, K, V projections
+        // 2. Q(+gate), K, V projections
+        let q_mult = if cfg.has_output_gate { 2 } else { 1 };
         {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * 2) as u32);
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * q_mult) as u32);
             inst.set_output_ptr(1, q_gate_attn_ptr);
             inst.set_ptr(2, w.w_q_gate.as_ptr());
             inst.set_ptr(3, normed_ptr);
-            inst.set_int(4, (nqh * hd * 2) as i32);
+            inst.set_int(4, (nqh * hd * q_mult) as i32);
             inst.set_int(5, hs as i32);
             if n > 1 { inst.set_int(6, n as i32); }
             inst.set_no_sync();
@@ -863,8 +866,25 @@ impl MegakernelProgram {
             instructions.push(inst);
         }
 
-        // 3. Deinterleave Q+gate → Q, gate
-        if n > 1 {
+        // 3. Deinterleave Q+gate → Q, gate (only for gated Q models like Qwen3.5)
+        if !cfg.has_output_gate {
+            // No gate: Q projection writes directly to q_gate_attn which IS q_attn
+            // Just copy q_gate_attn → q_attn (they may be different buffers)
+            if n > 1 {
+                let total = n * nqh * hd;
+                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total as u32, 256));
+                inst.set_output_ptr(1, q_attn_ptr);
+                inst.set_ptr(2, q_gate_attn_ptr);
+                inst.set_int(3, total as i32);
+                instructions.push(inst);
+            } else {
+                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((nqh * hd) as u32, 256));
+                inst.set_output_ptr(1, q_attn_ptr);
+                inst.set_ptr(2, q_gate_attn_ptr);
+                inst.set_int(3, (nqh * hd) as i32);
+                instructions.push(inst);
+            }
+        } else if n > 1 {
             // Batched: single OP_DEINTERLEAVE
             let total_elems = n * nqh * hd;
             let mut inst = Instruction::new(OP_DEINTERLEAVE, div_ceil(total_elems as u32, 256));
@@ -1160,8 +1180,8 @@ impl MegakernelProgram {
             }
         }
 
-        // 10. Output gate
-        {
+        // 10. Output gate (Qwen3.5 only) or pass-through
+        let final_attn_ptr = if cfg.has_output_gate {
             let gate_size = n * nqh * hd;
             let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
             inst.set_output_ptr(1, gated_out_ptr);
@@ -1169,14 +1189,17 @@ impl MegakernelProgram {
             inst.set_ptr(3, gate_attn_ptr);
             inst.set_int(4, gate_size as i32);
             instructions.push(inst);
-        }
+            gated_out_ptr
+        } else {
+            attn_out_ptr // skip output gate, use attention output directly
+        };
 
         // 11. Output projection + residual
         {
             let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
             inst.set_output_ptr(1, out_proj_ptr);
             inst.set_ptr(2, w.w_o.as_ptr());
-            inst.set_ptr(3, gated_out_ptr);
+            inst.set_ptr(3, final_attn_ptr);
             inst.set_int(4, hs as i32);
             inst.set_int(5, (nqh * hd) as i32);
             if n > 1 { inst.set_int(6, n as i32); }

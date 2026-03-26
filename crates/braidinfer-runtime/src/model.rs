@@ -110,6 +110,7 @@ pub struct ModelConfig {
     pub recurrent_kind: RecurrentLayerKind,
     pub rope_type: RopeType,
     pub has_qk_norm: bool,
+    pub has_output_gate: bool,  // Qwen3.5 interleaves Q+gate; others don't
     pub attention_layer_indices: Vec<usize>,
     pub model_type: String,
     pub tie_word_embeddings: bool,
@@ -258,6 +259,7 @@ impl ModelConfig {
             },
             rope_type: RopeType::MRope { sections: [11, 11, 10] },
             has_qk_norm: false,
+            has_output_gate: false,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings: true, // 0.8B fallback for tests
@@ -412,6 +414,7 @@ impl ModelConfig {
             },
             rope_type,
             has_qk_norm: false,
+            has_output_gate: false,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings,
@@ -520,6 +523,7 @@ impl ModelConfig {
             },
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
             has_qk_norm: false,
+            has_output_gate: false,
             attention_layer_indices,
             model_type: "nemotron_h".to_string(),
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
@@ -557,7 +561,7 @@ impl ModelConfig {
             expert_intermediate_size: 0, shared_expert_intermediate_size: 0,
             recurrent_kind: RecurrentLayerKind::None,
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
-            has_qk_norm: false, attention_layer_indices,
+            has_qk_norm: false, has_output_gate: false, attention_layer_indices,
             model_type: raw.model_type,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(true),
         })
@@ -607,7 +611,7 @@ impl ModelConfig {
             expert_intermediate_size: expert_is, shared_expert_intermediate_size: shared_is,
             recurrent_kind: RecurrentLayerKind::None,
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
-            has_qk_norm: false, attention_layer_indices,
+            has_qk_norm: false, has_output_gate: false, attention_layer_indices,
             model_type: raw.model_type,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(true),
         })
@@ -680,7 +684,7 @@ impl ModelConfig {
             shared_expert_intermediate_size: 0,
             recurrent_kind: RecurrentLayerKind::None,
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
-            has_qk_norm: false, attention_layer_indices,
+            has_qk_norm: false, has_output_gate: false, attention_layer_indices,
             model_type: raw.model_type,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(true),
         })
@@ -1131,6 +1135,18 @@ impl Model {
         let names = st.tensor_names();
         let has_qk_norm = names.iter().any(|n| n.contains("q_norm.weight"));
         config.has_qk_norm = has_qk_norm;
+
+        // Detect gated Q: Qwen3.5 packs Q+gate in q_proj [nqh*hd*2, hidden].
+        // Standard models have q_proj [nqh*hd, hidden].
+        let first_attn_idx = config.layers.iter().position(|l| l.layer_type == LayerType::Attention);
+        let has_output_gate = if let Some(ai) = first_attn_idx {
+            let q_name = format!("{prefix}layers.{ai}.self_attn.q_proj.weight");
+            if let Ok(raw) = st.tensor_data(&q_name) {
+                let expected_gated = config.num_q_heads * config.head_dim * 2 * config.hidden_size * 2; // bf16
+                raw.len() == expected_gated
+            } else { false }
+        } else { false };
+        config.has_output_gate = has_output_gate;
         let embed_name = names.iter()
             .find(|n| n.starts_with(&prefix) && (n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
             .or_else(|| names.iter().find(|n| n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
@@ -1164,7 +1180,10 @@ impl Model {
             if config.layer_is_attention[i] {
                 let w = AttentionLayerWeights {
                     input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
-                    w_q_gate: load_weight_bf16(&st, &format!("{p}self_attn.q_proj.weight"), device, config.num_q_heads * config.head_dim * 2 * config.hidden_size)?,
+                    w_q_gate: {
+                        let q_mult = if has_output_gate { 2 } else { 1 };
+                        load_weight_bf16(&st, &format!("{p}self_attn.q_proj.weight"), device, config.num_q_heads * config.head_dim * q_mult * config.hidden_size)?
+                    },
                     w_k: load_weight_bf16(&st, &format!("{p}self_attn.k_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
                     w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
                     w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * config.num_q_heads * config.head_dim)?,
@@ -1194,20 +1213,29 @@ impl Model {
                         let eis = *expert_intermediate_size;
                         let hs = config.hidden_size;
 
-                        // Router gate
-                        let gate = load_weight_bf16(&st, &format!("{p}mlp.gate.weight"), device, ne * hs)?;
+                        // Router gate: try mlp.gate, block_sparse_moe.gate, mlp.router
+                        let gate_name = [
+                            format!("{p}mlp.gate.weight"),
+                            format!("{p}block_sparse_moe.gate.weight"),
+                            format!("{p}mlp.router.weight"),
+                        ].into_iter().find(|n| st.tensor_data(n).is_ok())
+                            .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.gate.weight (or variants)")))?;
+                        let gate = load_weight_bf16(&st, &gate_name, device, ne * hs)?;
 
-                        // Expert weights: try fused format first, then per-expert
+                        // Expert weights: try fused, then per-expert with multiple name patterns
                         let fused_name = format!("{p}mlp.experts.gate_up_proj");
                         let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
-                            // Fused: [num_experts, 2*expert_is, hidden_size]
                             load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
                         } else {
-                            // Per-expert: load individually and concatenate
+                            // Per-expert: try gate_proj/up_proj (Qwen) or w1/w3 (Mixtral)
+                            // Also try mlp.experts.N or block_sparse_moe.experts.N
                             let mut buf = DeviceBuffer::<u16>::alloc(device, ne * 2 * eis * hs)?;
                             for e in 0..ne {
-                                let gp = format!("{p}mlp.experts.{e}.gate_proj.weight");
-                                let up = format!("{p}mlp.experts.{e}.up_proj.weight");
+                                let (gp, up) = [
+                                    (format!("{p}mlp.experts.{e}.gate_proj.weight"), format!("{p}mlp.experts.{e}.up_proj.weight")),
+                                    (format!("{p}block_sparse_moe.experts.{e}.w1.weight"), format!("{p}block_sparse_moe.experts.{e}.w3.weight")),
+                                ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
+                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.experts.{e}.gate_proj.weight (or variants)")))?;
                                 let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
                                 let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
                                 // gate_proj and up_proj are each [expert_is, hidden_size]
@@ -1228,7 +1256,11 @@ impl Model {
                         } else {
                             let mut buf = DeviceBuffer::<u16>::alloc(device, ne * hs * eis)?;
                             for e in 0..ne {
-                                let dp = format!("{p}mlp.experts.{e}.down_proj.weight");
+                                let dp = [
+                                    format!("{p}mlp.experts.{e}.down_proj.weight"),
+                                    format!("{p}block_sparse_moe.experts.{e}.w2.weight"),
+                                ].into_iter().find(|n| st.tensor_data(n).is_ok())
+                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.down_proj (or variants)")))?;
                                 let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
                                 let offset = e * hs * eis * 2;
                                 unsafe {
@@ -1327,7 +1359,13 @@ impl Model {
                         let eis = *expert_intermediate_size;
                         let hs = config.hidden_size;
 
-                        let gate = load_weight_bf16(&st, &format!("{p}mlp.gate.weight"), device, ne * hs)?;
+                        let gate_name = [
+                            format!("{p}mlp.gate.weight"),
+                            format!("{p}block_sparse_moe.gate.weight"),
+                            format!("{p}mlp.router.weight"),
+                        ].into_iter().find(|n| st.tensor_data(n).is_ok())
+                            .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.gate.weight (GDN MoE)")))?;
+                        let gate = load_weight_bf16(&st, &gate_name, device, ne * hs)?;
 
                         let fused_name = format!("{p}mlp.experts.gate_up_proj");
                         let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
@@ -1335,8 +1373,11 @@ impl Model {
                         } else {
                             let mut buf = DeviceBuffer::<u16>::alloc(device, ne * 2 * eis * hs)?;
                             for e in 0..ne {
-                                let gp = format!("{p}mlp.experts.{e}.gate_proj.weight");
-                                let up = format!("{p}mlp.experts.{e}.up_proj.weight");
+                                let (gp, up) = [
+                                    (format!("{p}mlp.experts.{e}.gate_proj.weight"), format!("{p}mlp.experts.{e}.up_proj.weight")),
+                                    (format!("{p}block_sparse_moe.experts.{e}.w1.weight"), format!("{p}block_sparse_moe.experts.{e}.w3.weight")),
+                                ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
+                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.gate_proj (GDN MoE)")))?;
                                 let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
                                 let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
                                 let offset = e * 2 * eis * hs * 2;
@@ -1355,7 +1396,11 @@ impl Model {
                         } else {
                             let mut buf = DeviceBuffer::<u16>::alloc(device, ne * hs * eis)?;
                             for e in 0..ne {
-                                let dp = format!("{p}mlp.experts.{e}.down_proj.weight");
+                                let dp = [
+                                    format!("{p}mlp.experts.{e}.down_proj.weight"),
+                                    format!("{p}block_sparse_moe.experts.{e}.w2.weight"),
+                                ].into_iter().find(|n| st.tensor_data(n).is_ok())
+                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.down_proj (or variants)")))?;
                                 let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
                                 let offset = e * hs * eis * 2;
                                 unsafe {
@@ -1463,7 +1508,7 @@ impl Model {
             recurrent_out: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             normed_gated: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             out_proj: DeviceBuffer::<f32>::alloc(device, hs)?,
-            q_gate_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd * 2)?,
+            q_gate_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd * if config.has_output_gate { 2 } else { 1 })?,
             q_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
             gate_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
             k_attn: DeviceBuffer::<f32>::alloc(device, nkh * hd)?,
