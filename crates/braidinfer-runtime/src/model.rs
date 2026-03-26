@@ -389,10 +389,10 @@ impl ModelConfig {
 
 pub struct GdnLayerWeights {
     pub input_norm: DeviceBuffer<u16>,  // bf16: (1+w) pattern, zeros init
-    pub w_qkv: DeviceBuffer<u16>,      // bf16 [6144, 1024]
-    pub w_a: DeviceBuffer<u16>,        // bf16 [16, 1024]
-    pub w_b: DeviceBuffer<u16>,        // bf16 [16, 1024]
-    pub w_z: DeviceBuffer<u16>,        // bf16 [2048, 1024]
+    pub w_qkv: LinearWeight,           // [6144, 1024]
+    pub w_a: LinearWeight,             // [16, 1024]
+    pub w_b: LinearWeight,             // [16, 1024]
+    pub w_z: LinearWeight,             // [2048, 1024]
     pub conv1d_weight: DeviceBuffer<u16>, // bf16 [6144, 4] (kept for traced path)
     pub conv1d_weight_q: DeviceBuffer<u16>, // bf16 [nh*kd, ck] pre-split Q slice
     pub conv1d_weight_k: DeviceBuffer<u16>, // bf16 [nh*kd, ck] pre-split K slice
@@ -400,25 +400,25 @@ pub struct GdnLayerWeights {
     pub a_log: DeviceBuffer<f32>,      // f32 (special: log space)
     pub dt_bias: DeviceBuffer<u16>,    // bf16 [16]
     pub output_norm: DeviceBuffer<f32>, // f32 [128] (QK-norm, (1+w) pattern)
-    pub w_out: DeviceBuffer<u16>,      // bf16 [1024, 2048]
+    pub w_out: LinearWeight,           // [1024, 2048]
     pub post_norm: DeviceBuffer<u16>,  // bf16
-    pub w_gate: DeviceBuffer<u16>,     // bf16 [3584, 1024]
-    pub w_up: DeviceBuffer<u16>,       // bf16 [3584, 1024]
-    pub w_down: DeviceBuffer<u16>,     // bf16 [1024, 3584]
+    pub w_gate: LinearWeight,          // [3584, 1024]
+    pub w_up: LinearWeight,            // [3584, 1024]
+    pub w_down: LinearWeight,          // [1024, 3584]
 }
 
 pub struct AttentionLayerWeights {
-    pub input_norm: DeviceBuffer<u16>,  // bf16: (1+w) pattern
-    pub w_q_gate: DeviceBuffer<u16>,   // bf16 [4096, 1024]
-    pub w_k: DeviceBuffer<u16>,        // bf16 [512, 1024]
-    pub w_v: DeviceBuffer<u16>,        // bf16 [512, 1024]
-    pub w_o: DeviceBuffer<u16>,        // bf16 [1024, 2048]
-    pub q_norm: DeviceBuffer<u16>,     // bf16 [256] (QK-norm, (1+w) pattern)
-    pub k_norm: DeviceBuffer<u16>,     // bf16 [256] (QK-norm, (1+w) pattern)
-    pub post_norm: DeviceBuffer<u16>,  // bf16
-    pub w_gate: DeviceBuffer<u16>,     // bf16
-    pub w_up: DeviceBuffer<u16>,       // bf16
-    pub w_down: DeviceBuffer<u16>,     // bf16
+    pub input_norm: DeviceBuffer<u16>,  // bf16: stays bf16
+    pub w_q_gate: LinearWeight,        // [nqh*hd*q_mult, hs]
+    pub w_k: LinearWeight,             // [nkh*hd, hs]
+    pub w_v: LinearWeight,             // [nkh*hd, hs]
+    pub w_o: LinearWeight,             // [hs, nqh*hd]
+    pub q_norm: DeviceBuffer<u16>,     // bf16: stays bf16
+    pub k_norm: DeviceBuffer<u16>,     // bf16: stays bf16
+    pub post_norm: DeviceBuffer<u16>,  // bf16: stays bf16
+    pub w_gate: LinearWeight,          // MLP gate
+    pub w_up: LinearWeight,            // MLP up
+    pub w_down: LinearWeight,          // MLP down
 }
 
 pub enum LayerWeights {
@@ -1228,16 +1228,20 @@ impl Model {
         for i in 0..config.num_layers {
             let p = format!("{prefix}layers.{i}.");
             let is_moe = matches!(config.layers[i].ffn_type, FfnType::MoE { .. });
+            let wq = config.weight_quant;
             if config.layer_is_attention[i] {
+                let hs = config.hidden_size;
+                let q_mult = if has_output_gate { 2 } else { 1 };
                 let w = AttentionLayerWeights {
-                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
-                    w_q_gate: {
-                        let q_mult = if has_output_gate { 2 } else { 1 };
-                        load_weight_bf16(&st, &format!("{p}self_attn.q_proj.weight"), device, config.num_q_heads * config.head_dim * q_mult * config.hidden_size)?
-                    },
-                    w_k: load_weight_bf16(&st, &format!("{p}self_attn.k_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
-                    w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
-                    w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * config.num_q_heads * config.head_dim)?,
+                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, hs)?,
+                    w_q_gate: load_linear_weight(&st, &format!("{p}self_attn.q_proj.weight"), device,
+                        config.num_q_heads * config.head_dim * q_mult, hs, wq)?,
+                    w_k: load_linear_weight(&st, &format!("{p}self_attn.k_proj.weight"), device,
+                        config.num_kv_heads * config.head_dim, hs, wq)?,
+                    w_v: load_linear_weight(&st, &format!("{p}self_attn.v_proj.weight"), device,
+                        config.num_kv_heads * config.head_dim, hs, wq)?,
+                    w_o: load_linear_weight(&st, &format!("{p}self_attn.o_proj.weight"), device,
+                        hs, config.num_q_heads * config.head_dim, wq)?,
                     q_norm: if has_qk_norm {
                         let name = format!("{p}self_attn.q_norm.weight");
                         let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
@@ -1248,16 +1252,19 @@ impl Model {
                         let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
                         load_weight_bf16(&st, &name, device, raw.len() / 2)?
                     } else { DeviceBuffer::<u16>::alloc(device, 0)? },
-                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
+                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, hs)?,
                     w_gate: if !is_moe {
-                        load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?
-                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                        load_linear_weight(&st, &format!("{p}mlp.gate_proj.weight"), device,
+                            config.intermediate_size, hs, wq)?
+                    } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_up: if !is_moe {
-                        load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?
-                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                        load_linear_weight(&st, &format!("{p}mlp.up_proj.weight"), device,
+                            config.intermediate_size, hs, wq)?
+                    } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_down: if !is_moe {
-                        load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?
-                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                        load_linear_weight(&st, &format!("{p}mlp.down_proj.weight"), device,
+                            hs, config.intermediate_size, wq)?
+                    } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                 };
                 layers.push(LayerWeights::Attention(w));
 
@@ -1380,30 +1387,31 @@ impl Model {
                 conv_w_q_buf.copy_from_host(&conv_raw[..q_dim * ck])?;
                 conv_w_k_buf.copy_from_host(&conv_raw[q_dim * ck..2 * q_dim * ck])?;
                 conv_w_v_buf.copy_from_host(&conv_raw[2 * q_dim * ck..])?;
+                let hs = config.hidden_size;
                 let w = GdnLayerWeights {
-                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
-                    w_qkv: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_qkv.weight"), device, qkv_out * config.hidden_size)?,
-                    w_a: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nvh * config.hidden_size)?,
-                    w_b: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nvh * config.hidden_size)?,
-                    w_z: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_z.weight"), device, z_out * config.hidden_size)?,
+                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, hs)?,
+                    w_qkv: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_qkv.weight"), device, qkv_out, hs, wq)?,
+                    w_a: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nvh, hs, wq)?,
+                    w_b: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nvh, hs, wq)?,
+                    w_z: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_z.weight"), device, z_out, hs, wq)?,
                     conv1d_weight: conv1d_weight_buf,
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
                     conv1d_weight_v: conv_w_v_buf,
-                    a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nvh)?,  // f32
+                    a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nvh)?,
                     dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nvh)?,
-                    output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,  // f32
-                    w_out: load_weight_bf16(&st, &format!("{p}linear_attn.out_proj.weight"), device, config.hidden_size * z_out)?,
-                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
+                    output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,
+                    w_out: load_linear_weight(&st, &format!("{p}linear_attn.out_proj.weight"), device, hs, z_out, wq)?,
+                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, hs)?,
                     w_gate: if !is_moe {
-                        load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?
-                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                        load_linear_weight(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size, hs, wq)?
+                    } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_up: if !is_moe {
-                        load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?
-                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                        load_linear_weight(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size, hs, wq)?
+                    } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_down: if !is_moe {
-                        load_weight_bf16(&st, &format!("{p}mlp.down_proj.weight"), device, config.hidden_size * config.intermediate_size)?
-                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                        load_linear_weight(&st, &format!("{p}mlp.down_proj.weight"), device, hs, config.intermediate_size, wq)?
+                    } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                 };
                 layers.push(LayerWeights::Gdn(w));
 
@@ -1645,40 +1653,17 @@ impl Model {
         )?;
 
         // 2. Project QKV [6144]
-        self.kernels.linear_proj.forward(
-            &mut self.activations.qkv,
-            &weights.w_qkv,
-            &self.activations.normed,
-            nh * kd * 2 + nvh * vd,
-            hs,
-            &self.stream,
-        )?;
+        weights.w_qkv.forward(&self.kernels.linear_proj,
+            &mut self.activations.qkv, &self.activations.normed,
+            nh * kd * 2 + nvh * vd, hs, &self.stream)?;
 
         // 3. Project a [nvh], b [nvh], z [nvh*vd]
-        self.kernels.linear_proj.forward(
-            &mut self.activations.a_proj,
-            &weights.w_a,
-            &self.activations.normed,
-            nvh,
-            hs,
-            &self.stream,
-        )?;
-        self.kernels.linear_proj.forward(
-            &mut self.activations.b_proj,
-            &weights.w_b,
-            &self.activations.normed,
-            nvh,
-            hs,
-            &self.stream,
-        )?;
-        self.kernels.linear_proj.forward(
-            &mut self.activations.z_proj,
-            &weights.w_z,
-            &self.activations.normed,
-            nvh * vd,
-            hs,
-            &self.stream,
-        )?;
+        weights.w_a.forward(&self.kernels.linear_proj,
+            &mut self.activations.a_proj, &self.activations.normed, nvh, hs, &self.stream)?;
+        weights.w_b.forward(&self.kernels.linear_proj,
+            &mut self.activations.b_proj, &self.activations.normed, nvh, hs, &self.stream)?;
+        weights.w_z.forward(&self.kernels.linear_proj,
+            &mut self.activations.z_proj, &self.activations.normed, nvh * vd, hs, &self.stream)?;
 
         // 4. Causal conv1d: split qkv into q/k/v
         unsafe {
@@ -1811,12 +1796,9 @@ impl Model {
             LayerWeights::Gdn(w) => w,
             _ => unreachable!(),
         };
-        self.kernels.linear_proj.forward(
-            &mut self.activations.out_proj,
-            &weights_gdn.w_out,
-            &self.activations.normed_gated,
-            hs,
-            nh * vd,
+        weights_gdn.w_out.forward(&self.kernels.linear_proj,
+            &mut self.activations.out_proj, &self.activations.normed_gated,
+            hs, nh * vd,
             &self.stream,
         )?;
 
@@ -2065,14 +2047,16 @@ impl Model {
         }
 
 
-        // 2. Project Q+gate [4096], K [512], V [512]
-        let (w_q_gate, w_k, w_v, w_o_ptr, q_norm_w, k_norm_w) =
+        // 2. Project Q+gate, K, V
+        // Use raw pointers to LinearWeight to work around borrow checker
+        // (self.layers borrows self, but we need &mut self.activations)
+        let (w_q_gate_p, w_k_p, w_v_p, w_o_p, q_norm_w, k_norm_w) =
             match &self.layers[layer_idx] {
                 LayerWeights::Attention(w) => (
-                    &w.w_q_gate as *const DeviceBuffer<u16>,
-                    &w.w_k as *const DeviceBuffer<u16>,
-                    &w.w_v as *const DeviceBuffer<u16>,
-                    &w.w_o as *const DeviceBuffer<u16>,
+                    &w.w_q_gate as *const LinearWeight,
+                    &w.w_k as *const LinearWeight,
+                    &w.w_v as *const LinearWeight,
+                    &w.w_o as *const LinearWeight,
                     &w.q_norm as *const DeviceBuffer<u16>,
                     &w.k_norm as *const DeviceBuffer<u16>,
                 ),
@@ -2081,30 +2065,15 @@ impl Model {
 
         let q_mult = if cfg.has_output_gate { 2u32 } else { 1 };
         unsafe {
-            self.kernels.linear_proj.forward(
-                &mut self.activations.q_gate_attn,
-                &*w_q_gate,
-                &self.activations.normed,
-                nqh * hd * q_mult,
-                hs,
-                &self.stream,
-            )?;
-            self.kernels.linear_proj.forward(
-                &mut self.activations.k_attn,
-                &*w_k,
-                &self.activations.normed,
-                nkh * hd,
-                hs,
-                &self.stream,
-            )?;
-            self.kernels.linear_proj.forward(
-                &mut self.activations.v_attn,
-                &*w_v,
-                &self.activations.normed,
-                nkh * hd,
-                hs,
-                &self.stream,
-            )?;
+            (*w_q_gate_p).forward(&self.kernels.linear_proj,
+                &mut self.activations.q_gate_attn, &self.activations.normed,
+                nqh * hd * q_mult, hs, &self.stream)?;
+            (*w_k_p).forward(&self.kernels.linear_proj,
+                &mut self.activations.k_attn, &self.activations.normed,
+                nkh * hd, hs, &self.stream)?;
+            (*w_v_p).forward(&self.kernels.linear_proj,
+                &mut self.activations.v_attn, &self.activations.normed,
+                nkh * hd, hs, &self.stream)?;
         }
 
 
@@ -2235,14 +2204,9 @@ impl Model {
 
         // 9. Output projection
         unsafe {
-            self.kernels.linear_proj.forward(
-                &mut self.activations.out_proj,
-                &*w_o_ptr,
-                &*final_attn,
-                hs,
-                nqh * hd,
-                &self.stream,
-            )?;
+            (*w_o_p).forward(&self.kernels.linear_proj,
+                &mut self.activations.out_proj, &*final_attn,
+                hs, nqh * hd, &self.stream)?;
         }
 
 
@@ -2337,8 +2301,8 @@ impl Model {
                 self.moe_ffn_forward(layer_i)?;
             } else {
                 let (post_norm, w_gate, w_up, w_down) = match &self.layers[layer_i] {
-                    LayerWeights::Attention(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
-                    LayerWeights::Gdn(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+                    LayerWeights::Attention(w) => (&w.post_norm, w.w_gate.as_bf16(), w.w_up.as_bf16(), w.w_down.as_bf16()),
+                    LayerWeights::Gdn(w) => (&w.post_norm, w.w_gate.as_bf16(), w.w_up.as_bf16(), w.w_down.as_bf16()),
                 };
                 let post_norm = post_norm as *const DeviceBuffer<u16>;
                 let w_gate = w_gate as *const DeviceBuffer<u16>;
@@ -2613,25 +2577,18 @@ impl Model {
         let gqa_traced = nvh_traced / nh;
 
         // QKV projection
-        self.kernels.linear_proj.forward(
-            &mut self.activations.qkv, &w.w_qkv, &self.activations.normed,
-            nh * kd * 2 + nvh_traced * vd, hs, &self.stream,
-        )?;
+        w.w_qkv.forward(&self.kernels.linear_proj,
+            &mut self.activations.qkv, &self.activations.normed,
+            nh * kd * 2 + nvh_traced * vd, hs, &self.stream)?;
         traces.push(("qkv_pre_conv".into(), self.read_buf(&self.activations.qkv)?));
 
         // a, b, z projections
-        self.kernels.linear_proj.forward(
-            &mut self.activations.a_proj, &w.w_a, &self.activations.normed,
-            nh, hs, &self.stream,
-        )?;
-        self.kernels.linear_proj.forward(
-            &mut self.activations.b_proj, &w.w_b, &self.activations.normed,
-            nh, hs, &self.stream,
-        )?;
-        self.kernels.linear_proj.forward(
-            &mut self.activations.z_proj, &w.w_z, &self.activations.normed,
-            nh * vd, hs, &self.stream,
-        )?;
+        w.w_a.forward(&self.kernels.linear_proj,
+            &mut self.activations.a_proj, &self.activations.normed, nh, hs, &self.stream)?;
+        w.w_b.forward(&self.kernels.linear_proj,
+            &mut self.activations.b_proj, &self.activations.normed, nh, hs, &self.stream)?;
+        w.w_z.forward(&self.kernels.linear_proj,
+            &mut self.activations.z_proj, &self.activations.normed, nh * vd, hs, &self.stream)?;
         traces.push(("a_proj".into(), self.read_buf(&self.activations.a_proj)?));
         traces.push(("b_proj".into(), self.read_buf(&self.activations.b_proj)?));
         traces.push(("z_proj".into(), self.read_buf(&self.activations.z_proj)?));
@@ -2713,10 +2670,9 @@ impl Model {
         traces.push(("normed_gated".into(), self.read_buf(&self.activations.normed_gated)?));
 
         // out_proj
-        self.kernels.linear_proj.forward(
-            &mut self.activations.out_proj, &w.w_out, &self.activations.normed_gated,
-            hs, nh * vd, &self.stream,
-        )?;
+        w.w_out.forward(&self.kernels.linear_proj,
+            &mut self.activations.out_proj, &self.activations.normed_gated,
+            hs, nh * vd, &self.stream)?;
         traces.push(("out_proj".into(), self.read_buf(&self.activations.out_proj)?));
 
         // Residual
