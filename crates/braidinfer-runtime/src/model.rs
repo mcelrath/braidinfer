@@ -756,6 +756,36 @@ pub enum LayerWeights {
     Attention(AttentionLayerWeights),
 }
 
+/// Combined layer: recurrent/attention weights + FFN weights (dense or MoE)
+pub struct FullLayerWeights {
+    pub layer: LayerWeights,
+    pub ffn: FfnWeights,
+}
+
+/// Dense FFN weights (gate_proj + up_proj + down_proj)
+pub struct DenseFfnWeights {
+    pub gate_proj: DeviceBuffer<u16>,
+    pub up_proj: DeviceBuffer<u16>,
+    pub down_proj: DeviceBuffer<u16>,
+}
+
+/// MoE FFN weights for one layer
+pub struct MoeWeights {
+    pub gate: DeviceBuffer<u16>,                    // [num_experts, hidden_size] — router
+    pub expert_gate_up: DeviceBuffer<u16>,           // [num_experts, 2*expert_is, hidden_size] fused
+    pub expert_down: DeviceBuffer<u16>,              // [num_experts, hidden_size, expert_is]
+    pub shared_expert: Option<DenseFfnWeights>,      // always-on shared expert
+    pub shared_expert_gate: Option<DeviceBuffer<u16>>, // [1, hidden_size] gate for shared expert
+    pub num_experts: usize,
+    pub expert_intermediate_size: usize,
+}
+
+/// Per-layer FFN weights: either dense or MoE
+pub enum FfnWeights {
+    Dense(DenseFfnWeights),
+    MoE(MoeWeights),
+}
+
 pub struct GdnState {
     pub recurrent: DeviceBuffer<f32>, // [16, 128, 128]
 }
@@ -866,6 +896,7 @@ pub struct Model {
     pub(crate) lm_head_weight: DeviceBuffer<u16>,  // separate from embed when tie_word_embeddings=false
     pub(crate) final_norm_weight: DeviceBuffer<u16>,
     pub(crate) layers: Vec<LayerWeights>,
+    pub(crate) moe_weights: Vec<Option<MoeWeights>>,  // per-layer MoE FFN (None for dense FFN layers)
     pub(crate) activations: ActivationBuffers,
     pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
     pub(crate) kv_caches: Vec<KvCache>,
@@ -1289,6 +1320,7 @@ impl Model {
             gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
         };
 
+        let n_layers = config.num_layers;
         Ok(Model {
             config,
             device,
@@ -1298,6 +1330,7 @@ impl Model {
             lm_head_weight,
             final_norm_weight,
             layers,
+            moe_weights: (0..n_layers).map(|_| None).collect(),
             activations,
             gdn_conv_states,
             kv_caches,
