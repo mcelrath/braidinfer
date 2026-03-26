@@ -105,6 +105,7 @@ pub struct ModelConfig {
     pub has_qk_norm: bool,
     pub attention_layer_indices: Vec<usize>,
     pub model_type: String,
+    pub tie_word_embeddings: bool,
 }
 
 // Serde structs for config.json parsing
@@ -185,6 +186,7 @@ struct RawConfig {
     shared_expert_intermediate_size_alt: Option<usize>,
     // Qwen3-Next style
     full_attention_interval: Option<usize>,
+    tie_word_embeddings: Option<bool>,
     #[allow(dead_code)]
     decoder_sparse_step: Option<usize>,
     #[allow(dead_code)]
@@ -238,6 +240,7 @@ impl ModelConfig {
             has_qk_norm: true,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
+            tie_word_embeddings: true,
         }
     }
 
@@ -387,6 +390,7 @@ impl ModelConfig {
             has_qk_norm: true,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
+            tie_word_embeddings: true,
         })
     }
 
@@ -492,6 +496,7 @@ impl ModelConfig {
             has_qk_norm: false,
             attention_layer_indices,
             model_type: "nemotron_h".to_string(),
+            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
         })
     }
 
@@ -528,6 +533,7 @@ impl ModelConfig {
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
             has_qk_norm: false, attention_layer_indices,
             model_type: raw.model_type,
+            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(true),
         })
     }
 
@@ -575,6 +581,7 @@ impl ModelConfig {
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
             has_qk_norm: false, attention_layer_indices,
             model_type: raw.model_type,
+            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(true),
         })
     }
 
@@ -645,6 +652,7 @@ impl ModelConfig {
             rope_type: RopeType::Standard { rotary_dim: rope_dim },
             has_qk_norm: false, attention_layer_indices,
             model_type: raw.model_type,
+            tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(true),
         })
     }
 
@@ -827,6 +835,7 @@ pub struct Model {
     pub(crate) stream: Stream,
     kernels: AllKernels,
     pub(crate) embed_weight: DeviceBuffer<u16>,
+    pub(crate) lm_head_weight: DeviceBuffer<u16>,  // separate from embed when tie_word_embeddings=false
     pub(crate) final_norm_weight: DeviceBuffer<u16>,
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) activations: ActivationBuffers,
@@ -1071,6 +1080,16 @@ impl Model {
             .to_string();
 
         let embed_weight = load_weight_bf16(&st, &embed_name, device, config.vocab_size * config.hidden_size)?;
+        let lm_head_weight = if config.tie_word_embeddings {
+            // Weight-tied: reuse embed_weight pointer (allocate a dummy — the megakernel uses embed_weight)
+            DeviceBuffer::<u16>::alloc(device, 0)?  // placeholder, megakernel will use embed_weight
+        } else {
+            let lm_head_name = names.iter()
+                .find(|n| n.contains("lm_head.weight"))
+                .ok_or_else(|| ModelError::MissingWeight("lm_head.weight not found".into()))?
+                .to_string();
+            load_weight_bf16(&st, &lm_head_name, device, config.vocab_size * config.hidden_size)?
+        };
         let final_norm_weight = load_weight_bf16(&st, &norm_name, device, config.hidden_size)?;
 
         // Per-layer weights
@@ -1242,6 +1261,7 @@ impl Model {
             stream,
             kernels,
             embed_weight,
+            lm_head_weight,
             final_norm_weight,
             layers,
             activations,

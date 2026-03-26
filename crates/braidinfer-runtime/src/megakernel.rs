@@ -333,7 +333,7 @@ impl MegakernelProgram {
         {
             let mut inst = Instruction::new(OP_LINEAR_PROJ, vs as u32);
             inst.set_output_ptr(1, act.logits.as_ptr());
-            inst.set_ptr(2, model.embed_weight.as_ptr()); // weight-tied
+            inst.set_ptr(2, if model.config.tie_word_embeddings { model.embed_weight.as_ptr() } else { model.lm_head_weight.as_ptr() });
             inst.set_ptr(3, act.hidden.as_ptr());
             inst.set_int(4, vs as i32);
             inst.set_int(5, hs as i32);
