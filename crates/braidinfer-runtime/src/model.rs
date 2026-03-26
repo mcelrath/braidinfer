@@ -649,6 +649,209 @@ fn load_weight_bf16(
     Ok(buf)
 }
 
+// --- Weight Quantization ---
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeightFormat {
+    Bf16,
+    Rnf4G128,  // residual NF4, group_size=128, 8.25 bits/element
+    PcG32Q4,   // per-channel-group asymmetric 4-bit, group_size=32, 5.0 bits/element
+}
+
+/// Packed quantized weight buffer on GPU.
+pub struct PackedWeights {
+    pub data: DeviceBuffer<u8>,
+    pub format: WeightFormat,
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
+const NF4_TABLE: [f32; 16] = [
+    -1.0, -0.6961928, -0.5250731, -0.3949175,
+    -0.2844414, -0.1847734, -0.0910500,  0.0,
+     0.0795803,  0.1609302,  0.2461123,  0.3379152,
+     0.4407098,  0.5626170,  0.7229568,  1.0,
+];
+
+fn nf4_boundaries() -> [f32; 15] {
+    let mut b = [0.0f32; 15];
+    for i in 0..15 {
+        b[i] = (NF4_TABLE[i] + NF4_TABLE[i + 1]) / 2.0;
+    }
+    b
+}
+
+fn nf4_quantize_index(x: f32) -> u8 {
+    let bounds = nf4_boundaries();
+    for (i, &b) in bounds.iter().enumerate() {
+        if x < b { return i as u8; }
+    }
+    15
+}
+
+fn f32_to_bf16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    // Round to nearest even
+    let rounding = ((bits >> 16) & 1) + 0x7FFF;
+    ((bits + rounding) >> 16) as u16
+}
+
+fn bf16_to_f32_cpu(x: u16) -> f32 {
+    f32::from_bits((x as u32) << 16)
+}
+
+/// Quantize bf16 weights to rnf4_g128 format on CPU.
+/// Input: &[u16] bf16 weights, row-major [out_dim, in_dim].
+/// Output: packed bytes, groups of 132 bytes per 128 elements.
+fn quantize_rnf4_g128(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    let group_size = 128;
+    let group_bytes = 132; // 64 + 2 + 64 + 2
+    let num_groups_per_row = (in_dim + group_size - 1) / group_size;
+    let total_bytes = out_dim * num_groups_per_row * group_bytes;
+    let mut packed = vec![0u8; total_bytes];
+
+    for row in 0..out_dim {
+        for g in 0..num_groups_per_row {
+            let base = row * in_dim + g * group_size;
+            let count = std::cmp::min(group_size, in_dim - g * group_size);
+
+            // Convert to f32
+            let mut vals = [0.0f32; 128];
+            for i in 0..count {
+                vals[i] = bf16_to_f32_cpu(bf16_data[base + i]);
+            }
+
+            // Round 1: NF4 with absmax
+            let absmax1 = vals[..count].iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-10);
+            let mut idx1 = [0u8; 128];
+            let mut dequant1 = [0.0f32; 128];
+            for i in 0..count {
+                let normalized = vals[i] / absmax1;
+                idx1[i] = nf4_quantize_index(normalized);
+                dequant1[i] = NF4_TABLE[idx1[i] as usize] * absmax1;
+            }
+
+            // Residual
+            let mut residual = [0.0f32; 128];
+            for i in 0..count {
+                residual[i] = vals[i] - dequant1[i];
+            }
+
+            // Round 2: NF4 on residual with its own absmax
+            let absmax2 = residual[..count].iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-10);
+            let mut idx2 = [0u8; 128];
+            for i in 0..count {
+                let normalized = residual[i] / absmax2;
+                idx2[i] = nf4_quantize_index(normalized);
+            }
+
+            // Pack: [64B idx1 | 2B absmax1_bf16 | 64B idx2 | 2B absmax2_bf16]
+            let dst = (row * num_groups_per_row + g) * group_bytes;
+
+            // Pack idx1: 2 values per byte, low nibble first
+            for i in (0..128).step_by(2) {
+                packed[dst + i / 2] = (idx1[i] & 0xF) | ((idx1[i + 1] & 0xF) << 4);
+            }
+            let absmax1_bf16 = f32_to_bf16(absmax1);
+            packed[dst + 64] = (absmax1_bf16 & 0xFF) as u8;
+            packed[dst + 65] = (absmax1_bf16 >> 8) as u8;
+
+            // Pack idx2
+            for i in (0..128).step_by(2) {
+                packed[dst + 66 + i / 2] = (idx2[i] & 0xF) | ((idx2[i + 1] & 0xF) << 4);
+            }
+            let absmax2_bf16 = f32_to_bf16(absmax2);
+            packed[dst + 130] = (absmax2_bf16 & 0xFF) as u8;
+            packed[dst + 131] = (absmax2_bf16 >> 8) as u8;
+        }
+    }
+    packed
+}
+
+/// Quantize bf16 weights to PcG32Q4 format on CPU.
+/// Per-channel-group asymmetric 4-bit, group_size=32.
+fn quantize_pc_g32_q4(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    let group_size = 32;
+    let group_bytes = 20; // 16 + 2 + 2
+    let num_groups_per_row = (in_dim + group_size - 1) / group_size;
+    let total_bytes = out_dim * num_groups_per_row * group_bytes;
+    let mut packed = vec![0u8; total_bytes];
+
+    for row in 0..out_dim {
+        for g in 0..num_groups_per_row {
+            let base = row * in_dim + g * group_size;
+            let count = std::cmp::min(group_size, in_dim - g * group_size);
+
+            let mut vals = [0.0f32; 32];
+            for i in 0..count {
+                vals[i] = bf16_to_f32_cpu(bf16_data[base + i]);
+            }
+
+            let mn = vals[..count].iter().cloned().fold(f32::INFINITY, f32::min);
+            let mx = vals[..count].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let scale = ((mx - mn) / 15.0).max(1e-10);
+
+            let mut indices = [0u8; 32];
+            for i in 0..count {
+                let idx = ((vals[i] - mn) / scale).round().clamp(0.0, 15.0) as u8;
+                indices[i] = idx;
+            }
+
+            let dst = (row * num_groups_per_row + g) * group_bytes;
+
+            // Pack indices: 2 per byte, low nibble first
+            for i in (0..32).step_by(2) {
+                packed[dst + i / 2] = (indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4);
+            }
+            let mn_bf16 = f32_to_bf16(mn);
+            let sc_bf16 = f32_to_bf16(scale);
+            packed[dst + 16] = (mn_bf16 & 0xFF) as u8;
+            packed[dst + 17] = (mn_bf16 >> 8) as u8;
+            packed[dst + 18] = (sc_bf16 & 0xFF) as u8;
+            packed[dst + 19] = (sc_bf16 >> 8) as u8;
+        }
+    }
+    packed
+}
+
+/// Load a weight tensor, optionally quantizing at load time.
+fn load_weight_quantized(
+    st: &SafeTensorSet,
+    name: &str,
+    device: DeviceId,
+    out_dim: usize,
+    in_dim: usize,
+    format: WeightFormat,
+) -> Result<PackedWeights, ModelError> {
+    let expected_len = out_dim * in_dim;
+    let raw = st.tensor_data(name)
+        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
+    assert_eq!(raw.len(), expected_len * 2, "weight {name}: expected {} bytes, got {}", expected_len * 2, raw.len());
+    let bf16_data: &[u16] = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
+    };
+
+    match format {
+        WeightFormat::Bf16 => {
+            let mut buf = DeviceBuffer::<u8>::alloc(device, expected_len * 2)?;
+            buf.copy_from_host(raw)?;
+            Ok(PackedWeights { data: buf, format, out_dim, in_dim })
+        }
+        WeightFormat::Rnf4G128 => {
+            let packed = quantize_rnf4_g128(bf16_data, out_dim, in_dim);
+            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+            buf.copy_from_host(&packed)?;
+            Ok(PackedWeights { data: buf, format, out_dim, in_dim })
+        }
+        WeightFormat::PcG32Q4 => {
+            let packed = quantize_pc_g32_q4(bf16_data, out_dim, in_dim);
+            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+            buf.copy_from_host(&packed)?;
+            Ok(PackedWeights { data: buf, format, out_dim, in_dim })
+        }
+    }
+}
+
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
 /// Only used for the few tensors that need f32 on the GPU (A_log, output_norm).
 fn load_weight_f32(

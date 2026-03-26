@@ -221,6 +221,48 @@ impl LinearProjKernel {
             &mut args,
         )
     }
+
+    /// Forward pass with PackedWeights (dispatches by format).
+    pub fn forward_packed(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        weight: &crate::model::PackedWeights,
+        input: &DeviceBuffer<f32>,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let out_dim = weight.out_dim as u32;
+        let in_dim = weight.in_dim as u32;
+
+        let func_name = match weight.format {
+            crate::model::WeightFormat::Bf16 => "linear_proj_f32",
+            crate::model::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
+            crate::model::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
+        };
+        let func = self.module.get_function(func_name)?;
+
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut w_ptr: *const c_void = weight.data.as_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut od = out_dim as i32;
+        let mut id = in_dim as i32;
+
+        let mut args: [*mut c_void; 5] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(od).cast(),
+            std::ptr::addr_of_mut!(id).cast(),
+        ];
+
+        let block_size = 256u32;
+        func.launch(
+            (out_dim, 1, 1),
+            (block_size, 1, 1),
+            256 * 4,
+            stream,
+            &mut args,
+        )
+    }
 }
 
 pub struct SiluMulKernel {
