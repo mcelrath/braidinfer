@@ -182,6 +182,7 @@ struct RawConfig {
     layers_block_type: Option<Vec<String>>,
     // MoE fields
     num_experts: Option<usize>,
+    num_local_experts: Option<usize>,
     n_routed_experts: Option<usize>,
     num_experts_per_tok: Option<usize>,
     num_selected_experts: Option<usize>,
@@ -271,6 +272,7 @@ impl ModelConfig {
             "qwen3_5" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" => Self::from_qwen35_config(raw),
             "nemotron_h" => Self::from_nemotron_config(raw),
             "ministral3" | "mistral" => Self::from_dense_transformer_config(raw),
+            "phimoe" | "mixtral" => Self::from_glm_config(raw),  // pure attention + MoE
             "glm4_moe_lite" => Self::from_glm_config(raw),
             "lfm2" => Self::from_lfm2_config(raw),
             other => Err(format!("Unknown model_type: {other}").into()),
@@ -575,8 +577,8 @@ impl ModelConfig {
         let rope_dim = ((head_dim as f64) * raw.partial_rotary_factor.unwrap_or(1.0)) as usize;
         let rms_norm_eps = raw.norm_eps.or(raw.rms_norm_eps).unwrap_or(1e-5) as f32;
 
-        let num_experts = raw.n_routed_experts.unwrap_or(0);
-        let num_active = raw.num_experts_per_tok.unwrap_or(0);
+        let num_experts = raw.n_routed_experts.unwrap_or(raw.num_local_experts.unwrap_or(raw.num_experts.unwrap_or(0)));
+        let num_active = raw.num_experts_per_tok.unwrap_or(raw.num_selected_experts.unwrap_or(0));
         let num_shared = raw.n_shared_experts.unwrap_or(0);
         let expert_is = raw.moe_intermediate_size.unwrap_or(intermediate_size);
         let shared_is = raw.shared_expert_intermediate_size.unwrap_or(0);

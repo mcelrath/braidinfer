@@ -10,6 +10,7 @@ fn test_parse_all_hf_models() {
     let supported_types = [
         "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
         "nemotron_h", "ministral3", "glm4_moe_lite", "lfm2",
+        "phimoe", "mixtral",
     ];
 
     let mut passed = 0;
