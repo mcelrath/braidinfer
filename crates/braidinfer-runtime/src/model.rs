@@ -237,7 +237,7 @@ impl ModelConfig {
                 kernel_size: 4,
             },
             rope_type: RopeType::MRope { sections: [11, 11, 10] },
-            has_qk_norm: true,
+            has_qk_norm: false,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings: true, // 0.8B fallback for tests
@@ -388,7 +388,7 @@ impl ModelConfig {
                 kernel_size: linear_conv_kernel_dim,
             },
             rope_type,
-            has_qk_norm: true,
+            has_qk_norm: false,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings,
@@ -1067,8 +1067,10 @@ impl Model {
         let stream = Stream::new(device)?;
         let kernels = AllKernels::load(device)?;
 
-        // Discover embedding and final norm tensor names
+        // Discover model features from tensor names
         let names = st.tensor_names();
+        let has_qk_norm = names.iter().any(|n| n.contains("q_norm.weight"));
+        config.has_qk_norm = has_qk_norm;
         let embed_name = names.iter()
             .find(|n| n.starts_with(&prefix) && (n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
             .or_else(|| names.iter().find(|n| n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
@@ -1104,8 +1106,12 @@ impl Model {
                     w_k: load_weight_bf16(&st, &format!("{p}self_attn.k_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
                     w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
                     w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * config.num_q_heads * config.head_dim)?,
-                    q_norm: load_weight_bf16(&st, &format!("{p}self_attn.q_norm.weight"), device, config.head_dim)?,
-                    k_norm: load_weight_bf16(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?,
+                    q_norm: if has_qk_norm {
+                        load_weight_bf16(&st, &format!("{p}self_attn.q_norm.weight"), device, config.head_dim)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
+                    k_norm: if has_qk_norm {
+                        load_weight_bf16(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?
+                    } else { DeviceBuffer::<u16>::alloc(device, 0)? },
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
                     w_gate: load_weight_bf16(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
                     w_up: load_weight_bf16(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size * config.hidden_size)?,
