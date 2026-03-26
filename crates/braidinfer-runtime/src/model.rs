@@ -1038,24 +1038,40 @@ impl Model {
             unsafe { ffi::hipHostRegister(ptr, len, 0) };
         }
 
-        let prefix = "model.language_model.";
+        // Discover tensor name prefix by finding "layers.0." in tensor names.
+        // Prefer prefixes containing "model" to avoid matching MTP/draft heads.
+        let prefix = {
+            let names = st.tensor_names();
+            let candidates: Vec<&str> = names.iter()
+                .filter(|n| n.contains("layers.0."))
+                .map(|n| &n[..n.find("layers.0.").unwrap()])
+                .collect();
+            let prefix = candidates.iter()
+                .find(|p| p.contains("model"))
+                .or_else(|| candidates.iter().find(|p| !p.contains("mtp")))
+                .or(candidates.first())
+                .ok_or_else(|| ModelError::MissingWeight("no layers.0. tensor found".into()))?;
+            prefix.to_string()
+        };
 
         let stream = Stream::new(device)?;
         let kernels = AllKernels::load(device)?;
 
-        // Global weights (BF16)
-        let embed_weight = load_weight_bf16(
-            &st,
-            &format!("{prefix}embed_tokens.weight"),
-            device,
-            config.vocab_size * config.hidden_size,
-        )?;
-        let final_norm_weight = load_weight_bf16(
-            &st,
-            &format!("{prefix}norm.weight"),
-            device,
-            config.hidden_size,
-        )?;
+        // Discover embedding and final norm tensor names
+        let names = st.tensor_names();
+        let embed_name = names.iter()
+            .find(|n| n.starts_with(&prefix) && (n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
+            .or_else(|| names.iter().find(|n| n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
+            .ok_or_else(|| ModelError::MissingWeight("embedding tensor not found".into()))?
+            .to_string();
+        let norm_name = names.iter()
+            .find(|n| n.starts_with(&prefix) && (n.ends_with("norm.weight") || n.ends_with("ln_f.weight")) && !n.contains("layers."))
+            .or_else(|| names.iter().find(|n| (n.contains("norm.weight") || n.contains("ln_f.weight")) && !n.contains("layers.") && !n.contains("visual") && !n.contains("mtp")))
+            .ok_or_else(|| ModelError::MissingWeight("final norm tensor not found".into()))?
+            .to_string();
+
+        let embed_weight = load_weight_bf16(&st, &embed_name, device, config.vocab_size * config.hidden_size)?;
+        let final_norm_weight = load_weight_bf16(&st, &norm_name, device, config.hidden_size)?;
 
         // Per-layer weights
         let mut layers = Vec::with_capacity(config.num_layers);
