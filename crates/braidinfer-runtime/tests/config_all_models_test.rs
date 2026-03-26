@@ -7,10 +7,9 @@ fn test_parse_all_hf_models() {
     let hub_path = Path::new(hub);
     if !hub_path.exists() { return; }
 
-    let supported_types = [
-        "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
-        "nemotron_h", "ministral3", "glm4_moe_lite", "lfm2",
-        "phimoe", "mixtral",
+    // Universal parser — try ALL model types (skip non-decoder models)
+    let skip_types = [
+        "bert", "roberta", "t5", "nvembed", "llama_bidirec",  // encoder/embedding models
     ];
 
     let mut passed = 0;
@@ -44,7 +43,7 @@ fn test_parse_all_hf_models() {
             Err(_) => continue,
         };
 
-        if !supported_types.contains(&model_type.as_str()) {
+        if skip_types.contains(&model_type.as_str()) {
             skipped += 1;
             continue;
         }
