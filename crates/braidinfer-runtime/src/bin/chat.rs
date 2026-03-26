@@ -10,7 +10,7 @@ use braidinfer_runtime::generate::{
 };
 use braidinfer_runtime::model::Model;
 
-const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
+const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
 #[tokio::main]
 async fn main() {
@@ -21,7 +21,10 @@ async fn main() {
 
     let system_prompt = std::env::var("SYSTEM").ok();
 
-    let model_dir = Path::new(MODEL_DIR);
+    let model_path = std::env::var("MODEL").ok()
+        .or_else(|| std::env::args().nth(1))
+        .unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+    let model_dir = Path::new(&model_path);
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);

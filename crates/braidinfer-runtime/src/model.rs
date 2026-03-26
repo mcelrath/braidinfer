@@ -83,7 +83,8 @@ pub struct ModelConfig {
     // mrope sections (pairs)
     pub mrope_section: [usize; 3],
     // GDN config
-    pub linear_num_heads: usize,
+    pub linear_num_heads: usize,       // num_key_heads for GDN
+    pub linear_num_value_heads: usize,  // may differ from linear_num_heads (e.g. 4B: 32 vs 16)
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
@@ -215,6 +216,7 @@ impl ModelConfig {
             rms_norm_eps: 1e-6,
             mrope_section: [11, 11, 10],
             linear_num_heads: 16,
+            linear_num_value_heads: 16,
             linear_key_head_dim: 128,
             linear_value_head_dim: 128,
             linear_conv_kernel_dim: 4,
@@ -344,6 +346,7 @@ impl ModelConfig {
         };
 
         let linear_num_heads = tc.linear_num_key_heads.unwrap_or(16);
+        let linear_num_value_heads = tc.linear_num_value_heads.unwrap_or(linear_num_heads);
         let linear_key_head_dim = tc.linear_key_head_dim.unwrap_or(128);
         let linear_value_head_dim = tc.linear_value_head_dim.unwrap_or(128);
         let linear_conv_kernel_dim = tc.linear_conv_kernel_dim.unwrap_or(4);
@@ -362,6 +365,7 @@ impl ModelConfig {
             rms_norm_eps: tc.rms_norm_eps.unwrap_or(1e-6) as f32,
             mrope_section,
             linear_num_heads,
+            linear_num_value_heads,
             linear_key_head_dim,
             linear_value_head_dim,
             linear_conv_kernel_dim,
@@ -466,6 +470,7 @@ impl ModelConfig {
             rms_norm_eps,
             mrope_section: [0, 0, 0],
             linear_num_heads: mamba_num_heads,
+            linear_num_value_heads: mamba_num_heads,
             linear_key_head_dim: mamba_head_dim,
             linear_value_head_dim: mamba_head_dim,
             linear_conv_kernel_dim: conv_kernel,
@@ -514,7 +519,7 @@ impl ModelConfig {
             hidden_size, num_layers, intermediate_size, vocab_size,
             num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
             mrope_section: [0, 0, 0],
-            linear_num_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0, linear_conv_kernel_dim: 0,
+            linear_num_heads: 0, linear_num_value_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0, linear_conv_kernel_dim: 0,
             layers, layer_is_attention,
             max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
             num_experts: 0, num_active_experts: 0, num_shared_experts: 0,
@@ -561,7 +566,7 @@ impl ModelConfig {
             hidden_size, num_layers, intermediate_size, vocab_size,
             num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
             mrope_section: [0, 0, 0],
-            linear_num_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0, linear_conv_kernel_dim: 0,
+            linear_num_heads: 0, linear_num_value_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0, linear_conv_kernel_dim: 0,
             layers, layer_is_attention,
             max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
             num_experts, num_active_experts: num_active, num_shared_experts: num_shared,
@@ -629,7 +634,7 @@ impl ModelConfig {
             hidden_size, num_layers, intermediate_size, vocab_size,
             num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
             mrope_section: [0, 0, 0],
-            linear_num_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0,
+            linear_num_heads: 0, linear_num_value_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0,
             linear_conv_kernel_dim: raw.conv_kernel.unwrap_or(4),
             layers, layer_is_attention,
             max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
@@ -1059,10 +1064,10 @@ impl Model {
             if config.layer_is_attention[i] {
                 let w = AttentionLayerWeights {
                     input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
-                    w_q_gate: load_weight_bf16(&st, &format!("{p}self_attn.q_proj.weight"), device, 4096 * config.hidden_size)?,
-                    w_k: load_weight_bf16(&st, &format!("{p}self_attn.k_proj.weight"), device, 512 * config.hidden_size)?,
-                    w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, 512 * config.hidden_size)?,
-                    w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * 2048)?,
+                    w_q_gate: load_weight_bf16(&st, &format!("{p}self_attn.q_proj.weight"), device, config.num_q_heads * config.head_dim * 2 * config.hidden_size)?,
+                    w_k: load_weight_bf16(&st, &format!("{p}self_attn.k_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
+                    w_v: load_weight_bf16(&st, &format!("{p}self_attn.v_proj.weight"), device, config.num_kv_heads * config.head_dim * config.hidden_size)?,
+                    w_o: load_weight_bf16(&st, &format!("{p}self_attn.o_proj.weight"), device, config.hidden_size * config.num_q_heads * config.head_dim)?,
                     q_norm: load_weight_bf16(&st, &format!("{p}self_attn.q_norm.weight"), device, config.head_dim)?,
                     k_norm: load_weight_bf16(&st, &format!("{p}self_attn.k_norm.weight"), device, config.head_dim)?,
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
@@ -1073,13 +1078,14 @@ impl Model {
                 layers.push(LayerWeights::Attention(w));
             } else {
                 let nh = config.linear_num_heads;
+                let nvh = config.linear_num_value_heads;
                 let kd = config.linear_key_head_dim;
                 let vd = config.linear_value_head_dim;
-                let qkv_out = nh * kd + nh * kd + nh * vd; // 2048+2048+2048=6144
-                let z_out = nh * vd; // 2048
+                let qkv_out = nh * kd + nh * kd + nvh * vd;
+                let z_out = nvh * vd;
                 let ck = config.linear_conv_kernel_dim;
                 let q_dim = nh * kd;
-                let v_dim = nh * vd;
+                let v_dim = nvh * vd;
                 let conv_total = qkv_out * ck;
                 let conv_name = format!("{p}linear_attn.conv1d.weight");
                 let conv_raw_bytes = st.tensor_data(&conv_name)
@@ -1099,15 +1105,15 @@ impl Model {
                 let w = GdnLayerWeights {
                     input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, config.hidden_size)?,
                     w_qkv: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_qkv.weight"), device, qkv_out * config.hidden_size)?,
-                    w_a: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nh * config.hidden_size)?,
-                    w_b: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nh * config.hidden_size)?,
+                    w_a: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nvh * config.hidden_size)?,
+                    w_b: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nvh * config.hidden_size)?,
                     w_z: load_weight_bf16(&st, &format!("{p}linear_attn.in_proj_z.weight"), device, z_out * config.hidden_size)?,
                     conv1d_weight: conv1d_weight_buf,
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
                     conv1d_weight_v: conv_w_v_buf,
-                    a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nh)?,  // f32
-                    dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nh)?,
+                    a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nvh)?,  // f32
+                    dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nvh)?,
                     output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,  // f32
                     w_out: load_weight_bf16(&st, &format!("{p}linear_attn.out_proj.weight"), device, config.hidden_size * z_out)?,
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, config.hidden_size)?,
@@ -1124,12 +1130,13 @@ impl Model {
             unsafe { ffi::hipHostUnregister(ptr) };
         }
 
-        // GDN states: [nh * kd * vd] = [16*128*128] = 262144 per GDN layer
+        // GDN states: [nh * kd * vd] per GDN layer
         let nh = config.linear_num_heads;
+        let nvh = config.linear_num_value_heads;
         let kd = config.linear_key_head_dim;
         let vd = config.linear_value_head_dim;
         let ck = config.linear_conv_kernel_dim;
-        let qkv_out = nh * kd * 2 + nh * vd; // 6144
+        let qkv_out = nh * kd * 2 + nvh * vd;
 
         let mut gdn_states = Vec::new();
         let mut gdn_conv_states = Vec::new();
@@ -1183,13 +1190,13 @@ impl Model {
             qkv: DeviceBuffer::<f32>::alloc(device, qkv_out)?,
             q_gdn: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             k_gdn: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
-            v_gdn: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
+            v_gdn: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             a_proj: DeviceBuffer::<f32>::alloc(device, nh)?,
             b_proj: DeviceBuffer::<f32>::alloc(device, nh)?,
-            z_proj: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
+            z_proj: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             gate_gdn: DeviceBuffer::<f32>::alloc(device, nh)?,
-            recurrent_out: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
-            normed_gated: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
+            recurrent_out: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
+            normed_gated: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             out_proj: DeviceBuffer::<f32>::alloc(device, hs)?,
             q_gate_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd * 2)?,
             q_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
@@ -1208,10 +1215,10 @@ impl Model {
             position_ids: pos_buf,
             gdn_cs_q: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,
             gdn_cs_k: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,
-            gdn_cs_v: DeviceBuffer::<f32>::alloc(device, nh * vd * (ck - 1))?,
+            gdn_cs_v: DeviceBuffer::<f32>::alloc(device, nvh * vd * (ck - 1))?,
             gdn_conv_out_q: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             gdn_conv_out_k: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
-            gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
+            gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
         };
 
         Ok(Model {
@@ -1244,6 +1251,7 @@ impl Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size as u32;
         let nh = cfg.linear_num_heads as u32;
+        let nvh = cfg.linear_num_value_heads as u32;
         let kd = cfg.linear_key_head_dim as u32;
         let vd = cfg.linear_value_head_dim as u32;
         let ck = cfg.linear_conv_kernel_dim as u32;
@@ -1270,12 +1278,12 @@ impl Model {
             &mut self.activations.qkv,
             &weights.w_qkv,
             &self.activations.normed,
-            nh * kd * 2 + nh * vd,
+            nh * kd * 2 + nvh * vd,
             hs,
             &self.stream,
         )?;
 
-        // 3. Project a [nh], b [nh], z [nh*vd]
+        // 3. Project a [nh], b [nh], z [nvh*vd]
         self.kernels.linear_proj.forward(
             &mut self.activations.a_proj,
             &weights.w_a,
@@ -1296,22 +1304,21 @@ impl Model {
             &mut self.activations.z_proj,
             &weights.w_z,
             &self.activations.normed,
-            nh * vd,
+            nvh * vd,
             hs,
             &self.stream,
         )?;
 
-        // 4. Causal conv1d: split qkv into q/k/v, run 3 depthwise convs using pre-split weights
-        // D2D copy: qkv[0..2048] → q_gdn, qkv[2048..4096] → k_gdn, qkv[4096..6144] → v_gdn
+        // 4. Causal conv1d: split qkv into q/k/v
         unsafe {
             d2d_copy_f32(&mut self.activations.q_gdn, 0, &self.activations.qkv, 0, nh as usize * kd as usize, &self.stream)?;
             d2d_copy_f32(&mut self.activations.k_gdn, 0, &self.activations.qkv, nh as usize * kd as usize, nh as usize * kd as usize, &self.stream)?;
-            d2d_copy_f32(&mut self.activations.v_gdn, 0, &self.activations.qkv, nh as usize * kd as usize * 2, nh as usize * vd as usize, &self.stream)?;
+            d2d_copy_f32(&mut self.activations.v_gdn, 0, &self.activations.qkv, nh as usize * kd as usize * 2, nvh as usize * vd as usize, &self.stream)?;
         }
 
         let conv_q_out_len = nh as usize * kd as usize;
         let conv_k_out_len = nh as usize * kd as usize;
-        let conv_v_out_len = nh as usize * vd as usize;
+        let conv_v_out_len = nvh as usize * vd as usize;
         let ck_usize = ck as usize;
 
         // Split conv state into q/k/v sub-states
