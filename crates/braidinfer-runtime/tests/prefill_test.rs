@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 use braidinfer_runtime::megakernel::{MegakernelProgram, PrefillBuffers};
 use std::path::Path;
 use std::time::Instant;
@@ -22,7 +22,7 @@ fn test_prefill_correctness() {
     let tokens: Vec<u32> = vec![9707, 13, 220, 5120, 374, 1234, 5678, 42];
 
     // Sequential decode
-    let mut model_seq = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model_seq = Model::load(model_dir, device).expect("load");
     let mut seq_logits = vec![];
     for (i, &tok) in tokens.iter().enumerate() {
         seq_logits = model_seq.decode_step_paged(tok, i as u32).expect("decode");
@@ -31,7 +31,7 @@ fn test_prefill_correctness() {
     println!("Sequential: argmax={seq_argmax}");
 
     // Prefill
-    let mut model_pre = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model_pre = Model::load(model_dir, device).expect("load");
     let pre_logits = model_pre.prefill(&tokens).expect("prefill");
     let pre_argmax = argmax(&pre_logits);
     println!("Prefill: argmax={pre_argmax}");
@@ -55,7 +55,7 @@ fn test_prefill_batched_multi_token() {
     let tokens = [9707u32, 13, 220, 5120, 374];
 
     // Sequential decode (using flat megakernel, not paged)
-    let mut model_seq = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model_seq = Model::load(model_dir, device).expect("load");
     let mut seq_logits = vec![];
     for (i, &tok) in tokens.iter().enumerate() {
         seq_logits = model_seq.decode_step(tok, i as u32).expect("decode");
@@ -64,7 +64,7 @@ fn test_prefill_batched_multi_token() {
     println!("Sequential: argmax={seq_argmax}");
 
     // Batched prefill
-    let mut model_pre = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model_pre = Model::load(model_dir, device).expect("load");
     let mut prefill_bufs = PrefillBuffers::alloc(device, model_pre.config(), tokens.len()).expect("alloc");
     let program = MegakernelProgram::compile_prefill(&model_pre, &tokens, 0, &mut prefill_bufs).expect("compile");
     println!("Prefill program: {} instructions", program.instruction_count());
@@ -90,7 +90,7 @@ fn test_prefill_batched_single_token() {
         return;
     }
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model = Model::load(model_dir, device).expect("load");
 
     // Compile prefill program for single token (should match decode exactly)
     let mut prefill_bufs = PrefillBuffers::alloc(device, &model.config(), 1).expect("alloc prefill");
@@ -105,7 +105,7 @@ fn test_prefill_batched_single_token() {
     println!("Prefill single token: argmax={prefill_argmax}");
 
     // Compare with decode
-    let mut model2 = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model2 = Model::load(model_dir, device).expect("load");
     let decode_logits = model2.decode_step(9707, 0).expect("decode");
     let decode_argmax = argmax(&decode_logits);
     println!("Decode single token: argmax={decode_argmax}");
@@ -130,11 +130,11 @@ fn test_prefill_benchmark() {
     let tokens: Vec<u32> = (0..n).map(|i| 9707 + (i % 10) as u32).collect();
 
     // Sequential decode baseline
-    let mut model_seq = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model_seq = Model::load(model_dir, device).expect("load");
     for (i, &tok) in tokens[..8].iter().enumerate() {
         model_seq.decode_step_paged(tok, i as u32).expect("warmup");
     }
-    let mut model_seq = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut model_seq = Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
     for (i, &tok) in tokens.iter().enumerate() {
         model_seq.decode_step_paged(tok, i as u32).expect("decode");
@@ -146,9 +146,9 @@ fn test_prefill_benchmark() {
         elapsed.as_secs_f64());
 
     // Batched prefill API (uses compile_prefill internally)
-    let mut model_pre = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut model_pre = Model::load(model_dir, device).expect("reload");
     model_pre.prefill(&tokens[..8]).expect("warmup");
-    let mut model_pre = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut model_pre = Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
     let _logits = model_pre.prefill(&tokens).expect("prefill");
     let elapsed = start.elapsed();
@@ -160,7 +160,7 @@ fn test_prefill_benchmark() {
     // Batched prefill benchmark (64 tokens = 1 chunk)
     let nb = 64;
     let batch_tokens: Vec<u32> = (0..nb).map(|i| 9707 + (i % 10) as u32).collect();
-    let mut model2 = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut model2 = Model::load(model_dir, device).expect("reload");
     let mut prefill_bufs = PrefillBuffers::alloc(device, model2.config(), nb).expect("alloc");
     let program = MegakernelProgram::compile_prefill(&model2, &batch_tokens, 0, &mut prefill_bufs).expect("compile");
     println!("Batched program: {} instructions", program.instruction_count());
@@ -168,7 +168,7 @@ fn test_prefill_benchmark() {
     program.execute(model2.stream()).expect("warmup");
     model2.stream().synchronize().expect("sync");
 
-    let mut model3 = Qwen35Model::load(model_dir, device).expect("reload");
+    let mut model3 = Model::load(model_dir, device).expect("reload");
     let mut prefill_bufs2 = PrefillBuffers::alloc(device, model3.config(), nb).expect("alloc");
     let program2 = MegakernelProgram::compile_prefill(&model3, &batch_tokens, 0, &mut prefill_bufs2).expect("compile");
     let start = Instant::now();

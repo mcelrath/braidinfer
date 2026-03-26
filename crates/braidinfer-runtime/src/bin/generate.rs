@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Instant;
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{chat_generate, greedy_generate, load_tokenizer, TokenConfig};
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 
 const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
@@ -30,7 +30,7 @@ fn main() {
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
 
     eprintln!("max_seq_len: {}", model.config().max_seq_len);
     eprintln!("stop tokens: {:?}", token_config.eos_token_ids);

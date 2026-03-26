@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 use std::path::Path;
 
 const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
@@ -21,7 +21,7 @@ fn test_quantized_kv_vs_f32_paged() {
     let num_steps = 10;
 
     // Run f32 paged path
-    let mut model_f32 = Qwen35Model::load(model_dir, device).expect("load model (f32)");
+    let mut model_f32 = Model::load(model_dir, device).expect("load model (f32)");
     let mut f32_tokens = Vec::new();
     let mut logits = model_f32.decode_step_paged(prompt_token, 0).expect("f32 step 0");
     for i in 0..num_steps {
@@ -32,7 +32,7 @@ fn test_quantized_kv_vs_f32_paged() {
     println!("F32 paged tokens: {:?}", f32_tokens);
 
     // Run quantized paged path
-    let mut model_q = Qwen35Model::load(model_dir, device).expect("load model (quant)");
+    let mut model_q = Model::load(model_dir, device).expect("load model (quant)");
     let mut q_tokens = Vec::new();
     let mut logits = model_q.decode_step_paged_quantized(prompt_token, 0).expect("quant step 0");
     for i in 0..num_steps {
@@ -59,7 +59,7 @@ fn test_quantized_kv_long_sequence() {
     let prompt_token = 9707u32;
     let num_steps = 80;
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
     let mut tokens = Vec::new();
     let mut logits = model.decode_step_paged_quantized(prompt_token, 0).expect("step 0");
     for i in 0..num_steps {

@@ -20,6 +20,32 @@ use crate::paged_kv::{self, PageAllocator, RecurrentCheckpointPool, SequenceStat
 
 // ---- Model config ----
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayerType {
+    Attention,
+    Gdn,
+    Mamba2,
+    LfmConv,
+}
+
+#[derive(Debug, Clone)]
+pub enum FfnType {
+    Dense,
+    MoE {
+        num_experts: usize,
+        num_active: usize,
+        num_shared: usize,
+        expert_intermediate_size: usize,
+        shared_intermediate_size: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct LayerConfig {
+    pub layer_type: LayerType,
+    pub ffn_type: FfnType,
+}
+
 #[derive(Debug, Clone)]
 pub enum RecurrentLayerKind {
     Gdn {
@@ -61,9 +87,17 @@ pub struct ModelConfig {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
-    // layer types: true = full_attention, false = linear_attention (GDN)
+    // Per-layer config: layer type + FFN type
+    pub layers: Vec<LayerConfig>,
+    // Legacy compat (derived from layers)
     pub layer_is_attention: Vec<bool>,
     pub max_seq_len: usize,
+    // MoE config (global defaults, may be overridden per-layer)
+    pub num_experts: usize,
+    pub num_active_experts: usize,
+    pub num_shared_experts: usize,
+    pub expert_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
     // Extended config
     pub recurrent_kind: RecurrentLayerKind,
     pub rope_type: RopeType,
@@ -86,7 +120,7 @@ struct RopeParameters {
 struct TextConfig {
     hidden_size: usize,
     num_hidden_layers: usize,
-    intermediate_size: usize,
+    intermediate_size: Option<usize>,
     vocab_size: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
@@ -102,14 +136,23 @@ struct TextConfig {
     linear_value_head_dim: Option<usize>,
     linear_conv_kernel_dim: Option<usize>,
     #[allow(dead_code)]
+    linear_num_value_heads: Option<usize>,
+    #[allow(dead_code)]
     model_type: Option<String>,
+    // MoE fields in text_config
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    // Qwen3-Next
+    full_attention_interval: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct RawConfig {
     model_type: String,
     text_config: Option<TextConfig>,
-    // Nemotron-style: top-level fields
+    // Top-level fields (Nemotron, Devstral, GLM, LFM2, etc.)
     hidden_size: Option<usize>,
     num_hidden_layers: Option<usize>,
     intermediate_size: Option<usize>,
@@ -118,6 +161,7 @@ struct RawConfig {
     num_key_value_heads: Option<usize>,
     head_dim: Option<usize>,
     norm_eps: Option<f64>,
+    rms_norm_eps: Option<f64>,
     rope_theta: Option<f64>,
     partial_rotary_factor: Option<f64>,
     hybrid_override_pattern: Option<String>,
@@ -126,17 +170,37 @@ struct RawConfig {
     mamba_head_dim: Option<usize>,
     conv_kernel: Option<usize>,
     max_position_embeddings: Option<usize>,
+    // MoE fields
+    num_experts: Option<usize>,
+    n_routed_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    num_selected_experts: Option<usize>,
+    n_shared_experts: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    #[serde(rename = "moe_shared_expert_intermediate_size")]
+    shared_expert_intermediate_size: Option<usize>,
+    #[serde(rename = "shared_expert_intermediate_size")]
+    shared_expert_intermediate_size_alt: Option<usize>,
+    // Qwen3-Next style
+    full_attention_interval: Option<usize>,
+    #[allow(dead_code)]
+    decoder_sparse_step: Option<usize>,
+    #[allow(dead_code)]
+    #[serde(rename = "conv_L_cache")]
+    conv_l_cache: Option<usize>,
+    layer_types: Option<Vec<String>>,
+    full_attn_idxs: Option<Vec<usize>>,
 }
 
 impl ModelConfig {
     pub fn qwen35_0_8b() -> Self {
-        // From config.json: layer_types = ["linear_attention"]*3 + ["full_attention"] repeated 6x
-        // → 24 layers total:  0,1,2 = GDN; 3 = attn; 4,5,6 = GDN; 7 = attn; ...
-        let mut layer_is_attention = vec![false; 24];
         let attention_layer_indices: Vec<usize> = vec![3, 7, 11, 15, 19, 23];
-        for &i in &attention_layer_indices {
-            layer_is_attention[i] = true;
-        }
+        let ffn = FfnType::Dense;
+        let layers: Vec<LayerConfig> = (0..24).map(|i| LayerConfig {
+            layer_type: if attention_layer_indices.contains(&i) { LayerType::Attention } else { LayerType::Gdn },
+            ffn_type: ffn.clone(),
+        }).collect();
+        let layer_is_attention: Vec<bool> = layers.iter().map(|l| l.layer_type == LayerType::Attention).collect();
         ModelConfig {
             hidden_size: 1024,
             num_layers: 24,
@@ -153,8 +217,14 @@ impl ModelConfig {
             linear_key_head_dim: 128,
             linear_value_head_dim: 128,
             linear_conv_kernel_dim: 4,
+            layers,
             layer_is_attention,
-            max_seq_len: 2048, // fallback for tests; load() reads from config.json
+            max_seq_len: 2048,
+            num_experts: 0,
+            num_active_experts: 0,
+            num_shared_experts: 0,
+            expert_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
             recurrent_kind: RecurrentLayerKind::Gdn {
                 num_heads: 16,
                 key_value_dim: 128,
@@ -173,27 +243,87 @@ impl ModelConfig {
         let raw: RawConfig = serde_json::from_str(&data)?;
 
         match raw.model_type.as_str() {
-            "qwen3_5" => Self::from_qwen35_config(raw),
+            "qwen3_5" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" => Self::from_qwen35_config(raw),
             "nemotron_h" => Self::from_nemotron_config(raw),
+            "ministral3" | "mistral" => Self::from_dense_transformer_config(raw),
+            "glm4_moe_lite" => Self::from_glm_config(raw),
+            "lfm2" => Self::from_lfm2_config(raw),
             other => Err(format!("Unknown model_type: {other}").into()),
         }
     }
 
     fn from_qwen35_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        let tc = raw.text_config.ok_or("qwen3_5 config missing text_config")?;
+        // Some Qwen variants (qwen3_next) put fields at top level, not in text_config
+        let tc = if let Some(tc) = raw.text_config { tc } else {
+            // Synthesize TextConfig from top-level fields
+            let data = serde_json::to_string(&serde_json::json!({
+                "hidden_size": raw.hidden_size,
+                "num_hidden_layers": raw.num_hidden_layers,
+                "intermediate_size": raw.intermediate_size,
+                "vocab_size": raw.vocab_size,
+                "num_attention_heads": raw.num_attention_heads,
+                "num_key_value_heads": raw.num_key_value_heads,
+                "head_dim": raw.head_dim,
+                "rms_norm_eps": raw.rms_norm_eps.or(raw.norm_eps),
+                "max_position_embeddings": raw.max_position_embeddings,
+                "linear_num_key_heads": serde_json::Value::Null,
+                "linear_key_head_dim": serde_json::Value::Null,
+                "linear_value_head_dim": serde_json::Value::Null,
+                "linear_conv_kernel_dim": serde_json::Value::Null,
+                "num_experts": raw.num_experts,
+                "num_experts_per_tok": raw.num_experts_per_tok,
+                "moe_intermediate_size": raw.moe_intermediate_size,
+                "shared_expert_intermediate_size": raw.shared_expert_intermediate_size.or(raw.shared_expert_intermediate_size_alt),
+                "full_attention_interval": raw.full_attention_interval,
+            }))?;
+            serde_json::from_str(&data)?
+        };
 
         let num_layers = tc.num_hidden_layers;
-        let layer_types = tc.layer_types.unwrap_or_else(|| vec!["linear_attention".to_string(); num_layers]);
 
-        let attention_layer_indices: Vec<usize> = layer_types.iter().enumerate()
-            .filter(|(_, t)| t.as_str() == "full_attention")
+        // Determine layer pattern: explicit layer_types or full_attention_interval
+        let layer_type_strs: Vec<String> = if let Some(lt) = &tc.layer_types {
+            lt.clone()
+        } else if let Some(interval) = tc.full_attention_interval {
+            // Qwen3-Next: every Nth layer is attention, rest are GDN
+            (0..num_layers).map(|i| {
+                if (i + 1) % interval == 0 { "full_attention".to_string() }
+                else { "linear_attention".to_string() }
+            }).collect()
+        } else {
+            vec!["linear_attention".to_string(); num_layers]
+        };
+
+        // Detect MoE
+        let num_experts = tc.num_experts.unwrap_or(0);
+        let num_active = tc.num_experts_per_tok.unwrap_or(0);
+        let expert_is = tc.moe_intermediate_size.unwrap_or(0);
+        let shared_is = tc.shared_expert_intermediate_size.unwrap_or(0);
+        let num_shared = if shared_is > 0 { 1 } else { 0 };
+
+        let ffn = if num_experts > 0 {
+            FfnType::MoE {
+                num_experts, num_active, num_shared,
+                expert_intermediate_size: expert_is,
+                shared_intermediate_size: shared_is,
+            }
+        } else {
+            FfnType::Dense
+        };
+
+        let layers: Vec<LayerConfig> = layer_type_strs.iter().map(|t| LayerConfig {
+            layer_type: match t.as_str() {
+                "full_attention" => LayerType::Attention,
+                _ => LayerType::Gdn,
+            },
+            ffn_type: ffn.clone(),
+        }).collect();
+
+        let attention_layer_indices: Vec<usize> = layers.iter().enumerate()
+            .filter(|(_, l)| l.layer_type == LayerType::Attention)
             .map(|(i, _)| i)
             .collect();
-
-        let mut layer_is_attention = vec![false; num_layers];
-        for &i in &attention_layer_indices {
-            layer_is_attention[i] = true;
-        }
+        let layer_is_attention: Vec<bool> = layers.iter().map(|l| l.layer_type == LayerType::Attention).collect();
 
         let rope_params = tc.rope_parameters.unwrap_or(RopeParameters {
             mrope_section: None,
@@ -221,7 +351,7 @@ impl ModelConfig {
         Ok(ModelConfig {
             hidden_size: tc.hidden_size,
             num_layers,
-            intermediate_size: tc.intermediate_size,
+            intermediate_size: tc.intermediate_size.unwrap_or(expert_is),
             vocab_size: tc.vocab_size,
             num_q_heads: tc.num_attention_heads,
             num_kv_heads: tc.num_key_value_heads,
@@ -234,8 +364,14 @@ impl ModelConfig {
             linear_key_head_dim,
             linear_value_head_dim,
             linear_conv_kernel_dim,
+            layers,
             layer_is_attention,
             max_seq_len: tc.max_position_embeddings.unwrap_or(2048),
+            num_experts,
+            num_active_experts: num_active,
+            num_shared_experts: num_shared,
+            expert_intermediate_size: expert_is,
+            shared_expert_intermediate_size: shared_is,
             recurrent_kind: RecurrentLayerKind::Gdn {
                 num_heads: linear_num_heads,
                 key_value_dim: linear_key_head_dim,
@@ -262,17 +398,35 @@ impl ModelConfig {
         let rope_dim = ((head_dim as f64) * partial_rotary_factor) as usize;
         let rms_norm_eps = raw.norm_eps.unwrap_or(1e-5) as f32;
 
+        // Parse hybrid_override_pattern: M=Mamba2, E=MoE FFN, *=Attention
         let pattern = raw.hybrid_override_pattern.unwrap_or_default();
-        let attention_layer_indices: Vec<usize> = pattern.chars().enumerate()
-            .filter(|(_, c)| *c == '*')
+        let num_experts = raw.n_routed_experts.unwrap_or(raw.num_experts.unwrap_or(0));
+        let num_active = raw.num_experts_per_tok.unwrap_or(raw.num_selected_experts.unwrap_or(0));
+        let num_shared = raw.n_shared_experts.unwrap_or(0);
+        let expert_is = raw.moe_intermediate_size.unwrap_or(intermediate_size);
+        let shared_is = raw.shared_expert_intermediate_size
+            .or(raw.shared_expert_intermediate_size_alt)
+            .unwrap_or(0);
+
+        let moe_ffn = FfnType::MoE {
+            num_experts, num_active, num_shared,
+            expert_intermediate_size: expert_is,
+            shared_intermediate_size: shared_is,
+        };
+        let dense_ffn = FfnType::Dense;
+
+        let layers: Vec<LayerConfig> = pattern.chars().map(|c| match c {
+            'M' => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: dense_ffn.clone() },
+            'E' => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: moe_ffn.clone() },
+            '*' => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
+            _ => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
+        }).collect();
+
+        let attention_layer_indices: Vec<usize> = layers.iter().enumerate()
+            .filter(|(_, l)| l.layer_type == LayerType::Attention)
             .map(|(i, _)| i)
             .collect();
-        let mut layer_is_attention = vec![false; num_layers];
-        for &i in &attention_layer_indices {
-            if i < num_layers {
-                layer_is_attention[i] = true;
-            }
-        }
+        let layer_is_attention: Vec<bool> = layers.iter().map(|l| l.layer_type == LayerType::Attention).collect();
 
         let ssm_state_dim = raw.ssm_state_size.unwrap_or(128);
         let mamba_num_heads = raw.mamba_num_heads.unwrap_or(64);
@@ -295,8 +449,14 @@ impl ModelConfig {
             linear_key_head_dim: mamba_head_dim,
             linear_value_head_dim: mamba_head_dim,
             linear_conv_kernel_dim: conv_kernel,
+            layers,
             layer_is_attention,
             max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
+            num_experts,
+            num_active_experts: num_active,
+            num_shared_experts: num_shared,
+            expert_intermediate_size: expert_is,
+            shared_expert_intermediate_size: shared_is,
             recurrent_kind: RecurrentLayerKind::Mamba2 {
                 state_dim: ssm_state_dim,
                 num_heads: mamba_num_heads,
@@ -307,6 +467,159 @@ impl ModelConfig {
             has_qk_norm: false,
             attention_layer_indices,
             model_type: "nemotron_h".to_string(),
+        })
+    }
+
+    /// Dense transformer (Devstral, Mistral, etc): all attention, all dense FFN.
+    fn from_dense_transformer_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
+        let head_dim = raw.head_dim.unwrap_or(128);
+        let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
+        let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_q_heads);
+        let intermediate_size = raw.intermediate_size.ok_or("missing intermediate_size")?;
+        let vocab_size = raw.vocab_size.ok_or("missing vocab_size")?;
+        let rope_theta = raw.rope_theta.unwrap_or(10000.0) as f32;
+        let rope_dim = ((head_dim as f64) * raw.partial_rotary_factor.unwrap_or(1.0)) as usize;
+        let rms_norm_eps = raw.rms_norm_eps.or(raw.norm_eps).unwrap_or(1e-5) as f32;
+
+        let layers: Vec<LayerConfig> = (0..num_layers).map(|_| LayerConfig {
+            layer_type: LayerType::Attention,
+            ffn_type: FfnType::Dense,
+        }).collect();
+        let layer_is_attention = vec![true; num_layers];
+        let attention_layer_indices: Vec<usize> = (0..num_layers).collect();
+
+        Ok(ModelConfig {
+            hidden_size, num_layers, intermediate_size, vocab_size,
+            num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
+            mrope_section: [0, 0, 0],
+            linear_num_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0, linear_conv_kernel_dim: 0,
+            layers, layer_is_attention,
+            max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
+            num_experts: 0, num_active_experts: 0, num_shared_experts: 0,
+            expert_intermediate_size: 0, shared_expert_intermediate_size: 0,
+            recurrent_kind: RecurrentLayerKind::None,
+            rope_type: RopeType::Standard { rotary_dim: rope_dim },
+            has_qk_norm: false, attention_layer_indices,
+            model_type: raw.model_type,
+        })
+    }
+
+    /// GLM-4 MoE: all attention + MoE FFN.
+    fn from_glm_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
+        let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
+        let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_q_heads);
+        let head_dim = raw.head_dim.unwrap_or(hidden_size / num_q_heads);
+        let intermediate_size = raw.intermediate_size.ok_or("missing intermediate_size")?;
+        let vocab_size = raw.vocab_size.ok_or("missing vocab_size")?;
+        let rope_theta = raw.rope_theta.unwrap_or(10000.0) as f32;
+        let rope_dim = ((head_dim as f64) * raw.partial_rotary_factor.unwrap_or(1.0)) as usize;
+        let rms_norm_eps = raw.norm_eps.or(raw.rms_norm_eps).unwrap_or(1e-5) as f32;
+
+        let num_experts = raw.n_routed_experts.unwrap_or(0);
+        let num_active = raw.num_experts_per_tok.unwrap_or(0);
+        let num_shared = raw.n_shared_experts.unwrap_or(0);
+        let expert_is = raw.moe_intermediate_size.unwrap_or(intermediate_size);
+        let shared_is = raw.shared_expert_intermediate_size.unwrap_or(0);
+
+        let moe_ffn = FfnType::MoE {
+            num_experts, num_active, num_shared,
+            expert_intermediate_size: expert_is,
+            shared_intermediate_size: shared_is,
+        };
+        let layers: Vec<LayerConfig> = (0..num_layers).map(|_| LayerConfig {
+            layer_type: LayerType::Attention,
+            ffn_type: moe_ffn.clone(),
+        }).collect();
+        let layer_is_attention = vec![true; num_layers];
+        let attention_layer_indices: Vec<usize> = (0..num_layers).collect();
+
+        Ok(ModelConfig {
+            hidden_size, num_layers, intermediate_size, vocab_size,
+            num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
+            mrope_section: [0, 0, 0],
+            linear_num_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0, linear_conv_kernel_dim: 0,
+            layers, layer_is_attention,
+            max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
+            num_experts, num_active_experts: num_active, num_shared_experts: num_shared,
+            expert_intermediate_size: expert_is, shared_expert_intermediate_size: shared_is,
+            recurrent_kind: RecurrentLayerKind::None,
+            rope_type: RopeType::Standard { rotary_dim: rope_dim },
+            has_qk_norm: false, attention_layer_indices,
+            model_type: raw.model_type,
+        })
+    }
+
+    /// LFM-2: gated conv + attention layers.
+    fn from_lfm2_config(raw: RawConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        let num_layers = raw.num_hidden_layers.ok_or("missing num_hidden_layers")?;
+        let hidden_size = raw.hidden_size.ok_or("missing hidden_size")?;
+        let num_q_heads = raw.num_attention_heads.ok_or("missing num_attention_heads")?;
+        let num_kv_heads = raw.num_key_value_heads.unwrap_or(num_q_heads);
+        let head_dim = raw.head_dim.unwrap_or(hidden_size / num_q_heads);
+        let intermediate_size = raw.intermediate_size.ok_or("missing intermediate_size")?;
+        let vocab_size = raw.vocab_size.ok_or("missing vocab_size")?;
+        let rope_theta = raw.rope_theta.unwrap_or(1000000.0) as f32;
+        let rope_dim = head_dim; // LFM2 uses full rotary
+        let rms_norm_eps = raw.norm_eps.or(raw.rms_norm_eps).unwrap_or(1e-5) as f32;
+
+        // Layer types from config
+        let layer_type_strs = raw.layer_types.unwrap_or_default();
+        let full_attn_idxs = raw.full_attn_idxs.unwrap_or_default();
+
+        // MoE detection (LFM2-24B-A2B has MoE)
+        let num_experts = raw.n_routed_experts.unwrap_or(raw.num_experts.unwrap_or(0));
+        let num_active = raw.num_experts_per_tok.unwrap_or(0);
+        let ffn = if num_experts > 0 {
+            FfnType::MoE {
+                num_experts, num_active, num_shared: 0,
+                expert_intermediate_size: raw.moe_intermediate_size.unwrap_or(intermediate_size),
+                shared_intermediate_size: 0,
+            }
+        } else {
+            FfnType::Dense
+        };
+
+        let layers: Vec<LayerConfig> = if !layer_type_strs.is_empty() {
+            layer_type_strs.iter().map(|t| LayerConfig {
+                layer_type: match t.as_str() {
+                    "full_attention" => LayerType::Attention,
+                    "conv" => LayerType::LfmConv,
+                    _ => LayerType::LfmConv,
+                },
+                ffn_type: ffn.clone(),
+            }).collect()
+        } else {
+            // Infer from full_attn_idxs
+            (0..num_layers).map(|i| LayerConfig {
+                layer_type: if full_attn_idxs.contains(&i) { LayerType::Attention } else { LayerType::LfmConv },
+                ffn_type: ffn.clone(),
+            }).collect()
+        };
+
+        let layer_is_attention: Vec<bool> = layers.iter().map(|l| l.layer_type == LayerType::Attention).collect();
+        let attention_layer_indices: Vec<usize> = layers.iter().enumerate()
+            .filter(|(_, l)| l.layer_type == LayerType::Attention)
+            .map(|(i, _)| i).collect();
+
+        Ok(ModelConfig {
+            hidden_size, num_layers, intermediate_size, vocab_size,
+            num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
+            mrope_section: [0, 0, 0],
+            linear_num_heads: 0, linear_key_head_dim: 0, linear_value_head_dim: 0,
+            linear_conv_kernel_dim: raw.conv_kernel.unwrap_or(4),
+            layers, layer_is_attention,
+            max_seq_len: raw.max_position_embeddings.unwrap_or(2048),
+            num_experts, num_active_experts: num_active, num_shared_experts: 0,
+            expert_intermediate_size: raw.moe_intermediate_size.unwrap_or(0),
+            shared_expert_intermediate_size: 0,
+            recurrent_kind: RecurrentLayerKind::None,
+            rope_type: RopeType::Standard { rotary_dim: rope_dim },
+            has_qk_norm: false, attention_layer_indices,
+            model_type: raw.model_type,
         })
     }
 
@@ -483,7 +796,7 @@ impl AllKernels {
 
 // ---- Main model struct ----
 
-pub struct Qwen35Model {
+pub struct Model {
     pub(crate) config: ModelConfig,
     pub(crate) device: DeviceId,
     pub(crate) stream: Stream,
@@ -669,7 +982,7 @@ fn compute_inv_freq(rope_dim: usize, rope_theta: f32) -> Vec<f32> {
 
 // ---- Model impl ----
 
-impl Qwen35Model {
+impl Model {
     /// Default max_seq_len cap for flat KV cache (limits VRAM usage).
     /// Override with `load_with_max_seq_len`. Paged KV grows dynamically.
     const DEFAULT_MAX_SEQ_LEN: usize = 8192;
@@ -881,7 +1194,7 @@ impl Qwen35Model {
             gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nh * vd)?,
         };
 
-        Ok(Qwen35Model {
+        Ok(Model {
             config,
             device,
             stream,

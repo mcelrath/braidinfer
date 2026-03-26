@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 use std::path::Path;
 use std::time::Instant;
 
@@ -14,7 +14,7 @@ fn bench_decode_step() {
         return;
     }
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
 
     // Warmup
     let _ = model.decode_step(9707, 0).expect("warmup");

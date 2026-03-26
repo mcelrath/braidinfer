@@ -8,7 +8,7 @@ use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{
     apply_chat_template, generate_from_ids, load_tokenizer, ChatMessage, TokenConfig,
 };
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 
 const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
@@ -25,7 +25,7 @@ async fn main() {
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
 
     eprintln!("braidinfer chat (max_tokens={max_tokens}, ^D to quit)");
     if let Some(sys) = &system_prompt {

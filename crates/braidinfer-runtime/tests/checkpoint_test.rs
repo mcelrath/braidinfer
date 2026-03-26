@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 use std::path::Path;
 
 const MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
@@ -19,7 +19,7 @@ fn test_checkpoint_roundtrip() {
         return;
     }
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
 
     // Run 16 tokens to build up recurrent state
     for pos in 0u32..16 {

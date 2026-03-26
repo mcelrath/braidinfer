@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 use braidinfer_runtime::megakernel::MegakernelProgram;
 use std::path::Path;
 
@@ -12,12 +12,12 @@ fn test_megakernel_diff_investigation() {
     if !model_dir.exists() { return; }
 
     // Run naive
-    let mut model = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model = Model::load(model_dir, device).expect("load");
     let logits_naive = model.decode_step(9707, 0).expect("decode");
 
     // Reload and run megakernel
     drop(model);
-    let mut model = Qwen35Model::load(model_dir, device).expect("load");
+    let mut model = Model::load(model_dir, device).expect("load");
     let mut prog = MegakernelProgram::compile(&model).expect("compile");
     model.set_position(0).unwrap();
     prog.update_step(9707, 0).unwrap();

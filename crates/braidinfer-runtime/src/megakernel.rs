@@ -7,7 +7,7 @@ use std::ffi::c_void;
 
 use crate::model::{
     ActivationBuffers, AttentionLayerWeights, KvCache, GdnState,
-    LayerWeights, ModelConfig, Qwen35Model,
+    LayerWeights, ModelConfig, Model,
 };
 use crate::paged_kv::{PageAllocator, SequenceState};
 
@@ -195,15 +195,15 @@ impl MegakernelProgram {
     pub fn instruction_count(&self) -> usize { self.instructions.len() }
     pub fn block_count(&self) -> u32 { self.num_blocks }
 
-    pub fn compile(model: &Qwen35Model) -> HipResult<Self> {
+    pub fn compile(model: &Model) -> HipResult<Self> {
         Self::compile_inner(model, false)
     }
 
-    pub fn compile_paged(model: &Qwen35Model) -> HipResult<Self> {
+    pub fn compile_paged(model: &Model) -> HipResult<Self> {
         Self::compile_inner(model, true)
     }
 
-    fn compile_inner(model: &Qwen35Model, paged: bool) -> HipResult<Self> {
+    fn compile_inner(model: &Model, paged: bool) -> HipResult<Self> {
         let cfg = &model.config;
         let device = model.device;
         let act = &model.activations;
@@ -374,7 +374,7 @@ impl MegakernelProgram {
     /// Attention layers run sequentially (one token at a time).
     /// Returns a program + list of per-token attention instruction indices for paged KV updates.
     pub fn compile_prefill(
-        model: &Qwen35Model,
+        model: &Model,
         tokens: &[u32],
         start_pos: u32,
         prefill_bufs: &mut PrefillBuffers,

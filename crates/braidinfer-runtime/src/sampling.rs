@@ -1,7 +1,7 @@
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
-use crate::model::{ModelError, Qwen35Model};
+use crate::model::{ModelError, Model};
 
 
 pub struct SamplingParams {
@@ -134,7 +134,7 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 pub fn generate(
-    model: &mut Qwen35Model,
+    model: &mut Model,
     prompt_tokens: &[u32],
     params: &SamplingParams,
     stop_tokens: &[u32],

@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-use crate::model::{ModelError, Qwen35Model};
+use crate::model::{ModelError, Model};
 
 pub struct ChatMessage<'a> {
     pub role: &'a str,
@@ -116,7 +116,7 @@ pub fn apply_chat_template(
 
 /// Generate from pre-tokenized prompt IDs (no chat template applied).
 pub fn generate_from_ids(
-    model: &mut Qwen35Model,
+    model: &mut Model,
     tokenizer: &Tokenizer,
     token_config: &TokenConfig,
     prompt_ids: &[u32],
@@ -158,7 +158,7 @@ pub fn generate_from_ids(
 
 /// Generate with chat template applied.
 pub fn chat_generate(
-    model: &mut Qwen35Model,
+    model: &mut Model,
     tokenizer: &Tokenizer,
     token_config: &TokenConfig,
     user_message: &str,
@@ -176,7 +176,7 @@ pub fn chat_generate(
 
 /// Legacy: generate from raw text (no chat template).
 pub fn greedy_generate(
-    model: &mut Qwen35Model,
+    model: &mut Model,
     tokenizer: &Tokenizer,
     token_config: &TokenConfig,
     prompt: &str,

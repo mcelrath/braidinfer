@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::model::Qwen35Model;
+use braidinfer_runtime::model::Model;
 use braidinfer_runtime::megakernel::MegakernelProgram;
 use std::path::Path;
 use std::time::Instant;
@@ -23,13 +23,13 @@ fn test_megakernel_correctness() {
         return;
     }
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
     let ref_logits = model.decode_step(9707, 0).expect("naive decode");
     let (ref_idx, ref_val) = argmax(&ref_logits);
     println!("Reference: argmax={ref_idx}, logit={ref_val:.4}");
     assert_eq!(ref_idx, 13);
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("reload model");
+    let mut model = Model::load(model_dir, device).expect("reload model");
     let mut program = MegakernelProgram::compile(&model).expect("compile program");
     println!("Program: {} instructions, {} blocks", program.instruction_count(), program.block_count());
 
@@ -58,7 +58,7 @@ fn test_paged_single_token() {
     }
 
     // Get reference logits from flat megakernel
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
     let mut program = MegakernelProgram::compile(&model).expect("compile flat");
     model.set_position(0).expect("set pos");
     program.update_step(9707, 0, model.stream()).expect("flat update");
@@ -69,7 +69,7 @@ fn test_paged_single_token() {
     println!("Flat megakernel: argmax={flat_idx}, logit={flat_val:.4}");
 
     // Get paged logits
-    let mut model = Qwen35Model::load(model_dir, device).expect("reload for paged");
+    let mut model = Model::load(model_dir, device).expect("reload for paged");
     let paged_logits = model.decode_step_paged(9707, 0).expect("paged decode");
     let (paged_idx, paged_val) = argmax(&paged_logits);
     println!("Paged: argmax={paged_idx}, logit={paged_val:.4}");
@@ -92,7 +92,7 @@ fn test_paged_multi_token() {
     let tokens = [9707u32, 13, 220, 5120, 374];
 
     // Flat path: 5 tokens
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
     let mut program = MegakernelProgram::compile(&model).expect("compile flat");
     for (i, &tok) in tokens.iter().enumerate() {
         model.set_position(i as u32).expect("set pos");
@@ -105,7 +105,7 @@ fn test_paged_multi_token() {
     println!("Flat 5-token: argmax={flat_idx}, logit={flat_val:.4}");
 
     // Paged path: same 5 tokens
-    let mut model = Qwen35Model::load(model_dir, device).expect("reload for paged");
+    let mut model = Model::load(model_dir, device).expect("reload for paged");
     let mut paged_logits = vec![];
     for (i, &tok) in tokens.iter().enumerate() {
         paged_logits = model.decode_step_paged(tok, i as u32).expect("paged decode");
@@ -129,7 +129,7 @@ fn test_paged_chunk_boundary() {
     }
 
     // Run 70 tokens — crosses 64-token chunk boundary
-    let mut model_flat = Qwen35Model::load(model_dir, device).expect("load flat");
+    let mut model_flat = Model::load(model_dir, device).expect("load flat");
     let mut program = MegakernelProgram::compile(&model_flat).expect("compile flat");
     for i in 0..70u32 {
         model_flat.set_position(i).expect("set pos");
@@ -141,7 +141,7 @@ fn test_paged_chunk_boundary() {
     let (flat_idx, flat_val) = argmax(&flat_logits);
     println!("Flat 70-token: argmax={flat_idx}, logit={flat_val:.4}");
 
-    let mut model_paged = Qwen35Model::load(model_dir, device).expect("load paged");
+    let mut model_paged = Model::load(model_dir, device).expect("load paged");
     let mut paged_logits = vec![];
     for i in 0..70u32 {
         paged_logits = model_paged.decode_step_paged(9707, i).expect("paged decode");
@@ -163,7 +163,7 @@ fn test_megakernel_benchmark() {
         return;
     }
 
-    let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+    let mut model = Model::load(model_dir, device).expect("load model");
     let mut program = MegakernelProgram::compile(&model).expect("compile");
 
     model.set_position(0).expect("set pos");
@@ -199,7 +199,7 @@ fn test_multi_step_decode() {
     let seed_token = 9707u32;
 
     let run = |label: &str| -> Vec<u32> {
-        let mut model = Qwen35Model::load(model_dir, device).expect("load model");
+        let mut model = Model::load(model_dir, device).expect("load model");
         let mut argmax_seq = Vec::with_capacity(n_steps);
         let mut next_token = seed_token;
         for step in 0..n_steps {
