@@ -10,6 +10,7 @@ use crate::model::{
     LayerWeights, ModelConfig, Model,
 };
 use crate::paged_kv::{PageAllocator, SequenceState};
+use crate::trace::TraceWriter;
 
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
 pub const CHUNK_TOKENS: usize = 64;
@@ -231,8 +232,10 @@ impl MegakernelProgram {
 
         // Query max blocks for cooperative launch
         let func = module.get_function("megakernel_f32")?;
-        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?; // 2KB shared for gdn_recurrent
-        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(384); // conservative
+        let _blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        // Cooperative launch limit is stricter than occupancy on gfx1100.
+        // With __launch_bounds__(256,1), safe max = NUM_CUS (one block per CU).
+        let num_blocks = NUM_CUS;
 
         let mut instructions: Vec<Instruction> = Vec::new();
         let mut mrope_inst_indices = Vec::new();
@@ -414,8 +417,8 @@ impl MegakernelProgram {
 
         let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
         let func = module.get_function("megakernel_f32")?;
-        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
-        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(384);
+        let _blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        let num_blocks = NUM_CUS;
 
         let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -2049,6 +2052,30 @@ impl MegakernelProgram {
         Ok(results)
     }
 
+    pub fn dump_active(&self) -> bool {
+        self.dump_buffer.is_some()
+    }
+
+    pub fn disable_dump(&mut self) {
+        self.dump_buffer = None;
+        self.dump_counter = None;
+        self.dump_capacity = 0;
+    }
+
+    /// Write dump results to a BTRC trace file compatible with compare_traces.py.
+    /// Names are derived from opcode + sequential index (e.g., "inst003_LINEAR_PROJ").
+    pub fn write_dump_btrc(&self, stream: &Stream, path: &str) -> HipResult<()> {
+        let slots = self.read_dump(stream)?;
+        let mut tw = TraceWriter::open(path).expect("failed to open dump trace file");
+        for (opcode, inst_idx, data) in &slots {
+            let name = format!("inst{:03}_{}", inst_idx, opcode_name(*opcode));
+            tw.write_checkpoint(&name, data);
+        }
+        tw.close().expect("failed to close dump trace file");
+        eprintln!("Megakernel dump: {} instructions written to {}", slots.len(), path);
+        Ok(())
+    }
+
     /// Execute the megakernel program.
     pub fn execute(&self, stream: &Stream) -> HipResult<()> {
         let func = self.module.get_function("megakernel_f32")?;
@@ -2077,5 +2104,40 @@ impl MegakernelProgram {
             stream,
             &mut args,
         )
+    }
+}
+
+fn opcode_name(op: u32) -> &'static str {
+    match op {
+        OP_NOP => "NOP",
+        OP_RMSNORM => "RMSNORM",
+        OP_LINEAR_PROJ => "LINEAR_PROJ",
+        OP_CONV1D => "CONV1D",
+        OP_GDN_GATE => "GDN_GATE",
+        OP_GDN_RECUR => "GDN_RECUR",
+        OP_RMSNORM_GATE => "RMSNORM_GATE",
+        OP_RESIDUAL_ADD => "RESIDUAL_ADD",
+        OP_QK_NORM => "QK_NORM",
+        OP_MROPE => "MROPE",
+        OP_GQA_ATTN => "GQA_ATTN",
+        OP_OUTPUT_GATE => "OUTPUT_GATE",
+        OP_FFN_GATE_UP => "FFN_GATE_UP",
+        OP_FFN_DOWN_RES => "FFN_DOWN_RES",
+        OP_EMBEDDING => "EMBEDDING",
+        OP_LM_HEAD => "LM_HEAD",
+        OP_HALT => "HALT",
+        OP_D2D_COPY => "D2D_COPY",
+        OP_ATTN_PAGED => "ATTN_PAGED",
+        OP_ATTN_PREFILL => "ATTN_PREFILL",
+        OP_DEINTERLEAVE => "DEINTERLEAVE",
+        OP_KV_QUANTIZE => "KV_QUANTIZE",
+        OP_ATTN_PAGED_Q => "ATTN_PAGED_Q",
+        OP_MOE_GATE => "MOE_GATE",
+        OP_MOE_FFN => "MOE_FFN",
+        OP_LINEAR_PROJ_RNF4 => "LINEAR_PROJ_RNF4",
+        OP_LINEAR_PROJ_PCG32 => "LINEAR_PROJ_PCG32",
+        OP_RMSNORM_WX => "RMSNORM_WX",
+        OP_SILU_MUL => "SILU_MUL",
+        _ => "UNKNOWN",
     }
 }

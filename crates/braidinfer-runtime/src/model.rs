@@ -1561,13 +1561,28 @@ impl Model {
 
         // Dense models: use megakernel (handles bf16 + quantized weights, both RMSNorm variants)
         if self.megakernel.is_none() {
-            self.megakernel = Some(MegakernelProgram::compile(self)?);
+            let mut mk = MegakernelProgram::compile(self)?;
+            if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {
+                let max_slots: i32 = std::env::var("MEGAKERNEL_DUMP_SLOTS")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+                mk.enable_dump(max_slots)?;
+                eprintln!("Megakernel dump enabled: {} slots, output={}", max_slots, dump_path);
+            }
+            self.megakernel = Some(mk);
         }
         let mk = self.megakernel.as_mut().unwrap();
         mk.update_step(token_id, position, &self.stream)?;
         mk.execute(&self.stream)?;
 
         self.stream.synchronize()?;
+
+        // Write dump after first decode token if MEGAKERNEL_DUMP is set
+        if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {
+            if mk.dump_active() {
+                mk.write_dump_btrc(&self.stream, &dump_path)?;
+                mk.disable_dump();
+            }
+        }
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;

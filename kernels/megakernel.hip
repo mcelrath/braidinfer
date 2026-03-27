@@ -204,6 +204,23 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_SILU_MUL: output[i] = silu(gate[i]) * up[i]
+// args: [1]=output, [2]=gate, [3]=up, [4]=size
+__device__ void op_silu_mul(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* gate = inst_fptr(inst, 2);
+    const float* up = inst_fptr(inst, 3);
+    int size = inst_int(inst, 4);
+
+    // vblock indexes chunks of blockDim.x elements
+    int base = vblock * blockDim.x + threadIdx.x;
+    if (base < size) {
+        float g = gate[base];
+        float silu_g = g / (1.0f + expf(-g));
+        output[base] = silu_g * up[base];
+    }
+}
+
 // OP_LINEAR_PROJ_RNF4: y = W_rnf4 @ x (one virtual block per output row, decode only)
 // args: [1]=output, [2]=weight (packed rnf4), [3]=input, [4]=out_dim, [5]=in_dim
 // Weight layout per row: groups of 128 elements, each 132 bytes.
@@ -1684,6 +1701,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
                 case OP_LINEAR_PROJ_RNF4:  op_linear_proj_rnf4(inst, vb); break;
                 case OP_LINEAR_PROJ_PCG32: op_linear_proj_pcg32(inst, vb); break;
                 case OP_RMSNORM_WX: op_rmsnorm_wx(inst, vb); break;
+                case OP_SILU_MUL:   op_silu_mul(inst, vb); break;
                 default: break;
             }
         }
