@@ -74,7 +74,7 @@ fn main() {
     for line in opcodes_h.lines() {
         if let Some(rest) = line.strip_prefix("#define ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() == 2 {
+            if parts.len() >= 2 {  // >= to handle trailing comments
                 if let Ok(val) = parts[1].parse::<u32>() {
                     opcodes_rs.push_str(&format!(
                         "#[allow(dead_code)]\npub const {}: u32 = {val};\n",
