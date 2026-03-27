@@ -68,7 +68,7 @@ pub fn quantized_kv_offsets(
 pub fn recurrent_state_bytes(config: &ModelConfig) -> usize {
     let num_gdn_layers = config.layer_is_attention.iter().filter(|&&a| !a).count();
     let floats_per_layer =
-        config.linear_num_heads * config.linear_key_head_dim * config.linear_value_head_dim;
+        config.linear_num_value_heads * config.linear_key_head_dim * config.linear_value_head_dim;
     num_gdn_layers * floats_per_layer * std::mem::size_of::<f32>()
 }
 

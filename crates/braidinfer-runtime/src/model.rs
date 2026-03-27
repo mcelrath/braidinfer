@@ -781,7 +781,7 @@ impl Model {
                     conv1d_weight_v: conv_w_v_buf,
                     a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nvh)?,
                     dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nvh)?,
-                    output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, kd)?,
+                    output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, vd)?,  // normalizes [nvh, vd] output
                     w_out: load_linear_weight(&st, &format!("{p}linear_attn.out_proj.weight"), device, hs, z_out, wq)?,
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, hs)?,
                     w_gate: if !is_moe {
@@ -1104,7 +1104,7 @@ impl Model {
             &self.activations.recurrent_out,
             &self.activations.z_proj,
             &weights_gdn.output_norm,
-            nh,
+            nvh,  // value heads, not key heads
             vd,
             eps,
             &self.stream,
@@ -1117,7 +1117,7 @@ impl Model {
         };
         weights_gdn.w_out.forward(&self.kernels.linear_proj,
             &mut self.activations.out_proj, &self.activations.normed_gated,
-            hs, nh * vd,
+            hs, nvh * vd,  // value heads, not key heads
             &self.stream,
         )?;
 
@@ -1921,7 +1921,7 @@ impl Model {
         // Conv1d: split qkv, run 3 separate convs, reassemble
         let conv_q_len = (nh * kd) as usize;
         let conv_k_len = (nh * kd) as usize;
-        let conv_v_len = (nh * vd) as usize;
+        let conv_v_len = (nvh_traced * vd) as usize;
         let ck_usize = ck as usize;
 
         unsafe {
@@ -1990,14 +1990,14 @@ impl Model {
         // RMSNormGated
         self.kernels.rmsnorm_gated.forward(
             &mut self.activations.normed_gated, &self.activations.recurrent_out,
-            &self.activations.z_proj, &w.output_norm, nh, vd, eps, &self.stream,
+            &self.activations.z_proj, &w.output_norm, nvh_traced, vd, eps, &self.stream,
         )?;
         traces.push(("normed_gated".into(), self.read_buf(&self.activations.normed_gated)?));
 
         // out_proj
         w.w_out.forward(&self.kernels.linear_proj,
             &mut self.activations.out_proj, &self.activations.normed_gated,
-            hs, nh * vd, &self.stream)?;
+            hs, nvh_traced * vd, &self.stream)?;
         traces.push(("out_proj".into(), self.read_buf(&self.activations.out_proj)?));
 
         // Residual

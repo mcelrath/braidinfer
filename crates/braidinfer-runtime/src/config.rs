@@ -42,7 +42,8 @@ pub struct LayerConfig {
 #[derive(Debug, Clone)]
 pub enum RecurrentLayerKind {
     Gdn {
-        num_heads: usize,
+        num_heads: usize,        // key heads
+        num_value_heads: usize,  // value heads (may differ from key heads)
         key_dim: usize,
         value_dim: usize,
         conv_dim: usize,
@@ -141,6 +142,7 @@ impl ModelConfig {
             shared_expert_intermediate_size: 0,
             recurrent_kind: RecurrentLayerKind::Gdn {
                 num_heads: 16,
+                num_value_heads: 16,
                 key_dim: 128,
                 value_dim: 128,
                 conv_dim: 6144,
@@ -243,7 +245,8 @@ impl ModelConfig {
         let recurrent_kind = if linear_num_heads > 0 {
             let conv_dim = linear_num_heads * (linear_key_head_dim + linear_value_head_dim);
             RecurrentLayerKind::Gdn {
-                num_heads: linear_num_heads, key_dim: linear_key_head_dim, value_dim: linear_value_head_dim,
+                num_heads: linear_num_heads, num_value_heads: linear_num_value_heads,
+                key_dim: linear_key_head_dim, value_dim: linear_value_head_dim,
                 conv_dim, kernel_size: linear_conv_kernel_dim,
             }
         } else if let (Some(sd), Some(nh), Some(hd)) = (ssm_state_size, mamba_num_heads, mamba_head_dim) {
@@ -356,8 +359,8 @@ impl ModelConfig {
 
     pub fn recurrent_state_bytes_per_layer(&self) -> usize {
         match &self.recurrent_kind {
-            RecurrentLayerKind::Gdn { num_heads, key_dim, value_dim, .. } => {
-                num_heads * key_dim * value_dim * 4
+            RecurrentLayerKind::Gdn { num_value_heads, key_dim, value_dim, .. } => {
+                num_value_heads * key_dim * value_dim * 4
             }
             RecurrentLayerKind::Mamba2 { state_dim, num_heads, head_dim, .. } => {
                 num_heads * head_dim * state_dim * 4
