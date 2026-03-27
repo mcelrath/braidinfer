@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 LOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "launch-gpu"
-VRAM_IN_USE_THRESHOLD_MB = 512
+VRAM_IN_USE_THRESHOLD_MB = 100  # Idle GPU has ~27MB used; 512 was too high
 GPU_WAIT_POLL_S = 5
 DEFAULT_GPU_WAIT_TIMEOUT_S = 3600
 DEFAULT_MIN_VRAM_MB = 4096
