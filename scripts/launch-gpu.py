@@ -30,6 +30,57 @@ from pathlib import Path
 
 LOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "launch-gpu"
 VRAM_IN_USE_THRESHOLD_MB = 100  # Idle GPU has ~27MB used; 512 was too high
+
+
+def compute_rocr_visible_devices():
+    """Compute ROCR_VISIBLE_DEVICES to make HIP device IDs match PCI bus order.
+
+    HIP enumerates via KFD topology nodes, which may not follow PCI bus order.
+    This reads KFD topology to find native HIP->PCI mapping, then returns the
+    reordering string so HIP dev 0 = lowest PCI bus, matching rocm-smi.
+    Returns None if already in order or on non-ROCm systems.
+    Ported from ../llama.cpp/scripts/launch-llama.py.
+    """
+    topo = Path("/sys/class/kfd/kfd/topology/nodes")
+    if not topo.exists():
+        return None
+    hip_to_pci = {}
+    gpu_index = 0
+    for node_dir in sorted(topo.iterdir(), key=lambda p: int(p.name)):
+        props = node_dir / "properties"
+        if not props.exists():
+            continue
+        simd_count = 0
+        location = None
+        for line in props.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                if parts[0] == "simd_count":
+                    simd_count = int(parts[1])
+                elif parts[0] == "location_id":
+                    location = int(parts[1])
+        if simd_count > 0 and location is not None:
+            bus = (location >> 8) & 0xff
+            dev = (location >> 3) & 0x1f
+            func = location & 0x7
+            pci_bus = f"{bus:02x}:{dev:02x}.{func}"
+            hip_to_pci[gpu_index] = pci_bus
+            gpu_index += 1
+    if not hip_to_pci:
+        return None
+    sorted_by_pci = sorted(hip_to_pci.items(), key=lambda x: x[1])
+    reorder = [str(hip_dev) for hip_dev, _ in sorted_by_pci]
+    if reorder == [str(i) for i in range(len(reorder))]:
+        return None
+    return ",".join(reorder)
+
+
+# Ensure HIP device IDs match PCI bus order (and thus rocm-smi).
+# Must be set before any HIP initialization.
+if "ROCR_VISIBLE_DEVICES" not in os.environ:
+    _rocr = compute_rocr_visible_devices()
+    if _rocr:
+        os.environ["ROCR_VISIBLE_DEVICES"] = _rocr
 GPU_WAIT_POLL_S = 5
 DEFAULT_GPU_WAIT_TIMEOUT_S = 3600
 DEFAULT_MIN_VRAM_MB = 4096

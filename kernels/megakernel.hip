@@ -308,11 +308,15 @@ __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
 // OP_RMSNORM_WX: y = x * w / sqrt(mean(x^2) + eps) — standard w*x variant (Llama, OLMoE)
 // Same args as OP_RMSNORM: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 __device__ void op_rmsnorm_wx(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
+    float* output_base = inst_fptr(inst, 1);
+    const float* input_base = inst_fptr(inst, 2);
     const unsigned short* weight = inst_u16ptr(inst, 3);
     int hidden_size = inst_int(inst, 4);
     float eps = __int_as_float(inst_int(inst, 5));
+
+    // vblock = batch index (same as op_rmsnorm)
+    float* output = output_base + (long long)vblock * hidden_size;
+    const float* input = input_base + (long long)vblock * hidden_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
