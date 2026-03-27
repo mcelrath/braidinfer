@@ -846,117 +846,132 @@ fn bf16_to_f32_cpu(x: u16) -> f32 {
     f32::from_bits((x as u32) << 16)
 }
 
-/// Quantize bf16 weights to rnf4_g128 format on CPU.
+/// Binary search NF4 quantize: 4 comparisons instead of 15 (branchless).
+#[inline(always)]
+fn nf4_quantize_fast(x: f32, bounds: &[f32; 15]) -> u8 {
+    let mut i: usize = 0;
+    i += if x >= bounds[7] { 8 } else { 0 };
+    i += if x >= bounds[i + 3] { 4 } else { 0 };
+    i += if x >= bounds[i + 1] { 2 } else { 0 };
+    i += if x >= bounds[i] { 1 } else { 0 };
+    i as u8
+}
+
+/// Quantize one group of 128 bf16 elements to rnf4_g128 packed format (132 bytes).
+fn quantize_rnf4_group(bf16_data: &[u16], count: usize, out: &mut [u8]) {
+    let bounds = nf4_boundaries();
+
+    let mut vals = [0.0f32; 128];
+    for i in 0..count {
+        vals[i] = bf16_to_f32_cpu(bf16_data[i]);
+    }
+
+    // Round 1: NF4 with absmax
+    let absmax1 = vals[..count].iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-10);
+    let inv1 = 1.0 / absmax1;
+    let mut idx1 = [0u8; 128];
+    let mut dequant1 = [0.0f32; 128];
+    for i in 0..count {
+        idx1[i] = nf4_quantize_fast(vals[i] * inv1, &bounds);
+        dequant1[i] = NF4_TABLE[idx1[i] as usize] * absmax1;
+    }
+
+    // Round 2: NF4 on residual
+    let mut absmax2 = 0.0f32;
+    for i in 0..count {
+        absmax2 = absmax2.max((vals[i] - dequant1[i]).abs());
+    }
+    absmax2 = absmax2.max(1e-10);
+    let inv2 = 1.0 / absmax2;
+    let mut idx2 = [0u8; 128];
+    for i in 0..count {
+        idx2[i] = nf4_quantize_fast((vals[i] - dequant1[i]) * inv2, &bounds);
+    }
+
+    // Pack: [64B idx1 | 2B absmax1_bf16 | 64B idx2 | 2B absmax2_bf16]
+    for i in (0..128).step_by(2) {
+        out[i / 2] = (idx1[i] & 0xF) | ((idx1[i + 1] & 0xF) << 4);
+    }
+    let a1 = f32_to_bf16(absmax1);
+    out[64] = (a1 & 0xFF) as u8;
+    out[65] = (a1 >> 8) as u8;
+    for i in (0..128).step_by(2) {
+        out[66 + i / 2] = (idx2[i] & 0xF) | ((idx2[i + 1] & 0xF) << 4);
+    }
+    let a2 = f32_to_bf16(absmax2);
+    out[130] = (a2 & 0xFF) as u8;
+    out[131] = (a2 >> 8) as u8;
+}
+
+/// Quantize bf16 weights to rnf4_g128 format on CPU (parallel over rows).
 /// Input: &[u16] bf16 weights, row-major [out_dim, in_dim].
 /// Output: packed bytes, groups of 132 bytes per 128 elements.
 pub fn quantize_rnf4_g128(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    use rayon::prelude::*;
     let group_size = 128;
-    let group_bytes = 132; // 64 + 2 + 64 + 2
+    let group_bytes = 132;
     let num_groups_per_row = (in_dim + group_size - 1) / group_size;
     let total_bytes = out_dim * num_groups_per_row * group_bytes;
     let mut packed = vec![0u8; total_bytes];
 
-    for row in 0..out_dim {
-        for g in 0..num_groups_per_row {
-            let base = row * in_dim + g * group_size;
-            let count = std::cmp::min(group_size, in_dim - g * group_size);
-
-            // Convert to f32
-            let mut vals = [0.0f32; 128];
-            for i in 0..count {
-                vals[i] = bf16_to_f32_cpu(bf16_data[base + i]);
+    // Parallel over rows: each row writes to a disjoint slice of packed
+    packed.par_chunks_mut(num_groups_per_row * group_bytes)
+        .enumerate()
+        .for_each(|(row, row_out)| {
+            for g in 0..num_groups_per_row {
+                let base = row * in_dim + g * group_size;
+                let count = std::cmp::min(group_size, in_dim - g * group_size);
+                let dst = g * group_bytes;
+                quantize_rnf4_group(&bf16_data[base..base + count], count, &mut row_out[dst..dst + group_bytes]);
             }
-
-            // Round 1: NF4 with absmax
-            let absmax1 = vals[..count].iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-10);
-            let mut idx1 = [0u8; 128];
-            let mut dequant1 = [0.0f32; 128];
-            for i in 0..count {
-                let normalized = vals[i] / absmax1;
-                idx1[i] = nf4_quantize_index(normalized);
-                dequant1[i] = NF4_TABLE[idx1[i] as usize] * absmax1;
-            }
-
-            // Residual
-            let mut residual = [0.0f32; 128];
-            for i in 0..count {
-                residual[i] = vals[i] - dequant1[i];
-            }
-
-            // Round 2: NF4 on residual with its own absmax
-            let absmax2 = residual[..count].iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-10);
-            let mut idx2 = [0u8; 128];
-            for i in 0..count {
-                let normalized = residual[i] / absmax2;
-                idx2[i] = nf4_quantize_index(normalized);
-            }
-
-            // Pack: [64B idx1 | 2B absmax1_bf16 | 64B idx2 | 2B absmax2_bf16]
-            let dst = (row * num_groups_per_row + g) * group_bytes;
-
-            // Pack idx1: 2 values per byte, low nibble first
-            for i in (0..128).step_by(2) {
-                packed[dst + i / 2] = (idx1[i] & 0xF) | ((idx1[i + 1] & 0xF) << 4);
-            }
-            let absmax1_bf16 = f32_to_bf16(absmax1);
-            packed[dst + 64] = (absmax1_bf16 & 0xFF) as u8;
-            packed[dst + 65] = (absmax1_bf16 >> 8) as u8;
-
-            // Pack idx2
-            for i in (0..128).step_by(2) {
-                packed[dst + 66 + i / 2] = (idx2[i] & 0xF) | ((idx2[i + 1] & 0xF) << 4);
-            }
-            let absmax2_bf16 = f32_to_bf16(absmax2);
-            packed[dst + 130] = (absmax2_bf16 & 0xFF) as u8;
-            packed[dst + 131] = (absmax2_bf16 >> 8) as u8;
-        }
-    }
+        });
     packed
 }
 
-/// Quantize bf16 weights to PcG32Q4 format on CPU.
+/// Quantize bf16 weights to PcG32Q4 format on CPU (parallel over rows).
 /// Per-channel-group asymmetric 4-bit, group_size=32.
 pub fn quantize_pc_g32_q4(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> Vec<u8> {
+    use rayon::prelude::*;
     let group_size = 32;
     let group_bytes = 20; // 16 + 2 + 2
     let num_groups_per_row = (in_dim + group_size - 1) / group_size;
     let total_bytes = out_dim * num_groups_per_row * group_bytes;
     let mut packed = vec![0u8; total_bytes];
 
-    for row in 0..out_dim {
-        for g in 0..num_groups_per_row {
-            let base = row * in_dim + g * group_size;
-            let count = std::cmp::min(group_size, in_dim - g * group_size);
+    packed.par_chunks_mut(num_groups_per_row * group_bytes)
+        .enumerate()
+        .for_each(|(row, row_out)| {
+            for g in 0..num_groups_per_row {
+                let base = row * in_dim + g * group_size;
+                let count = std::cmp::min(group_size, in_dim - g * group_size);
 
-            let mut vals = [0.0f32; 32];
-            for i in 0..count {
-                vals[i] = bf16_to_f32_cpu(bf16_data[base + i]);
+                let mut vals = [0.0f32; 32];
+                for i in 0..count {
+                    vals[i] = bf16_to_f32_cpu(bf16_data[base + i]);
+                }
+
+                let mn = vals[..count].iter().cloned().fold(f32::INFINITY, f32::min);
+                let mx = vals[..count].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let scale = ((mx - mn) / 15.0).max(1e-10);
+                let inv_scale = 1.0 / scale;
+
+                let mut indices = [0u8; 32];
+                for i in 0..count {
+                    indices[i] = ((vals[i] - mn) * inv_scale).round().clamp(0.0, 15.0) as u8;
+                }
+
+                let dst = g * group_bytes;
+                for i in (0..32).step_by(2) {
+                    row_out[dst + i / 2] = (indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4);
+                }
+                let mn_bf16 = f32_to_bf16(mn);
+                let sc_bf16 = f32_to_bf16(scale);
+                row_out[dst + 16] = (mn_bf16 & 0xFF) as u8;
+                row_out[dst + 17] = (mn_bf16 >> 8) as u8;
+                row_out[dst + 18] = (sc_bf16 & 0xFF) as u8;
+                row_out[dst + 19] = (sc_bf16 >> 8) as u8;
             }
-
-            let mn = vals[..count].iter().cloned().fold(f32::INFINITY, f32::min);
-            let mx = vals[..count].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let scale = ((mx - mn) / 15.0).max(1e-10);
-
-            let mut indices = [0u8; 32];
-            for i in 0..count {
-                let idx = ((vals[i] - mn) / scale).round().clamp(0.0, 15.0) as u8;
-                indices[i] = idx;
-            }
-
-            let dst = (row * num_groups_per_row + g) * group_bytes;
-
-            // Pack indices: 2 per byte, low nibble first
-            for i in (0..32).step_by(2) {
-                packed[dst + i / 2] = (indices[i] & 0xF) | ((indices[i + 1] & 0xF) << 4);
-            }
-            let mn_bf16 = f32_to_bf16(mn);
-            let sc_bf16 = f32_to_bf16(scale);
-            packed[dst + 16] = (mn_bf16 & 0xFF) as u8;
-            packed[dst + 17] = (mn_bf16 >> 8) as u8;
-            packed[dst + 18] = (sc_bf16 & 0xFF) as u8;
-            packed[dst + 19] = (sc_bf16 >> 8) as u8;
-        }
-    }
+        });
     packed
 }
 

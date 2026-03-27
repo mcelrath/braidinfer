@@ -6,6 +6,15 @@ use braidinfer_runtime::model::Model;
 
 const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
+fn vram_usage_mb() -> (f64, f64) {
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    unsafe { braidinfer_hip::ffi::hipMemGetInfo(&mut free, &mut total); }
+    let used = (total - free) as f64 / (1024.0 * 1024.0);
+    let total_mb = total as f64 / (1024.0 * 1024.0);
+    (used, total_mb)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let prompt = if args.len() > 1 {
@@ -35,6 +44,8 @@ fn main() {
     let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN").ok().and_then(|v| v.parse().ok());
     let mut model = Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
+    let (vram_used, vram_total) = vram_usage_mb();
+    eprintln!("VRAM after load: {:.0}/{:.0} MB", vram_used, vram_total);
     eprintln!("max_seq_len: {}", model.config().max_seq_len);
     eprintln!("stop tokens: {:?}", token_config.eos_token_ids);
 
