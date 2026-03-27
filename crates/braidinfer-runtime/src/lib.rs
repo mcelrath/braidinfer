@@ -4,4 +4,5 @@ pub mod kernel_lib;
 pub mod megakernel;
 pub mod model;
 pub mod paged_kv;
+pub mod quant;
 pub mod sampling;

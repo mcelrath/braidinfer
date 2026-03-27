@@ -1,7 +1,7 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::{DeviceBuffer, Stream};
 use braidinfer_runtime::kernel::LinearProjKernel;
-use braidinfer_runtime::model::{WeightFormat, PackedWeights, quantize_rnf4_g128, quantize_pc_g32_q4};
+use braidinfer_runtime::quant::{WeightFormat, PackedWeights, quantize_rnf4_g128, quantize_pc_g32_q4};
 
 fn f32_to_bf16(x: f32) -> u16 {
     let bits = x.to_bits();
