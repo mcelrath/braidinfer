@@ -43,7 +43,8 @@ pub struct LayerConfig {
 pub enum RecurrentLayerKind {
     Gdn {
         num_heads: usize,
-        key_value_dim: usize,
+        key_dim: usize,
+        value_dim: usize,
         conv_dim: usize,
         kernel_size: usize,
     },
@@ -140,7 +141,8 @@ impl ModelConfig {
             shared_expert_intermediate_size: 0,
             recurrent_kind: RecurrentLayerKind::Gdn {
                 num_heads: 16,
-                key_value_dim: 128,
+                key_dim: 128,
+                value_dim: 128,
                 conv_dim: 6144,
                 kernel_size: 4,
             },
@@ -205,6 +207,8 @@ impl ModelConfig {
             .unwrap_or(1.0);
         let rope_dim = ((head_dim as f64) * partial_rotary_factor) as usize;
         let max_seq_len = get_usize("max_position_embeddings").unwrap_or(2048);
+        // Default true matches HF convention (most models tie). Models with separate lm_head
+        // that omit this field will use embedding weights — load path should verify at runtime.
         let tie_word_embeddings = get_bool("tie_word_embeddings").unwrap_or(true);
 
         // mRoPE
@@ -237,7 +241,7 @@ impl ModelConfig {
         let recurrent_kind = if linear_num_heads > 0 {
             let conv_dim = linear_num_heads * (linear_key_head_dim + linear_value_head_dim);
             RecurrentLayerKind::Gdn {
-                num_heads: linear_num_heads, key_value_dim: linear_key_head_dim,
+                num_heads: linear_num_heads, key_dim: linear_key_head_dim, value_dim: linear_value_head_dim,
                 conv_dim, kernel_size: linear_conv_kernel_dim,
             }
         } else if let (Some(sd), Some(nh), Some(hd)) = (ssm_state_size, mamba_num_heads, mamba_head_dim) {
@@ -350,8 +354,8 @@ impl ModelConfig {
 
     pub fn recurrent_state_bytes_per_layer(&self) -> usize {
         match &self.recurrent_kind {
-            RecurrentLayerKind::Gdn { num_heads, key_value_dim, .. } => {
-                num_heads * key_value_dim * key_value_dim * 4
+            RecurrentLayerKind::Gdn { num_heads, key_dim, value_dim, .. } => {
+                num_heads * key_dim * value_dim * 4
             }
             RecurrentLayerKind::Mamba2 { state_dim, num_heads, head_dim, .. } => {
                 num_heads * head_dim * state_dim * 4

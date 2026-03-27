@@ -26,4 +26,4 @@
 #define OP_KV_QUANTIZE  21
 #define OP_ATTN_PAGED_Q 22
 #define OP_MOE_GATE     23
-#define OP_MOE_FFN      24
+#define OP_MOE_FFN      24  // Reserved — MoE uses kernel-by-kernel dispatch (see braidinfer-cea.7)

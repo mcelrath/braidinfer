@@ -896,11 +896,19 @@ impl Model {
             gdn_conv_out_q: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             gdn_conv_out_k: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
-            // MoE scratch: sized for max expert dimensions across all layers
-            moe_scores: DeviceBuffer::<f32>::alloc(device, config.num_experts.max(1))?,
-            moe_expert_gate: DeviceBuffer::<f32>::alloc(device, config.expert_intermediate_size.max(1))?,
-            moe_expert_up: DeviceBuffer::<f32>::alloc(device, config.expert_intermediate_size.max(1))?,
-            moe_expert_act: DeviceBuffer::<f32>::alloc(device, config.expert_intermediate_size.max(1))?,
+            // MoE scratch: sized for per-layer max expert dimensions
+            moe_scores: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
+                FfnType::MoE { num_experts, .. } => Some(*num_experts), _ => None
+            }).max().unwrap_or(1))?,
+            moe_expert_gate: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
+                FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
+            }).max().unwrap_or(1))?,
+            moe_expert_up: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
+                FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
+            }).max().unwrap_or(1))?,
+            moe_expert_act: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
+                FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
+            }).max().unwrap_or(1))?,
             moe_expert_out: DeviceBuffer::<f32>::alloc(device, hs)?,
         };
 
@@ -1901,11 +1909,11 @@ impl Model {
 
         // a, b, z projections
         w.w_a.forward(&self.kernels.linear_proj,
-            &mut self.activations.a_proj, &self.activations.normed, nh, hs, &self.stream)?;
+            &mut self.activations.a_proj, &self.activations.normed, nvh_traced, hs, &self.stream)?;
         w.w_b.forward(&self.kernels.linear_proj,
-            &mut self.activations.b_proj, &self.activations.normed, nh, hs, &self.stream)?;
+            &mut self.activations.b_proj, &self.activations.normed, nvh_traced, hs, &self.stream)?;
         w.w_z.forward(&self.kernels.linear_proj,
-            &mut self.activations.z_proj, &self.activations.normed, nh * vd, hs, &self.stream)?;
+            &mut self.activations.z_proj, &self.activations.normed, nvh_traced * vd, hs, &self.stream)?;
         traces.push(("a_proj".into(), self.read_buf(&self.activations.a_proj)?));
         traces.push(("b_proj".into(), self.read_buf(&self.activations.b_proj)?));
         traces.push(("z_proj".into(), self.read_buf(&self.activations.z_proj)?));
@@ -2012,7 +2020,7 @@ impl Model {
         let qkv_out = nh * kd * 2 + nvh_r * vd;
 
         for state in &mut self.gdn_states {
-            let zeros = vec![0.0f32; nh * kd * vd];
+            let zeros = vec![0.0f32; nvh_r * kd * vd];
             state.recurrent.copy_from_host(&zeros)?;
         }
         for conv_state in &mut self.gdn_conv_states {
