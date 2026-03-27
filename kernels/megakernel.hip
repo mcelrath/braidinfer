@@ -1551,9 +1551,99 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
 
 #define INST_SIZE 16  // 16 u64s per instruction = 128 bytes
 
+// Dump mode: per-instruction activation capture
+// dump_base: GPU buffer for storing instruction outputs (NULL = disabled)
+// dump_capacity: max number of slots
+// Each slot: [opcode(u32) inst_idx(u32) size(u32) pad(u32)] [data(float...)]
+#define DUMP_HEADER_INTS 4
+#define DUMP_MAX_FLOATS  8192
+#define DUMP_SLOT_BYTES  (DUMP_HEADER_INTS * 4 + DUMP_MAX_FLOATS * 4)
+
+__device__ void dump_instruction_output(
+    char* dump_base, int dump_capacity, int* dump_count,
+    const u64* inst, int opcode, int pc
+) {
+    if (dump_base == nullptr) return;
+    if (blockIdx.x != 0) return;  // Only block 0 dumps
+
+    // Get output pointer and size from instruction (inst[1] is output for all compute ops)
+    float* output = inst_fptr(inst, 1);
+    int size = 0;
+
+    // Determine output size from opcode + instruction args
+    switch (opcode) {
+        case OP_RMSNORM: case OP_RMSNORM_WX:
+            size = inst_int(inst, 4); // hidden_size
+            break;
+        case OP_LINEAR_PROJ: case OP_LINEAR_PROJ_RNF4: case OP_LINEAR_PROJ_PCG32:
+            size = inst_int(inst, 4); // out_dim (total for batch=1)
+            break;
+        case OP_RMSNORM_GATE:
+            size = inst_int(inst, 4) * inst_int(inst, 5); // num_heads * value_dim
+            break;
+        case OP_RESIDUAL_ADD:
+            size = inst_int(inst, 4); // size
+            break;
+        case OP_SILU_MUL:
+            size = inst_int(inst, 4); // size
+            break;
+        case OP_EMBEDDING:
+            size = inst_int(inst, 4); // hidden_size
+            break;
+        case OP_FFN_GATE_UP:
+            size = inst_int(inst, 7); // intermediate_size
+            break;
+        case OP_FFN_DOWN_RES:
+            size = inst_int(inst, 5); // hidden_size
+            break;
+        case OP_GQA_ATTN:
+            size = inst_int(inst, 4) * inst_int(inst, 6); // nqh * hd
+            break;
+        case OP_OUTPUT_GATE:
+            size = inst_int(inst, 4); // size
+            break;
+        default:
+            return;  // Skip non-compute ops
+    }
+
+    if (size <= 0) return;
+    if (size > DUMP_MAX_FLOATS) size = DUMP_MAX_FLOATS;
+
+    // Allocate slot (thread 0 only)
+    int slot;
+    if (threadIdx.x == 0) {
+        slot = atomicAdd(dump_count, 1);
+    }
+    __shared__ int s_slot;
+    if (threadIdx.x == 0) s_slot = slot;
+    __syncthreads();
+    slot = s_slot;
+
+    if (slot >= dump_capacity) return;
+
+    char* slot_ptr = dump_base + (long long)slot * DUMP_SLOT_BYTES;
+
+    // Write header
+    if (threadIdx.x == 0) {
+        ((int*)slot_ptr)[0] = opcode;
+        ((int*)slot_ptr)[1] = pc;
+        ((int*)slot_ptr)[2] = size;
+        ((int*)slot_ptr)[3] = 0;
+    }
+
+    // Copy output data cooperatively
+    float* dst = (float*)(slot_ptr + DUMP_HEADER_INTS * 4);
+    for (int i = threadIdx.x; i < size; i += blockDim.x) {
+        dst[i] = output[i];
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
     const u64* __restrict__ program,
-    int num_instructions
+    int num_instructions,
+    char* dump_base,      // NULL when not dumping
+    int dump_capacity,    // max slots
+    int* dump_count       // atomic counter (device memory)
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
@@ -1599,5 +1689,11 @@ extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
         }
 
         if (!no_sync) grid.sync();
+
+        // Dump output AFTER grid.sync() — all blocks finished writing
+        if (dump_base && !no_sync) {
+            dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
+            grid.sync();  // Ensure dump completes before next instruction
+        }
     }
 }

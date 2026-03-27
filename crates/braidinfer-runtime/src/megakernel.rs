@@ -121,6 +121,10 @@ pub struct MegakernelProgram {
     quant_page_table: Option<DeviceBuffer<u64>>,// page table for sealed quantized chunks
     last_quant_page_table_len: usize,
     pub quantized_kv: bool,                      // whether this program uses quantized KV
+    // Dump mode: per-instruction activation capture
+    dump_buffer: Option<DeviceBuffer<u8>>,        // slot data
+    dump_counter: Option<DeviceBuffer<i32>>,       // atomic slot counter
+    dump_capacity: i32,
     // Prevent Send — contains raw GPU device pointers as u64
     _not_send: std::marker::PhantomData<*mut ()>,
 }
@@ -383,6 +387,9 @@ impl MegakernelProgram {
             quant_page_table: None,
             last_quant_page_table_len: 0,
             quantized_kv: false,
+            dump_buffer: None,
+            dump_counter: None,
+            dump_capacity: 0,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
             _not_send: std::marker::PhantomData,
@@ -769,6 +776,9 @@ impl MegakernelProgram {
             quant_page_table: None,
             last_quant_page_table_len: 0,
             quantized_kv: false,
+            dump_buffer: None,
+            dump_counter: None,
+            dump_capacity: 0,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
             _not_send: std::marker::PhantomData,
@@ -1987,21 +1997,83 @@ impl MegakernelProgram {
         )
     }
 
+    /// Enable per-instruction dump mode. Allocates GPU buffer for capturing outputs.
+    pub fn enable_dump(&mut self, max_slots: i32) -> HipResult<()> {
+        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
+        let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
+        self.dump_buffer = Some(DeviceBuffer::<u8>::alloc(self.device, buf_size)?);
+        let mut counter = DeviceBuffer::<i32>::alloc(self.device, 1)?;
+        counter.copy_from_host(&[0i32])?;
+        self.dump_counter = Some(counter);
+        self.dump_capacity = max_slots;
+        Ok(())
+    }
+
+    /// Read dump results after execute. Returns Vec of (opcode, inst_idx, data).
+    pub fn read_dump(&self, stream: &Stream) -> HipResult<Vec<(u32, u32, Vec<f32>)>> {
+        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
+        let counter = self.dump_counter.as_ref().unwrap();
+        stream.synchronize()?;
+        let mut count = [0i32];
+        counter.copy_to_host(&mut count)?;
+        let num_slots = count[0].min(self.dump_capacity) as usize;
+
+        let buf = self.dump_buffer.as_ref().unwrap();
+        let total_bytes = num_slots * DUMP_SLOT_BYTES;
+        let mut host = vec![0u8; total_bytes];
+        if num_slots > 0 {
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    host.as_mut_ptr() as *mut std::ffi::c_void,
+                    buf.as_ptr() as *const std::ffi::c_void,
+                    total_bytes,
+                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                    stream.raw(),
+                );
+            }
+            stream.synchronize()?;
+        }
+
+        let mut results = Vec::with_capacity(num_slots);
+        for i in 0..num_slots {
+            let slot = &host[i * DUMP_SLOT_BYTES..];
+            let opcode = u32::from_le_bytes(slot[0..4].try_into().unwrap());
+            let inst_idx = u32::from_le_bytes(slot[4..8].try_into().unwrap());
+            let size = u32::from_le_bytes(slot[8..12].try_into().unwrap()) as usize;
+            let data: Vec<f32> = (0..size).map(|j| {
+                let off = 16 + j * 4;
+                f32::from_le_bytes(slot[off..off+4].try_into().unwrap())
+            }).collect();
+            results.push((opcode, inst_idx, data));
+        }
+        Ok(results)
+    }
+
     /// Execute the megakernel program.
     pub fn execute(&self, stream: &Stream) -> HipResult<()> {
         let func = self.module.get_function("megakernel_f32")?;
         let mut prog_ptr: *const c_void = self.device_program.as_ptr().cast();
         let mut num_inst = self.instructions.len() as i32;
+        let mut dump_ptr: *mut c_void = self.dump_buffer.as_ref()
+            .map(|b| b.as_ptr() as *mut c_void)
+            .unwrap_or(std::ptr::null_mut());
+        let mut dump_cap = self.dump_capacity;
+        let mut dump_cnt_ptr: *mut c_void = self.dump_counter.as_ref()
+            .map(|b| b.as_ptr() as *mut c_void)
+            .unwrap_or(std::ptr::null_mut());
 
-        let mut args: [*mut c_void; 2] = [
+        let mut args: [*mut c_void; 5] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),
+            std::ptr::addr_of_mut!(dump_ptr).cast(),
+            std::ptr::addr_of_mut!(dump_cap).cast(),
+            std::ptr::addr_of_mut!(dump_cnt_ptr).cast(),
         ];
 
         func.launch_cooperative(
             (self.num_blocks, 1, 1),
             (256, 1, 1),
-            256 * 4 * 2, // 2KB shared memory (enough for gdn_recurrent's 2 arrays)
+            256 * 4 * 2,
             stream,
             &mut args,
         )
