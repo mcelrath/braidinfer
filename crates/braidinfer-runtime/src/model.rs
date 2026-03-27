@@ -585,6 +585,7 @@ pub struct Model {
     quant_allocator: Option<PageAllocator>,
     paged_seq: Option<SequenceState>,
     checkpoint_pool: Option<RecurrentCheckpointPool>,
+    last_checkpoint_slot: Option<u32>,
 }
 
 // ---- Error type ----
@@ -624,20 +625,7 @@ impl std::error::Error for ModelError {}
 
 // ---- Helper: load a tensor by name, convert to f32, upload to GPU ----
 
-/// Load a tensor's raw bytes from safetensors directly to GPU. Zero-copy from mmap.
-/// Returns DeviceBuffer<u8> containing the on-disk representation.
-#[allow(dead_code)]
-fn load_tensor_raw(
-    st: &SafeTensorSet,
-    name: &str,
-    device: DeviceId,
-) -> Result<DeviceBuffer<u8>, ModelError> {
-    let raw = st.tensor_data(name)
-        .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
-    let mut buf = DeviceBuffer::<u8>::alloc(device, raw.len())?;
-    buf.copy_from_host(raw)?;
-    Ok(buf)
-}
+
 
 /// Load a bf16 tensor, returning a typed DeviceBuffer<u16>.
 /// The underlying data is copied directly from mmap — zero conversion.
@@ -1412,6 +1400,7 @@ impl Model {
             quant_allocator: None,
             paged_seq: None,
             checkpoint_pool: None,
+            last_checkpoint_slot: None,
         })
     }
 
@@ -2208,15 +2197,22 @@ impl Model {
     /// Lazy-initializes the pool on first call. Returns the slot index.
     pub fn save_recurrent_checkpoint(&mut self) -> Result<u32, ModelError> {
         if self.checkpoint_pool.is_none() {
+            // Pool capacity 1: prefill uses ring-buffer overwrite (only most-recent needed).
+            // Speculative decode (future) may increase this.
             self.checkpoint_pool = Some(RecurrentCheckpointPool::new(
                 self.device,
                 &self.config,
-                4,
+                1,
             )?);
+        }
+        // Free previous slot before allocating new one (ring buffer with capacity 1)
+        if let Some(prev) = self.last_checkpoint_slot.take() {
+            self.checkpoint_pool.as_mut().unwrap().free(prev);
         }
         let recurrent_bufs: Vec<&DeviceBuffer<f32>> = self.gdn_states.iter().map(|s| &s.recurrent).collect();
         let pool = self.checkpoint_pool.as_mut().unwrap();
         let slot = paged_kv::save_checkpoint(pool, &recurrent_bufs, self.stream.raw())?;
+        self.last_checkpoint_slot = Some(slot);
         Ok(slot)
     }
 

@@ -10,75 +10,7 @@ pub(crate) fn kernel_dir() -> PathBuf {
     PathBuf::from(env!("BRAIDINFER_KERNEL_DIR"))
 }
 
-pub struct GdnRecurrentStepKernel {
-    module: Module,
-    device: DeviceId,
-}
-
-impl GdnRecurrentStepKernel {
-    pub fn load(device: DeviceId) -> HipResult<Self> {
-        let path = kernel_dir().join("gdn_recurrent_step_v2.hsaco");
-        let module = Module::load(device, &path)?;
-        Ok(Self { module, device })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
-        &self,
-        q: &DeviceBuffer<f32>,
-        k: &DeviceBuffer<f32>,
-        v: &DeviceBuffer<f32>,
-        g: &DeviceBuffer<f32>,
-        b: &DeviceBuffer<f32>,
-        state: &mut DeviceBuffer<f32>,
-        output: &mut DeviceBuffer<f32>,
-        num_heads: u32,
-        key_dim: u32,
-        value_dim: u32,
-        stream: &Stream,
-    ) -> HipResult<()> {
-        assert_eq!(q.device(), self.device);
-        assert_eq!(k.device(), self.device);
-        assert_eq!(v.device(), self.device);
-        assert_eq!(g.device(), self.device);
-        assert_eq!(b.device(), self.device);
-        assert_eq!(state.device(), self.device);
-        assert_eq!(output.device(), self.device);
-        assert_eq!(stream.device(), self.device);
-
-        let func = self.module.get_function("gdn_recurrent_step_v2_f32")?;
-
-        let mut q_ptr: *const c_void = q.as_ptr().cast();
-        let mut k_ptr: *const c_void = k.as_ptr().cast();
-        let mut v_ptr: *const c_void = v.as_ptr().cast();
-        let mut g_ptr: *const c_void = g.as_ptr().cast();
-        let mut b_ptr: *const c_void = b.as_ptr().cast();
-        let mut state_ptr: *mut c_void = state.as_mut_ptr().cast();
-        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
-        let mut kd = key_dim as i32;
-        let mut vd = value_dim as i32;
-
-        let mut args: [*mut c_void; 9] = [
-            std::ptr::addr_of_mut!(q_ptr).cast(),
-            std::ptr::addr_of_mut!(k_ptr).cast(),
-            std::ptr::addr_of_mut!(v_ptr).cast(),
-            std::ptr::addr_of_mut!(g_ptr).cast(),
-            std::ptr::addr_of_mut!(b_ptr).cast(),
-            std::ptr::addr_of_mut!(state_ptr).cast(),
-            std::ptr::addr_of_mut!(out_ptr).cast(),
-            std::ptr::addr_of_mut!(kd).cast(),
-            std::ptr::addr_of_mut!(vd).cast(),
-        ];
-
-        func.launch(
-            (num_heads, 1, 1),
-            (256, 1, 1),
-            256 * 2 * 4, // 2 * block_size * sizeof(float) for q/k norm reductions
-            stream,
-            &mut args,
-        )
-    }
-}
+// GdnRecurrentStepKernel v1 removed — replaced by GdnRecurrentStepV2Kernel (with gqa_group param)
 
 pub struct RmsNormKernel {
     module: Module,
