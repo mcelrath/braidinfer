@@ -14,31 +14,8 @@ use crate::paged_kv::{PageAllocator, SequenceState};
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
 pub const CHUNK_TOKENS: usize = 64;
 
-// Opcode constants — must match megakernel.hip
-const _OP_NOP: u32 = 0;
-const OP_RMSNORM: u32 = 1;
-const OP_LINEAR_PROJ: u32 = 2;
-const OP_CONV1D: u32 = 3;
-const OP_GDN_GATE: u32 = 4;
-const OP_GDN_RECUR: u32 = 5;
-const OP_RMSNORM_GATE: u32 = 6;
-const OP_RESIDUAL_ADD: u32 = 7;
-const OP_QK_NORM: u32 = 8;
-const OP_MROPE: u32 = 9;
-const OP_GQA_ATTN: u32 = 10;
-const OP_OUTPUT_GATE: u32 = 11;
-const OP_FFN_GATE_UP: u32 = 12;
-const OP_FFN_DOWN_RES: u32 = 13;
-const OP_EMBEDDING: u32 = 14;
-const _OP_LM_HEAD: u32 = 15;
-const OP_HALT: u32 = 16;
-const OP_D2D_COPY: u32 = 17;
-const OP_ATTN_PAGED: u32 = 18;
-const OP_ATTN_PREFILL: u32 = 19;
-const OP_DEINTERLEAVE: u32 = 20;
-const OP_KV_QUANTIZE: u32 = 21;
-const OP_ATTN_PAGED_Q: u32 = 22;
-const OP_MOE_GATE: u32 = 23;
+// Opcode constants — auto-generated from kernels/opcodes.h (single source of truth)
+include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 
 const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
