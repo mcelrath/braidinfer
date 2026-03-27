@@ -1727,10 +1727,13 @@ impl Model {
 
         // 4. Zero accumulation buffer on GPU (no CPU round-trip)
         unsafe {
-            braidinfer_hip::ffi::hipMemsetAsync(
+            let rc = braidinfer_hip::ffi::hipMemsetAsync(
                 self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
                 0, hs * 4, self.stream.raw(),
             );
+            if rc != 0 {
+                return Err(braidinfer_hip::HipError(rc).into());
+            }
         }
 
         // 5. For each selected expert: run FFN and GPU-accumulate
