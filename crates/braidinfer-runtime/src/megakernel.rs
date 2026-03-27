@@ -1515,6 +1515,7 @@ impl MegakernelProgram {
         act: &ActivationBuffers,
         instructions: &mut Vec<Instruction>,
     ) {
+        use crate::model::LinearWeight;
         let hs = cfg.hidden_size;
         let is = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
@@ -1524,34 +1525,98 @@ impl MegakernelProgram {
             LayerWeights::Attention(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
         };
 
-        // FFN gate+up (fused with RMSNorm)
-        let mut inst = Instruction::new(OP_FFN_GATE_UP, is as u32);
-        inst.set_output_ptr(1, act.ffn_act.as_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_ptr(3, post_norm.as_ptr());
-        inst.set_ptr(4, w_gate.as_bf16_ptr());
-        inst.set_ptr(5, w_up.as_bf16_ptr());
-        inst.set_int(6, hs as i32);
-        inst.set_int(7, is as i32);
-        inst.set_float(8, eps);
-        instructions.push(inst);
+        let all_bf16 = matches!(w_gate, LinearWeight::Bf16(_))
+            && matches!(w_up, LinearWeight::Bf16(_))
+            && matches!(w_down, LinearWeight::Bf16(_));
 
-        // Save residual
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.residual.as_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_int(3, hs as i32);
-        instructions.push(inst);
+        if all_bf16 {
+            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only)
+            let mut inst = Instruction::new(OP_FFN_GATE_UP, is as u32);
+            inst.set_output_ptr(1, act.ffn_act.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_ptr(3, post_norm.as_ptr());
+            inst.set_ptr(4, w_gate.as_bf16_ptr());
+            inst.set_ptr(5, w_up.as_bf16_ptr());
+            inst.set_int(6, hs as i32);
+            inst.set_int(7, is as i32);
+            inst.set_float(8, eps);
+            instructions.push(inst);
 
-        // FFN down + residual
-        let mut inst = Instruction::new(OP_FFN_DOWN_RES, hs as u32);
-        inst.set_output_ptr(1, act.hidden.as_ptr());
-        inst.set_ptr(2, act.residual.as_ptr());
-        inst.set_ptr(3, w_down.as_bf16_ptr());
-        inst.set_ptr(4, act.ffn_act.as_ptr());
-        inst.set_int(5, hs as i32);
-        inst.set_int(6, is as i32);
-        instructions.push(inst);
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.residual.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+
+            let mut inst = Instruction::new(OP_FFN_DOWN_RES, hs as u32);
+            inst.set_output_ptr(1, act.hidden.as_ptr());
+            inst.set_ptr(2, act.residual.as_ptr());
+            inst.set_ptr(3, w_down.as_bf16_ptr());
+            inst.set_ptr(4, act.ffn_act.as_ptr());
+            inst.set_int(5, hs as i32);
+            inst.set_int(6, is as i32);
+            instructions.push(inst);
+        } else {
+            // Unfused path for quantized weights (decode n=1 only)
+            // D2D_COPY: hidden → residual
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.residual.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+
+            // RMSNorm: hidden → normed
+            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
+            inst.set_output_ptr(1, act.normed.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_ptr(3, post_norm.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_float(5, eps);
+            instructions.push(inst);
+
+            // Gate: normed → ffn_gate
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
+            emit_linear_proj(&mut inst, w_gate, 2);
+            inst.set_output_ptr(1, act.ffn_gate.as_ptr());
+            inst.set_ptr(3, act.normed.as_ptr());
+            inst.set_int(4, is as i32);
+            inst.set_int(5, hs as i32);
+            instructions.push(inst);
+
+            // Up: normed → ffn_up
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
+            emit_linear_proj(&mut inst, w_up, 2);
+            inst.set_output_ptr(1, act.ffn_up.as_ptr());
+            inst.set_ptr(3, act.normed.as_ptr());
+            inst.set_int(4, is as i32);
+            inst.set_int(5, hs as i32);
+            instructions.push(inst);
+
+            // SiLU(gate) * up → ffn_act
+            let mut inst = Instruction::new(OP_SILU_MUL, div_ceil(is as u32, 256));
+            inst.set_output_ptr(1, act.ffn_act.as_ptr());
+            inst.set_ptr(2, act.ffn_gate.as_ptr());
+            inst.set_ptr(3, act.ffn_up.as_ptr());
+            inst.set_int(4, is as i32);
+            instructions.push(inst);
+
+            // Down: ffn_act → ffn_down
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+            emit_linear_proj(&mut inst, w_down, 2);
+            inst.set_output_ptr(1, act.ffn_down.as_ptr());
+            inst.set_ptr(3, act.ffn_act.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_int(5, is as i32);
+            instructions.push(inst);
+
+            // Residual: ffn_down + residual → hidden
+            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.hidden.as_ptr());
+            inst.set_ptr(2, act.ffn_down.as_ptr());
+            inst.set_ptr(3, act.residual.as_ptr());
+            inst.set_int(4, hs as i32);
+            instructions.push(inst);
+        }
     }
 
     /// Update per-step fields (token_id, position) and upload only changed instructions.

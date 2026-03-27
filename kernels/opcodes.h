@@ -30,3 +30,4 @@
 #define OP_LINEAR_PROJ_RNF4  25
 #define OP_LINEAR_PROJ_PCG32 26
 #define OP_RMSNORM_WX   27  // w*x variant (Llama, OLMoE) vs (1+w)*x (Qwen3.5)
+#define OP_SILU_MUL     28  // output[i] = silu(gate[i]) * up[i]
