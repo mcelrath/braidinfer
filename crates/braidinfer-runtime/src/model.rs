@@ -86,7 +86,7 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
     // mrope sections (pairs)
-    pub mrope_section: [usize; 3],
+    pub mrope_section: [usize; 3],  // TODO(kvn.1): redundant with rope_type.sections, unify during split
     // GDN config
     pub linear_num_heads: usize,       // num_key_heads for GDN
     pub linear_num_value_heads: usize,  // may differ from linear_num_heads (e.g. 4B: 32 vs 16)
@@ -96,7 +96,7 @@ pub struct ModelConfig {
     // Per-layer config: layer type + FFN type
     pub layers: Vec<LayerConfig>,
     // Legacy compat (derived from layers)
-    pub layer_is_attention: Vec<bool>,
+    pub layer_is_attention: Vec<bool>,  // TODO(kvn.1): derive from layers vec during model.rs split
     pub max_seq_len: usize,
     // MoE config (global defaults, may be overridden per-layer)
     pub num_experts: usize,
@@ -1364,6 +1364,9 @@ impl Model {
         }
 
         // Run 3 conv1d operations using pre-split weight buffers from the layer
+        // SAFETY: Raw pointers break the borrow on self.layers so we can mutably access
+        // self.activations. The pointers remain valid because layers[layer_idx] is not
+        // modified or moved during this function call.
         let (conv_w_q_ptr, conv_w_k_ptr, conv_w_v_ptr) = match &self.layers[layer_idx] {
             LayerWeights::Gdn(w) => (
                 &w.conv1d_weight_q as *const DeviceBuffer<u16>,
@@ -1540,7 +1543,8 @@ impl Model {
         let ne = moe.num_experts;
         let eps = self.config.rms_norm_eps;
 
-        // Get post_norm weight from the layer
+        // SAFETY: Raw pointer breaks borrow on self.layers to allow mutable access to
+        // self.activations. Pointer valid for duration of this function (layers not modified).
         let post_norm = match &self.layers[layer_idx] {
             LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
             LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
@@ -1696,6 +1700,8 @@ impl Model {
         let _max_sl = cfg.max_seq_len as u32;
 
         // 1. RMSNorm
+        // SAFETY: Raw pointer breaks borrow on self.layers for mutable self.activations access.
+        // Pointer valid: layers not modified during attention_forward.
         let input_norm = match &self.layers[layer_idx] {
             LayerWeights::Attention(w) => &w.input_norm as *const DeviceBuffer<u16>,
             _ => panic!("expected attention layer"),
@@ -1967,6 +1973,8 @@ impl Model {
             if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. }) {
                 self.moe_ffn_forward(layer_i)?;
             } else {
+                // SAFETY: Raw pointers break borrow on self.layers for mutable self.activations.
+                // as_bf16() panics if weights are quantized — only called for non-MoE (bf16) layers.
                 let (post_norm, w_gate, w_up, w_down) = match &self.layers[layer_i] {
                     LayerWeights::Attention(w) => (&w.post_norm, w.w_gate.as_bf16(), w.w_up.as_bf16(), w.w_down.as_bf16()),
                     LayerWeights::Gdn(w) => (&w.post_norm, w.w_gate.as_bf16(), w.w_up.as_bf16(), w.w_down.as_bf16()),
