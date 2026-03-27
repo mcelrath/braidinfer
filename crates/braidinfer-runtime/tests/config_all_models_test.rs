@@ -10,6 +10,7 @@ fn test_parse_all_hf_models() {
     // Universal parser — try ALL model types (skip non-decoder models)
     let skip_types = [
         "bert", "roberta", "t5", "nvembed", "llama_bidirec",  // encoder/embedding models
+        "nemotron_parse",  // no hidden_size — uses nested text_encoder_config
     ];
 
     let mut passed = 0;

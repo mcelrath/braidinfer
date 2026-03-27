@@ -182,7 +182,9 @@ impl ModelConfig {
         let model_type = get_str("model_type").unwrap_or_default();
         let hidden_size = get_usize("hidden_size")
             .or(get_usize("n_embd"))
+            .or(get_usize("n_embed"))  // bloom
             .or(get_usize("d_model"))
+            .or(get_usize("model_dim"))  // openelm
             .ok_or("missing hidden_size")?;
         let num_layers = get_usize("num_hidden_layers")
             .or(get_usize("n_layer"))
