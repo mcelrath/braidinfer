@@ -4,16 +4,25 @@ GPU-native LLM inference engine in Rust + HIP, targeting AMD RDNA3 (gfx1100, 790
 
 ## GPU Binary Launch Requirements
 
-**MANDATORY**: Always use `scripts/launch-gpu.py` to run any command that uses GPUs. This includes cargo tests, benchmarks, profiling, and any binary that touches HIP. No exceptions.
+**MANDATORY**: Always use `scripts/launch-gpu.py` to run any command that uses GPUs. This includes cargo tests, benchmarks, profiling, and any binary that touches HIP. **No exceptions. No workarounds.**
 
 **Why**: Multiple users/sessions share the GPUs. Direct invocation skips GPU reservation (flock), risks VRAM conflicts, and leaves orphaned processes.
+
+### How to use it
+
+The launch script wraps your command. Everything after `--` is the command to run:
 
 ```bash
 # Run a test:
 python3 scripts/launch-gpu.py --timeout 300 -- \
   cargo test -p braidinfer-runtime --test megakernel_test -- --nocapture
 
-# Run benchmarks:
+# Run a binary with env vars (env vars go BEFORE python3):
+MODEL=/path/to/model RAW=1 MAX_TOKENS=20 \
+  python3 scripts/launch-gpu.py --timeout 120 -- \
+  cargo run --release -p braidinfer-runtime --bin generate -- "Hello"
+
+# Run benchmarks (longer timeout):
 python3 scripts/launch-gpu.py --timeout 600 -- \
   cargo test -p braidinfer-runtime --test bench_decode -- --nocapture
 
@@ -27,7 +36,18 @@ python3 scripts/launch-gpu.py --cleanup
 
 **GPU waiting is automatic**: The script blocks until GPUs are free (polls every 5s, 1hr timeout). Do NOT manually check with `rocm-smi`. Set `Bash timeout=600000` to allow wait time.
 
+### PROHIBITED patterns
+
+| Anti-pattern | Why it's wrong |
+|---|---|
+| `HIP_VISIBLE_DEVICES=0 cargo run ...` | Bypasses reservation, risks VRAM conflict |
+| `bash -c 'cargo run ... & PID=$!; rocm-smi'` | Subshell bypasses reservation |
+| `cargo test ... && rocm-smi` | Direct GPU access without reservation |
+| Running rocm-smi to check GPU state | launch-gpu.py handles this; manual checks race |
+
 **If the script doesn't support what you need**: STOP. Do not bypass. Tell the user.
+
+**If you need in-process measurements** (e.g., VRAM after model load): Add reporting to the binary itself (e.g., print VRAM usage from within Rust), don't try to race external tools against the process.
 
 ## Build
 
