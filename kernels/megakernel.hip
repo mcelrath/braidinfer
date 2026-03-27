@@ -26,6 +26,7 @@
 //   [15]: arg14
 
 #include "opcodes.h"
+#include "quant_consts.h"
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
 
@@ -47,6 +48,9 @@ __device__ __forceinline__ float* inst_fptr(const u64* inst, int idx) {
 }
 __device__ __forceinline__ const unsigned short* inst_u16ptr(const u64* inst, int idx) {
     return (const unsigned short*)(inst[idx]);
+}
+__device__ __forceinline__ const void* inst_ptr(const u64* inst, int idx) {
+    return (const void*)(inst[idx]);
 }
 __device__ __forceinline__ int inst_int(const u64* inst, int idx) {
     return (int)(inst[idx]);
@@ -197,6 +201,138 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
             if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
             __syncthreads();
         }
+    }
+}
+
+// OP_LINEAR_PROJ_RNF4: y = W_rnf4 @ x (one virtual block per output row, decode only)
+// args: [1]=output, [2]=weight (packed rnf4), [3]=input, [4]=out_dim, [5]=in_dim
+// Weight layout per row: groups of 128 elements, each 132 bytes.
+__device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
+    const float* input = inst_fptr(inst, 3);
+    int out_dim = inst_int(inst, 4);
+    int in_dim = inst_int(inst, 5);
+
+    int row = vblock;
+    if (row >= out_dim) return;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 128;
+    const int group_bytes = 132;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+
+    float acc = 0.0f;
+    for (int g = tid; g < num_groups; g += stride) {
+        const unsigned char* gp = row_data + g * group_bytes;
+        const unsigned char* idx1_packed = gp;
+        float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+        const unsigned char* idx2_packed = gp + 66;
+        float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+
+        int base = g * group_size;
+        int count = min(group_size, in_dim - base);
+        for (int i = 0; i < count; i += 2) {
+            unsigned char b1 = idx1_packed[i / 2];
+            unsigned char b2 = idx2_packed[i / 2];
+            float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+            acc += v0 * input[base + i];
+            if (i + 1 < count) {
+                float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+                acc += v1 * input[base + i + 1];
+            }
+        }
+    }
+
+    extern __shared__ float shared[];
+    shared[tid] = acc;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) output[row] = shared[0];
+}
+
+// OP_LINEAR_PROJ_PCG32: y = W_pcg32 @ x (one virtual block per output row, decode only)
+// args: [1]=output, [2]=weight (packed pcg32), [3]=input, [4]=out_dim, [5]=in_dim
+// Weight layout per row: groups of 32 elements, each 20 bytes.
+__device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
+    const float* input = inst_fptr(inst, 3);
+    int out_dim = inst_int(inst, 4);
+    int in_dim = inst_int(inst, 5);
+
+    int row = vblock;
+    if (row >= out_dim) return;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 32;
+    const int group_bytes = 20;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+
+    float acc = 0.0f;
+    for (int g = tid; g < num_groups; g += stride) {
+        const unsigned char* gp = row_data + g * group_bytes;
+        float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+        float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+
+        int base = g * group_size;
+        int count = min(group_size, in_dim - base);
+        for (int i = 0; i < count; i += 2) {
+            unsigned char byte = gp[i / 2];
+            float v0 = (float)(byte & 0xF) * sc + mn;
+            acc += v0 * input[base + i];
+            if (i + 1 < count) {
+                float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                acc += v1 * input[base + i + 1];
+            }
+        }
+    }
+
+    extern __shared__ float shared[];
+    shared[tid] = acc;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) output[row] = shared[0];
+}
+
+// OP_RMSNORM_WX: y = x * w / sqrt(mean(x^2) + eps) — standard w*x variant (Llama, OLMoE)
+// Same args as OP_RMSNORM: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
+__device__ void op_rmsnorm_wx(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* input = inst_fptr(inst, 2);
+    const unsigned short* weight = inst_u16ptr(inst, 3);
+    int hidden_size = inst_int(inst, 4);
+    float eps = __int_as_float(inst_int(inst, 5));
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_size; i += stride) {
+        float val = input[i];
+        sum_sq += val * val;
+    }
+    extern __shared__ float shared[];
+    shared[tid] = sum_sq;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(shared[0] / (float)hidden_size + eps);
+
+    for (int i = tid; i < hidden_size; i += stride) {
+        output[i] = input[i] * rms * bf16_to_f32(weight[i]);
     }
 }
 
@@ -1451,6 +1587,9 @@ extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
                 case OP_KV_QUANTIZE:  op_kv_quantize(inst, vb); break;
                 case OP_ATTN_PAGED_Q: op_attn_paged_quant(inst, vb); break;
                 case OP_MOE_GATE:    op_moe_gate(inst, vb); break;
+                case OP_LINEAR_PROJ_RNF4:  op_linear_proj_rnf4(inst, vb); break;
+                case OP_LINEAR_PROJ_PCG32: op_linear_proj_pcg32(inst, vb); break;
+                case OP_RMSNORM_WX: op_rmsnorm_wx(inst, vb); break;
                 default: break;
             }
         }

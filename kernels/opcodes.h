@@ -27,3 +27,6 @@
 #define OP_ATTN_PAGED_Q 22
 #define OP_MOE_GATE     23
 #define OP_MOE_FFN      24  // Reserved — MoE uses kernel-by-kernel dispatch (see braidinfer-cea.7)
+#define OP_LINEAR_PROJ_RNF4  25
+#define OP_LINEAR_PROJ_PCG32 26
+#define OP_RMSNORM_WX   27  // w*x variant (Llama, OLMoE) vs (1+w)*x (Qwen3.5)
