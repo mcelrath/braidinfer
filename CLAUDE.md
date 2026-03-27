@@ -34,7 +34,20 @@ python3 scripts/launch-gpu.py --status
 python3 scripts/launch-gpu.py --cleanup
 ```
 
-**GPU waiting is automatic**: The script blocks until GPUs are free (polls every 5s, 1hr timeout). Do NOT manually check with `rocm-smi`. Set `Bash timeout=600000` to allow wait time.
+**GPU waiting is automatic**: The script blocks until GPUs are free (polls every 5s). GPUs may be busy for hours — that is expected and correct. Never reduce timeouts to work around busy GPUs.
+
+### Always launch as background Bash with run_in_background
+
+GPUs may not be available immediately. **Always** launch GPU commands as background tasks so you get notified when they complete, rather than blocking your context window:
+
+```bash
+# CORRECT: background task, long timeout, notified on completion
+python3 scripts/launch-gpu.py --timeout 43200 -- \
+  cargo run --release -p braidinfer-runtime --bin generate -- "Hello"
+```
+Use `Bash run_in_background=true` and `timeout=600000`. The launch script waits for a free GPU (up to 12 hours with `--timeout 43200`), runs the command, then the background task completes and you're notified.
+
+**Do NOT** set short timeouts hoping GPUs free up soon. Do NOT poll or check GPU status. Do NOT try alternative GPUs. The script handles all of this.
 
 ### PROHIBITED patterns
 
@@ -44,6 +57,9 @@ python3 scripts/launch-gpu.py --cleanup
 | `bash -c 'cargo run ... & PID=$!; rocm-smi'` | Subshell bypasses reservation |
 | `cargo test ... && rocm-smi` | Direct GPU access without reservation |
 | Running rocm-smi to check GPU state | launch-gpu.py handles this; manual checks race |
+| Short timeouts (`--timeout 60`) when GPUs are busy | GPUs may be busy for hours; use `--timeout 43200` |
+| Checking VRAM to see if GPUs are "almost free" | The script polls automatically; don't second-guess it |
+| Trying different `HIP_VISIBLE_DEVICES` values | The script selects the best GPU; manual selection conflicts |
 
 **If the script doesn't support what you need**: STOP. Do not bypass. Tell the user.
 
