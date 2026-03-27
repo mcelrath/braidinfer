@@ -221,6 +221,7 @@ pub struct Model {
     paged_seq: Option<SequenceState>,
     checkpoint_pool: Option<RecurrentCheckpointPool>,
     last_checkpoint_slot: Option<u32>,
+    trace: Option<crate::trace::TraceWriter>,
 }
 
 // ---- Error type ----
@@ -926,6 +927,9 @@ impl Model {
             paged_seq: None,
             checkpoint_pool: None,
             last_checkpoint_slot: None,
+            trace: std::env::var("TRACE").ok().and_then(|path| {
+                crate::trace::TraceWriter::open(&path).ok()
+            }),
         })
     }
 
@@ -1551,7 +1555,7 @@ impl Model {
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-        if has_moe {
+        if has_moe || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
 
@@ -1588,6 +1592,13 @@ impl Model {
             token_id as i32, hs, &self.stream,
         )?;
 
+        if self.trace.is_some() {
+            self.stream.synchronize()?;
+            let mut buf = vec![0.0f32; self.config.hidden_size];
+            self.activations.hidden.copy_to_host(&mut buf)?;
+            self.trace.as_mut().unwrap().write_checkpoint("embed", &buf);
+        }
+
         // Process each layer
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
@@ -1602,6 +1613,13 @@ impl Model {
                     gdn_idx += 1;
                 }
                 _ => panic!("unsupported layer type for MoE decode"),
+            }
+
+            if self.trace.is_some() {
+                self.stream.synchronize()?;
+                let mut buf = vec![0.0f32; self.config.hidden_size];
+                self.activations.hidden.copy_to_host(&mut buf)?;
+                self.trace.as_mut().unwrap().write_checkpoint(&format!("L{layer_i}.post_attn"), &buf);
             }
 
             // FFN: dense or MoE
@@ -1668,6 +1686,13 @@ impl Model {
                         hs as u32, &self.stream)?;
                 }
             }
+
+            if self.trace.is_some() {
+                self.stream.synchronize()?;
+                let mut buf = vec![0.0f32; self.config.hidden_size];
+                self.activations.hidden.copy_to_host(&mut buf)?;
+                self.trace.as_mut().unwrap().write_checkpoint(&format!("L{layer_i}.post_ffn"), &buf);
+            }
         }
 
         // Final RMSNorm
@@ -1695,6 +1720,21 @@ impl Model {
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
+
+        if self.trace.is_some() {
+            // Capture final_norm hidden state
+            let mut norm_buf = vec![0.0f32; self.config.hidden_size];
+            self.activations.normed.copy_to_host(&mut norm_buf)?;
+            self.trace.as_mut().unwrap().write_checkpoint("final_norm", &norm_buf);
+
+            // Capture top-10 logits (token_id + value pairs as f32)
+            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top10: Vec<f32> = indexed.iter().take(10)
+                .flat_map(|&(id, val)| [id as f32, val])
+                .collect();
+            self.trace.as_mut().unwrap().write_checkpoint("top10_logits", &top10);
+        }
 
         self.seq_len = position + 1;
         Ok(logits)
