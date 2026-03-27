@@ -734,6 +734,124 @@ fn load_linear_weight(
     }
 }
 
+/// Quantize a host bf16 buffer to a LinearWeight on GPU.
+fn host_bf16_to_linear_weight(
+    host_buf: &[u16],
+    out_dim: usize,
+    in_dim: usize,
+    fmt: WeightFormat,
+    device: DeviceId,
+) -> Result<LinearWeight, ModelError> {
+    match fmt {
+        WeightFormat::Bf16 => {
+            let mut buf = DeviceBuffer::<u16>::alloc(device, host_buf.len())?;
+            buf.copy_from_host(host_buf)?;
+            Ok(LinearWeight::Bf16(buf))
+        }
+        fmt => {
+            let packed = if fmt == WeightFormat::Rnf4G128 {
+                quantize_rnf4_g128(host_buf, out_dim, in_dim)
+            } else {
+                quantize_pc_g32_q4(host_buf, out_dim, in_dim)
+            };
+            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+            buf.copy_from_host(&packed)?;
+            Ok(LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim, in_dim }))
+        }
+    }
+}
+
+/// Load all MoE weights for a single layer (gate, experts, shared expert).
+fn load_moe_weights(
+    st: &SafeTensorSet,
+    prefix: &str,
+    config: &ModelConfig,
+    ffn_type: &FfnType,
+    device: DeviceId,
+    wq: WeightQuantMode,
+) -> Result<MoeWeights, ModelError> {
+    let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = ffn_type
+        else { unreachable!("load_moe_weights called on non-MoE layer") };
+    let ne = *num_experts;
+    let eis = *expert_intermediate_size;
+    let hs = config.hidden_size;
+
+    // Router gate: try mlp.gate, block_sparse_moe.gate, mlp.router (always bf16)
+    let gate_name = [
+        format!("{prefix}mlp.gate.weight"),
+        format!("{prefix}block_sparse_moe.gate.weight"),
+        format!("{prefix}mlp.router.weight"),
+    ].into_iter().find(|n| st.tensor_data(n).is_ok())
+        .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.gate.weight (or variants)")))?;
+    let gate = load_weight_bf16(st, &gate_name, device, ne * hs)?;
+
+    let expert_fmt = weight_format_for(&format!("{prefix}mlp.experts.0.gate_proj.weight"), wq);
+
+    // Expert gate+up: try fused tensor, else per-expert fuse on host
+    let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
+    let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
+        load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
+    } else {
+        let expert_elems = 2 * eis * hs;
+        let mut host_buf = vec![0u16; ne * expert_elems];
+        for e in 0..ne {
+            let (gp, up) = [
+                (format!("{prefix}mlp.experts.{e}.gate_proj.weight"), format!("{prefix}mlp.experts.{e}.up_proj.weight")),
+                (format!("{prefix}block_sparse_moe.experts.{e}.w1.weight"), format!("{prefix}block_sparse_moe.experts.{e}.w3.weight")),
+            ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
+                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.experts.{e}.gate_proj.weight (or variants)")))?;
+            let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
+            let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
+            let dst_off = e * expert_elems;
+            let g_slice = unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
+            let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
+            host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
+            host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
+        }
+        host_bf16_to_linear_weight(&host_buf, ne * 2 * eis, hs, expert_fmt, device)?
+    };
+
+    // Expert down: try fused tensor, else per-expert load
+    let down_name = format!("{prefix}mlp.experts.down_proj");
+    let expert_down = if st.tensor_data(&down_name).is_ok() {
+        load_linear_weight(st, &down_name, device, ne * hs, eis, wq)?
+    } else {
+        let expert_elems_d = hs * eis;
+        let mut host_buf_d = vec![0u16; ne * expert_elems_d];
+        for e in 0..ne {
+            let dp = [
+                format!("{prefix}mlp.experts.{e}.down_proj.weight"),
+                format!("{prefix}block_sparse_moe.experts.{e}.w2.weight"),
+            ].into_iter().find(|n| st.tensor_data(n).is_ok())
+                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.down_proj (or variants)")))?;
+            let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
+            let d_slice = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d) };
+            let dst_off = e * expert_elems_d;
+            host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
+        }
+        host_bf16_to_linear_weight(&host_buf_d, ne * hs, eis, expert_fmt, device)?
+    };
+
+    // Shared expert (optional)
+    let shared_expert = if *num_shared > 0 {
+        let sis = *shared_intermediate_size;
+        let sis = if sis == 0 { eis } else { sis };
+        Some(DenseFfnWeights {
+            gate_proj: load_linear_weight(st, &format!("{prefix}mlp.shared_expert.gate_proj.weight"), device, sis, hs, wq)?,
+            up_proj: load_linear_weight(st, &format!("{prefix}mlp.shared_expert.up_proj.weight"), device, sis, hs, wq)?,
+            down_proj: load_linear_weight(st, &format!("{prefix}mlp.shared_expert.down_proj.weight"), device, hs, sis, wq)?,
+        })
+    } else { None };
+
+    // Shared expert gate (optional)
+    let shared_gate_name = format!("{prefix}mlp.shared_expert_gate.weight");
+    let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
+        Some(load_weight_bf16(st, &shared_gate_name, device, hs)?)
+    } else { None };
+
+    Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate, num_experts: ne, expert_intermediate_size: eis })
+}
+
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
 /// Only used for the few tensors that need f32 on the GPU (A_log, output_norm).
 fn load_weight_f32(
@@ -987,132 +1105,7 @@ impl Model {
 
                 // Load MoE weights if this layer uses MoE FFN
                 if is_moe {
-                    if let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = &config.layers[i].ffn_type {
-                        let ne = *num_experts;
-                        let eis = *expert_intermediate_size;
-                        let hs = config.hidden_size;
-
-                        // Router gate: try mlp.gate, block_sparse_moe.gate, mlp.router
-                        let gate_name = [
-                            format!("{p}mlp.gate.weight"),
-                            format!("{p}block_sparse_moe.gate.weight"),
-                            format!("{p}mlp.router.weight"),
-                        ].into_iter().find(|n| st.tensor_data(n).is_ok())
-                            .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.gate.weight (or variants)")))?;
-                        let gate = load_weight_bf16(&st, &gate_name, device, ne * hs)?;
-
-                        // Expert weights: try fused, then per-expert with multiple name patterns
-                        let fused_name = format!("{p}mlp.experts.gate_up_proj");
-                        // Determine expert weight format
-                        let expert_fmt = weight_format_for(&format!("{p}mlp.experts.0.gate_proj.weight"), wq);
-
-                        let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
-                            load_linear_weight(&st, &fused_name, device, ne * 2 * eis, hs, wq)?
-                        } else {
-                            // Per-expert: fuse gate_proj + up_proj on host, then quantize + copy
-                            let expert_elems = 2 * eis * hs;
-                            let mut host_buf = vec![0u16; ne * expert_elems];
-                            for e in 0..ne {
-                                let (gp, up) = [
-                                    (format!("{p}mlp.experts.{e}.gate_proj.weight"), format!("{p}mlp.experts.{e}.up_proj.weight")),
-                                    (format!("{p}block_sparse_moe.experts.{e}.w1.weight"), format!("{p}block_sparse_moe.experts.{e}.w3.weight")),
-                                ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
-                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.experts.{e}.gate_proj.weight (or variants)")))?;
-                                let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
-                                let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
-                                let dst_off = e * expert_elems;
-                                let g_slice = unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
-                                let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
-                                host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
-                                host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
-                            }
-                            // Quantize the fused host buffer, treating all experts as one big [ne*2*eis, hs] matrix
-                            match expert_fmt {
-                                WeightFormat::Bf16 => {
-                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
-                                    buf.copy_from_host(&host_buf)?;
-                                    LinearWeight::Bf16(buf)
-                                }
-                                WeightFormat::Rnf4G128 => {
-                                    let packed = quantize_rnf4_g128(&host_buf, ne * 2 * eis, hs);
-                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
-                                    buf.copy_from_host(&packed)?;
-                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * 2 * eis, in_dim: hs })
-                                }
-                                WeightFormat::PcG32Q4 => {
-                                    let packed = quantize_pc_g32_q4(&host_buf, ne * 2 * eis, hs);
-                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
-                                    buf.copy_from_host(&packed)?;
-                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * 2 * eis, in_dim: hs })
-                                }
-                            }
-                        };
-
-                        let down_name = format!("{p}mlp.experts.down_proj");
-                        let expert_down = if st.tensor_data(&down_name).is_ok() {
-                            load_linear_weight(&st, &down_name, device, ne * hs, eis, wq)?
-                        } else {
-                            let expert_elems_d = hs * eis;
-                            let mut host_buf_d = vec![0u16; ne * expert_elems_d];
-                            for e in 0..ne {
-                                let dp = [
-                                    format!("{p}mlp.experts.{e}.down_proj.weight"),
-                                    format!("{p}block_sparse_moe.experts.{e}.w2.weight"),
-                                ].into_iter().find(|n| st.tensor_data(n).is_ok())
-                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.down_proj (or variants)")))?;
-                                let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
-                                let d_slice = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d) };
-                                let dst_off = e * expert_elems_d;
-                                host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
-                            }
-                            match expert_fmt {
-                                WeightFormat::Bf16 => {
-                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
-                                    buf.copy_from_host(&host_buf_d)?;
-                                    LinearWeight::Bf16(buf)
-                                }
-                                WeightFormat::Rnf4G128 => {
-                                    let packed = quantize_rnf4_g128(&host_buf_d, ne * hs, eis);
-                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
-                                    buf.copy_from_host(&packed)?;
-                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * hs, in_dim: eis })
-                                }
-                                WeightFormat::PcG32Q4 => {
-                                    let packed = quantize_pc_g32_q4(&host_buf_d, ne * hs, eis);
-                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
-                                    buf.copy_from_host(&packed)?;
-                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * hs, in_dim: eis })
-                                }
-                            }
-                        };
-
-                        // Shared expert
-                        let shared_expert = if *num_shared > 0 {
-                            let sis = *shared_intermediate_size;
-                            let sis = if sis == 0 { eis } else { sis };
-                            Some(DenseFfnWeights {
-                                gate_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis, hs, wq)?,
-                                up_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis, hs, wq)?,
-                                down_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs, sis, wq)?,
-                            })
-                        } else { None };
-
-                        // Shared expert gate (optional, e.g. Qwen3.5-122B has shared_expert_gate)
-                        let shared_gate_name = format!("{p}mlp.shared_expert_gate.weight");
-                        let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
-                            Some(load_weight_bf16(&st, &shared_gate_name, device, hs)?)
-                        } else { None };
-
-                        moe_weights_vec[i] = Some(MoeWeights {
-                            gate,
-                            expert_gate_up,
-                            expert_down,
-                            shared_expert,
-                            shared_expert_gate,
-                            num_experts: ne,
-                            expert_intermediate_size: eis,
-                        });
-                    }
+                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq)?);
                 }
             } else {
                 let nh = config.linear_num_heads;
@@ -1170,110 +1163,7 @@ impl Model {
 
                 // Load MoE weights for GDN layers with MoE FFN (e.g. Qwen3.5-122B)
                 if is_moe {
-                    if let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = &config.layers[i].ffn_type {
-                        let ne = *num_experts;
-                        let eis = *expert_intermediate_size;
-                        let hs = config.hidden_size;
-
-                        let gate_name = [
-                            format!("{p}mlp.gate.weight"),
-                            format!("{p}block_sparse_moe.gate.weight"),
-                            format!("{p}mlp.router.weight"),
-                        ].into_iter().find(|n| st.tensor_data(n).is_ok())
-                            .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.gate.weight (GDN MoE)")))?;
-                        let gate = load_weight_bf16(&st, &gate_name, device, ne * hs)?;
-
-                        let expert_fmt = weight_format_for(&format!("{p}mlp.experts.0.gate_proj.weight"), wq);
-                        let fused_name = format!("{p}mlp.experts.gate_up_proj");
-                        let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
-                            load_linear_weight(&st, &fused_name, device, ne * 2 * eis, hs, wq)?
-                        } else {
-                            let expert_elems = 2 * eis * hs;
-                            let mut host_buf = vec![0u16; ne * expert_elems];
-                            for e in 0..ne {
-                                let (gp, up) = [
-                                    (format!("{p}mlp.experts.{e}.gate_proj.weight"), format!("{p}mlp.experts.{e}.up_proj.weight")),
-                                    (format!("{p}block_sparse_moe.experts.{e}.w1.weight"), format!("{p}block_sparse_moe.experts.{e}.w3.weight")),
-                                ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
-                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.gate_proj (GDN MoE)")))?;
-                                let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
-                                let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
-                                let dst_off = e * expert_elems;
-                                let g_slice = unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
-                                let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
-                                host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
-                                host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
-                            }
-                            match expert_fmt {
-                                WeightFormat::Bf16 => {
-                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
-                                    buf.copy_from_host(&host_buf)?;
-                                    LinearWeight::Bf16(buf)
-                                }
-                                fmt => {
-                                    let packed = if fmt == WeightFormat::Rnf4G128 { quantize_rnf4_g128(&host_buf, ne * 2 * eis, hs) }
-                                                 else { quantize_pc_g32_q4(&host_buf, ne * 2 * eis, hs) };
-                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
-                                    buf.copy_from_host(&packed)?;
-                                    LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim: ne * 2 * eis, in_dim: hs })
-                                }
-                            }
-                        };
-
-                        let down_name = format!("{p}mlp.experts.down_proj");
-                        let expert_down = if st.tensor_data(&down_name).is_ok() {
-                            load_linear_weight(&st, &down_name, device, ne * hs, eis, wq)?
-                        } else {
-                            let expert_elems_d = hs * eis;
-                            let mut host_buf_d = vec![0u16; ne * expert_elems_d];
-                            for e in 0..ne {
-                                let dp = [
-                                    format!("{p}mlp.experts.{e}.down_proj.weight"),
-                                    format!("{p}block_sparse_moe.experts.{e}.w2.weight"),
-                                ].into_iter().find(|n| st.tensor_data(n).is_ok())
-                                    .ok_or_else(|| ModelError::MissingWeight(format!("{p}experts.{e}.down_proj (or variants)")))?;
-                                let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
-                                let d_slice = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d) };
-                                let dst_off = e * expert_elems_d;
-                                host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
-                            }
-                            match expert_fmt {
-                                WeightFormat::Bf16 => {
-                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
-                                    buf.copy_from_host(&host_buf_d)?;
-                                    LinearWeight::Bf16(buf)
-                                }
-                                fmt => {
-                                    let packed = if fmt == WeightFormat::Rnf4G128 { quantize_rnf4_g128(&host_buf_d, ne * hs, eis) }
-                                                 else { quantize_pc_g32_q4(&host_buf_d, ne * hs, eis) };
-                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
-                                    buf.copy_from_host(&packed)?;
-                                    LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim: ne * hs, in_dim: eis })
-                                }
-                            }
-                        };
-
-                        let shared_expert = if *num_shared > 0 {
-                            let sis = *shared_intermediate_size;
-                            let sis = if sis == 0 { eis } else { sis };
-                            Some(DenseFfnWeights {
-                                gate_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis, hs, wq)?,
-                                up_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis, hs, wq)?,
-                                down_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs, sis, wq)?,
-                            })
-                        } else { None };
-
-                        let shared_gate_name = format!("{p}mlp.shared_expert_gate.weight");
-                        let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
-                            Some(load_weight_bf16(&st, &shared_gate_name, device, hs)?)
-                        } else { None };
-
-                        moe_weights_vec[i] = Some(MoeWeights {
-                            gate, expert_gate_up, expert_down,
-                            shared_expert, shared_expert_gate,
-                            num_experts: ne, expert_intermediate_size: eis,
-                        });
-                    }
+                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq)?);
                 }
             }
         }
