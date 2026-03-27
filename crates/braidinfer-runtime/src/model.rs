@@ -434,16 +434,16 @@ pub struct FullLayerWeights {
 
 /// Dense FFN weights (gate_proj + up_proj + down_proj)
 pub struct DenseFfnWeights {
-    pub gate_proj: DeviceBuffer<u16>,
-    pub up_proj: DeviceBuffer<u16>,
-    pub down_proj: DeviceBuffer<u16>,
+    pub gate_proj: LinearWeight,
+    pub up_proj: LinearWeight,
+    pub down_proj: LinearWeight,
 }
 
 /// MoE FFN weights for one layer
 pub struct MoeWeights {
-    pub gate: DeviceBuffer<u16>,                    // [num_experts, hidden_size] — router
-    pub expert_gate_up: DeviceBuffer<u16>,           // [num_experts, 2*expert_is, hidden_size] fused
-    pub expert_down: DeviceBuffer<u16>,              // [num_experts, hidden_size, expert_is]
+    pub gate: DeviceBuffer<u16>,                    // [num_experts, hidden_size] — router, MUST stay bf16
+    pub expert_gate_up: LinearWeight,               // [num_experts, 2*expert_is, hidden_size] fused
+    pub expert_down: LinearWeight,                  // [num_experts, hidden_size, expert_is]
     pub shared_expert: Option<DenseFfnWeights>,      // always-on shared expert
     pub shared_expert_gate: Option<DeviceBuffer<u16>>, // [1, hidden_size] gate for shared expert
     pub num_experts: usize,
@@ -765,22 +765,46 @@ impl LinearWeight {
         }
     }
 
-    /// Compute byte offset for expert `expert_id` in a fused expert buffer.
-    /// For bf16: expert_id * elements_per_expert * 2.
-    /// For packed: expert_id * packed_bytes_per_expert.
-    pub fn expert_byte_offset(&self, expert_id: usize, elements_per_expert: usize) -> usize {
+    /// Compute byte offset for `row_start` rows into a [total_rows, in_dim] weight matrix.
+    /// For bf16: row_start * in_dim * 2.
+    /// For packed: row_start * packed_bytes_per_row.
+    pub fn row_byte_offset(&self, row_start: usize) -> usize {
         match self {
-            LinearWeight::Bf16(_) => expert_id * elements_per_expert * 2,
+            LinearWeight::Bf16(_) => {
+                // For bf16 LinearWeight we don't store in_dim, use elements
+                panic!("use row_byte_offset_with_dim for Bf16")
+            }
             LinearWeight::Packed(pw) => {
+                let in_dim = pw.in_dim;
                 match pw.format {
-                    WeightFormat::Bf16 => expert_id * elements_per_expert * 2,
+                    WeightFormat::Bf16 => row_start * in_dim * 2,
                     WeightFormat::Rnf4G128 => {
-                        let groups_per_expert = (elements_per_expert + 127) / 128;
-                        expert_id * groups_per_expert * 132
+                        let groups_per_row = (in_dim + 127) / 128;
+                        row_start * groups_per_row * 132
                     }
                     WeightFormat::PcG32Q4 => {
-                        let groups_per_expert = (elements_per_expert + 31) / 32;
-                        expert_id * groups_per_expert * 20
+                        let groups_per_row = (in_dim + 31) / 32;
+                        row_start * groups_per_row * 20
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compute byte offset for `row_start` rows, with explicit in_dim.
+    pub fn row_byte_offset_dim(&self, row_start: usize, in_dim: usize) -> usize {
+        match self {
+            LinearWeight::Bf16(_) => row_start * in_dim * 2,
+            LinearWeight::Packed(pw) => {
+                match pw.format {
+                    WeightFormat::Bf16 => row_start * in_dim * 2,
+                    WeightFormat::Rnf4G128 => {
+                        let groups_per_row = (in_dim + 127) / 128;
+                        row_start * groups_per_row * 132
+                    }
+                    WeightFormat::PcG32Q4 => {
+                        let groups_per_row = (in_dim + 31) / 32;
+                        row_start * groups_per_row * 20
                     }
                 }
             }
@@ -1286,11 +1310,14 @@ impl Model {
 
                         // Expert weights: try fused, then per-expert with multiple name patterns
                         let fused_name = format!("{p}mlp.experts.gate_up_proj");
+                        // Determine expert weight format
+                        let expert_fmt = weight_format_for(&format!("{p}mlp.experts.0.gate_proj.weight"), wq);
+
                         let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
-                            load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
+                            load_linear_weight(&st, &fused_name, device, ne * 2 * eis, hs, wq)?
                         } else {
-                            // Per-expert: fuse gate_proj + up_proj on host, then copy to GPU
-                            let expert_elems = 2 * eis * hs; // per expert
+                            // Per-expert: fuse gate_proj + up_proj on host, then quantize + copy
+                            let expert_elems = 2 * eis * hs;
                             let mut host_buf = vec![0u16; ne * expert_elems];
                             for e in 0..ne {
                                 let (gp, up) = [
@@ -1306,14 +1333,31 @@ impl Model {
                                 host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
                                 host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
                             }
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
-                            buf.copy_from_host(&host_buf)?;
-                            buf
+                            // Quantize the fused host buffer, treating all experts as one big [ne*2*eis, hs] matrix
+                            match expert_fmt {
+                                WeightFormat::Bf16 => {
+                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
+                                    buf.copy_from_host(&host_buf)?;
+                                    LinearWeight::Bf16(buf)
+                                }
+                                WeightFormat::Rnf4G128 => {
+                                    let packed = quantize_rnf4_g128(&host_buf, ne * 2 * eis, hs);
+                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+                                    buf.copy_from_host(&packed)?;
+                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * 2 * eis, in_dim: hs })
+                                }
+                                WeightFormat::PcG32Q4 => {
+                                    let packed = quantize_pc_g32_q4(&host_buf, ne * 2 * eis, hs);
+                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+                                    buf.copy_from_host(&packed)?;
+                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * 2 * eis, in_dim: hs })
+                                }
+                            }
                         };
 
                         let down_name = format!("{p}mlp.experts.down_proj");
                         let expert_down = if st.tensor_data(&down_name).is_ok() {
-                            load_weight_bf16(&st, &down_name, device, ne * hs * eis)?
+                            load_linear_weight(&st, &down_name, device, ne * hs, eis, wq)?
                         } else {
                             let expert_elems_d = hs * eis;
                             let mut host_buf_d = vec![0u16; ne * expert_elems_d];
@@ -1328,9 +1372,25 @@ impl Model {
                                 let dst_off = e * expert_elems_d;
                                 host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
                             }
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
-                            buf.copy_from_host(&host_buf_d)?;
-                            buf
+                            match expert_fmt {
+                                WeightFormat::Bf16 => {
+                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
+                                    buf.copy_from_host(&host_buf_d)?;
+                                    LinearWeight::Bf16(buf)
+                                }
+                                WeightFormat::Rnf4G128 => {
+                                    let packed = quantize_rnf4_g128(&host_buf_d, ne * hs, eis);
+                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+                                    buf.copy_from_host(&packed)?;
+                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * hs, in_dim: eis })
+                                }
+                                WeightFormat::PcG32Q4 => {
+                                    let packed = quantize_pc_g32_q4(&host_buf_d, ne * hs, eis);
+                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+                                    buf.copy_from_host(&packed)?;
+                                    LinearWeight::Packed(PackedWeights { data: buf, format: expert_fmt, out_dim: ne * hs, in_dim: eis })
+                                }
+                            }
                         };
 
                         // Shared expert
@@ -1338,9 +1398,9 @@ impl Model {
                             let sis = *shared_intermediate_size;
                             let sis = if sis == 0 { eis } else { sis };
                             Some(DenseFfnWeights {
-                                gate_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis * hs)?,
-                                up_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis * hs)?,
-                                down_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs * sis)?,
+                                gate_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis, hs, wq)?,
+                                up_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis, hs, wq)?,
+                                down_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs, sis, wq)?,
                             })
                         } else { None };
 
@@ -1430,9 +1490,10 @@ impl Model {
                             .ok_or_else(|| ModelError::MissingWeight(format!("{p}mlp.gate.weight (GDN MoE)")))?;
                         let gate = load_weight_bf16(&st, &gate_name, device, ne * hs)?;
 
+                        let expert_fmt = weight_format_for(&format!("{p}mlp.experts.0.gate_proj.weight"), wq);
                         let fused_name = format!("{p}mlp.experts.gate_up_proj");
                         let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
-                            load_weight_bf16(&st, &fused_name, device, ne * 2 * eis * hs)?
+                            load_linear_weight(&st, &fused_name, device, ne * 2 * eis, hs, wq)?
                         } else {
                             let expert_elems = 2 * eis * hs;
                             let mut host_buf = vec![0u16; ne * expert_elems];
@@ -1450,14 +1511,25 @@ impl Model {
                                 host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
                                 host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
                             }
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
-                            buf.copy_from_host(&host_buf)?;
-                            buf
+                            match expert_fmt {
+                                WeightFormat::Bf16 => {
+                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems)?;
+                                    buf.copy_from_host(&host_buf)?;
+                                    LinearWeight::Bf16(buf)
+                                }
+                                fmt => {
+                                    let packed = if fmt == WeightFormat::Rnf4G128 { quantize_rnf4_g128(&host_buf, ne * 2 * eis, hs) }
+                                                 else { quantize_pc_g32_q4(&host_buf, ne * 2 * eis, hs) };
+                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+                                    buf.copy_from_host(&packed)?;
+                                    LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim: ne * 2 * eis, in_dim: hs })
+                                }
+                            }
                         };
 
                         let down_name = format!("{p}mlp.experts.down_proj");
                         let expert_down = if st.tensor_data(&down_name).is_ok() {
-                            load_weight_bf16(&st, &down_name, device, ne * hs * eis)?
+                            load_linear_weight(&st, &down_name, device, ne * hs, eis, wq)?
                         } else {
                             let expert_elems_d = hs * eis;
                             let mut host_buf_d = vec![0u16; ne * expert_elems_d];
@@ -1472,18 +1544,29 @@ impl Model {
                                 let dst_off = e * expert_elems_d;
                                 host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
                             }
-                            let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
-                            buf.copy_from_host(&host_buf_d)?;
-                            buf
+                            match expert_fmt {
+                                WeightFormat::Bf16 => {
+                                    let mut buf = DeviceBuffer::<u16>::alloc(device, ne * expert_elems_d)?;
+                                    buf.copy_from_host(&host_buf_d)?;
+                                    LinearWeight::Bf16(buf)
+                                }
+                                fmt => {
+                                    let packed = if fmt == WeightFormat::Rnf4G128 { quantize_rnf4_g128(&host_buf_d, ne * hs, eis) }
+                                                 else { quantize_pc_g32_q4(&host_buf_d, ne * hs, eis) };
+                                    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+                                    buf.copy_from_host(&packed)?;
+                                    LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim: ne * hs, in_dim: eis })
+                                }
+                            }
                         };
 
                         let shared_expert = if *num_shared > 0 {
                             let sis = *shared_intermediate_size;
                             let sis = if sis == 0 { eis } else { sis };
                             Some(DenseFfnWeights {
-                                gate_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis * hs)?,
-                                up_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis * hs)?,
-                                down_proj: load_weight_bf16(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs * sis)?,
+                                gate_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.gate_proj.weight"), device, sis, hs, wq)?,
+                                up_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.up_proj.weight"), device, sis, hs, wq)?,
+                                down_proj: load_linear_weight(&st, &format!("{p}mlp.shared_expert.down_proj.weight"), device, hs, sis, wq)?,
                             })
                         } else { None };
 
@@ -1946,25 +2029,27 @@ impl Model {
         for (j, &(expert_id, _)) in topk.iter().enumerate() {
             let w = weights[j] * scaling;
 
-            // Expert weight pointers into contiguous buffer
-            let gate_w_ptr = unsafe { moe.expert_gate_up.as_ptr().add(expert_id * 2 * eis * hs) };
-            let up_w_ptr = unsafe { moe.expert_gate_up.as_ptr().add(expert_id * 2 * eis * hs + eis * hs) };
-            let down_w_ptr = unsafe { moe.expert_down.as_ptr().add(expert_id * hs * eis) };
+            // Expert byte offsets into fused buffers (format-aware)
+            // gate_up stored as [ne*2*eis, hs] rows: expert's gate at row expert_id*2*eis, up at +eis
+            let gate_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis, hs);
+            let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis + eis, hs);
+            // down stored as [ne*hs, eis] rows: expert's down at row expert_id*hs
+            let down_offset = moe.expert_down.row_byte_offset_dim(expert_id * hs, eis);
 
-            // Gate projection: bf16_weights[eis, hs] × f32_normed[hs] → f32_gate[eis]
-            self.kernels.linear_proj.forward_ptr(
+            // Gate projection
+            moe.expert_gate_up.forward_sub(
+                &self.kernels.linear_proj,
                 expert_scratch_gate.as_mut_ptr(),
-                gate_w_ptr,
                 self.activations.normed.as_ptr(),
-                eis as u32, hs as u32, &self.stream,
+                eis as u32, hs as u32, gate_offset, &self.stream,
             )?;
 
             // Up projection
-            self.kernels.linear_proj.forward_ptr(
+            moe.expert_gate_up.forward_sub(
+                &self.kernels.linear_proj,
                 expert_scratch_up.as_mut_ptr(),
-                up_w_ptr,
                 self.activations.normed.as_ptr(),
-                eis as u32, hs as u32, &self.stream,
+                eis as u32, hs as u32, up_offset, &self.stream,
             )?;
 
             // SiLU(gate) * up → scratch_act
@@ -1975,12 +2060,12 @@ impl Model {
                 eis as u32, &self.stream,
             )?;
 
-            // Down projection: bf16_weights[hs, eis] × f32_act[eis] → f32_output[hs]
-            self.kernels.linear_proj.forward_ptr(
+            // Down projection
+            moe.expert_down.forward_sub(
+                &self.kernels.linear_proj,
                 expert_output.as_mut_ptr(),
-                down_w_ptr,
                 expert_scratch_act.as_ptr(),
-                hs as u32, eis as u32, &self.stream,
+                hs as u32, eis as u32, down_offset, &self.stream,
             )?;
 
             // Weighted accumulate: ffn_down[h] += w * expert_output[h]
