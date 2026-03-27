@@ -608,14 +608,6 @@ impl Model {
             _ => WeightQuantMode::Bf16,
         };
 
-        // Early check: quantized weights + megakernel = error
-        let has_moe = config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-        if config.weight_quant != WeightQuantMode::Bf16 && !has_moe {
-            return Err(ModelError::MissingWeight(
-                "WEIGHT_QUANT requires MoE model (kernel-by-kernel path). Dense models use megakernel which only supports bf16. Set WEIGHT_QUANT=bf16 or unset it.".into()
-            ));
-        }
-
         let st = SafeTensorSet::open_directory(model_dir)?;
 
         // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
@@ -1562,13 +1554,8 @@ impl Model {
         if has_moe {
             return self.decode_step_moe(token_id, position);
         }
-        // Megakernel OP_RMSNORM hardcodes (1+w)*x — route non-Qwen3.5 dense models
-        // through kernel-by-kernel path which handles both RMSNorm variants.
-        if !self.config.rms_norm_one_plus_w {
-            return self.decode_step_moe(token_id, position);
-        }
 
-        // Dense models with (1+w) RMSNorm: use megakernel
+        // Dense models: use megakernel (handles bf16 + quantized weights, both RMSNorm variants)
         if self.megakernel.is_none() {
             self.megakernel = Some(MegakernelProgram::compile(self)?);
         }
@@ -1621,17 +1608,65 @@ impl Model {
             if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. }) {
                 self.moe_ffn_forward(layer_i)?;
             } else {
+                // Dense FFN: fused (bf16) or unfused (quantized)
+                let hs = self.config.hidden_size;
+                let is = self.config.intermediate_size;
+                let eps = self.config.rms_norm_eps;
+
                 // SAFETY: Raw pointers break borrow on self.layers for mutable self.activations.
-                // as_bf16() panics if weights are quantized — only called for non-MoE (bf16) layers.
-                let (post_norm, w_gate, w_up, w_down) = match &self.layers[layer_i] {
-                    LayerWeights::Attention(w) => (&w.post_norm, w.w_gate.as_bf16(), w.w_up.as_bf16(), w.w_down.as_bf16()),
-                    LayerWeights::Gdn(w) => (&w.post_norm, w.w_gate.as_bf16(), w.w_up.as_bf16(), w.w_down.as_bf16()),
+                let (post_norm_p, w_gate_p, w_up_p, w_down_p) = match &self.layers[layer_i] {
+                    LayerWeights::Attention(w) => (
+                        &w.post_norm as *const DeviceBuffer<u16>,
+                        &w.w_gate as *const LinearWeight,
+                        &w.w_up as *const LinearWeight,
+                        &w.w_down as *const LinearWeight,
+                    ),
+                    LayerWeights::Gdn(w) => (
+                        &w.post_norm as *const DeviceBuffer<u16>,
+                        &w.w_gate as *const LinearWeight,
+                        &w.w_up as *const LinearWeight,
+                        &w.w_down as *const LinearWeight,
+                    ),
                 };
-                let post_norm = post_norm as *const DeviceBuffer<u16>;
-                let w_gate = w_gate as *const DeviceBuffer<u16>;
-                let w_up = w_up as *const DeviceBuffer<u16>;
-                let w_down = w_down as *const DeviceBuffer<u16>;
-                unsafe { self.ffn_forward(&*post_norm, &*w_gate, &*w_up, &*w_down)?; }
+
+                let all_bf16 = unsafe {
+                    matches!(&*w_gate_p, LinearWeight::Bf16(_))
+                    && matches!(&*w_up_p, LinearWeight::Bf16(_))
+                    && matches!(&*w_down_p, LinearWeight::Bf16(_))
+                };
+
+                if all_bf16 {
+                    unsafe { self.ffn_forward(&*post_norm_p, (*w_gate_p).as_bf16(), (*w_up_p).as_bf16(), (*w_down_p).as_bf16())?; }
+                } else {
+                    // Unfused path for quantized weights
+                    unsafe {
+                        d2d_copy_f32(&mut self.activations.residual, 0, &self.activations.hidden, 0, hs, &self.stream)?;
+                    }
+                    unsafe {
+                        self.kernels.rmsnorm.forward(
+                            &mut self.activations.normed, &self.activations.hidden, &*post_norm_p,
+                            1, hs as u32, eps, self.config.rms_norm_one_plus_w, &self.stream)?;
+                    }
+                    unsafe {
+                        (*w_gate_p).forward(&self.kernels.linear_proj,
+                            &mut self.activations.ffn_gate, &self.activations.normed,
+                            is as u32, hs as u32, &self.stream)?;
+                        (*w_up_p).forward(&self.kernels.linear_proj,
+                            &mut self.activations.ffn_up, &self.activations.normed,
+                            is as u32, hs as u32, &self.stream)?;
+                    }
+                    self.kernels.silu_mul.forward(
+                        &mut self.activations.ffn_act, &self.activations.ffn_gate, &self.activations.ffn_up,
+                        is as u32, &self.stream)?;
+                    unsafe {
+                        (*w_down_p).forward(&self.kernels.linear_proj,
+                            &mut self.activations.ffn_down, &self.activations.ffn_act,
+                            hs as u32, is as u32, &self.stream)?;
+                    }
+                    self.kernels.residual_add.forward(
+                        &mut self.activations.hidden, &self.activations.ffn_down, &self.activations.residual,
+                        hs as u32, &self.stream)?;
+                }
             }
         }
 
@@ -1769,10 +1804,12 @@ impl Model {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
 
-        // MoE models can't use megakernel prefill (FFN weights not compiled in).
-        // Fall back to sequential decode_step_moe.
+        // MoE and quantized-weight models can't use megakernel prefill
+        // (batched FFN fused kernel only handles bf16).
+        // Fall back to sequential decode.
         let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-        if has_moe {
+        let has_quant = self.config.weight_quant != WeightQuantMode::Bf16;
+        if has_moe || has_quant {
             let mut logits = vec![];
             for (i, &tok) in tokens.iter().enumerate() {
                 logits = self.decode_step_moe(tok, i as u32)?;
