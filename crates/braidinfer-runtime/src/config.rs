@@ -243,7 +243,7 @@ impl ModelConfig {
         let mamba_head_dim = get_usize("mamba_head_dim");
 
         let recurrent_kind = if linear_num_heads > 0 {
-            let conv_dim = linear_num_heads * (linear_key_head_dim + linear_value_head_dim);
+            let conv_dim = 2 * linear_num_heads * linear_key_head_dim + linear_num_value_heads * linear_value_head_dim;
             RecurrentLayerKind::Gdn {
                 num_heads: linear_num_heads, num_value_heads: linear_num_value_heads,
                 key_dim: linear_key_head_dim, value_dim: linear_value_head_dim,

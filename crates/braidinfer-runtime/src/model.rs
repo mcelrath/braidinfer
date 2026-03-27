@@ -1562,8 +1562,13 @@ impl Model {
         if has_moe {
             return self.decode_step_moe(token_id, position);
         }
+        // Megakernel OP_RMSNORM hardcodes (1+w)*x — route non-Qwen3.5 dense models
+        // through kernel-by-kernel path which handles both RMSNorm variants.
+        if !self.config.rms_norm_one_plus_w {
+            return self.decode_step_moe(token_id, position);
+        }
 
-        // Dense models: use megakernel
+        // Dense models with (1+w) RMSNorm: use megakernel
         if self.megakernel.is_none() {
             self.megakernel = Some(MegakernelProgram::compile(self)?);
         }
