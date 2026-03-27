@@ -508,6 +508,12 @@ pub struct ActivationBuffers {
     pub gdn_conv_out_q: DeviceBuffer<f32>, // [nh*kd]
     pub gdn_conv_out_k: DeviceBuffer<f32>, // [nh*kd]
     pub gdn_conv_out_v: DeviceBuffer<f32>, // [nh*vd]
+    // MoE scratch buffers (pre-allocated to avoid hipMalloc in hot path)
+    pub moe_scores: DeviceBuffer<f32>,        // [max_num_experts]
+    pub moe_expert_gate: DeviceBuffer<f32>,   // [max_expert_intermediate_size]
+    pub moe_expert_up: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
+    pub moe_expert_act: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
+    pub moe_expert_out: DeviceBuffer<f32>,    // [hidden_size]
 }
 
 // ---- All kernels ----
@@ -1377,6 +1383,12 @@ impl Model {
             gdn_conv_out_q: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             gdn_conv_out_k: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
             gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
+            // MoE scratch: sized for max expert dimensions across all layers
+            moe_scores: DeviceBuffer::<f32>::alloc(device, config.num_experts.max(1))?,
+            moe_expert_gate: DeviceBuffer::<f32>::alloc(device, config.expert_intermediate_size.max(1))?,
+            moe_expert_up: DeviceBuffer::<f32>::alloc(device, config.expert_intermediate_size.max(1))?,
+            moe_expert_act: DeviceBuffer::<f32>::alloc(device, config.expert_intermediate_size.max(1))?,
+            moe_expert_out: DeviceBuffer::<f32>::alloc(device, hs)?,
         };
 
         Ok(Model {
@@ -1671,10 +1683,8 @@ impl Model {
         }
 
         // 2. Gate projection: normed → scores[num_experts]
-        // We need a temporary buffer for scores
-        let mut scores_buf = DeviceBuffer::<f32>::alloc(self.device, ne)?;
         self.kernels.linear_proj.forward(
-            &mut scores_buf,
+            &mut self.activations.moe_scores,
             &moe.gate,
             &self.activations.normed,
             ne as u32, hs as u32, &self.stream,
@@ -1683,7 +1693,7 @@ impl Model {
 
         // 3. Read scores to CPU and do top-k selection
         let mut scores = vec![0.0f32; ne];
-        scores_buf.copy_to_host(&mut scores)?;
+        self.activations.moe_scores.copy_to_host(&mut scores)?;
 
         let k = match &self.config.layers[layer_idx].ffn_type {
             FfnType::MoE { num_active, .. } => *num_active,
@@ -1715,72 +1725,63 @@ impl Model {
             _ => unreachable!(),
         };
 
-        // 4. Zero output buffer (reuse ffn_down for accumulation)
-        let zeros = vec![0.0f32; hs];
-        self.activations.ffn_down.copy_from_host(&zeros)?;
+        // 4. Zero accumulation buffer on GPU (no CPU round-trip)
+        unsafe {
+            braidinfer_hip::ffi::hipMemsetAsync(
+                self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
+                0, hs * 4, self.stream.raw(),
+            );
+        }
 
-        // 5. For each selected expert: run FFN and accumulate
-        let mut expert_scratch_gate = DeviceBuffer::<f32>::alloc(self.device, eis)?;
-        let mut expert_scratch_up = DeviceBuffer::<f32>::alloc(self.device, eis)?;
-        let mut expert_scratch_act = DeviceBuffer::<f32>::alloc(self.device, eis)?;
-        let mut expert_output = DeviceBuffer::<f32>::alloc(self.device, hs)?;
-
+        // 5. For each selected expert: run FFN and GPU-accumulate
         for (j, &(expert_id, _)) in topk.iter().enumerate() {
             let w = weights[j] * scaling;
 
             // Expert byte offsets into fused buffers (format-aware)
-            // gate_up stored as [ne*2*eis, hs] rows: expert's gate at row expert_id*2*eis, up at +eis
             let gate_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis, hs);
             let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis + eis, hs);
-            // down stored as [ne*hs, eis] rows: expert's down at row expert_id*hs
             let down_offset = moe.expert_down.row_byte_offset_dim(expert_id * hs, eis);
 
-            // Gate projection
+            // Gate projection (pre-allocated buffer)
             moe.expert_gate_up.forward_sub(
                 &self.kernels.linear_proj,
-                expert_scratch_gate.as_mut_ptr(),
+                self.activations.moe_expert_gate.as_mut_ptr(),
                 self.activations.normed.as_ptr(),
                 eis as u32, hs as u32, gate_offset, &self.stream,
             )?;
 
-            // Up projection
+            // Up projection (pre-allocated buffer)
             moe.expert_gate_up.forward_sub(
                 &self.kernels.linear_proj,
-                expert_scratch_up.as_mut_ptr(),
+                self.activations.moe_expert_up.as_mut_ptr(),
                 self.activations.normed.as_ptr(),
                 eis as u32, hs as u32, up_offset, &self.stream,
             )?;
 
-            // SiLU(gate) * up → scratch_act
+            // SiLU(gate) * up → act (pre-allocated buffer)
             self.kernels.silu_mul.forward(
-                &mut expert_scratch_act,
-                &expert_scratch_gate,
-                &expert_scratch_up,
+                &mut self.activations.moe_expert_act,
+                &self.activations.moe_expert_gate,
+                &self.activations.moe_expert_up,
                 eis as u32, &self.stream,
             )?;
 
-            // Down projection
+            // Down projection (pre-allocated buffer)
             moe.expert_down.forward_sub(
                 &self.kernels.linear_proj,
-                expert_output.as_mut_ptr(),
-                expert_scratch_act.as_ptr(),
+                self.activations.moe_expert_out.as_mut_ptr(),
+                self.activations.moe_expert_act.as_ptr(),
                 hs as u32, eis as u32, down_offset, &self.stream,
             )?;
 
-            // Weighted accumulate: ffn_down[h] += w * expert_output[h]
-            // Use a simple kernel or CPU-side scaling
-            // For now: scale expert_output by w, then add to ffn_down
-            // We can do this with residual_add if we pre-scale
-            // Actually, just accumulate on host for v1 correctness
-            self.stream.synchronize()?;
-            let mut exp_out = vec![0.0f32; hs];
-            expert_output.copy_to_host(&mut exp_out)?;
-            let mut accum = vec![0.0f32; hs];
-            self.activations.ffn_down.copy_to_host(&mut accum)?;
-            for h in 0..hs {
-                accum[h] += w * exp_out[h];
-            }
-            self.activations.ffn_down.copy_from_host(&accum)?;
+            // GPU-side weighted accumulate: ffn_down += w * expert_out
+            self.kernels.residual_add.weighted_accumulate(
+                &mut self.activations.ffn_down,
+                &self.activations.moe_expert_out,
+                w,
+                hs as u32,
+                &self.stream,
+            )?;
         }
 
         // 6. Residual add: hidden = residual + ffn_down

@@ -67,6 +67,7 @@ unsafe extern "C" {
     ) -> hipError_t;
     pub fn hipHostUnregister(host_ptr: *mut c_void) -> hipError_t;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
+    pub fn hipMemsetAsync(dst: *mut c_void, value: c_int, size_bytes: usize, stream: hipStream_t) -> hipError_t;
 
     // Stream management
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;

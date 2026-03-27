@@ -399,6 +399,40 @@ impl ResidualAddKernel {
             &mut args,
         )
     }
+
+    /// GPU-side weighted accumulate: output[i] += weight * input[i]
+    pub fn weighted_accumulate(
+        &self,
+        output: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        weight: f32,
+        size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("weighted_accumulate_f32")?;
+
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut w = weight;
+        let mut sz = size as i32;
+
+        let mut args: [*mut c_void; 4] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(w).cast(),
+            std::ptr::addr_of_mut!(sz).cast(),
+        ];
+
+        let block_size = 256u32;
+        let grid_size = (size + block_size - 1) / block_size;
+        func.launch(
+            (grid_size, 1, 1),
+            (block_size, 1, 1),
+            0,
+            stream,
+            &mut args,
+        )
+    }
 }
 
 pub struct EmbeddingKernel {
