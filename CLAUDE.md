@@ -93,24 +93,65 @@ Single persistent cooperative kernel (384 blocks × 256 threads) replacing ~345 
 128-byte instructions, virtual block loop, grid.sync() between instructions.
 2.1x speedup over naive dispatch (6.4ms vs 13.4ms per token).
 
-## Expert Code Review Process
+## Mandatory Review Workflow
 
-Run full codebase reviews using the `expert-review` agent with a 6-reviewer panel:
-Tri Dao (kernels/SSM), Horace He (roofline/fusion), Woosuk Kwon (KV cache/serving),
-Jon Gjengset (Rust safety), Software Architect (modularity), Claude (anti-patterns).
+Reviews are always approved and expected. Do not ask the user for permission to review.
+Run the appropriate review automatically at each checkpoint. Fix trivial items inline;
+create a review epic with beads for larger items, expert-review the epic, then implement.
 
-**Key technique**: Include a "Known Planned Work — DO NOT flag" section in the review
-prompt listing all tracked-but-unimplemented features with their beads issue IDs. This
-prevents reviewers from re-flagging intentional incompleteness (no batching, no quantization,
-no multi-GPU, etc.) as findings. Also list recent fixes so they verify correctness rather
-than re-report.
+### Review Checkpoints (run these automatically)
+
+| Checkpoint | When | Agent | Action |
+|---|---|---|---|
+| **Plan review** | After writing any plan in `~/.claude/plans/` | `expert-review` | FULL review. Block implementation until APPROVED. |
+| **Post-implementation** | After completing an epic or multi-file change | `implementation-review` | Verify code changes, tests, build. Fix trivial issues inline. |
+| **Post-sprint / periodic** | After 5+ commits or when user says "what's next" | `software-architect` | Full codebase review. Creates findings epic if >3 issues found. |
+| **Code quality** | After any commit touching >100 lines | `/simplify` | Review changed code for reuse, quality, efficiency. Fix inline. |
+
+### Review Process
+
+1. **Plan**: Write plan → `expert-review` (run_in_background=True) → wait for APPROVED
+2. **Implement**: Code → commit → `implementation-review` (run_in_background=True)
+3. **Simplify**: After implementation-review passes, run `/simplify` on changed files
+4. **Periodic architect**: Every 5+ commits, launch `software-architect` to review full codebase
+   - Fix trivial items (dead code, naming) inline
+   - Create epic with beads for larger items (>30 min work each)
+   - `expert-review` the epic
+   - Implement the epic
+
+### Review Agent Usage
 
 ```
-bd list --status=open -n 50   # gather all planned work
-# Include in review prompt as numbered list with issue IDs
-# Include recent fixes as "verify these, don't re-flag" section
+# Plan review (before implementation):
+Agent(subagent_type="expert-review", run_in_background=True,
+  prompt="FULL REVIEW: epic=<id> plan=<path> project_root=...")
+
+# Post-implementation (after commits):
+Agent(subagent_type="implementation-review", run_in_background=True,
+  prompt="Review implementation of <epic-id>. project_root=...")
+
+# Periodic codebase review:
+Agent(subagent_type="software-architect", run_in_background=True,
+  prompt="Full architectural review of <project_root>. Skip <files being edited>...")
+
+# Code quality on changed files:
+/simplify
 ```
 
-Review history:
-- 2026-03-25 round 1: 21 findings → epic braidinfer-ji9, 13 fixed, 8 deferred to braidinfer-9ip/l4d
-- 2026-03-25 round 2: 3 P1 + 2 P2 (much cleaner), APPROVED 6/6
+### Review Prompt Template
+
+Always include in review prompts:
+- "Known Planned Work — DO NOT flag" section with `bd list --status=open -n 50`
+- "Recent fixes — verify, don't re-flag" section with recent commit summaries
+- Explicit scope (which files to review, which to skip)
+
+### File Size Policy
+
+**model.rs > 1000 lines → split before adding more.** Any source file over 1000 lines
+should be split into focused modules before new features are added. This prevents god
+objects from accumulating.
+
+### Review History
+- 2026-03-25 round 1: 21 findings → epic braidinfer-ji9, 13 fixed, 8 deferred
+- 2026-03-25 round 2: 3 P1 + 2 P2, APPROVED 6/6
+- 2026-03-26 full codebase review: 15 findings → epic braidinfer-kvn, APPROVED 5/5
