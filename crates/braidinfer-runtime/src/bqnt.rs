@@ -8,6 +8,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use memmap2::Mmap;
+
 use crate::quant::WeightFormat;
 
 const MAGIC: u32 = 0x544E5142; // "BQNT" little-endian
@@ -258,5 +260,86 @@ impl BqntFile {
         let mut buf = vec![0u8; self.metadata_size as usize];
         file.read_exact(&mut buf)?;
         String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+// --- mmap-based loader ---
+
+/// Memory-mapped .bqnt file for zero-copy GPU loading.
+/// Holds the mmap and parsed tensor table. Tensor data is accessed
+/// via raw byte slices that can be passed directly to hipMemcpyAsync.
+pub struct MmapBqnt {
+    mmap: Mmap,
+    header: BqntFile,
+}
+
+impl MmapBqnt {
+    /// Open and mmap a .bqnt file.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let header = BqntFile::open(path)?;
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self { mmap, header })
+    }
+
+    /// Number of tensors in the file.
+    pub fn n_tensors(&self) -> usize {
+        self.header.n_tensors
+    }
+
+    /// Look up a tensor entry by name.
+    pub fn entry(&self, name: &str) -> Option<&TensorEntry> {
+        self.header.get(name)
+    }
+
+    /// Get raw packed bytes for a tensor — zero-copy from mmap.
+    /// The returned slice is 64KB-aligned and byte-identical to what
+    /// the GPU dequant kernel expects. Pass directly to hipMemcpyAsync.
+    pub fn tensor_data(&self, name: &str) -> Option<&[u8]> {
+        let entry = self.header.get(name)?;
+        let start = entry.data_offset as usize;
+        let end = start + entry.data_bytes as usize;
+        if end <= self.mmap.len() {
+            Some(&self.mmap[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Get raw packed bytes by hash — for hot-path loading without string hashing.
+    pub fn tensor_data_by_hash(&self, hash: u64) -> Option<&[u8]> {
+        let entry = self.header.entries.get(&hash)?;
+        let start = entry.data_offset as usize;
+        let end = start + entry.data_bytes as usize;
+        if end <= self.mmap.len() {
+            Some(&self.mmap[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Iterate all tensors: yields (name_hash, entry, data_slice).
+    pub fn iter_tensors(&self) -> impl Iterator<Item = (u64, &TensorEntry, &[u8])> {
+        self.header.entries.iter().filter_map(move |(&hash, entry)| {
+            let start = entry.data_offset as usize;
+            let end = start + entry.data_bytes as usize;
+            if end <= self.mmap.len() {
+                Some((hash, entry, &self.mmap[start..end]))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Read JSON metadata.
+    pub fn metadata(&self) -> io::Result<String> {
+        let start = self.header.metadata_offset as usize;
+        let end = start + self.header.metadata_size as usize;
+        if end <= self.mmap.len() {
+            String::from_utf8(self.mmap[start..end].to_vec())
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+        } else {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Metadata out of bounds"))
+        }
     }
 }
