@@ -361,7 +361,7 @@ impl ModelConfig {
             expert_intermediate_size, shared_expert_intermediate_size,
             recurrent_kind, rope_type,
             has_qk_norm: false, has_output_gate: false, // auto-detected from tensor names at load time
-            rms_norm_one_plus_w: model_type.starts_with("qwen3_5"),
+            rms_norm_one_plus_w: model_type.starts_with("qwen3_5"),  // Only Qwen3.5 uses (1+w)*x; Qwen3 uses w*x
             use_rope: model_type != "nemotron_h",  // Nemotron-H attention has no RoPE
             attention_layer_indices, model_type, tie_word_embeddings,
             weight_quant: WeightQuantMode::Bf16,
