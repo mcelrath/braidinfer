@@ -1086,13 +1086,16 @@ impl Model {
                 FfnType::MoE { num_experts, .. } => Some(*num_experts), _ => None
             }).max().unwrap_or(1))?,
             moe_expert_gate: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
-                FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
+                FfnType::MoE { expert_intermediate_size, shared_intermediate_size, .. } =>
+                    Some((*expert_intermediate_size).max(*shared_intermediate_size)), _ => None
             }).max().unwrap_or(1))?,
             moe_expert_up: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
-                FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
+                FfnType::MoE { expert_intermediate_size, shared_intermediate_size, .. } =>
+                    Some((*expert_intermediate_size).max(*shared_intermediate_size)), _ => None
             }).max().unwrap_or(1))?,
             moe_expert_act: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
-                FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
+                FfnType::MoE { expert_intermediate_size, shared_intermediate_size, .. } =>
+                    Some((*expert_intermediate_size).max(*shared_intermediate_size)), _ => None
             }).max().unwrap_or(1))?,
             moe_expert_out: DeviceBuffer::<f32>::alloc(device, hs)?,
             // Mamba2 scratch: sized from recurrent_kind if Mamba2
@@ -1627,6 +1630,15 @@ impl Model {
                 &self.activations.moe_expert_out,
                 1.0,
                 hs as u32, &self.stream)?;
+        }
+
+        // Debug: check ffn_down magnitude
+        if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 3 {
+            self.stream.synchronize()?;
+            let mut buf = vec![0.0f32; hs];
+            self.activations.ffn_down.copy_to_host(&mut buf)?;
+            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("  MoE L{layer_idx} ffn_down max_abs={max_abs:.4}");
         }
 
         // 7. Residual add: hidden = residual + ffn_down
