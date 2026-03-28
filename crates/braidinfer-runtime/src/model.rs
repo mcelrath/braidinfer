@@ -1719,13 +1719,17 @@ impl Model {
         // 6. rmsnorm_gated: normed_out = rmsnorm(ssm_out) * silu(gate)
         // gate is at mamba2_in_proj[0..intermediate]
         // Use mamba2_conv_out[0..intermediate] as output (conv_out is no longer needed)
+        // Mamba2 uses per-group norm: group_size = intermediate / n_groups
+        // So num_heads = n_groups (8), value_dim = group_size (512) for Nemotron
+        let norm_groups = ng as u32;
+        let group_size = intermediate / norm_groups;
         unsafe {
             self.kernels.rmsnorm_gated.forward(
-                &mut self.activations.mamba2_conv_out, // reuse as output (>= intermediate size)
+                &mut self.activations.mamba2_conv_out,
                 &self.activations.mamba2_ssm_out,
                 &self.activations.mamba2_in_proj,  // gate (first intermediate elements)
                 &(*w).norm_weight,
-                1, intermediate, eps,
+                norm_groups, group_size, eps,
                 &self.stream,
             )?;
         }
