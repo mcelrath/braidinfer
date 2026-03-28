@@ -32,3 +32,5 @@
 #define OP_RMSNORM_WX   27  // w*x variant (Llama, OLMoE) vs (1+w)*x (Qwen3.5)
 #define OP_SILU_MUL     28  // output[i] = silu(gate[i]) * up[i]
 #define OP_SSM_UPDATE   29  // Mamba2 selective state update
+#define OP_FFN_GATE_UP_RNF4  30  // Fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights)
+#define OP_FFN_DOWN_RES_RNF4 31  // Fused down_proj + residual add (rnf4 weights)

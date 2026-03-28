@@ -1560,6 +1560,10 @@ impl MegakernelProgram {
             && matches!(w_up, LinearWeight::Bf16(_))
             && matches!(w_down, LinearWeight::Bf16(_));
 
+        let all_rnf4 = matches!(w_gate, LinearWeight::Packed(pw) if pw.format == crate::quant::WeightFormat::Rnf4G128)
+            && matches!(w_up, LinearWeight::Packed(pw) if pw.format == crate::quant::WeightFormat::Rnf4G128)
+            && matches!(w_down, LinearWeight::Packed(pw) if pw.format == crate::quant::WeightFormat::Rnf4G128);
+
         if all_bf16 {
             // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only)
             let mut inst = Instruction::new(OP_FFN_GATE_UP, is as u32);
@@ -1583,6 +1587,37 @@ impl MegakernelProgram {
             inst.set_output_ptr(1, act.hidden.as_ptr());
             inst.set_ptr(2, act.residual.as_ptr());
             inst.set_ptr(3, w_down.as_bf16_ptr());
+            inst.set_ptr(4, act.ffn_act.as_ptr());
+            inst.set_int(5, hs as i32);
+            inst.set_int(6, is as i32);
+            instructions.push(inst);
+        } else if all_rnf4 {
+            // Fused path: OP_FFN_GATE_UP_RNF4 + OP_FFN_DOWN_RES_RNF4 (rnf4 decode n=1 only)
+            let w_gate_ptr = match w_gate { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let w_up_ptr   = match w_up   { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let w_down_ptr = match w_down { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+
+            let mut inst = Instruction::new(OP_FFN_GATE_UP_RNF4, is as u32);
+            inst.set_output_ptr(1, act.ffn_act.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_ptr(3, post_norm.as_ptr());
+            inst.set_ptr(4, w_gate_ptr);
+            inst.set_ptr(5, w_up_ptr);
+            inst.set_int(6, hs as i32);
+            inst.set_int(7, is as i32);
+            inst.set_float(8, eps);
+            instructions.push(inst);
+
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.residual.as_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+
+            let mut inst = Instruction::new(OP_FFN_DOWN_RES_RNF4, hs as u32);
+            inst.set_output_ptr(1, act.hidden.as_ptr());
+            inst.set_ptr(2, act.residual.as_ptr());
+            inst.set_ptr(3, w_down_ptr);
             inst.set_ptr(4, act.ffn_act.as_ptr());
             inst.set_int(5, hs as i32);
             inst.set_int(6, is as i32);
@@ -2183,6 +2218,8 @@ fn opcode_name(op: u32) -> &'static str {
         OP_RMSNORM_WX => "RMSNORM_WX",
         OP_SILU_MUL => "SILU_MUL",
         OP_SSM_UPDATE => "SSM_UPDATE",
+        OP_FFN_GATE_UP_RNF4 => "FFN_GATE_UP_RNF4",
+        OP_FFN_DOWN_RES_RNF4 => "FFN_DOWN_RES_RNF4",
         _ => "UNKNOWN",
     }
 }

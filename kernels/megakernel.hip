@@ -714,6 +714,153 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
     if (tid == 0) output[row] = shared[0] + residual[row];
 }
 
+// OP_FFN_GATE_UP_RNF4: fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights, decode n=1)
+// args: [1]=scratch, [2]=input, [3]=rms_weight, [4]=w_gate (rnf4), [5]=w_up (rnf4),
+//       [6]=hidden_size, [7]=intermediate_size, [8]=eps
+// vblock = output row index in [0, intermediate_size)
+__device__ void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
+    float* scratch = inst_fptr(inst, 1);
+    const float* input = inst_fptr(inst, 2);
+    const unsigned short* rms_weight = inst_u16ptr(inst, 3);
+    const unsigned char* w_gate = (const unsigned char*)inst_ptr(inst, 4);
+    const unsigned char* w_up = (const unsigned char*)inst_ptr(inst, 5);
+    int hidden_size = inst_int(inst, 6);
+    int intermediate_size = inst_int(inst, 7);
+    float eps = inst_float(inst, 8);
+
+    int row = vblock;
+    if (row >= intermediate_size) return;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 128;
+    const int group_bytes = 132;
+    const int num_groups = (hidden_size + group_size - 1) / group_size;
+
+    extern __shared__ float shared[];
+
+    // RMSNorm: compute sum of squares
+    float sum_sq = 0.0f;
+    for (int i = tid; i < hidden_size; i += stride) { float v = input[i]; sum_sq += v * v; }
+    shared[tid] = sum_sq;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float rms_scale = rsqrtf(shared[0] / (float)hidden_size + eps);
+    __syncthreads();
+
+    const unsigned char* wg_row = w_gate + (long long)row * num_groups * group_bytes;
+    const unsigned char* wu_row = w_up  + (long long)row * num_groups * group_bytes;
+    float acc_gate = 0.0f, acc_up = 0.0f;
+
+    for (int g = tid; g < num_groups; g += stride) {
+        const unsigned char* gp_g = wg_row + g * group_bytes;
+        const unsigned char* gp_u = wu_row + g * group_bytes;
+
+        float absmax_g1 = bf16_to_f32(*(const unsigned short*)(gp_g + 64));
+        float absmax_g2 = bf16_to_f32(*(const unsigned short*)(gp_g + 130));
+        float absmax_u1 = bf16_to_f32(*(const unsigned short*)(gp_u + 64));
+        float absmax_u2 = bf16_to_f32(*(const unsigned short*)(gp_u + 130));
+
+        int base = g * group_size;
+        int count = min(group_size, hidden_size - base);
+        for (int i = 0; i < count; i += 2) {
+            unsigned char bg1 = gp_g[i / 2];
+            unsigned char bg2 = (gp_g + 66)[i / 2];
+            unsigned char bu1 = gp_u[i / 2];
+            unsigned char bu2 = (gp_u + 66)[i / 2];
+
+            float normed0 = input[base + i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + i]));
+            float wg0 = NF4_TABLE[bg1 & 0xF] * absmax_g1 + NF4_TABLE[bg2 & 0xF] * absmax_g2;
+            float wu0 = NF4_TABLE[bu1 & 0xF] * absmax_u1 + NF4_TABLE[bu2 & 0xF] * absmax_u2;
+            acc_gate += wg0 * normed0;
+            acc_up   += wu0 * normed0;
+
+            if (i + 1 < count) {
+                float normed1 = input[base + i + 1] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + i + 1]));
+                float wg1 = NF4_TABLE[(bg1 >> 4) & 0xF] * absmax_g1 + NF4_TABLE[(bg2 >> 4) & 0xF] * absmax_g2;
+                float wu1 = NF4_TABLE[(bu1 >> 4) & 0xF] * absmax_u1 + NF4_TABLE[(bu2 >> 4) & 0xF] * absmax_u2;
+                acc_gate += wg1 * normed1;
+                acc_up   += wu1 * normed1;
+            }
+        }
+    }
+
+    shared[tid] = acc_gate;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float gate_val = shared[0];
+    __syncthreads();
+
+    shared[tid] = acc_up;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float up_val = shared[0];
+
+    if (tid == 0) {
+        float silu_g = gate_val / (1.0f + expf(-gate_val));
+        scratch[row] = silu_g * up_val;
+    }
+}
+
+// OP_FFN_DOWN_RES_RNF4: down_proj(scratch) + residual (rnf4 weights, decode n=1)
+// args: [1]=output, [2]=residual, [3]=w_down (rnf4), [4]=scratch, [5]=hidden_size, [6]=intermediate_size
+// vblock = output row index in [0, hidden_size)
+__device__ void op_ffn_down_res_rnf4(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* residual = inst_fptr(inst, 2);
+    const unsigned char* w_down = (const unsigned char*)inst_ptr(inst, 3);
+    const float* scratch = inst_fptr(inst, 4);
+    int hidden_size = inst_int(inst, 5);
+    int intermediate_size = inst_int(inst, 6);
+
+    int row = vblock;
+    if (row >= hidden_size) return;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 128;
+    const int group_bytes = 132;
+    const int num_groups = (intermediate_size + group_size - 1) / group_size;
+    const unsigned char* row_data = w_down + (long long)row * num_groups * group_bytes;
+
+    float acc = 0.0f;
+    for (int g = tid; g < num_groups; g += stride) {
+        const unsigned char* gp = row_data + g * group_bytes;
+        float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+        float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+        int base = g * group_size;
+        int count = min(group_size, intermediate_size - base);
+        for (int i = 0; i < count; i += 2) {
+            unsigned char b1 = gp[i / 2];
+            unsigned char b2 = (gp + 66)[i / 2];
+            float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+            acc += v0 * scratch[base + i];
+            if (i + 1 < count) {
+                float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+                acc += v1 * scratch[base + i + 1];
+            }
+        }
+    }
+
+    extern __shared__ float shared[];
+    shared[tid] = acc;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) output[row] = shared[0] + residual[row];
+}
+
 // OP_EMBEDDING: output[i] = table[token_id * hidden_size + i]
 // args: [1]=output, [2]=table, [3]=token_id, [4]=hidden_size
 __device__ void op_embedding(const u64* inst, u32 vblock) {
@@ -1657,9 +1804,11 @@ __device__ void dump_instruction_output(
             size = inst_int(inst, 4); // hidden_size
             break;
         case OP_FFN_GATE_UP:
+        case OP_FFN_GATE_UP_RNF4:
             size = inst_int(inst, 7); // intermediate_size
             break;
         case OP_FFN_DOWN_RES:
+        case OP_FFN_DOWN_RES_RNF4:
             size = inst_int(inst, 5); // hidden_size
             break;
         case OP_GQA_ATTN:
@@ -1759,6 +1908,8 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_LINEAR_PROJ_PCG32: op_linear_proj_pcg32(inst, vb); break;
                 case OP_RMSNORM_WX: op_rmsnorm_wx(inst, vb); break;
                 case OP_SILU_MUL:   op_silu_mul(inst, vb); break;
+                case OP_FFN_GATE_UP_RNF4:  op_ffn_gate_up_rnf4(inst, vb); break;
+                case OP_FFN_DOWN_RES_RNF4: op_ffn_down_res_rnf4(inst, vb); break;
                 default: break;
             }
         }
