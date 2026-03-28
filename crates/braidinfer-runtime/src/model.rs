@@ -1564,12 +1564,14 @@ impl Model {
             // Debug: check intermediate values
             if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 1 && j == 0 {
                 self.stream.synchronize()?;
-                let mut up_buf = vec![0.0f32; eis];
-                let mut act_buf = vec![0.0f32; eis];
+                let up_len = self.activations.moe_expert_up.len();
+                let act_len = self.activations.moe_expert_act.len();
+                let mut up_buf = vec![0.0f32; up_len];
+                let mut act_buf = vec![0.0f32; act_len];
                 self.activations.moe_expert_up.copy_to_host(&mut up_buf)?;
                 self.activations.moe_expert_act.copy_to_host(&mut act_buf)?;
-                let up_max = up_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-                let act_max = act_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                let up_max = up_buf[..eis].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                let act_max = act_buf[..eis].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
                 eprintln!("  Expert {expert_id}: up_max={up_max:.4}, act_max(relu²)={act_max:.4}, w={w:.6}");
             }
 
