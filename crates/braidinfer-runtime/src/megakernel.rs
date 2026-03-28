@@ -1090,6 +1090,7 @@ impl MegakernelProgram {
                 attn_quant_indices.push(quant_idx);
                 {
                     use crate::paged_kv::quantized_kv_offsets;
+                    let chunk_tokens: usize = CHUNK_TOKENS;
                     let (q1d, q1s, rd_off, rs) = quantized_kv_offsets(cfg, chunk_tokens, *attn_layer_index, false);
                     let mut inst = Instruction::new(OP_ATTN_PAGED_Q, 0); // grid_x=0: skip until chunks are quantized
                     inst.set_int(1, 0);  // scratch ptr — patched when quantized KV is enabled
@@ -1127,7 +1128,7 @@ impl MegakernelProgram {
                     inst.set_int(7, nkh as i32);
                     inst.set_int(8, hd as i32);
                     inst.set_int(9, 1); // seq_len — patched per step
-                    inst.set_int(10, chunk_tokens as i32);
+                    inst.set_int(10, CHUNK_TOKENS as i32);
                     inst.set_int(11, rd as i32);
                     inst.words[12] = paged_layer_k_offset;
                     inst.words[13] = paged_layer_v_offset;

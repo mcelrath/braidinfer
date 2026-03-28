@@ -1013,10 +1013,12 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
             // Apply QK-norm to cached K (cache stores pre-norm K for quantization quality).
             // k[i] = k[i] * rsqrt(sum_sq/head_dim + eps) * (1 + k_norm_weight[i])
             // k_norm_weight is passed as inst[16] (bf16 pointer, or null for non-QK-norm models)
+            // NOTE: partial aliases sh_k (both = shmem). Save K to register before reduction.
             {
                 const unsigned short* kn_w = (const unsigned short*)(inst[16]);
                 if (kn_w != nullptr) {
-                    partial[tid] = (tid < head_dim) ? sh_k[tid] * sh_k[tid] : 0.0f;
+                    float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
+                    partial[tid] = my_k * my_k;  // overwrites sh_k via alias
                     __syncthreads();
                     for (int s = block_size / 2; s > 0; s >>= 1) {
                         if (tid < s) partial[tid] += partial[tid + s];
@@ -1025,7 +1027,7 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
                     float k_rms = rsqrtf(partial[0] / (float)head_dim + 1e-6f);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
-                        sh_k[tid] = sh_k[tid] * k_rms * w;
+                        sh_k[tid] = my_k * k_rms * w;  // use saved register value
                     }
                     __syncthreads();
                 }
@@ -1225,10 +1227,12 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
 
             // Apply QK-norm to dequantized K (cache stores pre-norm K for quantization quality).
             // k_norm_weight passed as inst[16] (bf16 pointer, or 0 for non-QK-norm models)
+            // NOTE: partial aliases sh_k (both = shmem). Save K to register before reduction.
             {
                 const unsigned short* kn_w = (const unsigned short*)(inst[16]);
                 if (kn_w != nullptr) {
-                    partial[tid] = (tid < head_dim) ? sh_k[tid] * sh_k[tid] : 0.0f;
+                    float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
+                    partial[tid] = my_k * my_k;
                     __syncthreads();
                     for (int s = block_size / 2; s > 0; s >>= 1) {
                         if (tid < s) partial[tid] += partial[tid + s];
@@ -1237,7 +1241,7 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
                     float k_rms = rsqrtf(partial[0] / (float)head_dim + 1e-6f);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
-                        sh_k[tid] = sh_k[tid] * k_rms * w;
+                        sh_k[tid] = my_k * k_rms * w;
                     }
                     __syncthreads();
                 }

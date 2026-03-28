@@ -1831,7 +1831,7 @@ impl Model {
         let s1 = cfg.mrope_section[1] as u32;
         let s2 = cfg.mrope_section[2] as u32;
         let eps = cfg.rms_norm_eps;
-        let _max_sl = cfg.max_seq_len as u32;
+        let max_sl = cfg.max_seq_len as u32;
 
         // 1. RMSNorm
         // SAFETY: Raw pointer breaks borrow on self.layers for mutable self.activations access.
