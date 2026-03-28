@@ -752,13 +752,13 @@ impl Model {
         } else { false };
         config.has_output_gate = has_output_gate;
         let embed_name = names.iter()
-            .find(|n| n.starts_with(&prefix) && (n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
-            .or_else(|| names.iter().find(|n| n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight")))
+            .find(|n| n.starts_with(&prefix) && (n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight") || n.contains("embeddings.weight")))
+            .or_else(|| names.iter().find(|n| n.contains("embed_tokens.weight") || n.contains("tok_embeddings.weight") || n.ends_with("wte.weight") || n.contains("embeddings.weight")))
             .ok_or_else(|| ModelError::MissingWeight("embedding tensor not found".into()))?
             .to_string();
         let norm_name = names.iter()
-            .find(|n| n.starts_with(&prefix) && (n.ends_with("norm.weight") || n.ends_with("ln_f.weight")) && !n.contains("layers."))
-            .or_else(|| names.iter().find(|n| (n.contains("norm.weight") || n.contains("ln_f.weight")) && !n.contains("layers.") && !n.contains("visual") && !n.contains("mtp")))
+            .find(|n| n.starts_with(&prefix) && (n.ends_with("norm.weight") || n.ends_with("ln_f.weight") || n.ends_with("norm_f.weight")) && !n.contains("layers."))
+            .or_else(|| names.iter().find(|n| (n.contains("norm.weight") || n.contains("ln_f.weight") || n.contains("norm_f.weight")) && !n.contains("layers.") && !n.contains("visual") && !n.contains("mtp")))
             .ok_or_else(|| ModelError::MissingWeight("final norm tensor not found".into()))?
             .to_string();
 
@@ -1418,6 +1418,12 @@ impl Model {
             _ => unreachable!(),
         };
 
+        // Debug: check for NaN in scores
+        let nan_count = scores.iter().filter(|s| s.is_nan()).count();
+        if nan_count > 0 {
+            eprintln!("WARNING: {nan_count}/{ne} NaN MoE scores at layer {layer_idx}, first 5 scores: {:?}", &scores[..5.min(ne)]);
+        }
+
         // Softmax over ALL experts first (standard MoE routing)
         let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
@@ -1425,7 +1431,7 @@ impl Model {
 
         // Top-k selection from softmax probabilities
         let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
 
         let (weights, scaling) = match &self.config.layers[layer_idx].ffn_type {
