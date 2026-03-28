@@ -57,12 +57,18 @@ fn test_parse_nemotron_cascade_30b() {
     let cfg = parse_config(&dir).expect("config not found");
     assert_eq!(cfg.num_layers, 52);
     let mamba = cfg.layers.iter().filter(|l| l.layer_type == LayerType::Mamba2).count();
+    let moe_ffn = cfg.layers.iter().filter(|l| l.layer_type == LayerType::MoeFfn).count();
     let attn = cfg.layers.iter().filter(|l| l.layer_type == LayerType::Attention).count();
-    assert_eq!(mamba, 46, "23 M + 23 E = 46 Mamba2 layers");
-    assert_eq!(attn, 6);
-    let moe_count = cfg.layers.iter().filter(|l| matches!(l.ffn_type, FfnType::MoE { .. })).count();
-    assert_eq!(moe_count, 23, "E layers should have MoE FFN");
-    println!("Nemotron-Cascade-30B: {mamba} Mamba2 + {attn} Attn, {moe_count} MoE layers");
+    assert_eq!(mamba, 23, "M layers = pure Mamba2 SSM");
+    assert_eq!(moe_ffn, 23, "E layers = pure MoE FFN");
+    assert_eq!(attn, 6, "* layers = attention");
+    assert_eq!(mamba + moe_ffn + attn, 52);
+    // M layers have no FFN, E layers have MoE FFN
+    assert!(cfg.layers.iter().filter(|l| l.layer_type == LayerType::Mamba2)
+        .all(|l| matches!(l.ffn_type, FfnType::None)));
+    assert!(cfg.layers.iter().filter(|l| l.layer_type == LayerType::MoeFfn)
+        .all(|l| matches!(l.ffn_type, FfnType::MoE { .. })));
+    println!("Nemotron-Cascade-30B: {mamba} Mamba2 + {moe_ffn} MoeFfn + {attn} Attn");
 }
 
 #[test]
@@ -71,12 +77,12 @@ fn test_parse_nemotron_120b() {
     let cfg = parse_config(&dir).expect("config not found");
     assert_eq!(cfg.num_layers, 88);
     let mamba = cfg.layers.iter().filter(|l| l.layer_type == LayerType::Mamba2).count();
+    let moe_ffn = cfg.layers.iter().filter(|l| l.layer_type == LayerType::MoeFfn).count();
     let attn = cfg.layers.iter().filter(|l| l.layer_type == LayerType::Attention).count();
-    assert_eq!(mamba, 80);
-    assert_eq!(attn, 8);
-    let moe_count = cfg.layers.iter().filter(|l| matches!(l.ffn_type, FfnType::MoE { .. })).count();
-    assert_eq!(moe_count, 40);
-    println!("Nemotron-120B: {mamba} Mamba2 + {attn} Attn, {moe_count} MoE layers");
+    assert_eq!(mamba, 40, "M layers = pure Mamba2 SSM");
+    assert_eq!(moe_ffn, 40, "E layers = pure MoE FFN");
+    assert_eq!(attn, 8, "* layers = attention");
+    println!("Nemotron-120B: {mamba} Mamba2 + {moe_ffn} MoeFfn + {attn} Attn");
 }
 
 #[test]

@@ -11,6 +11,7 @@ pub enum LayerType {
     Attention,
     Gdn,
     Mamba2,
+    MoeFfn,  // Standalone MoE FFN layer (Nemotron-H 'E' layers)
     LfmConv,
 }
 
@@ -22,6 +23,7 @@ pub enum GateType {
 
 #[derive(Debug, Clone)]
 pub enum FfnType {
+    None,   // Standalone layer with no FFN sub-layer (Nemotron-H M and * layers)
     Dense,
     MoE {
         num_experts: usize,
@@ -54,6 +56,8 @@ pub enum RecurrentLayerKind {
         num_heads: usize,
         head_dim: usize,
         conv_kernel: usize,
+        n_groups: usize,
+        conv_dim: usize,  // intermediate + 2 * n_groups * state_dim
     },
     None,
 }
@@ -250,9 +254,13 @@ impl ModelConfig {
                 conv_dim, kernel_size: linear_conv_kernel_dim,
             }
         } else if let (Some(sd), Some(nh), Some(hd)) = (ssm_state_size, mamba_num_heads, mamba_head_dim) {
+            let ng = get_usize("n_groups").unwrap_or(1);
+            let mamba_intermediate = nh * hd;
+            let mamba_conv_dim = mamba_intermediate + 2 * ng * sd;
             RecurrentLayerKind::Mamba2 {
                 state_dim: sd, num_heads: nh, head_dim: hd,
                 conv_kernel: linear_conv_kernel_dim,
+                n_groups: ng, conv_dim: mamba_conv_dim,
             }
         } else {
             RecurrentLayerKind::None
@@ -299,19 +307,21 @@ impl ModelConfig {
                 LayerConfig { layer_type, ffn_type: ffn }
             }).collect()
         } else if let Some(pattern) = get_str("hybrid_override_pattern") {
+            // Nemotron-H: M=pure Mamba2 SSM, E=pure MoE FFN, *=pure Attention
+            // Each letter is a standalone layer type, not a mixer+FFN pair
             pattern.chars().map(|c| match c {
-                'M' => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: dense_ffn.clone() },
-                'E' => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: moe_ffn.clone() },
-                '*' => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
-                _ => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
+                'M' => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: FfnType::None },
+                'E' => LayerConfig { layer_type: LayerType::MoeFfn, ffn_type: moe_ffn.clone() },
+                '*' => LayerConfig { layer_type: LayerType::Attention, ffn_type: FfnType::None },
+                _ => LayerConfig { layer_type: LayerType::Attention, ffn_type: FfnType::None },
             }).collect()
         } else if let Some(lbt) = get("layers_block_type").and_then(|v| v.as_array()) {
             lbt.iter().map(|t| {
                 let ts = t.as_str().unwrap_or("");
                 match ts {
-                    "mamba" => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: dense_ffn.clone() },
-                    "moe" => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: moe_ffn.clone() },
-                    "attention" => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
+                    "mamba" => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: FfnType::None },
+                    "moe" => LayerConfig { layer_type: LayerType::MoeFfn, ffn_type: moe_ffn.clone() },
+                    "attention" => LayerConfig { layer_type: LayerType::Attention, ffn_type: FfnType::None },
                     _ => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
                 }
             }).collect()

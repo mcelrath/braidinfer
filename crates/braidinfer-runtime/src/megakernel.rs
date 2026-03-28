@@ -311,6 +311,9 @@ impl MegakernelProgram {
                 LayerType::Mamba2 => {
                     panic!("Mamba2 layers not yet implemented in megakernel (braidinfer-ce9)");
                 }
+                LayerType::MoeFfn => {
+                    panic!("MoeFfn layers not yet implemented in megakernel (braidinfer-cea.7)");
+                }
                 LayerType::LfmConv => {
                     panic!("LfmConv layers not yet implemented in megakernel (braidinfer-aes.4)");
                 }
