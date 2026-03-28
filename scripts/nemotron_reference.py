@@ -13,11 +13,50 @@ Outputs per-layer hidden states for comparison with braidinfer megakernel.
 import sys
 import argparse
 
-# Block CUDA-only Mamba/DeltaNet dependencies — forces pure-torch fallback
+# Block CUDA-only Mamba/DeltaNet dependencies — forces pure-torch fallback.
+# Use mock modules that allow `from X import Y` to succeed with None values.
+import types
+def _mock_module(name):
+    import importlib
+    class _Proxy(types.ModuleType):
+        def __getattr__(self, attr):
+            return None
+    m = _Proxy(name)
+    m.__spec__ = importlib.machinery.ModuleSpec(name, None)
+    m.__path__ = []
+    m.__file__ = None
+    m.__all__ = []
+    m.__version__ = '0.0.0'
+    return m
+
+# Provide pure-torch fallbacks for CUDA-only functions
+def _rmsnorm_fn(x, weight, bias=None, z=None, eps=1e-6, group_size=None, norm_before_gate=False):
+    """Pure-torch RMSNorm gated (replaces mamba_ssm.ops.triton.layernorm_gated.rmsnorm_fn)"""
+    if group_size is None:
+        group_size = x.shape[-1]
+    orig_shape = x.shape
+    x = x.reshape(*x.shape[:-1], -1, group_size)
+    variance = x.float().pow(2).mean(-1, keepdim=True)
+    x = x * torch.rsqrt(variance + eps)
+    x = x.reshape(orig_shape)
+    x = x * weight
+    if z is not None:
+        z_act = z * torch.sigmoid(z)  # silu
+        if norm_before_gate:
+            x = x * z_act
+        else:
+            x = x * z_act
+    return x.to(weight.dtype)
+
 for _m in ['causal_conv1d', 'causal_conv1d.causal_conv1d_varlen_fn',
            'mamba_ssm', 'mamba_ssm.ops', 'mamba_ssm.ops.selective_scan_interface',
+           'mamba_ssm.ops.triton', 'mamba_ssm.ops.triton.selective_state_update',
+           'mamba_ssm.ops.triton.ssd_combined', 'mamba_ssm.ops.triton.layernorm_gated',
            'fla', 'fla.ops', 'fla.ops.gated_delta_rule']:
-    sys.modules[_m] = None
+    sys.modules[_m] = _mock_module(_m)
+
+# Inject pure-torch rmsnorm_fn into the mock layernorm_gated module
+sys.modules['mamba_ssm.ops.triton.layernorm_gated'].rmsnorm_fn = _rmsnorm_fn
 
 import torch
 import json
@@ -41,14 +80,19 @@ model = AutoModelForCausalLM.from_pretrained(
     args.model, dtype=torch.bfloat16,
     device_map=args.device if args.device != 'auto' else 'auto',
     max_memory=max_mem if args.device == 'auto' else None,
-    low_cpu_mem_usage=True)
-tokenizer = AutoTokenizer.from_pretrained(args.model)
+    low_cpu_mem_usage=True, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 model.eval()
 
-first_dev = next(iter(model.hf_device_map.values())) if hasattr(model, 'hf_device_map') else 'cuda:0'
-dev = f'cuda:{first_dev}' if isinstance(first_dev, int) else str(first_dev)
+if args.device == 'cpu':
+    dev = 'cpu'
+elif hasattr(model, 'hf_device_map'):
+    first_dev = next(iter(model.hf_device_map.values()))
+    dev = f'cuda:{first_dev}' if isinstance(first_dev, int) else str(first_dev)
+else:
+    dev = 'cuda:0'
 
 ids = tokenizer(args.prompt, return_tensors='pt').input_ids.to(dev)
 print(f"Input: {ids.shape[1]} tokens on {dev}", flush=True)
