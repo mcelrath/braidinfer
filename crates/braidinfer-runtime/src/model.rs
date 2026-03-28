@@ -1997,6 +1997,18 @@ impl Model {
                 LayerType::LfmConv => panic!("LfmConv not yet implemented"),
             }
 
+            // Debug: check for NaN in hidden state after each layer
+            if std::env::var("DEBUG_NAN").is_ok() {
+                self.stream.synchronize()?;
+                let mut buf = vec![0.0f32; self.config.hidden_size];
+                self.activations.hidden.copy_to_host(&mut buf)?;
+                let nan_count = buf.iter().filter(|x| x.is_nan()).count();
+                let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                if nan_count > 0 || max_abs > 1e6 {
+                    eprintln!("L{layer_i} ({:?}): {nan_count} NaN, max_abs={max_abs:.2}", self.config.layers[layer_i].layer_type);
+                }
+            }
+
             if self.trace.is_some() {
                 self.stream.synchronize()?;
                 let mut buf = vec![0.0f32; self.config.hidden_size];
