@@ -2162,6 +2162,7 @@ fn opcode_name(op: u32) -> &'static str {
         OP_LINEAR_PROJ_PCG32 => "LINEAR_PROJ_PCG32",
         OP_RMSNORM_WX => "RMSNORM_WX",
         OP_SILU_MUL => "SILU_MUL",
+        OP_SSM_UPDATE => "SSM_UPDATE",
         _ => "UNKNOWN",
     }
 }

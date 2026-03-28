@@ -1508,3 +1508,87 @@ impl AttnLayerFusedKernel {
         Ok(())
     }
 }
+
+/// Mamba2 selective state update kernel.
+pub struct SelectiveStateUpdateKernel {
+    module: Module,
+    _device: DeviceId,
+}
+
+impl SelectiveStateUpdateKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("selective_state_update.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, _device: device })
+    }
+
+    /// Mamba2 SSM recurrence: updates ssm_state in-place and writes output.
+    ///
+    /// ssm_state: [num_heads, head_dim, state_size] f32 — updated in-place
+    /// x:         [num_heads * head_dim] f32
+    /// dt:        [num_heads] f32 (before softplus)
+    /// dt_bias:   [num_heads] f32
+    /// a_log:     [num_heads] f32
+    /// b:         [n_groups * state_size] f32
+    /// c:         [n_groups * state_size] f32
+    /// d:         [num_heads] f32
+    /// output:    [num_heads * head_dim] f32
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        ssm_state: &mut DeviceBuffer<f32>,
+        x: &DeviceBuffer<f32>,
+        dt: &DeviceBuffer<f32>,
+        dt_bias: &DeviceBuffer<f32>,
+        a_log: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        c: &DeviceBuffer<f32>,
+        d_param: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        num_heads: u32,
+        head_dim: u32,
+        state_size: u32,
+        n_groups: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("selective_state_update_f32")?;
+
+        let mut state_ptr: *mut c_void = ssm_state.as_mut_ptr().cast();
+        let mut x_ptr: *const c_void = x.as_ptr().cast();
+        let mut dt_ptr: *const c_void = dt.as_ptr().cast();
+        let mut dt_bias_ptr: *const c_void = dt_bias.as_ptr().cast();
+        let mut a_log_ptr: *const c_void = a_log.as_ptr().cast();
+        let mut b_ptr: *const c_void = b.as_ptr().cast();
+        let mut c_ptr: *const c_void = c.as_ptr().cast();
+        let mut d_ptr: *const c_void = d_param.as_ptr().cast();
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ss = state_size as i32;
+        let mut ng = n_groups as i32;
+
+        let mut args: [*mut c_void; 13] = [
+            std::ptr::addr_of_mut!(state_ptr).cast(),
+            std::ptr::addr_of_mut!(x_ptr).cast(),
+            std::ptr::addr_of_mut!(dt_ptr).cast(),
+            std::ptr::addr_of_mut!(dt_bias_ptr).cast(),
+            std::ptr::addr_of_mut!(a_log_ptr).cast(),
+            std::ptr::addr_of_mut!(b_ptr).cast(),
+            std::ptr::addr_of_mut!(c_ptr).cast(),
+            std::ptr::addr_of_mut!(d_ptr).cast(),
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(nh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(),
+            std::ptr::addr_of_mut!(ss).cast(),
+            std::ptr::addr_of_mut!(ng).cast(),
+        ];
+
+        func.launch(
+            (num_heads, 1, 1),
+            (256, 1, 1),
+            0,
+            stream,
+            &mut args,
+        )
+    }
+}
