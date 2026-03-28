@@ -1,0 +1,170 @@
+BQNT File Format Specification
+==============================
+
+Version: 1
+Status: Draft
+
+Overview
+--------
+BQNT (BraidInfer Quantized Neural Tensors) stores quantized model weights
+with on-disk layout matching GPU memory layout exactly. Zero-copy loading
+via mmap() + hipMemcpyAsync.
+
+File Structure
+--------------
+Offset  Size     Field
+------  -------  -----
+0x0000  4        magic: "BQNT" (0x544E5142 little-endian)
+0x0004  4        version: u32le (currently 1)
+0x0008  4        n_tensors: u32le
+0x000C  4        reserved: u32 (0)
+0x0010  8        metadata_offset: u64le (byte offset to JSON metadata at EOF)
+0x0018  8        metadata_size: u64le
+0x0020  varies   tensor_table: TensorEntry[n_tensors]
+(pad)   varies   zero padding to next 64KB boundary
+...     varies   tensor_data[0] (64KB-aligned)
+...     varies   tensor_data[1] (64KB-aligned)
+...
+EOF-N   varies   JSON metadata blob (UTF-8)
+
+All integers are little-endian.
+
+Tensor Table Entry (48 bytes)
+-----------------------------
+Offset  Size  Type    Field
+------  ----  ------  -----
+0x00    8     u64le   name_hash (FNV-1a 64-bit of tensor name)
+0x08    1     u8      format (see Format Codes)
+0x09    3     u8[3]   reserved (0)
+0x0C    4     u32le   out_features (rows)
+0x10    4     u32le   in_features (columns)
+0x14    4     u32le   original_ndim
+0x18    8     u64le   data_offset (from file start)
+0x20    8     u64le   data_bytes
+0x28    8     u64le   reserved (0)
+
+Format Codes
+------------
+0  Bf16       Raw bfloat16, 2.0 bytes/element
+1  PcG32Q4    Per-channel-group asymmetric 4-bit, group_size=32
+2  Rnf4G128   Residual NF4, two rounds, group_size=128
+3  PcG32Q5    Per-channel-group asymmetric 5-bit, group_size=32
+
+
+PcG32Q4 Layout (format=1)
+-------------------------
+Per row (out_features rows), ceil(in_features/32) groups.
+Each group = 20 bytes:
+
+  Bytes 0-15:  idx_packed (32 x 4-bit indices, 2 per byte)
+               byte[i] = (idx[2i+1] << 4) | idx[2i]
+               Low nibble = even index, high nibble = odd
+               Values 0-15
+
+  Bytes 16-17: min (bf16)
+  Bytes 18-19: scale (bf16), computed as (max - min) / 15
+
+Dequant: value[i] = idx[i] * scale + min
+
+Total bytes/tensor: out_features * ceil(in_features / 32) * 20
+
+Read by: linear_proj_pcg32_q4() in kernels/linear_proj.hip
+
+
+Rnf4G128 Layout (format=2)
+---------------------------
+Per row (out_features rows), ceil(in_features/128) groups.
+Each group = 132 bytes:
+
+  Bytes 0-63:   idx1_packed (128 x 4-bit NF4 indices)
+                Same packing as PcG32Q4
+  Bytes 64-65:  absmax1 (bf16)
+  Bytes 66-129: idx2_packed (128 x 4-bit residual NF4 indices)
+  Bytes 130-131: absmax2 (bf16)
+
+NF4 Codebook (16 values, hardcoded):
+  [-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0,
+    0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626,  0.7230, 1.0]
+
+Dequant: value[i] = NF4_TABLE[idx1[i]] * absmax1 + NF4_TABLE[idx2[i]] * absmax2
+
+Total bytes/tensor: out_features * ceil(in_features / 128) * 132
+
+Read by: linear_proj_rnf4_g128() in kernels/linear_proj.hip
+
+
+Bf16 Layout (format=0)
+-----------------------
+Raw bfloat16, row-major. out_features * in_features * 2 bytes.
+
+
+PcG32Q5 Layout (format=3)
+--------------------------
+Per row, ceil(in_features/32) groups. Each group = 24 bytes:
+
+  Bytes 0-19:  idx_packed (32 x 5-bit indices, bit-sequential little-endian)
+               idx[i] = (packed_bits >> (i * 5)) & 0x1F
+               Values 0-31
+  Bytes 20-21: min (bf16)
+  Bytes 22-23: scale (bf16), computed as (max - min) / 31
+
+Dequant: value[i] = idx[i] * scale + min
+
+
+Alignment
+---------
+- Header: 32 bytes at offset 0
+- Tensor table: immediately after header (offset 0x20)
+- Tensor data: each tensor starts at 64KB (0x10000) boundary
+- Padding between tensors: zero-filled
+- 64KB alignment ensures GPU DMA coalescing and page-aligned mmap
+
+
+FNV-1a Hash (64-bit)
+---------------------
+  hash = 0xcbf29ce484222325
+  for byte in name.bytes():
+      hash ^= byte
+      hash = hash.wrapping_mul(0x100000001b3)
+
+
+JSON Metadata
+-------------
+UTF-8 JSON at metadata_offset. Contains:
+- model_name: HuggingFace model path
+- model_type: architecture type string
+- quantizer_version: "braidinfer-bqnt-v1"
+- default_format: "PcG32Q4" | "Rnf4G128" | etc
+- tensor_names: { "hash_decimal": "full.tensor.name", ... }
+- format_overrides: { "pattern": "format", ... }
+- model_config: original model config dict
+- quantization_stats: { total_params, quantized_params, bf16_params, file_size_bytes, effective_bpw }
+
+
+Loading Procedure
+-----------------
+1. mmap file (read-only)
+2. Validate magic == "BQNT", version == 1
+3. Parse tensor table -> HashMap<u64, TensorEntry>
+4. For each model weight:
+   a. hash = fnv1a_64(tensor_name)
+   b. entry = table[hash]
+   c. hipMemcpyAsync(gpu_buf, mmap_ptr + entry.data_offset, entry.data_bytes, H2D)
+   d. PackedWeights { data: gpu_buf, format: entry.format, out_dim, in_dim }
+5. Read JSON metadata for model config if needed
+
+
+Quantization Procedure (bqnt-quantize)
+--------------------------------------
+1. For each safetensors shard:
+   a. mmap shard (read-only)
+   b. For each tensor: read bf16 -> determine format -> quantize -> write packed
+   c. Record TensorEntry
+2. Write tensor table at 0x0020
+3. Write JSON metadata at EOF
+4. Write header
+
+
+Version History
+---------------
+v1: Initial. PcG32Q4, Rnf4G128, Bf16, PcG32Q5.
