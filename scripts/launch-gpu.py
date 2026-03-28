@@ -28,7 +28,8 @@ import sys
 import time
 from pathlib import Path
 
-LOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "launch-gpu"
+# Shared with llama.cpp/scripts/launch-llama.py — same lock dir for cross-project GPU reservation
+LOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "launch-llama"
 VRAM_IN_USE_THRESHOLD_MB = 100  # Idle GPU has ~27MB used; 512 was too high
 
 
@@ -96,7 +97,8 @@ def is_pid_alive(pid):
 
 
 def lock_path(gpu_idx):
-    return LOCK_DIR / f"gpu-{gpu_idx}.lock"
+    # Use ROCmN naming to match llama.cpp/scripts/launch-llama.py lock files
+    return LOCK_DIR / f"gpu-ROCm{gpu_idx}.lock"
 
 
 def read_lock_info(gpu_idx):
