@@ -1430,23 +1430,10 @@ impl Model {
         let mut scores = vec![0.0f32; ne];
         self.activations.moe_scores.copy_to_host(&mut scores)?;
 
-        // Apply score correction bias (Nemotron) before softmax
-        if let Some(ref bias) = moe.score_correction_bias {
-            for (s, b) in scores.iter_mut().zip(bias.iter()) {
-                *s += b;
-            }
-        }
-
         let k = match &self.config.layers[layer_idx].ffn_type {
             FfnType::MoE { num_active, .. } => *num_active,
             _ => unreachable!(),
         };
-
-        // Debug: check for NaN in scores
-        let nan_count = scores.iter().filter(|s| s.is_nan()).count();
-        if nan_count > 0 {
-            eprintln!("WARNING: {nan_count}/{ne} NaN MoE scores at layer {layer_idx}, first 5 scores: {:?}", &scores[..5.min(ne)]);
-        }
 
         // Score transformation depends on gate type
         let gate_type = match &self.config.layers[layer_idx].ffn_type {
@@ -1454,24 +1441,38 @@ impl Model {
             _ => unreachable!(),
         };
 
-        let (topk, _probs) = match &gate_type {
+        let topk = match &gate_type {
             GateType::Sigmoid { .. } => {
-                // Sigmoid scoring: scores → sigmoid → top-k (no softmax)
-                let probs: Vec<f32> = scores.iter().map(|&s| 1.0 / (1.0 + (-s).exp())).collect();
-                let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                // Sigmoid scoring (Nemotron): sigmoid(logits) for weights,
+                // sigmoid(logits) + correction_bias for expert SELECTION only
+                let sigmoid_scores: Vec<f32> = scores.iter().map(|&s| 1.0 / (1.0 + (-s).exp())).collect();
+                // Selection uses biased scores
+                let mut selection_scores = sigmoid_scores.clone();
+                if let Some(ref bias) = moe.score_correction_bias {
+                    for (s, b) in selection_scores.iter_mut().zip(bias.iter()) {
+                        *s += b;
+                    }
+                }
+                let mut indexed: Vec<(usize, f32)> = selection_scores.iter().enumerate().map(|(i, &p)| (i, p)).collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
-                (topk, probs)
+                // Weights come from UN-BIASED sigmoid scores
+                let topk: Vec<(usize, f32)> = indexed[..k].iter()
+                    .map(|&(id, _)| (id, sigmoid_scores[id])).collect();
+                topk
             }
             _ => {
-                // Softmax scoring
+                // Softmax scoring (+ optional correction bias for selection)
+                if let Some(ref bias) = moe.score_correction_bias {
+                    for (s, b) in scores.iter_mut().zip(bias.iter()) {
+                        *s += b;
+                    }
+                }
                 let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
                 let probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp() / exp_sum).collect();
                 let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
                 indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
-                (topk, probs)
+                indexed[..k].to_vec()
             }
         };
 
@@ -1498,6 +1499,12 @@ impl Model {
             if rc != 0 {
                 return Err(braidinfer_hip::HipError(rc).into());
             }
+        }
+
+        // Debug MoE routing
+        if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 3 {
+            eprintln!("  MoE L{layer_idx}: topk={:?} weights={:?} scaling={scaling:.4}",
+                topk.iter().map(|(id,_)| *id).collect::<Vec<_>>(), &weights);
         }
 
         // 5. For each selected expert: run FFN and GPU-accumulate
@@ -1543,6 +1550,18 @@ impl Model {
                     &self.activations.moe_expert_up,
                     eis as u32, &self.stream,
                 )?;
+            }
+
+            // Debug: check intermediate values
+            if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 1 && j == 0 {
+                self.stream.synchronize()?;
+                let mut up_buf = vec![0.0f32; eis];
+                let mut act_buf = vec![0.0f32; eis];
+                self.activations.moe_expert_up.copy_to_host(&mut up_buf)?;
+                self.activations.moe_expert_act.copy_to_host(&mut act_buf)?;
+                let up_max = up_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                let act_max = act_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+                eprintln!("  Expert {expert_id}: up_max={up_max:.4}, act_max(relu²)={act_max:.4}, w={w:.6}");
             }
 
             // Down projection (pre-allocated buffer)
