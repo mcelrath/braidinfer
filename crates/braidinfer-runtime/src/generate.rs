@@ -133,11 +133,12 @@ pub fn generate_from_ids(
 
     let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
     let mut text_pieces: Vec<String> = Vec::new();
-    let mut logits = last_logits;
     let mut position = n_prompt as u32;
 
+    // First token from prefill/decode logits (already on CPU)
+    let mut next_token = argmax(&last_logits);
+
     for _ in 0..max_tokens {
-        let next_token = argmax(&logits);
         if token_config.is_stop_token(next_token) {
             break;
         }
@@ -146,7 +147,8 @@ pub fn generate_from_ids(
         let piece = tokenizer.decode(&[next_token], false).unwrap_or_default();
         text_pieces.push(piece);
 
-        logits = model.decode_step(next_token, position)?;
+        // GPU-resident argmax: only transfers 4 bytes instead of vocab_size×4
+        next_token = model.decode_step_token(next_token, position)?;
         position += 1;
     }
 

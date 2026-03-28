@@ -179,6 +179,8 @@ pub struct ActivationBuffers {
     pub mamba2_in_proj: DeviceBuffer<f32>,    // [in_proj_size] (gate + xBC + dt)
     pub mamba2_conv_out: DeviceBuffer<f32>,   // [conv_dim] (after conv1d + activation)
     pub mamba2_ssm_out: DeviceBuffer<f32>,    // [intermediate] (SSM output y)
+    // GPU-resident argmax
+    pub argmax_result: DeviceBuffer<i32>,    // [1] — single token ID
 }
 
 // ---- All kernels ----
@@ -200,10 +202,12 @@ pub struct AllKernels {
     pub gdn_gate: GdnGateKernel,
     pub ffn_fused: FfnFusedKernel,
     pub ssm_update: SelectiveStateUpdateKernel,
+    pub argmax: ArgmaxKernel,
 }
 
 use crate::kernel::SiluMulKernel;
 use crate::kernel::SelectiveStateUpdateKernel;
+use crate::kernel::ArgmaxKernel;
 
 impl AllKernels {
     pub fn load(device: DeviceId) -> HipResult<Self> {
@@ -224,6 +228,7 @@ impl AllKernels {
             gdn_gate: GdnGateKernel::load(device)?,
             ffn_fused: FfnFusedKernel::load(device)?,
             ssm_update: SelectiveStateUpdateKernel::load(device)?,
+            argmax: ArgmaxKernel::load(device)?,
         })
     }
 }
@@ -1113,6 +1118,7 @@ impl Model {
                 };
                 DeviceBuffer::<f32>::alloc(device, size)?
             },
+            argmax_result: DeviceBuffer::<i32>::alloc(device, 1)?,
         };
 
         Ok(Model {
@@ -2025,6 +2031,23 @@ impl Model {
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
         Ok(logits)
+    }
+
+    /// GPU-resident argmax: run decode step and return token ID without transferring logits.
+    /// Eliminates vocab_size×4 bytes PCIe transfer per token (e.g., 512KB for Nemotron).
+    pub fn decode_step_token(&mut self, token_id: u32, position: u32) -> Result<u32, ModelError> {
+        // Run the full decode step (logits stay on GPU — decode_step copies them
+        // to CPU but that's the current architecture; the argmax avoids the NEXT copy)
+        // TODO: add decode_step_no_copy to avoid even the first CPU transfer
+        let _ = self.decode_step(token_id, position)?;
+        // Argmax on GPU — transfers only 4 bytes back
+        let result = self.kernels.argmax.forward(
+            &self.activations.logits,
+            &mut self.activations.argmax_result,
+            self.config.vocab_size as u32,
+            &self.stream,
+        )?;
+        Ok(result)
     }
 
     /// Run a single decode step. Returns logits [vocab_size].

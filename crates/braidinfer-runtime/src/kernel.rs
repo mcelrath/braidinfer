@@ -10,7 +10,50 @@ pub(crate) fn kernel_dir() -> PathBuf {
     PathBuf::from(env!("BRAIDINFER_KERNEL_DIR"))
 }
 
-// GdnRecurrentStepKernel v1 removed — replaced by GdnRecurrentStepV2Kernel (with gqa_group param)
+/// GPU-resident argmax: returns index of max element without transferring logits to CPU.
+pub struct ArgmaxKernel {
+    module: Module,
+    _device: DeviceId,
+}
+
+impl ArgmaxKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("argmax.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, _device: device })
+    }
+
+    /// Find argmax of input[0..size], write result index to output[0].
+    /// Returns the index as u32 after synchronizing.
+    pub fn forward(
+        &self,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<i32>,
+        size: u32,
+        stream: &Stream,
+    ) -> HipResult<u32> {
+        let func = self.module.get_function("argmax_f32")?;
+
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut sz = size as i32;
+
+        let mut args: [*mut c_void; 3] = [
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(sz).cast(),
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = block_size * 4 * 2; // float + int per thread
+        func.launch((1, 1, 1), (block_size, 1, 1), shared_mem, stream, &mut args)?;
+        stream.synchronize()?;
+
+        let mut result = [0i32];
+        output.copy_to_host(&mut result)?;
+        Ok(result[0] as u32)
+    }
+}
 
 pub struct RmsNormKernel {
     module: Module,
