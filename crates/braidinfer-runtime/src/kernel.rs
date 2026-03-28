@@ -897,7 +897,7 @@ impl GdnLayerFusedKernel {
 }
 
 pub struct CausalConv1dUpdateKernel {
-    module: Module,
+    pub(crate) module: Module,
     device: DeviceId,
 }
 
@@ -943,6 +943,44 @@ impl CausalConv1dUpdateKernel {
             std::ptr::addr_of_mut!(state_ptr).cast(),
             std::ptr::addr_of_mut!(in_ptr).cast(),
             std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(cd).cast(),
+            std::ptr::addr_of_mut!(ks).cast(),
+        ];
+
+        let block_size = 256u32;
+        let grid_size = (conv_dim + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
+
+    /// Variant with per-channel bias (for Mamba2 conv1d).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_bias(
+        &self,
+        state: &mut DeviceBuffer<f32>,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<u16>,
+        bias: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        conv_dim: u32,
+        kernel_size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("causal_conv1d_update_bias_f32")?;
+
+        let mut state_ptr: *mut c_void = state.as_mut_ptr().cast();
+        let mut in_ptr: *const c_void = input.as_ptr().cast();
+        let mut w_ptr: *const c_void = weight.as_ptr().cast();
+        let mut bias_ptr: *const c_void = bias.as_ptr().cast();
+        let mut out_ptr: *mut c_void = output.as_mut_ptr().cast();
+        let mut cd = conv_dim as i32;
+        let mut ks = kernel_size as i32;
+
+        let mut args: [*mut c_void; 7] = [
+            std::ptr::addr_of_mut!(state_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(bias_ptr).cast(),
             std::ptr::addr_of_mut!(out_ptr).cast(),
             std::ptr::addr_of_mut!(cd).cast(),
             std::ptr::addr_of_mut!(ks).cast(),

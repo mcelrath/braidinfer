@@ -461,13 +461,26 @@ fn load_moe_weights(
         .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.gate.weight (or variants)")))?;
     let gate = load_weight_bf16(st, &gate_name, device, ne * hs)?;
 
-    let expert_fmt = weight_format_for(&format!("{prefix}mlp.experts.0.gate_proj.weight"), wq);
+    // Detect whether experts have gate_proj (SwiGLU) or just up_proj (relu²)
+    let has_gate_proj = [
+        format!("{prefix}mlp.experts.0.gate_proj.weight"),
+        format!("{prefix}experts.0.gate_proj.weight"),
+        format!("{prefix}block_sparse_moe.experts.0.w1.weight"),
+    ].iter().any(|n| st.tensor_data(n).is_ok());
+
+    let expert_fmt = if has_gate_proj {
+        weight_format_for(&format!("{prefix}mlp.experts.0.gate_proj.weight"), wq)
+    } else {
+        // Try Nemotron naming: experts.0.up_proj.weight (under mixer. prefix)
+        weight_format_for(&format!("{prefix}experts.0.up_proj.weight"), wq)
+    };
 
     // Expert gate+up: try fused tensor, else per-expert fuse on host
     let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
     let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
         load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
-    } else {
+    } else if has_gate_proj {
+        // SwiGLU: fuse gate_proj + up_proj per expert
         let expert_elems = 2 * eis * hs;
         let mut host_buf = vec![0u16; ne * expert_elems];
         for e in 0..ne {
@@ -475,7 +488,7 @@ fn load_moe_weights(
                 (format!("{prefix}mlp.experts.{e}.gate_proj.weight"), format!("{prefix}mlp.experts.{e}.up_proj.weight")),
                 (format!("{prefix}block_sparse_moe.experts.{e}.w1.weight"), format!("{prefix}block_sparse_moe.experts.{e}.w3.weight")),
             ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
-                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.experts.{e}.gate_proj.weight (or variants)")))?;
+                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.gate_proj.weight (or variants)")))?;
             let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
             let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
             let dst_off = e * expert_elems;
@@ -485,6 +498,23 @@ fn load_moe_weights(
             host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
         }
         host_bf16_to_linear_weight(&host_buf, ne * 2 * eis, hs, expert_fmt, device)?
+    } else {
+        // No gate_proj (relu² activation): load only up_proj per expert
+        let expert_elems = eis * hs;
+        let mut host_buf = vec![0u16; ne * expert_elems];
+        for e in 0..ne {
+            let up_name = [
+                format!("{prefix}experts.{e}.up_proj.weight"),
+                format!("{prefix}mlp.experts.{e}.up_proj.weight"),
+            ].into_iter().find(|n| st.tensor_data(n).is_ok())
+                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.up_proj.weight")))?;
+            let u_raw = st.tensor_data(&up_name).map_err(|_| ModelError::MissingWeight(up_name))?;
+            let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, expert_elems) };
+            let dst_off = e * expert_elems;
+            host_buf[dst_off..dst_off + expert_elems].copy_from_slice(u_slice);
+        }
+        // Store as expert_gate_up with size eis (not 2*eis) — dispatch must handle this
+        host_bf16_to_linear_weight(&host_buf, ne * eis, hs, expert_fmt, device)?
     };
 
     // Expert down: try fused tensor, else per-expert load
@@ -497,6 +527,7 @@ fn load_moe_weights(
         for e in 0..ne {
             let dp = [
                 format!("{prefix}mlp.experts.{e}.down_proj.weight"),
+                format!("{prefix}experts.{e}.down_proj.weight"),
                 format!("{prefix}block_sparse_moe.experts.{e}.w2.weight"),
             ].into_iter().find(|n| st.tensor_data(n).is_ok())
                 .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.down_proj (or variants)")))?;
@@ -512,10 +543,29 @@ fn load_moe_weights(
     let shared_expert = if *num_shared > 0 {
         let sis = *shared_intermediate_size;
         let sis = if sis == 0 { eis } else { sis };
+        // Try multiple naming patterns for shared expert weights
+        let se_up_name = find_weight_name(st, &[
+            format!("{prefix}mlp.shared_expert.up_proj.weight"),
+            format!("{prefix}shared_experts.up_proj.weight"),
+        ])?;
+        let se_down_name = find_weight_name(st, &[
+            format!("{prefix}mlp.shared_expert.down_proj.weight"),
+            format!("{prefix}shared_experts.down_proj.weight"),
+        ])?;
+        let se_gate_name = find_weight_name(st, &[
+            format!("{prefix}mlp.shared_expert.gate_proj.weight"),
+            format!("{prefix}shared_experts.gate_proj.weight"),
+        ]);
+        let gate_proj = if let Ok(name) = se_gate_name {
+            load_linear_weight(st, &name, device, sis, hs, wq)?
+        } else {
+            // No gate_proj (relu² models) — allocate dummy
+            LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?)
+        };
         Some(DenseFfnWeights {
-            gate_proj: load_linear_weight(st, &format!("{prefix}mlp.shared_expert.gate_proj.weight"), device, sis, hs, wq)?,
-            up_proj: load_linear_weight(st, &format!("{prefix}mlp.shared_expert.up_proj.weight"), device, sis, hs, wq)?,
-            down_proj: load_linear_weight(st, &format!("{prefix}mlp.shared_expert.down_proj.weight"), device, hs, sis, wq)?,
+            gate_proj,
+            up_proj: load_linear_weight(st, &se_up_name, device, sis, hs, wq)?,
+            down_proj: load_linear_weight(st, &se_down_name, device, hs, sis, wq)?,
         })
     } else { None };
 
@@ -783,15 +833,26 @@ impl Model {
                 let hs = config.hidden_size;
                 let q_mult = if has_output_gate { 2 } else { 1 };
                 let w = AttentionLayerWeights {
-                    input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, hs)?,
-                    w_q_gate: load_linear_weight(&st, &format!("{p}self_attn.q_proj.weight"), device,
-                        config.num_q_heads * config.head_dim * q_mult, hs, wq)?,
-                    w_k: load_linear_weight(&st, &format!("{p}self_attn.k_proj.weight"), device,
-                        config.num_kv_heads * config.head_dim, hs, wq)?,
-                    w_v: load_linear_weight(&st, &format!("{p}self_attn.v_proj.weight"), device,
-                        config.num_kv_heads * config.head_dim, hs, wq)?,
-                    w_o: load_linear_weight(&st, &format!("{p}self_attn.o_proj.weight"), device,
-                        hs, config.num_q_heads * config.head_dim, wq)?,
+                    input_norm: load_weight_bf16(&st, &find_weight_name(&st, &[
+                        format!("{p}input_layernorm.weight"),
+                        format!("{p}norm.weight"),
+                    ])?, device, hs)?,
+                    w_q_gate: load_linear_weight(&st, &find_weight_name(&st, &[
+                        format!("{p}self_attn.q_proj.weight"),
+                        format!("{p}mixer.q_proj.weight"),
+                    ])?, device, config.num_q_heads * config.head_dim * q_mult, hs, wq)?,
+                    w_k: load_linear_weight(&st, &find_weight_name(&st, &[
+                        format!("{p}self_attn.k_proj.weight"),
+                        format!("{p}mixer.k_proj.weight"),
+                    ])?, device, config.num_kv_heads * config.head_dim, hs, wq)?,
+                    w_v: load_linear_weight(&st, &find_weight_name(&st, &[
+                        format!("{p}self_attn.v_proj.weight"),
+                        format!("{p}mixer.v_proj.weight"),
+                    ])?, device, config.num_kv_heads * config.head_dim, hs, wq)?,
+                    w_o: load_linear_weight(&st, &find_weight_name(&st, &[
+                        format!("{p}self_attn.o_proj.weight"),
+                        format!("{p}mixer.o_proj.weight"),
+                    ])?, device, hs, config.num_q_heads * config.head_dim, wq)?,
                     q_norm: if has_qk_norm {
                         let name = format!("{p}self_attn.q_norm.weight");
                         let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
@@ -802,16 +863,22 @@ impl Model {
                         let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
                         load_weight_bf16(&st, &name, device, raw.len() / 2)?
                     } else { DeviceBuffer::<u16>::alloc(device, 0)? },
-                    post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, hs)?,
-                    w_gate: if !is_moe {
+                    post_norm: {
+                        let name = find_weight_name(&st, &[
+                            format!("{p}post_attention_layernorm.weight"),
+                        ]);
+                        if let Ok(n) = name { load_weight_bf16(&st, &n, device, hs)? }
+                        else { DeviceBuffer::<u16>::alloc(device, 0)? } // no post-norm (Nemotron * layers)
+                    },
+                    w_gate: if !is_moe && !matches!(config.layers[i].ffn_type, FfnType::None) {
                         load_linear_weight(&st, &format!("{p}mlp.gate_proj.weight"), device,
                             config.intermediate_size, hs, wq)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
-                    w_up: if !is_moe {
+                    w_up: if !is_moe && !matches!(config.layers[i].ffn_type, FfnType::None) {
                         load_linear_weight(&st, &format!("{p}mlp.up_proj.weight"), device,
                             config.intermediate_size, hs, wq)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
-                    w_down: if !is_moe {
+                    w_down: if !is_moe && !matches!(config.layers[i].ffn_type, FfnType::None) {
                         load_linear_weight(&st, &format!("{p}mlp.down_proj.weight"), device,
                             hs, config.intermediate_size, wq)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
@@ -1311,10 +1378,11 @@ impl Model {
 
         // SAFETY: Raw pointer breaks borrow on self.layers to allow mutable access to
         // self.activations. Pointer valid for duration of this function (layers not modified).
-        let post_norm = match &self.layers[layer_idx] {
+        let norm_weight = match &self.layers[layer_idx] {
             LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
             LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
-            _ => panic!("post_norm only for Attention/Gdn layers"),
+            LayerWeights::MoeFfn(w) => &w.input_norm as *const DeviceBuffer<u16>,
+            _ => panic!("no norm weight for this layer type in MoE FFN"),
         };
 
         // 1. RMSNorm(hidden) → normed
@@ -1322,7 +1390,7 @@ impl Model {
             self.kernels.rmsnorm.forward(
                 &mut self.activations.normed,
                 &self.activations.hidden,
-                &*post_norm,
+                &*norm_weight,
                 1, hs as u32, eps, self.config.rms_norm_one_plus_w, &self.stream,
             )?;
         }
@@ -1483,22 +1551,33 @@ impl Model {
 
         // 3. Conv1d update on xBC portion (offset intermediate from start)
         // xBC is at offset [intermediate..intermediate+conv_dim] in mamba2_in_proj
-        // For now, use a separate conv update kernel call
-        // TODO: implement conv1d_update for Mamba2 (different from GDN split conv)
-        // The conv1d is a depthwise conv on the entire xBC vector
-        // For now, skip conv1d (just copy xBC to conv_out) — PLACEHOLDER
-        unsafe {
-            let src = self.activations.mamba2_in_proj.as_ptr().add(intermediate as usize);
-            let dst = self.activations.mamba2_conv_out.as_mut_ptr();
-            braidinfer_hip::ffi::hipMemcpyAsync(
-                dst as *mut std::ffi::c_void,
-                src as *const std::ffi::c_void,
-                cd * std::mem::size_of::<f32>(),
-                braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                self.stream.raw(),
-            );
+        // 3. Conv1d update on xBC with bias + silu activation
+        // Input is mamba2_in_proj[intermediate..intermediate+cd], output to mamba2_conv_out
+        {
+            let state = &mut self.mamba2_states[mamba2_idx];
+            let func = self.kernels.causal_conv1d.module.get_function("causal_conv1d_update_bias_f32")?;
+            let mut state_ptr: *mut std::ffi::c_void = state.conv.as_mut_ptr().cast();
+            let mut in_ptr: *const std::ffi::c_void = unsafe {
+                self.activations.mamba2_in_proj.as_ptr().add(nh * hd).cast()
+            };
+            let mut w_ptr: *const std::ffi::c_void = unsafe { (*w).conv1d_weight.as_ptr().cast() };
+            let mut bias_ptr: *const std::ffi::c_void = unsafe { (*w).conv1d_bias.as_ptr().cast() };
+            let mut out_ptr: *mut std::ffi::c_void = self.activations.mamba2_conv_out.as_mut_ptr().cast();
+            let mut i_cd = cd as i32;
+            let mut i_ck = _ck as i32;
+            let mut args: [*mut std::ffi::c_void; 7] = [
+                std::ptr::addr_of_mut!(state_ptr).cast(),
+                std::ptr::addr_of_mut!(in_ptr).cast(),
+                std::ptr::addr_of_mut!(w_ptr).cast(),
+                std::ptr::addr_of_mut!(bias_ptr).cast(),
+                std::ptr::addr_of_mut!(out_ptr).cast(),
+                std::ptr::addr_of_mut!(i_cd).cast(),
+                std::ptr::addr_of_mut!(i_ck).cast(),
+            ];
+            let block_size = 256u32;
+            let grid_size = (cd as u32 + block_size - 1) / block_size;
+            func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, &self.stream, &mut args)?;
         }
-        // TODO: apply actual conv1d + silu activation here
 
         // 4. Split conv_out → x[intermediate], B[ng*sd], C[ng*sd]
         // x = conv_out[0..intermediate], B = conv_out[intermediate..intermediate+ng*sd], C = conv_out[intermediate+ng*sd..]
