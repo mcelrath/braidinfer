@@ -1615,7 +1615,7 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
 // Main megakernel entry point
 // ============================================================
 
-#define INST_SIZE 16  // 16 u64s per instruction = 128 bytes
+#define INST_SIZE 17  // 17 u64s per instruction = 136 bytes (expanded for QK-norm k_norm_weight ptr at slot 16)
 
 // Dump mode: per-instruction activation capture
 // dump_base: GPU buffer for storing instruction outputs (NULL = disabled)

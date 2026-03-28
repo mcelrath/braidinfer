@@ -20,7 +20,7 @@ include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 
 const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
-const INST_SIZE: usize = 16; // 16 u64s per instruction = 128 bytes
+const INST_SIZE: usize = 17; // 17 u64s per instruction = 136 bytes (was 16; expanded for QK-norm k_norm_weight ptr)
 const NUM_CUS: u32 = 96;
 
 /// A single instruction for the megakernel program.
@@ -1133,7 +1133,7 @@ impl MegakernelProgram {
                     inst.words[12] = paged_layer_k_offset;
                     inst.words[13] = paged_layer_v_offset;
                     inst.words[14] = 0; // partial_state — patched when quantized KV enabled
-                    // Pass k_norm weight for QK-norm after loading from cache
+                    // Pass k_norm weight for QK-norm after loading from cache (slot 16)
                     inst.set_ptr(16, if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() });
                     instructions.push(inst);
                 }
