@@ -1511,7 +1511,7 @@ impl AttnLayerFusedKernel {
 
 /// Mamba2 selective state update kernel.
 pub struct SelectiveStateUpdateKernel {
-    module: Module,
+    pub(crate) module: Module,
     _device: DeviceId,
 }
 

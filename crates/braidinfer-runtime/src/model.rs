@@ -64,7 +64,7 @@ pub struct Mamba2LayerWeights {
     pub dt_bias: DeviceBuffer<f32>,         // f32 [num_heads]
     pub a_log: DeviceBuffer<f32>,           // f32 [num_heads]
     pub d: DeviceBuffer<f32>,               // f32 [num_heads]
-    pub norm_weight: DeviceBuffer<u16>,     // bf16 rmsnorm_gated weight [intermediate]
+    pub norm_weight: DeviceBuffer<f32>,     // f32 rmsnorm_gated weight [intermediate]
     pub out_proj: LinearWeight,             // [intermediate, hidden_size]
 }
 
@@ -173,6 +173,10 @@ pub struct ActivationBuffers {
     pub moe_expert_up: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
     pub moe_expert_act: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
     pub moe_expert_out: DeviceBuffer<f32>,    // [hidden_size]
+    // Mamba2 scratch buffers
+    pub mamba2_in_proj: DeviceBuffer<f32>,    // [in_proj_size] (gate + xBC + dt)
+    pub mamba2_conv_out: DeviceBuffer<f32>,   // [conv_dim] (after conv1d + activation)
+    pub mamba2_ssm_out: DeviceBuffer<f32>,    // [intermediate] (SSM output y)
 }
 
 // ---- All kernels ----
@@ -193,10 +197,11 @@ pub struct AllKernels {
     pub output_gate: OutputGateKernel,
     pub gdn_gate: GdnGateKernel,
     pub ffn_fused: FfnFusedKernel,
+    pub ssm_update: SelectiveStateUpdateKernel,
 }
 
-// SiluMulKernel needs to be imported (it's in kernel.rs but not listed in the use above)
 use crate::kernel::SiluMulKernel;
+use crate::kernel::SelectiveStateUpdateKernel;
 
 impl AllKernels {
     pub fn load(device: DeviceId) -> HipResult<Self> {
@@ -216,6 +221,7 @@ impl AllKernels {
             output_gate: OutputGateKernel::load(device)?,
             gdn_gate: GdnGateKernel::load(device)?,
             ffn_fused: FfnFusedKernel::load(device)?,
+            ssm_update: SelectiveStateUpdateKernel::load(device)?,
         })
     }
 }
@@ -750,7 +756,7 @@ impl Model {
                     dt_bias: load_weight_f32(&st, &format!("{p}mixer.dt_bias"), device, nh)?,
                     a_log: load_weight_f32(&st, &format!("{p}mixer.A_log"), device, nh)?,
                     d: load_weight_f32(&st, &format!("{p}mixer.D"), device, nh)?,
-                    norm_weight: load_weight_bf16(&st, &format!("{p}mixer.norm.weight"), device, intermediate)?,
+                    norm_weight: load_weight_f32(&st, &format!("{p}mixer.norm.weight"), device, intermediate)?,
                     out_proj: load_linear_weight(&st, &format!("{p}mixer.out_proj.weight"), device, hs, intermediate, wq)?,
                 };
                 layers.push(LayerWeights::Mamba2(w));
@@ -1000,6 +1006,29 @@ impl Model {
                 FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size), _ => None
             }).max().unwrap_or(1))?,
             moe_expert_out: DeviceBuffer::<f32>::alloc(device, hs)?,
+            // Mamba2 scratch: sized from recurrent_kind if Mamba2
+            mamba2_in_proj: {
+                let size = match &config.recurrent_kind {
+                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, conv_dim, .. } =>
+                        num_heads * head_dim + conv_dim + num_heads, // gate + xBC + dt
+                    _ => 1,
+                };
+                DeviceBuffer::<f32>::alloc(device, size)?
+            },
+            mamba2_conv_out: {
+                let size = match &config.recurrent_kind {
+                    RecurrentLayerKind::Mamba2 { conv_dim, .. } => *conv_dim,
+                    _ => 1,
+                };
+                DeviceBuffer::<f32>::alloc(device, size)?
+            },
+            mamba2_ssm_out: {
+                let size = match &config.recurrent_kind {
+                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, .. } => num_heads * head_dim,
+                    _ => 1,
+                };
+                DeviceBuffer::<f32>::alloc(device, size)?
+            },
         };
 
         Ok(Model {
@@ -1419,6 +1448,151 @@ impl Model {
         Ok(())
     }
 
+    /// Mamba2 SSM layer forward pass (Nemotron-H 'M' layers).
+    /// Steps: norm → in_proj → split → conv1d → split → ssm_update → norm_gated → out_proj → residual
+    fn mamba2_forward(&mut self, layer_idx: usize, mamba2_idx: usize) -> Result<(), ModelError> {
+        let w = match &self.layers[layer_idx] {
+            LayerWeights::Mamba2(w) => w as *const Mamba2LayerWeights,
+            _ => panic!("mamba2_forward called on non-Mamba2 layer"),
+        };
+        let (nh, hd, sd, _ck, ng, cd) = match &self.config.recurrent_kind {
+            RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim } =>
+                (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim),
+            _ => panic!("mamba2_forward but no Mamba2 config"),
+        };
+        let hs = self.config.hidden_size as u32;
+        let intermediate = (nh * hd) as u32;
+        let in_proj_size = (nh * hd + cd + nh) as u32;
+        let eps = self.config.rms_norm_eps;
+
+        // 1. RMSNorm
+        unsafe {
+            self.kernels.rmsnorm.forward(
+                &mut self.activations.normed, &self.activations.hidden,
+                &(*w).input_norm, 1, hs, eps,
+                self.config.rms_norm_one_plus_w, &self.stream,
+            )?;
+        }
+
+        // 2. in_proj: normed → [gate(intermediate), xBC(conv_dim), dt(num_heads)]
+        unsafe {
+            (*w).in_proj.forward(&self.kernels.linear_proj,
+                &mut self.activations.mamba2_in_proj, &self.activations.normed,
+                in_proj_size, hs, &self.stream)?;
+        }
+
+        // 3. Conv1d update on xBC portion (offset intermediate from start)
+        // xBC is at offset [intermediate..intermediate+conv_dim] in mamba2_in_proj
+        // For now, use a separate conv update kernel call
+        // TODO: implement conv1d_update for Mamba2 (different from GDN split conv)
+        // The conv1d is a depthwise conv on the entire xBC vector
+        // For now, skip conv1d (just copy xBC to conv_out) — PLACEHOLDER
+        unsafe {
+            let src = self.activations.mamba2_in_proj.as_ptr().add(intermediate as usize);
+            let dst = self.activations.mamba2_conv_out.as_mut_ptr();
+            braidinfer_hip::ffi::hipMemcpyAsync(
+                dst as *mut std::ffi::c_void,
+                src as *const std::ffi::c_void,
+                cd * std::mem::size_of::<f32>(),
+                braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                self.stream.raw(),
+            );
+        }
+        // TODO: apply actual conv1d + silu activation here
+
+        // 4. Split conv_out → x[intermediate], B[ng*sd], C[ng*sd]
+        // x = conv_out[0..intermediate], B = conv_out[intermediate..intermediate+ng*sd], C = conv_out[intermediate+ng*sd..]
+        // dt = mamba2_in_proj[intermediate+cd..intermediate+cd+nh]
+
+        // 5. selective_state_update
+        let state = &mut self.mamba2_states[mamba2_idx];
+        unsafe {
+            let x_ptr = self.activations.mamba2_conv_out.as_ptr();
+            let b_ptr = self.activations.mamba2_conv_out.as_ptr().add(nh * hd);
+            let c_ptr = self.activations.mamba2_conv_out.as_ptr().add(nh * hd + ng * sd);
+            let dt_ptr = self.activations.mamba2_in_proj.as_ptr().add(nh * hd + cd);
+
+            // Create temporary DeviceBuffer wrappers pointing to sub-regions
+            // We need to call the kernel with raw pointers
+            let func = self.kernels.ssm_update.module.get_function("selective_state_update_f32")?;
+            let mut state_ptr: *mut std::ffi::c_void = state.ssm.as_mut_ptr().cast();
+            let mut x_p: *const std::ffi::c_void = x_ptr.cast();
+            let mut dt_p: *const std::ffi::c_void = dt_ptr.cast();
+            let mut dt_bias_p: *const std::ffi::c_void = (*w).dt_bias.as_ptr().cast();
+            let mut a_log_p: *const std::ffi::c_void = (*w).a_log.as_ptr().cast();
+            let mut b_p: *const std::ffi::c_void = b_ptr.cast();
+            let mut c_p: *const std::ffi::c_void = c_ptr.cast();
+            let mut d_p: *const std::ffi::c_void = (*w).d.as_ptr().cast();
+            let mut out_p: *mut std::ffi::c_void = self.activations.mamba2_ssm_out.as_mut_ptr().cast();
+            let mut i_nh = nh as i32;
+            let mut i_hd = hd as i32;
+            let mut i_sd = sd as i32;
+            let mut i_ng = ng as i32;
+
+            let mut args: [*mut std::ffi::c_void; 13] = [
+                std::ptr::addr_of_mut!(state_ptr).cast(),
+                std::ptr::addr_of_mut!(x_p).cast(),
+                std::ptr::addr_of_mut!(dt_p).cast(),
+                std::ptr::addr_of_mut!(dt_bias_p).cast(),
+                std::ptr::addr_of_mut!(a_log_p).cast(),
+                std::ptr::addr_of_mut!(b_p).cast(),
+                std::ptr::addr_of_mut!(c_p).cast(),
+                std::ptr::addr_of_mut!(d_p).cast(),
+                std::ptr::addr_of_mut!(out_p).cast(),
+                std::ptr::addr_of_mut!(i_nh).cast(),
+                std::ptr::addr_of_mut!(i_hd).cast(),
+                std::ptr::addr_of_mut!(i_sd).cast(),
+                std::ptr::addr_of_mut!(i_ng).cast(),
+            ];
+
+            func.launch(
+                (nh as u32, 1, 1),
+                (256, 1, 1),
+                0,
+                &self.stream,
+                &mut args,
+            )?;
+        }
+
+        // 6. rmsnorm_gated: normed_out = rmsnorm(ssm_out) * silu(gate)
+        // gate is at mamba2_in_proj[0..intermediate]
+        // Use mamba2_conv_out[0..intermediate] as output (conv_out is no longer needed)
+        unsafe {
+            self.kernels.rmsnorm_gated.forward(
+                &mut self.activations.mamba2_conv_out, // reuse as output (>= intermediate size)
+                &self.activations.mamba2_ssm_out,
+                &self.activations.mamba2_in_proj,  // gate (first intermediate elements)
+                &(*w).norm_weight,
+                1, intermediate, eps,
+                &self.stream,
+            )?;
+        }
+
+        // 7. out_proj: normed_out → output[hidden_size]
+        unsafe {
+            (*w).out_proj.forward(&self.kernels.linear_proj,
+                &mut self.activations.out_proj, &self.activations.mamba2_conv_out,
+                hs, intermediate, &self.stream)?;
+        }
+
+        // 8. Residual add
+        unsafe {
+            crate::model::d2d_copy_f32(
+                &mut self.activations.residual, 0,
+                &self.activations.hidden, 0,
+                self.config.hidden_size, &self.stream,
+            )?;
+        }
+        self.kernels.residual_add.forward(
+            &mut self.activations.hidden,
+            &self.activations.out_proj,
+            &self.activations.residual,
+            hs, &self.stream,
+        )?;
+
+        Ok(())
+    }
+
     fn attention_forward(
         &mut self,
         layer_idx: usize,
@@ -1716,6 +1890,7 @@ impl Model {
         // Process each layer
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
+        let mut mamba2_idx = 0usize;
         for layer_i in 0..self.config.num_layers {
             match self.config.layers[layer_i].layer_type {
                 LayerType::Attention => {
@@ -1726,19 +1901,29 @@ impl Model {
                     self.gdn_forward(layer_i, gdn_idx)?;
                     gdn_idx += 1;
                 }
-                _ => panic!("unsupported layer type for MoE decode"),
+                LayerType::Mamba2 => {
+                    self.mamba2_forward(layer_i, mamba2_idx)?;
+                    mamba2_idx += 1;
+                }
+                LayerType::MoeFfn => {
+                    // Standalone MoE FFN layer — just norm + MoE dispatch + residual
+                    // The norm is applied inside moe_ffn_forward, skip to FFN below
+                }
+                LayerType::LfmConv => panic!("LfmConv not yet implemented"),
             }
 
             if self.trace.is_some() {
                 self.stream.synchronize()?;
                 let mut buf = vec![0.0f32; self.config.hidden_size];
                 self.activations.hidden.copy_to_host(&mut buf)?;
-                self.trace.as_mut().unwrap().write_checkpoint(&format!("L{layer_i}.post_attn"), &buf);
+                self.trace.as_mut().unwrap().write_checkpoint(&format!("L{layer_i}.post_mixer"), &buf);
             }
 
-            // FFN: dense or MoE
+            // FFN: dense, MoE, or None (standalone layers like Nemotron M/*)
             if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. }) {
                 self.moe_ffn_forward(layer_i)?;
+            } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::None) {
+                // No FFN for this layer (Nemotron M and * layers)
             } else {
                 // Dense FFN: fused (bf16) or unfused (quantized)
                 let hs = self.config.hidden_size;
