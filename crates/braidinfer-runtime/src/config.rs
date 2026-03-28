@@ -103,6 +103,7 @@ pub struct ModelConfig {
     pub rope_type: RopeType,
     pub has_qk_norm: bool,
     pub has_output_gate: bool,  // Qwen3.5 interleaves Q+gate; others don't
+    pub use_rope: bool,         // false for Nemotron-H (attention has no RoPE)
     pub rms_norm_one_plus_w: bool, // true: (1+w)*x (Qwen3.5), false: w*x (Llama, OLMoE)
     pub attention_layer_indices: Vec<usize>,
     pub model_type: String,
@@ -155,6 +156,7 @@ impl ModelConfig {
             rope_type: RopeType::MRope { sections: [11, 11, 10] },
             has_qk_norm: false,
             has_output_gate: false,
+            use_rope: true,
             rms_norm_one_plus_w: true,
             attention_layer_indices,
             model_type: "qwen3_5".to_string(),
@@ -355,6 +357,7 @@ impl ModelConfig {
             recurrent_kind, rope_type,
             has_qk_norm: false, has_output_gate: false, // auto-detected from tensor names at load time
             rms_norm_one_plus_w: model_type.starts_with("qwen3_5"),
+            use_rope: model_type != "nemotron_h",  // Nemotron-H attention has no RoPE
             attention_layer_indices, model_type, tie_word_embeddings,
             weight_quant: WeightQuantMode::Bf16,
         })

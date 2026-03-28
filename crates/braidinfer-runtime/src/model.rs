@@ -1822,7 +1822,8 @@ impl Model {
         }
 
 
-        // 5. Update position IDs and apply mRoPE
+        // 5. Apply RoPE (skip for Nemotron-H which has no rotary embeddings)
+        if cfg.use_rope {
         let pos_data = [position as i32, position as i32, position as i32];
         self.activations.position_ids.copy_from_host(&pos_data)?;
 
@@ -1840,7 +1841,7 @@ impl Model {
             s2,
             &self.stream,
         )?;
-
+        } // end if cfg.use_rope
 
         // 6. Write K,V to cache at position `position` ([H,T,D] layout)
         let max_sl = self.config.max_seq_len;
