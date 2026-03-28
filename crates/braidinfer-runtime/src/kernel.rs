@@ -1133,7 +1133,7 @@ impl QkNormKernel {
 }
 
 pub struct RmsNormGatedKernel {
-    module: Module,
+    pub(crate) module: Module,
     device: DeviceId,
 }
 

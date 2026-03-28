@@ -1681,6 +1681,17 @@ impl Model {
             )?;
         }
 
+        // Debug: per-step tracing for layer 0
+        let dbg = std::env::var("DEBUG_NAN").is_ok() && layer_idx == 0;
+        if dbg {
+            self.stream.synchronize()?;
+            let n = self.activations.normed.len();
+            let mut buf = vec![0.0f32; n];
+            self.activations.normed.copy_to_host(&mut buf)?;
+            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("  M2.L0 after norm: max_abs={max_abs:.4e}, first5={:.4?}", &buf[..5]);
+        }
+
         // 2. in_proj: normed → [gate(intermediate), xBC(conv_dim), dt(num_heads)]
         unsafe {
             (*w).in_proj.forward(&self.kernels.linear_proj,
@@ -1688,8 +1699,17 @@ impl Model {
                 in_proj_size, hs, &self.stream)?;
         }
 
-        // 3. Conv1d update on xBC portion (offset intermediate from start)
-        // xBC is at offset [intermediate..intermediate+conv_dim] in mamba2_in_proj
+        if dbg {
+            self.stream.synchronize()?;
+            let n = self.activations.mamba2_in_proj.len();
+            let mut buf = vec![0.0f32; n];
+            self.activations.mamba2_in_proj.copy_to_host(&mut buf)?;
+            let gate_max = buf[..nh*hd].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let xbc_max = buf[nh*hd..nh*hd+cd].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let dt_max = buf[nh*hd+cd..].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("  M2.L0 in_proj: gate_max={gate_max:.4e}, xBC_max={xbc_max:.4e}, dt_max={dt_max:.4e}");
+        }
+
         // 3. Conv1d update on xBC with bias + silu activation
         // Input is mamba2_in_proj[intermediate..intermediate+cd], output to mamba2_conv_out
         {
@@ -1716,6 +1736,17 @@ impl Model {
             let block_size = 256u32;
             let grid_size = (cd as u32 + block_size - 1) / block_size;
             func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, &self.stream, &mut args)?;
+        }
+
+        if dbg {
+            self.stream.synchronize()?;
+            let n = self.activations.mamba2_conv_out.len();
+            let mut buf = vec![0.0f32; n];
+            self.activations.mamba2_conv_out.copy_to_host(&mut buf)?;
+            let x_max = buf[..nh*hd].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let b_max = buf[nh*hd..nh*hd+ng*sd].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let c_max = buf[nh*hd+ng*sd..].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("  M2.L0 conv1d: x_max={x_max:.4e}, B_max={b_max:.4e}, C_max={c_max:.4e}");
         }
 
         // 4. Split conv_out → x[intermediate], B[ng*sd], C[ng*sd]
@@ -1772,22 +1803,43 @@ impl Model {
             )?;
         }
 
+        if dbg {
+            self.stream.synchronize()?;
+            let n = self.activations.mamba2_ssm_out.len();
+            let mut buf = vec![0.0f32; n];
+            self.activations.mamba2_ssm_out.copy_to_host(&mut buf)?;
+            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("  M2.L0 ssm_out: max_abs={max_abs:.4e}, first5={:.4?}", &buf[..5]);
+        }
+
         // 6. rmsnorm_gated: normed_out = rmsnorm(ssm_out) * silu(gate)
-        // gate is at mamba2_in_proj[0..intermediate]
-        // Use mamba2_conv_out[0..intermediate] as output (conv_out is no longer needed)
-        // Mamba2 uses per-group norm: group_size = intermediate / n_groups
-        // So num_heads = n_groups (8), value_dim = group_size (512) for Nemotron
-        let norm_groups = ng as u32;
-        let group_size = intermediate / norm_groups;
-        unsafe {
-            self.kernels.rmsnorm_gated.forward(
-                &mut self.activations.mamba2_conv_out,
-                &self.activations.mamba2_ssm_out,
-                &self.activations.mamba2_in_proj,  // gate (first intermediate elements)
-                &(*w).norm_weight,
-                norm_groups, group_size, eps,
-                &self.stream,
-            )?;
+        // Mamba2 uses per-group norm (group_size=512, n_groups=8).
+        // The rmsnorm_gated kernel applies weight[0..group_size] per group,
+        // but Mamba2 needs weight[g*group_size..(g+1)*group_size] per group.
+        // Launch one kernel per group with offset pointers.
+        let group_size = (nh * hd / ng) as u32;
+        {
+            let func = self.kernels.rmsnorm_gated.module.get_function("rmsnorm_gated_f32")?;
+            for g in 0..ng {
+                let off = g * group_size as usize;
+                let mut out_p: *mut std::ffi::c_void = unsafe { self.activations.mamba2_conv_out.as_mut_ptr().add(off).cast() };
+                let mut x_p: *const std::ffi::c_void = unsafe { self.activations.mamba2_ssm_out.as_ptr().add(off).cast() };
+                let mut z_p: *const std::ffi::c_void = unsafe { self.activations.mamba2_in_proj.as_ptr().add(off).cast() };
+                let mut w_p: *const std::ffi::c_void = unsafe { (*w).norm_weight.as_ptr().add(off).cast() };
+                let mut i_nh = 1i32;
+                let mut i_vd = group_size as i32;
+                let mut f_eps = eps;
+                let mut args: [*mut std::ffi::c_void; 7] = [
+                    std::ptr::addr_of_mut!(out_p).cast(),
+                    std::ptr::addr_of_mut!(x_p).cast(),
+                    std::ptr::addr_of_mut!(z_p).cast(),
+                    std::ptr::addr_of_mut!(w_p).cast(),
+                    std::ptr::addr_of_mut!(i_nh).cast(),
+                    std::ptr::addr_of_mut!(i_vd).cast(),
+                    std::ptr::addr_of_mut!(f_eps).cast(),
+                ];
+                func.launch((1, 1, 1), (256, 1, 1), 256 * 4, &self.stream, &mut args)?;
+            }
         }
 
         // 7. out_proj: normed_out → output[hidden_size]
@@ -1795,6 +1847,15 @@ impl Model {
             (*w).out_proj.forward(&self.kernels.linear_proj,
                 &mut self.activations.out_proj, &self.activations.mamba2_conv_out,
                 hs, intermediate, &self.stream)?;
+        }
+
+        if dbg {
+            self.stream.synchronize()?;
+            let n = self.activations.out_proj.len();
+            let mut buf = vec![0.0f32; n.min(self.config.hidden_size)];
+            self.activations.out_proj.copy_to_host(&mut buf)?;
+            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("  M2.L0 out_proj: max_abs={max_abs:.4e}, first5={:.4?}", &buf[..5]);
         }
 
         // 8. Residual add
@@ -2125,6 +2186,14 @@ impl Model {
             &self.embed_weight,
             token_id as i32, hs, &self.stream,
         )?;
+
+        if std::env::var("DEBUG_NAN").is_ok() {
+            self.stream.synchronize()?;
+            let mut buf = vec![0.0f32; self.config.hidden_size];
+            self.activations.hidden.copy_to_host(&mut buf)?;
+            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            eprintln!("embed(tok={token_id}): max_abs={max_abs:.4e}, first5={:.4?}", &buf[..5]);
+        }
 
         if self.trace.is_some() {
             self.stream.synchronize()?;
