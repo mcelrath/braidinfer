@@ -101,6 +101,7 @@ pub struct MoeWeights {
     pub shared_expert: Option<DenseFfnWeights>,      // always-on shared expert
     pub shared_expert_gate: Option<DeviceBuffer<u16>>, // [1, hidden_size] gate for shared expert
     pub has_gate_proj: bool,                          // false for relu² (Nemotron), true for SwiGLU
+    pub score_correction_bias: Option<Vec<f32>>,      // [num_experts] f32, added to scores before top-k
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
 }
@@ -576,7 +577,22 @@ fn load_moe_weights(
         Some(load_weight_bf16(st, &shared_gate_name, device, hs)?)
     } else { None };
 
-    Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate, num_experts: ne, expert_intermediate_size: eis, has_gate_proj })
+    // Score correction bias (Nemotron): added to scores before top-k selection
+    let bias_name = find_weight_name(st, &[
+        format!("{prefix}gate.e_score_correction_bias"),
+        format!("{prefix}mlp.gate.e_score_correction_bias"),
+    ]);
+    let score_correction_bias = if let Ok(name) = bias_name {
+        let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
+        // f32 tensor: 4 bytes per element
+        let data: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr() as *const f32, ne)
+        }.to_vec();
+        Some(data)
+    } else { None };
+
+    Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate,
+        num_experts: ne, expert_intermediate_size: eis, has_gate_proj, score_correction_bias })
 }
 
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
@@ -1414,6 +1430,13 @@ impl Model {
         let mut scores = vec![0.0f32; ne];
         self.activations.moe_scores.copy_to_host(&mut scores)?;
 
+        // Apply score correction bias (Nemotron) before softmax
+        if let Some(ref bias) = moe.score_correction_bias {
+            for (s, b) in scores.iter_mut().zip(bias.iter()) {
+                *s += b;
+            }
+        }
+
         let k = match &self.config.layers[layer_idx].ffn_type {
             FfnType::MoE { num_active, .. } => *num_active,
             _ => unreachable!(),
@@ -1524,7 +1547,48 @@ impl Model {
             )?;
         }
 
-        // 6. Residual add: hidden = residual + ffn_down
+        // 6. Shared expert (always-on, added to output)
+        if let Some(ref se) = moe.shared_expert {
+            let se_is = match &self.config.layers[layer_idx].ffn_type {
+                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } =>
+                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size },
+                _ => eis,
+            };
+            se.up_proj.forward(&self.kernels.linear_proj,
+                &mut self.activations.moe_expert_up, &self.activations.normed,
+                se_is as u32, hs as u32, &self.stream)?;
+
+            if moe.has_gate_proj {
+                // SwiGLU shared expert
+                se.gate_proj.forward(&self.kernels.linear_proj,
+                    &mut self.activations.moe_expert_gate, &self.activations.normed,
+                    se_is as u32, hs as u32, &self.stream)?;
+                self.kernels.silu_mul.forward(
+                    &mut self.activations.moe_expert_act,
+                    &self.activations.moe_expert_gate,
+                    &self.activations.moe_expert_up,
+                    se_is as u32, &self.stream)?;
+            } else {
+                // relu² shared expert
+                self.kernels.silu_mul.relu_squared(
+                    &mut self.activations.moe_expert_act,
+                    &self.activations.moe_expert_up,
+                    se_is as u32, &self.stream)?;
+            }
+
+            se.down_proj.forward(&self.kernels.linear_proj,
+                &mut self.activations.moe_expert_out, &self.activations.moe_expert_act,
+                hs as u32, se_is as u32, &self.stream)?;
+
+            // Add shared expert output to accumulated FFN output (weight=1.0)
+            self.kernels.residual_add.weighted_accumulate(
+                &mut self.activations.ffn_down,
+                &self.activations.moe_expert_out,
+                1.0,
+                hs as u32, &self.stream)?;
+        }
+
+        // 7. Residual add: hidden = residual + ffn_down
         self.kernels.residual_add.forward(
             &mut self.activations.hidden,
             &self.activations.residual,
