@@ -96,10 +96,11 @@ pub struct DenseFfnWeights {
 /// MoE FFN weights for one layer
 pub struct MoeWeights {
     pub gate: DeviceBuffer<u16>,                    // [num_experts, hidden_size] — router, MUST stay bf16
-    pub expert_gate_up: LinearWeight,               // [num_experts, 2*expert_is, hidden_size] fused
+    pub expert_gate_up: LinearWeight,               // SwiGLU: [ne, 2*eis, hs] fused; relu²: [ne, eis, hs] (up only)
     pub expert_down: LinearWeight,                  // [num_experts, hidden_size, expert_is]
     pub shared_expert: Option<DenseFfnWeights>,      // always-on shared expert
     pub shared_expert_gate: Option<DeviceBuffer<u16>>, // [1, hidden_size] gate for shared expert
+    pub has_gate_proj: bool,                          // false for relu² (Nemotron), true for SwiGLU
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
 }
@@ -575,7 +576,7 @@ fn load_moe_weights(
         Some(load_weight_bf16(st, &shared_gate_name, device, hs)?)
     } else { None };
 
-    Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate, num_experts: ne, expert_intermediate_size: eis })
+    Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate, num_experts: ne, expert_intermediate_size: eis, has_gate_proj })
 }
 
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
@@ -1464,34 +1465,46 @@ impl Model {
         for (j, &(expert_id, _)) in topk.iter().enumerate() {
             let w = weights[j] * scaling;
 
-            // Expert byte offsets into fused buffers (format-aware)
-            let gate_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis, hs);
-            let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis + eis, hs);
             let down_offset = moe.expert_down.row_byte_offset_dim(expert_id * hs, eis);
 
-            // Gate projection (pre-allocated buffer)
-            moe.expert_gate_up.forward_sub(
-                &self.kernels.linear_proj,
-                self.activations.moe_expert_gate.as_mut_ptr(),
-                self.activations.normed.as_ptr(),
-                eis as u32, hs as u32, gate_offset, &self.stream,
-            )?;
+            if moe.has_gate_proj {
+                // SwiGLU: gate_proj → silu → * up_proj
+                let gate_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis, hs);
+                let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * 2 * eis + eis, hs);
 
-            // Up projection (pre-allocated buffer)
-            moe.expert_gate_up.forward_sub(
-                &self.kernels.linear_proj,
-                self.activations.moe_expert_up.as_mut_ptr(),
-                self.activations.normed.as_ptr(),
-                eis as u32, hs as u32, up_offset, &self.stream,
-            )?;
-
-            // SiLU(gate) * up → act (pre-allocated buffer)
-            self.kernels.silu_mul.forward(
-                &mut self.activations.moe_expert_act,
-                &self.activations.moe_expert_gate,
-                &self.activations.moe_expert_up,
-                eis as u32, &self.stream,
-            )?;
+                moe.expert_gate_up.forward_sub(
+                    &self.kernels.linear_proj,
+                    self.activations.moe_expert_gate.as_mut_ptr(),
+                    self.activations.normed.as_ptr(),
+                    eis as u32, hs as u32, gate_offset, &self.stream,
+                )?;
+                moe.expert_gate_up.forward_sub(
+                    &self.kernels.linear_proj,
+                    self.activations.moe_expert_up.as_mut_ptr(),
+                    self.activations.normed.as_ptr(),
+                    eis as u32, hs as u32, up_offset, &self.stream,
+                )?;
+                self.kernels.silu_mul.forward(
+                    &mut self.activations.moe_expert_act,
+                    &self.activations.moe_expert_gate,
+                    &self.activations.moe_expert_up,
+                    eis as u32, &self.stream,
+                )?;
+            } else {
+                // relu²: up_proj → relu² (no gate_proj)
+                let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * eis, hs);
+                moe.expert_gate_up.forward_sub(
+                    &self.kernels.linear_proj,
+                    self.activations.moe_expert_up.as_mut_ptr(),
+                    self.activations.normed.as_ptr(),
+                    eis as u32, hs as u32, up_offset, &self.stream,
+                )?;
+                self.kernels.silu_mul.relu_squared(
+                    &mut self.activations.moe_expert_act,
+                    &self.activations.moe_expert_up,
+                    eis as u32, &self.stream,
+                )?;
+            }
 
             // Down projection (pre-allocated buffer)
             moe.expert_down.forward_sub(
