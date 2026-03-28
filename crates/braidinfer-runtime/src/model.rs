@@ -1580,7 +1580,7 @@ impl Model {
         if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {
             if mk.dump_active() {
                 mk.write_dump_btrc(&self.stream, &dump_path)?;
-                mk.disable_dump();
+                mk.disable_dump()?;
             }
         }
 

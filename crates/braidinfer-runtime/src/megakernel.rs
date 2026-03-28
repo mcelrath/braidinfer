@@ -232,10 +232,8 @@ impl MegakernelProgram {
 
         // Query max blocks for cooperative launch
         let func = module.get_function("megakernel_f32")?;
-        let _blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
-        // Cooperative launch limit is stricter than occupancy on gfx1100.
-        // With __launch_bounds__(256,1), safe max = NUM_CUS (one block per CU).
-        let num_blocks = NUM_CUS;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();
         let mut mrope_inst_indices = Vec::new();
@@ -417,8 +415,8 @@ impl MegakernelProgram {
 
         let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
         let func = module.get_function("megakernel_f32")?;
-        let _blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
-        let num_blocks = NUM_CUS;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();
 
@@ -1675,7 +1673,10 @@ impl MegakernelProgram {
         // Upload entire instruction buffer in one hipMemcpyAsync call.
         // ~500 instructions × 128 bytes = ~64KB; one 64KB copy is cheaper than 24× 128-byte copies.
         let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
-        let dev_ptr = self.device_program.as_mut_ptr();
+        // When dump is active, device_program has an OP_NOP header at offset 0;
+        // instructions start at offset INST_SIZE words.
+        let offset_words = if self.dump_buffer.is_some() { INST_SIZE } else { 0 };
+        let dev_ptr = unsafe { self.device_program.as_mut_ptr().add(offset_words) };
         let size = flat.len() * std::mem::size_of::<u64>();
         braidinfer_hip::error::check(unsafe {
             braidinfer_hip::ffi::hipMemcpyAsync(
@@ -1835,7 +1836,8 @@ impl MegakernelProgram {
 
         // 6. Upload entire instruction buffer in one hipMemcpyAsync call.
         let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
-        let dev_ptr = self.device_program.as_mut_ptr();
+        let offset_words = if self.dump_buffer.is_some() { INST_SIZE } else { 0 };
+        let dev_ptr = unsafe { self.device_program.as_mut_ptr().add(offset_words) };
         let size = flat.len() * std::mem::size_of::<u64>();
         braidinfer_hip::error::check(unsafe {
             braidinfer_hip::ffi::hipMemcpyAsync(
@@ -2000,7 +2002,10 @@ impl MegakernelProgram {
         )
     }
 
-    /// Enable per-instruction dump mode. Allocates GPU buffer for capturing outputs.
+    /// Enable per-instruction dump mode. Allocates GPU buffer and prepends
+    /// an OP_NOP header instruction encoding dump pointers (words[1-3]).
+    /// This avoids adding kernel args which would increase register pressure
+    /// and reduce the cooperative launch block limit.
     pub fn enable_dump(&mut self, max_slots: i32) -> HipResult<()> {
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
         let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
@@ -2009,6 +2014,23 @@ impl MegakernelProgram {
         counter.copy_from_host(&[0i32])?;
         self.dump_counter = Some(counter);
         self.dump_capacity = max_slots;
+
+        // Prepend OP_NOP header with dump pointers, re-upload program
+        let mut header = Instruction::new(OP_NOP, 0);
+        header.set_ptr(1, self.dump_buffer.as_ref().unwrap().as_ptr());
+        header.set_int(2, max_slots);
+        header.set_ptr(3, self.dump_counter.as_ref().unwrap().as_ptr());
+
+        let total_words = (1 + self.instructions.len()) * INST_SIZE;
+        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
+        flat.extend_from_slice(&header.words);
+        for inst in &self.instructions {
+            flat.extend_from_slice(&inst.words);
+        }
+        let mut new_prog = DeviceBuffer::alloc(self.device, total_words)?;
+        new_prog.copy_from_host(&flat)?;
+        self.device_program = new_prog;
+
         Ok(())
     }
 
@@ -2056,10 +2078,20 @@ impl MegakernelProgram {
         self.dump_buffer.is_some()
     }
 
-    pub fn disable_dump(&mut self) {
+    pub fn disable_dump(&mut self) -> HipResult<()> {
         self.dump_buffer = None;
         self.dump_counter = None;
         self.dump_capacity = 0;
+        // Rebuild device program without the NOP header
+        let total_words = self.instructions.len() * INST_SIZE;
+        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
+        for inst in &self.instructions {
+            flat.extend_from_slice(&inst.words);
+        }
+        let mut new_prog = DeviceBuffer::alloc(self.device, total_words)?;
+        new_prog.copy_from_host(&flat)?;
+        self.device_program = new_prog;
+        Ok(())
     }
 
     /// Write dump results to a BTRC trace file compatible with compare_traces.py.
@@ -2080,21 +2112,13 @@ impl MegakernelProgram {
     pub fn execute(&self, stream: &Stream) -> HipResult<()> {
         let func = self.module.get_function("megakernel_f32")?;
         let mut prog_ptr: *const c_void = self.device_program.as_ptr().cast();
-        let mut num_inst = self.instructions.len() as i32;
-        let mut dump_ptr: *mut c_void = self.dump_buffer.as_ref()
-            .map(|b| b.as_ptr() as *mut c_void)
-            .unwrap_or(std::ptr::null_mut());
-        let mut dump_cap = self.dump_capacity;
-        let mut dump_cnt_ptr: *mut c_void = self.dump_counter.as_ref()
-            .map(|b| b.as_ptr() as *mut c_void)
-            .unwrap_or(std::ptr::null_mut());
+        // When dump is active, device_program has an extra OP_NOP header instruction
+        let extra = if self.dump_buffer.is_some() { 1 } else { 0 };
+        let mut num_inst = (self.instructions.len() + extra) as i32;
 
-        let mut args: [*mut c_void; 5] = [
+        let mut args: [*mut c_void; 2] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),
-            std::ptr::addr_of_mut!(dump_ptr).cast(),
-            std::ptr::addr_of_mut!(dump_cap).cast(),
-            std::ptr::addr_of_mut!(dump_cnt_ptr).cast(),
         ];
 
         func.launch_cooperative(

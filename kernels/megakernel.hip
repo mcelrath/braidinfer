@@ -1655,15 +1655,23 @@ __device__ void dump_instruction_output(
     }
 }
 
-extern "C" __global__ __launch_bounds__(256, 1) void megakernel_f32(
+extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     const u64* __restrict__ program,
-    int num_instructions,
-    char* dump_base,      // NULL when not dumping
-    int dump_capacity,    // max slots
-    int* dump_count       // atomic counter (device memory)
+    int num_instructions
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
+
+    // Dump state: encoded in first instruction if OP_NOP with dump_base != 0
+    // First instruction words: [0]=opcode(NOP), [1]=dump_base ptr, [2]=dump_capacity, [3]=dump_count ptr
+    char* dump_base = nullptr;
+    int dump_capacity = 0;
+    int* dump_count = nullptr;
+    if (num_instructions > 0 && inst_opcode(program) == OP_NOP && inst_ptr(program, 1) != nullptr) {
+        dump_base = (char*)inst_ptr(program, 1);
+        dump_capacity = inst_int(program, 2);
+        dump_count = (int*)inst_ptr(program, 3);
+    }
 
     for (int pc = 0; pc < num_instructions; pc++) {
         const u64* inst = program + pc * INST_SIZE;
