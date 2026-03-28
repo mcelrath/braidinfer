@@ -935,7 +935,50 @@ impl MegakernelProgram {
             }
         }
 
-        // 4. QK norm
+        // 4a. KV write for PagedKv — BEFORE QK-norm so cache stores pre-norm K/V.
+        //     Pre-norm K has full dynamic range; quantizing post-norm K (±0.06) is catastrophic
+        //     (TVD=0.97). See exterior_algebra kb-20260328-115542-e172dd.
+        //     QK-norm is applied at attention time after dequant (in op_attn_paged / op_attn_paged_quant).
+        let paged_kv_write_before_norm = matches!(variant, AttentionVariant::PagedKv { .. });
+        let mut paged_layer_k_offset: u64 = 0;
+        let mut paged_layer_v_offset: u64 = 0;
+        if paged_kv_write_before_norm {
+            if let AttentionVariant::PagedKv { kv_cache, attn_layer_index } = &variant {
+                let kv_stride = nkh * hd;
+                let chunk_tokens: usize = 64;
+                paged_layer_k_offset =
+                    (*attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+                paged_layer_v_offset =
+                    paged_layer_k_offset + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+                let chunk_head_stride = chunk_tokens * hd;
+                let mut head_indices = Vec::new();
+                for h in 0..nkh {
+                    let k_copy_idx = instructions.len();
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, unsafe { kv_cache.k.as_ptr().add(h * chunk_head_stride) });
+                        inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
+                        inst.set_int(3, hd as i32);
+                        inst.set_no_sync();
+                        instructions.push(inst);
+                    }
+                    let v_copy_idx = instructions.len();
+                    {
+                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
+                        inst.set_output_ptr(1, unsafe { kv_cache.v.as_ptr().add(h * chunk_head_stride) });
+                        inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
+                        inst.set_int(3, hd as i32);
+                        if h < nkh - 1 { inst.set_no_sync(); }
+                        instructions.push(inst);
+                    }
+                    head_indices.push((k_copy_idx, v_copy_idx));
+                }
+                kv_write_indices.push(head_indices);
+                kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
+            }
+        }
+
+        // 4b. QK norm (modifies q_attn and k_attn in-place for current token's attention)
         {
             let mut inst = Instruction::new(OP_QK_NORM, (n * (nqh + nkh)) as u32);
             inst.set_output_ptr(1, q_attn_ptr);
@@ -950,8 +993,7 @@ impl MegakernelProgram {
             instructions.push(inst);
         }
 
-        // Steps 5 (KV write paged — before mRoPE) or 6 (KV write flat/prefill — after mRoPE)
-        // is emitted by the variant block below. We emit mRoPE between them when needed.
+        // Steps 5/6: variant-specific attention ops. PagedKv KV write already done above.
 
         // Variant-specific: KV write placement and attention op
         match variant {
@@ -1020,42 +1062,10 @@ impl MegakernelProgram {
             }
 
             AttentionVariant::PagedKv { kv_cache, attn_layer_index } => {
-                // KV write BEFORE mRoPE (paged stores pre-RoPE K)
-                // Per-head D2D_COPY for [H,T,D] chunk layout
-                let kv_stride = nkh * hd;
-                let chunk_tokens: usize = 64;
-                let layer_k_offset_bytes =
-                    (*attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
-                let layer_v_offset_bytes =
-                    layer_k_offset_bytes + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+                // KV write already emitted above (step 4a, before QK-norm).
+                // Cache now stores pre-QK-norm K/V for quantization quality.
 
-                let chunk_head_stride = chunk_tokens * hd; // elements between heads within chunk
-                let mut head_indices = Vec::new();
-                for h in 0..nkh {
-                    let k_copy_idx = instructions.len();
-                    {
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe { kv_cache.k.as_ptr().add(h * chunk_head_stride) });
-                        inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
-                        inst.set_int(3, hd as i32);
-                        inst.set_no_sync();
-                        instructions.push(inst);
-                    }
-                    let v_copy_idx = instructions.len();
-                    {
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe { kv_cache.v.as_ptr().add(h * chunk_head_stride) });
-                        inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
-                        inst.set_int(3, hd as i32);
-                        if h < nkh - 1 { inst.set_no_sync(); }
-                        instructions.push(inst);
-                    }
-                    head_indices.push((k_copy_idx, v_copy_idx));
-                }
-                kv_write_indices.push(head_indices);
-                kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
-
-                // mRoPE after KV write
+                // mRoPE after KV write (applied to working Q/K buffers, not cache)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
                 {
@@ -1097,6 +1107,8 @@ impl MegakernelProgram {
                     inst.words[13] = q1s as u64;
                     inst.words[14] = rd_off as u64;
                     inst.words[15] = rs as u64;
+                    // Pass k_norm weight for QK-norm after dequant (null = no QK-norm)
+                    inst.set_ptr(16, if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() });
                     inst.set_no_sync(); // no sync between quant and f32 attention
                     instructions.push(inst);
                 }
@@ -1117,9 +1129,11 @@ impl MegakernelProgram {
                     inst.set_int(9, 1); // seq_len — patched per step
                     inst.set_int(10, chunk_tokens as i32);
                     inst.set_int(11, rd as i32);
-                    inst.words[12] = layer_k_offset_bytes;
-                    inst.words[13] = layer_v_offset_bytes;
+                    inst.words[12] = paged_layer_k_offset;
+                    inst.words[13] = paged_layer_v_offset;
                     inst.words[14] = 0; // partial_state — patched when quantized KV enabled
+                    // Pass k_norm weight for QK-norm after loading from cache
+                    inst.set_ptr(16, if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() });
                     instructions.push(inst);
                 }
             }

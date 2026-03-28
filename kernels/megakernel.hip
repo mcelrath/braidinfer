@@ -917,13 +917,15 @@ __device__ void op_output_gate(const u64* inst, u32 vblock) {
 }
 
 // OP_ATTN_PAGED: Paged GQA decode attention with lazy RoPE recurrence applied to K.
-// One virtual block per Q head. Walks paged KV chunks, applies RoPE to pre-RoPE K
+// One virtual block per Q head. Walks paged KV chunks, applies QK-norm + RoPE to pre-norm K
 // via trig recurrence (4 FMA per pair per token step — no cos/sin lookup table).
-// args: [1]=output, [2]=q (post-RoPE), [3]=page_table (u64* chunk base ptrs),
+// Cache stores pre-QK-norm K for quantization quality (post-norm K is ±0.06, catastrophic for Q4).
+// args: [1]=output, [2]=q (post-QK-norm, post-RoPE), [3]=page_table (u64* chunk base ptrs),
 //       [4]=position_table (int* per-token positions), [5]=inv_freq (float*, rope_dim/2 freqs),
 //       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len,
 //       [10]=chunk_tokens(64), [11]=rope_dim, [12]=layer_k_offset_bytes, [13]=layer_v_offset_bytes,
 //       [14]=partial_state (float* or 0; if non-null, init (m,d,v_acc) from quantized pass scratch)
+//       [16]=k_norm_weight (bf16* or null; if non-null, apply QK-norm after K load/dequant)
 __device__ void op_attn_paged(const u64* inst, u32 vblock) {
     float* output          = inst_fptr(inst, 1);
     const float* q         = inst_fptr(inst, 2);
@@ -1008,6 +1010,27 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
             }
             __syncthreads();
 
+            // Apply QK-norm to cached K (cache stores pre-norm K for quantization quality).
+            // k[i] = k[i] * rsqrt(sum_sq/head_dim + eps) * (1 + k_norm_weight[i])
+            // k_norm_weight is passed as inst[16] (bf16 pointer, or null for non-QK-norm models)
+            {
+                const unsigned short* kn_w = (const unsigned short*)(inst[16]);
+                if (kn_w != nullptr) {
+                    partial[tid] = (tid < head_dim) ? sh_k[tid] * sh_k[tid] : 0.0f;
+                    __syncthreads();
+                    for (int s = block_size / 2; s > 0; s >>= 1) {
+                        if (tid < s) partial[tid] += partial[tid + s];
+                        __syncthreads();
+                    }
+                    float k_rms = rsqrtf(partial[0] / (float)head_dim + 1e-6f);
+                    if (tid < head_dim) {
+                        float w = 1.0f + bf16_to_f32(kn_w[tid]);
+                        sh_k[tid] = sh_k[tid] * k_rms * w;
+                    }
+                    __syncthreads();
+                }
+            }
+
             // Apply lazy RoPE rotation to sh_k (in-place, rope_dim elements only)
             // Threads 0..rope_pairs-1 handle pairs (tid*2, tid*2+1)
             if (tid < rope_pairs) {
@@ -1071,13 +1094,15 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 // OP_ATTN_PAGED_Q: Paged GQA attention with residual_pc int4 quantized KV cache.
 // Writes PARTIAL softmax state to scratch buffer (not final output).
 // OP_ATTN_PAGED reads the scratch and merges with f32 active chunk.
+// Cache stores pre-QK-norm K — QK-norm applied after dequant for quantization quality.
 // args: [1]=scratch (float*, layout [nqh × (2+head_dim)]: m, d, v_acc per head),
-//       [2]=q (post-RoPE), [3]=page_table (u64*, quantized chunks only),
+//       [2]=q (post-QK-norm, post-RoPE), [3]=page_table (u64*, quantized chunks only),
 //       [4]=position_table (int*), [5]=inv_freq (float*),
 //       [6]=num_q_heads, [7]=num_kv_heads, [8]=head_dim, [9]=seq_len (of quantized chunks),
 //       [10]=chunk_tokens(64), [11]=rope_dim,
 //       [12]=layer_k_q1data_off, [13]=layer_k_q1scale_off,
 //       [14]=layer_k_rdata_off, [15]=layer_k_rscale_off
+//       [16]=k_norm_weight (bf16* or null; if non-null, apply QK-norm after dequant)
 // V offsets = K offsets + per_kv stride, computed from nkh/ct/hd.
 __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
     float* scratch         = inst_fptr(inst, 1);
@@ -1197,6 +1222,26 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
                 sh_k[tid] = (float)q1_nibble * k_s1 + (float)r_nibble * k_s2;
             }
             __syncthreads();
+
+            // Apply QK-norm to dequantized K (cache stores pre-norm K for quantization quality).
+            // k_norm_weight passed as inst[16] (bf16 pointer, or 0 for non-QK-norm models)
+            {
+                const unsigned short* kn_w = (const unsigned short*)(inst[16]);
+                if (kn_w != nullptr) {
+                    partial[tid] = (tid < head_dim) ? sh_k[tid] * sh_k[tid] : 0.0f;
+                    __syncthreads();
+                    for (int s = block_size / 2; s > 0; s >>= 1) {
+                        if (tid < s) partial[tid] += partial[tid + s];
+                        __syncthreads();
+                    }
+                    float k_rms = rsqrtf(partial[0] / (float)head_dim + 1e-6f);
+                    if (tid < head_dim) {
+                        float w = 1.0f + bf16_to_f32(kn_w[tid]);
+                        sh_k[tid] = sh_k[tid] * k_rms * w;
+                    }
+                    __syncthreads();
+                }
+            }
 
             // Apply lazy RoPE
             if (tid < rope_pairs) {

@@ -1905,7 +1905,22 @@ impl Model {
         }
 
 
-        // 4. QK norm (in-place on q_attn, k_attn)
+        // 4a. Write K,V to cache BEFORE QK-norm (pre-norm K has full dynamic range
+        //     for quantization; post-norm K is bounded ±0.06 which destroys Q4 quantization).
+        //     See exterior_algebra kb-20260328-115542-e172dd.
+        {
+            let max_sl = self.config.max_seq_len;
+            for h in 0..nkh as usize {
+                let src_off = h * hd as usize;
+                let dst_off = h * max_sl * hd as usize + position as usize * hd as usize;
+                unsafe {
+                    d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].k, dst_off, &self.activations.k_attn, src_off, hd as usize, &self.stream)?;
+                    d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].v, dst_off, &self.activations.v_attn, src_off, hd as usize, &self.stream)?;
+                }
+            }
+        }
+
+        // 4b. QK norm (in-place on q_attn, k_attn — for current token's attention computation)
         if cfg.has_qk_norm {
             let q_norm_len = unsafe { (*q_norm_w).len() };
             if q_norm_len == hd as usize {
@@ -1967,16 +1982,7 @@ impl Model {
         )?;
         } // end if cfg.use_rope
 
-        // 6. Write K,V to cache at position `position` ([H,T,D] layout)
-        let max_sl = self.config.max_seq_len;
-        for h in 0..nkh as usize {
-            let src_off = h * hd as usize;
-            let dst_off = h * max_sl * hd as usize + position as usize * hd as usize;
-            unsafe {
-                d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].k, dst_off, &self.activations.k_attn, src_off, hd as usize, &self.stream)?;
-                d2d_copy_f32(&mut self.kv_caches[kv_cache_idx].v, dst_off, &self.activations.v_attn, src_off, hd as usize, &self.stream)?;
-            }
-        }
+        // 6. KV write already done at step 4a (before QK-norm) for quantization quality.
 
 
         // 7. GQA attention
