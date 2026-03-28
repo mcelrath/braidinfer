@@ -1489,6 +1489,7 @@ impl MegakernelProgram {
         let (post_norm, w_gate, w_up, w_down) = match layer {
             LayerWeights::Gdn(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
             LayerWeights::Attention(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+            _ => panic!("prefill FFN only for Gdn/Attention layers"),
         };
 
         // FFN gate+up (batch=N)
@@ -1537,6 +1538,7 @@ impl MegakernelProgram {
         let (post_norm, w_gate, w_up, w_down) = match layer {
             LayerWeights::Gdn(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
             LayerWeights::Attention(w) => (&w.post_norm, &w.w_gate, &w.w_up, &w.w_down),
+            _ => panic!("prefill FFN only for Gdn/Attention layers"),
         };
 
         let all_bf16 = matches!(w_gate, LinearWeight::Bf16(_))

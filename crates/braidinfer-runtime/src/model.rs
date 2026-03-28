@@ -56,9 +56,28 @@ pub struct AttentionLayerWeights {
     pub w_down: LinearWeight,          // MLP down
 }
 
+pub struct Mamba2LayerWeights {
+    pub input_norm: DeviceBuffer<u16>,      // bf16 rmsnorm weight [hidden_size]
+    pub in_proj: LinearWeight,              // [hidden_size, in_proj_size]
+    pub conv1d_weight: DeviceBuffer<u16>,   // bf16 [conv_dim, 1, conv_kernel] (depthwise)
+    pub conv1d_bias: DeviceBuffer<f32>,     // f32 [conv_dim]
+    pub dt_bias: DeviceBuffer<f32>,         // f32 [num_heads]
+    pub a_log: DeviceBuffer<f32>,           // f32 [num_heads]
+    pub d: DeviceBuffer<f32>,               // f32 [num_heads]
+    pub norm_weight: DeviceBuffer<u16>,     // bf16 rmsnorm_gated weight [intermediate]
+    pub out_proj: LinearWeight,             // [intermediate, hidden_size]
+}
+
+/// Standalone MoE FFN layer (Nemotron-H 'E' layers) — just norm + MoE dispatch
+pub struct MoeFfnLayerWeights {
+    pub input_norm: DeviceBuffer<u16>,      // bf16 rmsnorm weight [hidden_size]
+}
+
 pub enum LayerWeights {
     Gdn(GdnLayerWeights),
     Attention(AttentionLayerWeights),
+    Mamba2(Mamba2LayerWeights),
+    MoeFfn(MoeFfnLayerWeights),
 }
 
 /// Combined layer: recurrent/attention weights + FFN weights (dense or MoE)
@@ -93,6 +112,11 @@ pub enum FfnWeights {
 
 pub struct GdnState {
     pub recurrent: DeviceBuffer<f32>, // [16, 128, 128]
+}
+
+pub struct Mamba2State {
+    pub ssm: DeviceBuffer<f32>,  // [num_heads, head_dim, state_size]
+    pub conv: DeviceBuffer<f32>, // [conv_dim, conv_kernel]
 }
 
 pub struct KvCache {
@@ -212,6 +236,7 @@ pub struct Model {
     pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
     pub(crate) kv_caches: Vec<KvCache>,
     pub(crate) gdn_states: Vec<GdnState>,
+    pub(crate) mamba2_states: Vec<Mamba2State>,
     pub(crate) seq_len: u32,
     megakernel: Option<MegakernelProgram>,
     // Paged KV path (lazy-init)
@@ -261,7 +286,15 @@ impl std::error::Error for ModelError {}
 
 // ---- Helper: load a tensor by name, convert to f32, upload to GPU ----
 
-
+/// Try multiple name patterns, return first that exists in safetensors.
+fn find_weight_name(st: &SafeTensorSet, candidates: &[String]) -> Result<String, ModelError> {
+    for name in candidates {
+        if st.tensor_data(name).is_ok() {
+            return Ok(name.clone());
+        }
+    }
+    Err(ModelError::MissingWeight(format!("none of {:?} found", candidates)))
+}
 
 /// Load a bf16 tensor, returning a typed DeviceBuffer<u16>.
 /// The underlying data is copied directly from mmap — zero conversion.
@@ -412,9 +445,10 @@ fn load_moe_weights(
     let eis = *expert_intermediate_size;
     let hs = config.hidden_size;
 
-    // Router gate: try mlp.gate, block_sparse_moe.gate, mlp.router (always bf16)
+    // Router gate: try mlp.gate, gate (Nemotron), block_sparse_moe.gate, mlp.router (always bf16)
     let gate_name = [
         format!("{prefix}mlp.gate.weight"),
+        format!("{prefix}gate.weight"),
         format!("{prefix}block_sparse_moe.gate.weight"),
         format!("{prefix}mlp.router.weight"),
     ].into_iter().find(|n| st.tensor_data(n).is_ok())
@@ -692,7 +726,54 @@ impl Model {
             let p = format!("{prefix}layers.{i}.");
             let is_moe = matches!(config.layers[i].ffn_type, FfnType::MoE { .. });
             let wq = config.weight_quant;
-            if config.layer_is_attention[i] {
+            let layer_type = &config.layers[i].layer_type;
+            if *layer_type == LayerType::Mamba2 {
+                // Mamba2 SSM layer (Nemotron-H 'M' layers)
+                let hs = config.hidden_size;
+                let (nh, hd, _sd, ck, _ng, cd) = match &config.recurrent_kind {
+                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim } =>
+                        (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim),
+                    _ => panic!("Mamba2 layer but no Mamba2 recurrent config"),
+                };
+                let intermediate = nh * hd;
+                let in_proj_size = intermediate + cd + nh; // gate + xBC + dt
+                // Try Nemotron weight names first, then generic
+                let norm_name = find_weight_name(&st, &[
+                    format!("{p}norm.weight"),
+                    format!("{p}input_layernorm.weight"),
+                ])?;
+                let w = Mamba2LayerWeights {
+                    input_norm: load_weight_bf16(&st, &norm_name, device, hs)?,
+                    in_proj: load_linear_weight(&st, &format!("{p}mixer.in_proj.weight"), device, in_proj_size, hs, wq)?,
+                    conv1d_weight: load_weight_bf16(&st, &format!("{p}mixer.conv1d.weight"), device, cd * ck)?,
+                    conv1d_bias: load_weight_f32(&st, &format!("{p}mixer.conv1d.bias"), device, cd)?,
+                    dt_bias: load_weight_f32(&st, &format!("{p}mixer.dt_bias"), device, nh)?,
+                    a_log: load_weight_f32(&st, &format!("{p}mixer.A_log"), device, nh)?,
+                    d: load_weight_f32(&st, &format!("{p}mixer.D"), device, nh)?,
+                    norm_weight: load_weight_bf16(&st, &format!("{p}mixer.norm.weight"), device, intermediate)?,
+                    out_proj: load_linear_weight(&st, &format!("{p}mixer.out_proj.weight"), device, hs, intermediate, wq)?,
+                };
+                layers.push(LayerWeights::Mamba2(w));
+            } else if *layer_type == LayerType::MoeFfn {
+                // Standalone MoE FFN layer (Nemotron-H 'E' layers)
+                let hs = config.hidden_size;
+                let norm_name = find_weight_name(&st, &[
+                    format!("{p}norm.weight"),
+                    format!("{p}input_layernorm.weight"),
+                ])?;
+                let w = MoeFfnLayerWeights {
+                    input_norm: load_weight_bf16(&st, &norm_name, device, hs)?,
+                };
+                layers.push(LayerWeights::MoeFfn(w));
+                // Load MoE weights — Nemotron uses mixer.gate/mixer.experts instead of mlp.gate/mlp.experts
+                // Try Nemotron naming first by checking if mixer.gate.weight exists
+                let moe_prefix = if st.tensor_data(&format!("{p}mixer.gate.weight")).is_ok() {
+                    format!("{p}mixer.")
+                } else {
+                    format!("{p}mlp.")
+                };
+                moe_weights_vec[i] = Some(load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq)?);
+            } else if config.layer_is_attention[i] {
                 let hs = config.hidden_size;
                 let q_mult = if has_output_gate { 2 } else { 1 };
                 let w = AttentionLayerWeights {
@@ -812,7 +893,7 @@ impl Model {
         let mut gdn_states = Vec::new();
         let mut gdn_conv_states = Vec::new();
         for i in 0..config.num_layers {
-            if !config.layer_is_attention[i] {
+            if config.layers[i].layer_type == LayerType::Gdn {
                 let mut recurrent = DeviceBuffer::<f32>::alloc(device, nvh * kd * vd)?;
                 let zeros = vec![0.0f32; nvh * kd * vd];
                 recurrent.copy_from_host(&zeros)?;
@@ -822,6 +903,22 @@ impl Model {
                 let zeros = vec![0.0f32; qkv_out * (ck - 1)];
                 conv_state.copy_from_host(&zeros)?;
                 gdn_conv_states.push(conv_state);
+            }
+        }
+
+        // Mamba2 states: [num_heads, head_dim, state_size] SSM + [conv_dim, conv_kernel] conv
+        let mut mamba2_states = Vec::new();
+        if let RecurrentLayerKind::Mamba2 { num_heads: m_nh, head_dim: m_hd, state_dim: m_sd, conv_kernel: m_ck, conv_dim: m_cd, .. } = &config.recurrent_kind {
+            for i in 0..config.num_layers {
+                if config.layers[i].layer_type == LayerType::Mamba2 {
+                    let ssm_size = m_nh * m_hd * m_sd;
+                    let mut ssm = DeviceBuffer::<f32>::alloc(device, ssm_size)?;
+                    ssm.copy_from_host(&vec![0.0f32; ssm_size])?;
+                    let conv_size = m_cd * (m_ck - 1); // conv state = [conv_dim, kernel-1]
+                    let mut conv = DeviceBuffer::<f32>::alloc(device, conv_size)?;
+                    conv.copy_from_host(&vec![0.0f32; conv_size])?;
+                    mamba2_states.push(Mamba2State { ssm, conv });
+                }
             }
         }
 
@@ -919,6 +1016,7 @@ impl Model {
             gdn_conv_states,
             kv_caches,
             gdn_states,
+            mamba2_states,
             seq_len: 0,
             megakernel: None,
             megakernel_paged: None,
@@ -1187,6 +1285,7 @@ impl Model {
         let post_norm = match &self.layers[layer_idx] {
             LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
             LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
+            _ => panic!("post_norm only for Attention/Gdn layers"),
         };
 
         // 1. RMSNorm(hidden) → normed
@@ -1660,6 +1759,7 @@ impl Model {
                         &w.w_up as *const LinearWeight,
                         &w.w_down as *const LinearWeight,
                     ),
+                    _ => panic!("dense FFN only for Attention/Gdn layers"),
                 };
 
                 let all_bf16 = unsafe {
