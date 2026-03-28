@@ -1635,10 +1635,11 @@ impl Model {
         // Debug: check ffn_down magnitude
         if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 3 {
             self.stream.synchronize()?;
-            let mut buf = vec![0.0f32; hs];
+            let ffn_len = self.activations.ffn_down.len();
+            let mut buf = vec![0.0f32; ffn_len];
             self.activations.ffn_down.copy_to_host(&mut buf)?;
             let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            eprintln!("  MoE L{layer_idx} ffn_down max_abs={max_abs:.4}");
+            eprintln!("  MoE L{layer_idx} ffn_down(len={ffn_len}) max_abs={max_abs:.4}");
         }
 
         // 7. Residual add: hidden = residual + ffn_down
