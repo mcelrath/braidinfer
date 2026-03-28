@@ -1448,29 +1448,45 @@ impl Model {
             eprintln!("WARNING: {nan_count}/{ne} NaN MoE scores at layer {layer_idx}, first 5 scores: {:?}", &scores[..5.min(ne)]);
         }
 
-        // Softmax over ALL experts first (standard MoE routing)
-        let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
-        let probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp() / exp_sum).collect();
+        // Score transformation depends on gate type
+        let gate_type = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { gate_type, .. } => gate_type.clone(),
+            _ => unreachable!(),
+        };
 
-        // Top-k selection from softmax probabilities
-        let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
+        let (topk, _probs) = match &gate_type {
+            GateType::Sigmoid { .. } => {
+                // Sigmoid scoring: scores → sigmoid → top-k (no softmax)
+                let probs: Vec<f32> = scores.iter().map(|&s| 1.0 / (1.0 + (-s).exp())).collect();
+                let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
+                (topk, probs)
+            }
+            _ => {
+                // Softmax scoring
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
+                let probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp() / exp_sum).collect();
+                let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
+                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let topk: Vec<(usize, f32)> = indexed[..k].to_vec();
+                (topk, probs)
+            }
+        };
 
-        let (weights, scaling) = match &self.config.layers[layer_idx].ffn_type {
-            FfnType::MoE { gate_type: GateType::NormTopK { routed_scaling_factor }, .. } => {
-                // NormTopK: renormalize selected weights to sum to 1, then scale
+        let (weights, scaling) = match &gate_type {
+            GateType::NormTopK { routed_scaling_factor } | GateType::Sigmoid { routed_scaling_factor } => {
+                // NormTopK/Sigmoid: renormalize selected weights to sum to 1, then scale
                 let sum: f32 = topk.iter().map(|(_, w)| w).sum();
                 let w: Vec<f32> = topk.iter().map(|(_, w)| w / sum).collect();
                 (w, *routed_scaling_factor)
             }
-            FfnType::MoE { gate_type: GateType::Softmax, .. } => {
+            GateType::Softmax => {
                 // Standard softmax: use raw probabilities (don't renormalize)
                 let w: Vec<f32> = topk.iter().map(|(_, w)| *w).collect();
                 (w, 1.0)
             }
-            _ => unreachable!(),
         };
 
         // 4. Zero accumulation buffer on GPU (no CPU round-trip)

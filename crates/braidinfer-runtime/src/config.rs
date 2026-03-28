@@ -19,6 +19,7 @@ pub enum LayerType {
 pub enum GateType {
     Softmax,
     NormTopK { routed_scaling_factor: f32 },
+    Sigmoid { routed_scaling_factor: f32 },  // Nemotron-H: sigmoid scores, not softmax
 }
 
 #[derive(Debug, Clone)]
@@ -269,8 +270,12 @@ impl ModelConfig {
         };
 
         // MoE config
-        let gate_type = if get_bool("norm_topk_prob").unwrap_or(false) {
-            GateType::NormTopK { routed_scaling_factor: get_f64("routed_scaling_factor").unwrap_or(1.0) as f32 }
+        let rsf = get_f64("routed_scaling_factor").unwrap_or(1.0) as f32;
+        let gate_type = if model_type == "nemotron_h" {
+            // Nemotron-H uses sigmoid scoring (not softmax) with correction bias
+            GateType::Sigmoid { routed_scaling_factor: rsf }
+        } else if get_bool("norm_topk_prob").unwrap_or(false) {
+            GateType::NormTopK { routed_scaling_factor: rsf }
         } else { GateType::Softmax };
         let num_experts = get_usize("num_experts")
             .or(get_usize("n_routed_experts"))
