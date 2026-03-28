@@ -15,3 +15,4 @@ rand = "0.8"
 safetensors = "0.7.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "time", "sync"] }
 rayon = "1"
+dirs = "6"
