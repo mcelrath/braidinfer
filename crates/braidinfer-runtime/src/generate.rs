@@ -140,7 +140,7 @@ pub fn generate_from_ids(
         model.prefill(prompt_ids)?
     };
 
-    // Debug: print top-5 logits for first token
+    // Debug: print top-5 logits and dump hidden state for first token
     if std::env::var("DEBUG_NAN").is_ok() {
         let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -148,6 +148,13 @@ pub fn generate_from_ids(
         for &(id, val) in &indexed[..5] {
             let tok = tokenizer.decode(&[id as u32], false).unwrap_or_default();
             eprintln!("  {val:.2}: {id} = {tok:?}");
+        }
+        // Dump hidden state to file for comparison with HF reference
+        if let Ok(hidden) = model.read_hidden() {
+            let max_abs = hidden.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let sum: f32 = hidden.iter().sum();
+            let std = (hidden.iter().map(|x| (x - sum / hidden.len() as f32).powi(2)).sum::<f32>() / hidden.len() as f32).sqrt();
+            eprintln!("Final hidden: max_abs={max_abs:.4}, std={std:.4}, sum={sum:.2}, first10={:.4?}", &hidden[..10]);
         }
     }
 

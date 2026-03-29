@@ -983,6 +983,8 @@ impl Model {
                     if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size },
                 _ => eis,
             };
+            // Shared expert receives the same normed input as routed experts.
+            // HF NemotronHMOE: residuals = hidden_states (already normed by block)
             se.up_proj.forward(&self.kernels.linear_proj,
                 &mut self.activations.moe_expert_up, &self.activations.normed,
                 se_is as u32, hs as u32, &self.stream)?;
@@ -1903,7 +1905,7 @@ impl Model {
         Ok(())
     }
 
-    fn read_hidden(&self) -> Result<Vec<f32>, ModelError> {
+    pub fn read_hidden(&self) -> Result<Vec<f32>, ModelError> {
         self.stream.synchronize()?;
         let mut buf = vec![0.0f32; self.config.hidden_size];
         self.activations.hidden.copy_to_host(&mut buf)?;
