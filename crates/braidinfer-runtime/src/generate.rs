@@ -18,6 +18,7 @@ pub struct TokenConfig {
     pub im_start_id: Option<u32>,
     pub im_end_id: Option<u32>,
     pub eos_token_ids: Vec<u32>,
+    pub bos_token_id: Option<u32>,
     chat_template: Option<String>,
 }
 
@@ -64,7 +65,15 @@ impl TokenConfig {
                 cfg.get("chat_template").and_then(|v| v.as_str()).map(|s| s.to_string())
             });
 
-        TokenConfig { im_start_id, im_end_id, eos_token_ids, chat_template }
+        // BOS token: check config.json bos_token_id
+        let bos_token_id = std::fs::read_to_string(model_dir.join("config.json")).ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .and_then(|cfg| {
+                cfg.get("bos_token_id").and_then(|v| v.as_u64().map(|n| n as u32))
+                    .or_else(|| cfg.pointer("/text_config/bos_token_id").and_then(|v| v.as_u64().map(|n| n as u32)))
+            });
+
+        TokenConfig { im_start_id, im_end_id, eos_token_ids, bos_token_id, chat_template }
     }
 
     pub fn is_stop_token(&self, token: u32) -> bool {
@@ -198,7 +207,13 @@ pub fn greedy_generate(
     let encoding = tokenizer
         .encode(prompt, false)
         .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    let mut prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    // Prepend BOS if the model has one and the tokenizer didn't add it
+    if let Some(bos) = token_config.bos_token_id {
+        if prompt_ids.first() != Some(&bos) {
+            prompt_ids.insert(0, bos);
+        }
+    }
     generate_from_ids(model, tokenizer, token_config, &prompt_ids, max_tokens)
 }
 
