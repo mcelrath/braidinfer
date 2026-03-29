@@ -14,7 +14,7 @@ use crate::model::ModelConfig;
 /// num_attn_layers * 2(K+V) * chunk_tokens * num_kv_heads * head_dim * sizeof(f32)
 /// Used for staging buffers and flat KV cache.
 pub fn chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
-    let num_attn_layers = config.layer_is_attention.iter().filter(|&&a| a).count();
+    let num_attn_layers = config.num_attn_layers();
     let kv_stride = config.num_kv_heads * config.head_dim;
     num_attn_layers * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()
 }
@@ -27,7 +27,7 @@ pub fn chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
 ///   r_scale:  same as q1_scale
 pub fn quantized_chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
     debug_assert_eq!(chunk_tokens, 64, "quantized chunk_tokens must equal group_size (64)");
-    let num_attn_layers = config.layer_is_attention.iter().filter(|&&a| a).count();
+    let num_attn_layers = config.num_attn_layers();
     let nkh = config.num_kv_heads;
     let hd = config.head_dim;
     // Per K or V per layer:
@@ -66,7 +66,7 @@ pub fn quantized_kv_offsets(
 /// Recurrent (GDN) state bytes per checkpoint slot, from ModelConfig:
 /// num_gdn_layers * linear_num_heads * linear_key_head_dim * linear_value_head_dim * sizeof(f32)
 pub fn recurrent_state_bytes(config: &ModelConfig) -> usize {
-    let num_gdn_layers = config.layer_is_attention.iter().filter(|&&a| !a).count();
+    let num_gdn_layers = config.num_recurrent_layers();
     let floats_per_layer =
         config.linear_num_value_heads * config.linear_key_head_dim * config.linear_value_head_dim;
     num_gdn_layers * floats_per_layer * std::mem::size_of::<f32>()
