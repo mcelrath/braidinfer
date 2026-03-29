@@ -26,13 +26,15 @@ extern "C" __global__ void causal_conv1d_update_f32(
     const unsigned short* w = weight + ch * kernel_size;
 
     // Compute depthwise conv: state holds previous (kernel_size-1) inputs.
-    // nn.Conv1d uses correlation (not convolution): w[0] is most recent, w[kernel-1] is oldest.
-    // State: s[0]=oldest, s[hist-1]=most recent. Current input = newest.
-    // conv = input * w[0] + s[hist-1] * w[1] + ... + s[0] * w[hist]
-    float acc = input[ch] * bf16_to_f32(w[0]);
+    // nn.Conv1d cross-correlation with left padding: w[kernel-1] applies to current input,
+    // w[kernel-2] to most recent history, w[0] to oldest.
+    // State: s[0]=oldest, s[hist-1]=most recent.
+    // conv = s[0]*w[0] + s[1]*w[1] + ... + s[hist-1]*w[hist-1] + input*w[hist]
+    float acc = 0.0f;
     for (int k = 0; k < hist; k++) {
-        acc += s[hist - 1 - k] * bf16_to_f32(w[k + 1]);
+        acc += s[k] * bf16_to_f32(w[k]);
     }
+    acc += input[ch] * bf16_to_f32(w[hist]);
 
     // SiLU activation
     output[ch] = acc / (1.0f + expf(-acc));
@@ -62,11 +64,12 @@ extern "C" __global__ void causal_conv1d_update_bias_f32(
     float* s = state + ch * hist;
     const unsigned short* w = weight + ch * kernel_size;
 
-    // nn.Conv1d correlation order: w[0]=current, w[1]=most recent history, w[hist]=oldest
-    float acc = input[ch] * bf16_to_f32(w[0]);
+    // nn.Conv1d cross-correlation: w[0]=oldest, w[hist]=current
+    float acc = 0.0f;
     for (int k = 0; k < hist; k++) {
-        acc += s[hist - 1 - k] * bf16_to_f32(w[k + 1]);
+        acc += s[k] * bf16_to_f32(w[k]);
     }
+    acc += input[ch] * bf16_to_f32(w[hist]);
     acc += bias[ch];
 
     // SiLU activation
