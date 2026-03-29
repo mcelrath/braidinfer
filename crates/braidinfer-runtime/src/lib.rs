@@ -5,6 +5,7 @@ pub mod kernel;
 pub mod megakernel;
 pub mod model;
 pub mod paged_kv;
+pub mod weights;
 pub mod quant;
 pub mod sampling;
 pub mod trace;
