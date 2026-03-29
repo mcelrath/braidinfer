@@ -131,6 +131,17 @@ pub fn generate_from_ids(
         model.prefill(prompt_ids)?
     };
 
+    // Debug: print top-5 logits for first token
+    if std::env::var("DEBUG_NAN").is_ok() {
+        let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!("Top-5 logits:");
+        for &(id, val) in &indexed[..5] {
+            let tok = tokenizer.decode(&[id as u32], false).unwrap_or_default();
+            eprintln!("  {val:.2}: {id} = {tok:?}");
+        }
+    }
+
     let mut all_tokens: Vec<u32> = prompt_ids.to_vec();
     let mut text_pieces: Vec<String> = Vec::new();
     let mut position = n_prompt as u32;
