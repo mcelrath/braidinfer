@@ -59,6 +59,9 @@ pub enum RecurrentLayerKind {
         conv_kernel: usize,
         n_groups: usize,
         conv_dim: usize,  // intermediate + 2 * n_groups * state_dim
+        dt_min: f32,
+        dt_max: f32,
+        dt_floor: f32,
     },
     None,
 }
@@ -90,8 +93,6 @@ pub struct ModelConfig {
     pub linear_conv_kernel_dim: usize,
     // Per-layer config: layer type + FFN type
     pub layers: Vec<LayerConfig>,
-    // Legacy compat (derived from layers)
-    pub layer_is_attention: Vec<bool>,  // TODO(kvn.1): derive from layers vec during model.rs split
     pub max_seq_len: usize,
     // MoE config (global defaults, may be overridden per-layer)
     pub num_experts: usize,
@@ -120,7 +121,6 @@ impl ModelConfig {
             layer_type: if attention_layer_indices.contains(&i) { LayerType::Attention } else { LayerType::Gdn },
             ffn_type: ffn.clone(),
         }).collect();
-        let layer_is_attention: Vec<bool> = layers.iter().map(|l| l.layer_type == LayerType::Attention).collect();
         ModelConfig {
             hidden_size: 1024,
             num_layers: 24,
@@ -139,7 +139,6 @@ impl ModelConfig {
             linear_value_head_dim: 128,
             linear_conv_kernel_dim: 4,
             layers,
-            layer_is_attention,
             max_seq_len: 2048,
             num_experts: 0,
             num_active_experts: 0,
@@ -260,10 +259,14 @@ impl ModelConfig {
             let ng = get_usize("n_groups").unwrap_or(1);
             let mamba_intermediate = nh * hd;
             let mamba_conv_dim = mamba_intermediate + 2 * ng * sd;
+            let dt_min = get_f64("time_step_min").unwrap_or(0.001) as f32;
+            let dt_max = get_f64("time_step_max").unwrap_or(0.1) as f32;
+            let dt_floor = get_f64("time_step_floor").unwrap_or(0.0001) as f32;
             RecurrentLayerKind::Mamba2 {
                 state_dim: sd, num_heads: nh, head_dim: hd,
                 conv_kernel: linear_conv_kernel_dim,
                 n_groups: ng, conv_dim: mamba_conv_dim,
+                dt_min, dt_max, dt_floor,
             }
         } else {
             RecurrentLayerKind::None
@@ -344,7 +347,6 @@ impl ModelConfig {
             (0..num_layers).map(|_| LayerConfig { layer_type: LayerType::Attention, ffn_type: ffn.clone() }).collect()
         };
 
-        let layer_is_attention: Vec<bool> = layers.iter().map(|l| l.layer_type == LayerType::Attention).collect();
         let attention_layer_indices: Vec<usize> = layers.iter().enumerate()
             .filter(|(_, l)| l.layer_type == LayerType::Attention)
             .map(|(i, _)| i).collect();
@@ -356,7 +358,7 @@ impl ModelConfig {
             num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
             mrope_section,
             linear_num_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, linear_conv_kernel_dim,
-            layers, layer_is_attention, max_seq_len,
+            layers, max_seq_len,
             num_experts, num_active_experts, num_shared_experts,
             expert_intermediate_size, shared_expert_intermediate_size,
             recurrent_kind, rope_type,
@@ -392,10 +394,10 @@ impl ModelConfig {
     }
 
     pub fn num_attn_layers(&self) -> usize {
-        self.layer_is_attention.iter().filter(|&&a| a).count()
+        self.layers.iter().filter(|l| l.layer_type == LayerType::Attention).count()
     }
 
     pub fn num_recurrent_layers(&self) -> usize {
-        self.layer_is_attention.iter().filter(|&&a| !a).count()
+        self.layers.iter().filter(|l| l.layer_type != LayerType::Attention).count()
     }
 }

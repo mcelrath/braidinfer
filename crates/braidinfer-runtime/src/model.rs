@@ -39,6 +39,7 @@ pub struct Model {
     checkpoint_pool: Option<RecurrentCheckpointPool>,
     last_checkpoint_slot: Option<u32>,
     trace: Option<crate::trace::TraceWriter>,
+    pub(crate) debug_nan: bool,
 }
 
 // ---- Model impl ----
@@ -49,13 +50,6 @@ impl Model {
     const DEFAULT_MAX_SEQ_LEN: usize = 8192;
 
     pub fn load(model_dir: &Path, device: DeviceId) -> Result<Self, ModelError> {
-        Self::load_with_max_seq_len(model_dir, device, None)
-    }
-
-    /// Load from a pre-quantized .bqnt file + safetensors (for non-quantized tensors).
-    /// Set BQNT_PATH env var to point to the .bqnt file.
-    /// Quantized weights load from bqnt (zero-copy mmap), norms/biases from safetensors.
-    pub fn load_bqnt(model_dir: &Path, device: DeviceId) -> Result<Self, ModelError> {
         Self::load_with_max_seq_len(model_dir, device, None)
     }
 
@@ -191,9 +185,9 @@ impl Model {
             if *layer_type == LayerType::Mamba2 {
                 // Mamba2 SSM layer (Nemotron-H 'M' layers)
                 let hs = config.hidden_size;
-                let (nh, hd, _sd, ck, _ng, cd) = match &config.recurrent_kind {
-                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim } =>
-                        (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim),
+                let (nh, hd, _sd, ck, _ng, cd, dt_min, dt_max_val, dt_floor) = match &config.recurrent_kind {
+                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim, dt_min, dt_max, dt_floor } =>
+                        (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim, *dt_min, *dt_max, *dt_floor),
                     _ => panic!("Mamba2 layer but no Mamba2 recurrent config"),
                 };
                 let intermediate = nh * hd;
@@ -214,9 +208,7 @@ impl Model {
                         // The safetensors dt_bias is NOT loaded by HF (overwritten by _init_weights).
                         // We replicate HF's init: dt = exp(uniform * (log(max)-log(min)) + log(min))
                         // then inv_softplus: bias = dt + log(1 - exp(-dt))
-                        let dt_min: f32 = 0.001; // from config time_step_min
-                        let dt_max_val: f32 = 0.1;   // from config time_step_max
-                        let dt_floor: f32 = 0.0001;
+                        // dt_min, dt_max_val, dt_floor come from config (time_step_min/max/floor)
                         let log_range = dt_max_val.ln() - dt_min.ln();
                         // Use deterministic sequence based on layer index
                         let mut dt_host = vec![0.0f32; nh];
@@ -255,7 +247,7 @@ impl Model {
                     format!("{p}mlp.")
                 };
                 moe_weights_vec[i] = Some(load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq)?);
-            } else if config.layer_is_attention[i] {
+            } else if config.layers[i].layer_type == LayerType::Attention {
                 let hs = config.hidden_size;
                 let q_mult = if has_output_gate { 2 } else { 1 };
                 let w = AttentionLayerWeights {
@@ -426,7 +418,7 @@ impl Model {
         let zeros_kv = vec![0.0f32; kv_size];
         let mut kv_caches = Vec::new();
         for i in 0..config.num_layers {
-            if config.layer_is_attention[i] {
+            if config.layers[i].layer_type == LayerType::Attention {
                 let mut k = DeviceBuffer::<f32>::alloc(device, kv_size)?;
                 let mut v = DeviceBuffer::<f32>::alloc(device, kv_size)?;
                 k.copy_from_host(&zeros_kv)?;
@@ -554,6 +546,7 @@ impl Model {
             trace: std::env::var("TRACE").ok().and_then(|path| {
                 crate::trace::TraceWriter::open(&path).ok()
             }),
+            debug_nan: std::env::var("DEBUG_NAN").is_ok(),
         })
     }
 
@@ -915,7 +908,7 @@ impl Model {
         }
 
         // Debug MoE routing
-        if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 3 {
+        if self.debug_nan && layer_idx <= 3 {
             eprintln!("  MoE L{layer_idx}: topk={:?} weights={:?} scaling={scaling:.4}",
                 topk.iter().map(|(id,_)| *id).collect::<Vec<_>>(), &weights);
         }
@@ -966,7 +959,7 @@ impl Model {
             }
 
             // Debug: check intermediate values
-            if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 1 && j == 0 {
+            if self.debug_nan && layer_idx <= 1 && j == 0 {
                 self.stream.synchronize()?;
                 let up_len = self.activations.moe_expert_up.len();
                 let act_len = self.activations.moe_expert_act.len();
@@ -1041,7 +1034,7 @@ impl Model {
         }
 
         // Debug: check ffn_down magnitude
-        if std::env::var("DEBUG_NAN").is_ok() && layer_idx <= 3 {
+        if self.debug_nan && layer_idx <= 3 {
             self.stream.synchronize()?;
             let ffn_len = self.activations.ffn_down.len();
             let mut buf = vec![0.0f32; ffn_len];
@@ -1069,7 +1062,7 @@ impl Model {
             _ => panic!("mamba2_forward called on non-Mamba2 layer"),
         };
         let (nh, hd, sd, _ck, ng, cd) = match &self.config.recurrent_kind {
-            RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim } =>
+            RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim, .. } =>
                 (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim),
             _ => panic!("mamba2_forward but no Mamba2 config"),
         };
@@ -1088,7 +1081,7 @@ impl Model {
         }
 
         // Debug: per-step tracing for layer 0
-        let dbg = std::env::var("DEBUG_NAN").is_ok() && layer_idx == 0;
+        let dbg = self.debug_nan && layer_idx == 0;
         if dbg {
             self.stream.synchronize()?;
             let n = self.activations.normed.len();
@@ -1593,7 +1586,7 @@ impl Model {
             token_id as i32, hs, &self.stream,
         )?;
 
-        if std::env::var("DEBUG_NAN").is_ok() {
+        if self.debug_nan {
             self.stream.synchronize()?;
             let mut buf = vec![0.0f32; self.config.hidden_size];
             self.activations.hidden.copy_to_host(&mut buf)?;
@@ -1634,7 +1627,7 @@ impl Model {
             }
 
             // Debug: check for NaN in hidden state after each layer
-            if std::env::var("DEBUG_NAN").is_ok() {
+            if self.debug_nan {
                 self.stream.synchronize()?;
                 let mut buf = vec![0.0f32; self.config.hidden_size];
                 self.activations.hidden.copy_to_host(&mut buf)?;
@@ -1947,7 +1940,7 @@ impl Model {
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
         for i in 0..self.config.num_layers {
-            if self.config.layer_is_attention[i] {
+            if self.config.layers[i].layer_type == LayerType::Attention {
                 self.attention_forward(i, kv_idx, position)?;
                 kv_idx += 1;
             } else {

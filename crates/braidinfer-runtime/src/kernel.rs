@@ -818,11 +818,13 @@ impl GqaAttentionKernel {
     }
 }
 
+#[cfg(test)]
 pub struct GdnLayerFusedKernel {
     module: Module,
     device: DeviceId,
 }
 
+#[cfg(test)]
 impl GdnLayerFusedKernel {
     pub fn load(device: DeviceId) -> HipResult<Self> {
         let path = kernel_dir().join("gdn_layer_fused.hsaco");
@@ -1380,11 +1382,13 @@ impl GdnRecurrentStepV2Kernel {
     }
 }
 
+#[cfg(test)]
 pub struct AttnLayerFusedKernel {
     module: Module,
     device: DeviceId,
 }
 
+#[cfg(test)]
 impl AttnLayerFusedKernel {
     pub fn load(device: DeviceId) -> HipResult<Self> {
         let path = kernel_dir().join("attn_layer_fused.hsaco");
