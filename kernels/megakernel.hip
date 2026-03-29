@@ -224,6 +224,12 @@ __device__ void op_silu_mul(const u64* inst, u32 vblock) {
 // OP_LINEAR_PROJ_RNF4: y = W_rnf4 @ x (one virtual block per output row, decode only)
 // args: [1]=output, [2]=weight (packed rnf4), [3]=input, [4]=out_dim, [5]=in_dim
 // Weight layout per row: groups of 128 elements, each 132 bytes.
+//   group = [idx1_packed(64B), absmax1(2B), idx2_packed(64B), absmax2(2B)] = 132 bytes
+//   idx1/idx2 are packed nibbles: 2 elements per byte, 64 bytes = 128 elements.
+//
+// Optimized: all 256 threads cooperate on one row, processing element pairs in stride.
+// Each thread handles in_dim/512 pairs (2 elements each). No shared memory for input
+// (read from global — L2 cached after first row in this block).
 __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
     float* output = inst_fptr(inst, 1);
     const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
@@ -235,42 +241,51 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
     if (row >= out_dim) return;
 
     const int tid = threadIdx.x;
-    const int stride = blockDim.x;
+    const int block_size = blockDim.x;  // 256
     const int group_size = 128;
     const int group_bytes = 132;
     const int num_groups = (in_dim + group_size - 1) / group_size;
     const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+    const int num_pairs = in_dim / 2;
 
     float acc = 0.0f;
-    for (int g = tid; g < num_groups; g += stride) {
+    for (int pair = tid; pair < num_pairs; pair += block_size) {
+        int elem = pair * 2;
+        int g = elem / group_size;
+        int local_pair = (elem % group_size) / 2;
+
         const unsigned char* gp = row_data + g * group_bytes;
-        const unsigned char* idx1_packed = gp;
         float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
-        const unsigned char* idx2_packed = gp + 66;
         float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
 
-        int base = g * group_size;
-        int count = min(group_size, in_dim - base);
-        for (int i = 0; i < count; i += 2) {
-            unsigned char b1 = idx1_packed[i / 2];
-            unsigned char b2 = idx2_packed[i / 2];
-            float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
-            acc += v0 * input[base + i];
-            if (i + 1 < count) {
-                float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
-                acc += v1 * input[base + i + 1];
-            }
-        }
+        unsigned char b1 = gp[local_pair];
+        unsigned char b2 = gp[66 + local_pair];
+
+        float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+        float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+
+        acc += v0 * input[elem] + v1 * input[elem + 1];
     }
 
-    extern __shared__ float shared[];
-    shared[tid] = acc;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
+    // Warp-level reduction
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset);
     }
-    if (tid == 0) output[row] = shared[0];
+
+    // Cross-warp reduction via shared memory
+    extern __shared__ float shared[];
+    if ((tid & 31) == 0) {
+        shared[tid >> 5] = acc;
+    }
+    __syncthreads();
+
+    if (tid < 8) {
+        acc = shared[tid];
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            acc += __shfl_down(acc, offset);
+        }
+        if (tid == 0) output[row] = acc;
+    }
 }
 
 // OP_LINEAR_PROJ_PCG32: y = W_pcg32 @ x (one virtual block per output row, decode only)

@@ -93,6 +93,7 @@ pub struct MegakernelProgram {
     device_program: DeviceBuffer<u64>,
     module: Module,
     num_blocks: u32,
+    shared_mem: u32,
     device: DeviceId,
     // Indices of instructions that need per-step updates
     embedding_inst_idx: usize,
@@ -230,9 +231,9 @@ impl MegakernelProgram {
         // cooperative launch works. Skipping capability check — hipModuleLaunchCooperativeKernel
         // will return an error if unsupported.
 
-        // Query max blocks for cooperative launch
+        let shared_mem = 256u32 * 4 * 2; // 2KB: GDN recurrent + warp reduction
         let func = module.get_function("megakernel_f32")?;
-        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();
@@ -372,6 +373,7 @@ impl MegakernelProgram {
             device_program,
             module,
             num_blocks,
+            shared_mem,
             device,
             embedding_inst_idx,
             _mrope_inst_indices: mrope_inst_indices,
@@ -417,8 +419,9 @@ impl MegakernelProgram {
         let act = &model.activations;
 
         let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
+        let shared_mem = (256u32 * 4 * 2).max((cfg.hidden_size as u32) * 4);
         let func = module.get_function("megakernel_f32")?;
-        let blocks_per_sm = func.max_active_blocks_per_sm(256, 256 * 4 * 2)?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();
@@ -761,6 +764,7 @@ impl MegakernelProgram {
             device_program,
             module,
             num_blocks,
+            shared_mem,
             device,
             embedding_inst_idx,
             _mrope_inst_indices: Vec::new(),
@@ -2051,7 +2055,7 @@ impl MegakernelProgram {
         func.launch_cooperative(
             (self.num_blocks, 1, 1),
             (256, 1, 1),
-            256 * 4 * 2,
+            self.shared_mem,
             stream,
             &mut args,
         )
@@ -2179,7 +2183,7 @@ impl MegakernelProgram {
         func.launch_cooperative(
             (self.num_blocks, 1, 1),
             (256, 1, 1),
-            256 * 4 * 2,
+            self.shared_mem,
             stream,
             &mut args,
         )
