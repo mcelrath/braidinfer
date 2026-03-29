@@ -22,15 +22,41 @@ def read_btrc(path):
             entries.append((name, data))
     return entries
 
-btrc = read_btrc(sys.argv[1])
+all_btrc = read_btrc(sys.argv[1])
 npz = np.load(sys.argv[2])
 
-# Map braidinfer checkpoint names to HF layer indices
-# braidinfer: embed, L0.post_mixer, L0.post_ffn, L1.post_mixer, ...
-# HF: layer_0 (embed), layer_1 (after L0), layer_2 (after L1), ...
-# Note: HF layer_{i+1} = after layer i. Token index 1 = Hello (after BOS).
+# With BOS + Hello, the BTRC has two full passes:
+# Pass 0 (BOS): embed, L0.post_mixer, L0.post_ffn, ..., L51.post_ffn, final_norm, top10_logits
+# Pass 1 (Hello): embed, L0.post_mixer, L0.post_ffn, ..., L51.post_ffn, final_norm, top10_logits
+# We want Pass 1 (Hello token) for comparison with HF layer_0..layer_52 (which includes BOS context).
+# Each pass has ~107 checkpoints. Use the second set.
+checkpoints_per_pass = sum(1 for n, _ in all_btrc if n == 'embed')
+if checkpoints_per_pass >= 2:
+    # Find start of second pass
+    embed_count = 0
+    second_pass_start = 0
+    for i, (name, _) in enumerate(all_btrc):
+        if name == 'embed':
+            embed_count += 1
+            if embed_count == 2:
+                second_pass_start = i
+                break
+    # Find end of second pass (start of third pass or end)
+    second_pass_end = len(all_btrc)
+    embed_count = 0
+    for i, (name, _) in enumerate(all_btrc):
+        if name == 'embed':
+            embed_count += 1
+            if embed_count == 3:
+                second_pass_end = i
+                break
+    btrc = all_btrc[second_pass_start:second_pass_end]
+    print(f"Using pass 2 (Hello token): checkpoints {second_pass_start}..{second_pass_end}")
+else:
+    btrc = all_btrc
+    print("Single pass (no BOS)")
 
-print(f"BTRC: {len(btrc)} checkpoints")
+print(f"BTRC: {len(btrc)} checkpoints (of {len(all_btrc)} total)")
 print(f"NPZ: {len(npz.files)} layers")
 
 for name, bi_data in btrc:
