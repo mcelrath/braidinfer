@@ -52,6 +52,13 @@ impl Model {
         Self::load_with_max_seq_len(model_dir, device, None)
     }
 
+    /// Load from a pre-quantized .bqnt file + safetensors (for non-quantized tensors).
+    /// Set BQNT_PATH env var to point to the .bqnt file.
+    /// Quantized weights load from bqnt (zero-copy mmap), norms/biases from safetensors.
+    pub fn load_bqnt(model_dir: &Path, device: DeviceId) -> Result<Self, ModelError> {
+        Self::load_with_max_seq_len(model_dir, device, None)
+    }
+
     pub fn load_with_max_seq_len(model_dir: &Path, device: DeviceId, max_seq_len: Option<usize>) -> Result<Self, ModelError> {
         let config_path = model_dir.join("config.json");
         let mut config = if config_path.exists() {
@@ -72,6 +79,23 @@ impl Model {
         };
 
         let st = SafeTensorSet::open_directory(model_dir)?;
+
+        // Check for pre-quantized .bqnt file (set BQNT_PATH env var)
+        let bqnt = std::env::var("BQNT_PATH").ok()
+            .and_then(|p| {
+                let path = std::path::PathBuf::from(&p);
+                match crate::bqnt::MmapBqnt::open(&path) {
+                    Ok(b) => {
+                        eprintln!("Loaded pre-quantized weights from {} ({} tensors)",
+                            p, b.n_tensors());
+                        Some(b)
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: Failed to open BQNT_PATH={p}: {e}");
+                        None
+                    }
+                }
+            });
 
         // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
         // Costs ~300ms upfront to fault in pages, but saves ~500ms on weight copies.
@@ -154,6 +178,15 @@ impl Model {
             let p = format!("{prefix}layers.{i}.");
             let is_moe = matches!(config.layers[i].ffn_type, FfnType::MoE { .. });
             let wq = config.weight_quant;
+            // Helper: load linear weight, trying bqnt first if available
+            let load_lw = |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
+                if let Some(ref b) = bqnt {
+                    if let Ok(lw) = crate::weights::load_linear_weight_bqnt(b, name, device) {
+                        return Ok(lw);
+                    }
+                }
+                load_linear_weight(&st, name, device, out_dim, in_dim, wq)
+            };
             let layer_type = &config.layers[i].layer_type;
             if *layer_type == LayerType::Mamba2 {
                 // Mamba2 SSM layer (Nemotron-H 'M' layers)
@@ -172,14 +205,14 @@ impl Model {
                 ])?;
                 let w = Mamba2LayerWeights {
                     input_norm: load_weight_bf16(&st, &norm_name, device, hs)?,
-                    in_proj: load_linear_weight(&st, &format!("{p}mixer.in_proj.weight"), device, in_proj_size, hs, wq)?,
+                    in_proj: load_lw(&format!("{p}mixer.in_proj.weight"), in_proj_size, hs)?,
                     conv1d_weight: load_weight_bf16(&st, &format!("{p}mixer.conv1d.weight"), device, cd * ck)?,
                     conv1d_bias: load_weight_f32(&st, &format!("{p}mixer.conv1d.bias"), device, cd)?,
                     dt_bias: load_weight_f32(&st, &format!("{p}mixer.dt_bias"), device, nh)?,
                     a_log: load_weight_f32(&st, &format!("{p}mixer.A_log"), device, nh)?,
                     d: load_weight_f32(&st, &format!("{p}mixer.D"), device, nh)?,
                     norm_weight: load_weight_f32(&st, &format!("{p}mixer.norm.weight"), device, intermediate)?,
-                    out_proj: load_linear_weight(&st, &format!("{p}mixer.out_proj.weight"), device, hs, intermediate, wq)?,
+                    out_proj: load_lw(&format!("{p}mixer.out_proj.weight"), hs, intermediate)?,
                 };
                 layers.push(LayerWeights::Mamba2(w));
             } else if *layer_type == LayerType::MoeFfn {
@@ -209,22 +242,22 @@ impl Model {
                         format!("{p}input_layernorm.weight"),
                         format!("{p}norm.weight"),
                     ])?, device, hs)?,
-                    w_q_gate: load_linear_weight(&st, &find_weight_name(&st, &[
+                    w_q_gate: load_lw(&find_weight_name(&st, &[
                         format!("{p}self_attn.q_proj.weight"),
                         format!("{p}mixer.q_proj.weight"),
-                    ])?, device, config.num_q_heads * config.head_dim * q_mult, hs, wq)?,
-                    w_k: load_linear_weight(&st, &find_weight_name(&st, &[
+                    ])?, config.num_q_heads * config.head_dim * q_mult, hs)?,
+                    w_k: load_lw(&find_weight_name(&st, &[
                         format!("{p}self_attn.k_proj.weight"),
                         format!("{p}mixer.k_proj.weight"),
-                    ])?, device, config.num_kv_heads * config.head_dim, hs, wq)?,
-                    w_v: load_linear_weight(&st, &find_weight_name(&st, &[
+                    ])?, config.num_kv_heads * config.head_dim, hs)?,
+                    w_v: load_lw(&find_weight_name(&st, &[
                         format!("{p}self_attn.v_proj.weight"),
                         format!("{p}mixer.v_proj.weight"),
-                    ])?, device, config.num_kv_heads * config.head_dim, hs, wq)?,
-                    w_o: load_linear_weight(&st, &find_weight_name(&st, &[
+                    ])?, config.num_kv_heads * config.head_dim, hs)?,
+                    w_o: load_lw(&find_weight_name(&st, &[
                         format!("{p}self_attn.o_proj.weight"),
                         format!("{p}mixer.o_proj.weight"),
-                    ])?, device, hs, config.num_q_heads * config.head_dim, wq)?,
+                    ])?, hs, config.num_q_heads * config.head_dim)?,
                     q_norm: if has_qk_norm {
                         let name = format!("{p}self_attn.q_norm.weight");
                         let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
@@ -243,16 +276,16 @@ impl Model {
                         else { DeviceBuffer::<u16>::alloc(device, 0)? } // no post-norm (Nemotron * layers)
                     },
                     w_gate: if !is_moe && !matches!(config.layers[i].ffn_type, FfnType::None) {
-                        load_linear_weight(&st, &format!("{p}mlp.gate_proj.weight"), device,
-                            config.intermediate_size, hs, wq)?
+                        load_lw(&format!("{p}mlp.gate_proj.weight"),
+                            config.intermediate_size, hs)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_up: if !is_moe && !matches!(config.layers[i].ffn_type, FfnType::None) {
-                        load_linear_weight(&st, &format!("{p}mlp.up_proj.weight"), device,
-                            config.intermediate_size, hs, wq)?
+                        load_lw(&format!("{p}mlp.up_proj.weight"),
+                            config.intermediate_size, hs)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_down: if !is_moe && !matches!(config.layers[i].ffn_type, FfnType::None) {
-                        load_linear_weight(&st, &format!("{p}mlp.down_proj.weight"), device,
-                            hs, config.intermediate_size, wq)?
+                        load_lw(&format!("{p}mlp.down_proj.weight"),
+                            hs, config.intermediate_size)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                 };
                 layers.push(LayerWeights::Attention(w));
@@ -290,10 +323,10 @@ impl Model {
                 let hs = config.hidden_size;
                 let w = GdnLayerWeights {
                     input_norm: load_weight_bf16(&st, &format!("{p}input_layernorm.weight"), device, hs)?,
-                    w_qkv: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_qkv.weight"), device, qkv_out, hs, wq)?,
-                    w_a: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_a.weight"), device, nvh, hs, wq)?,
-                    w_b: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_b.weight"), device, nvh, hs, wq)?,
-                    w_z: load_linear_weight(&st, &format!("{p}linear_attn.in_proj_z.weight"), device, z_out, hs, wq)?,
+                    w_qkv: load_lw(&format!("{p}linear_attn.in_proj_qkv.weight"), qkv_out, hs)?,
+                    w_a: load_lw(&format!("{p}linear_attn.in_proj_a.weight"), nvh, hs)?,
+                    w_b: load_lw(&format!("{p}linear_attn.in_proj_b.weight"), nvh, hs)?,
+                    w_z: load_lw(&format!("{p}linear_attn.in_proj_z.weight"), z_out, hs)?,
                     conv1d_weight: conv1d_weight_buf,
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
@@ -301,16 +334,16 @@ impl Model {
                     a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nvh)?,
                     dt_bias: load_weight_bf16(&st, &format!("{p}linear_attn.dt_bias"), device, nvh)?,
                     output_norm: load_weight_f32(&st, &format!("{p}linear_attn.norm.weight"), device, vd)?,  // normalizes [nvh, vd] output
-                    w_out: load_linear_weight(&st, &format!("{p}linear_attn.out_proj.weight"), device, hs, z_out, wq)?,
+                    w_out: load_lw(&format!("{p}linear_attn.out_proj.weight"), hs, z_out)?,
                     post_norm: load_weight_bf16(&st, &format!("{p}post_attention_layernorm.weight"), device, hs)?,
                     w_gate: if !is_moe {
-                        load_linear_weight(&st, &format!("{p}mlp.gate_proj.weight"), device, config.intermediate_size, hs, wq)?
+                        load_lw(&format!("{p}mlp.gate_proj.weight"), config.intermediate_size, hs)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_up: if !is_moe {
-                        load_linear_weight(&st, &format!("{p}mlp.up_proj.weight"), device, config.intermediate_size, hs, wq)?
+                        load_lw(&format!("{p}mlp.up_proj.weight"), config.intermediate_size, hs)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                     w_down: if !is_moe {
-                        load_linear_weight(&st, &format!("{p}mlp.down_proj.weight"), device, hs, config.intermediate_size, wq)?
+                        load_lw(&format!("{p}mlp.down_proj.weight"), hs, config.intermediate_size)?
                     } else { LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?) },
                 };
                 layers.push(LayerWeights::Gdn(w));
