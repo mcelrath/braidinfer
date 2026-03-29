@@ -407,6 +407,69 @@ pub fn host_bf16_to_linear_weight(
     }
 }
 
+// --- BQNT (pre-quantized) loading ---
+
+use crate::bqnt::{MmapBqnt, code_to_format};
+
+/// Load a linear weight directly from a pre-quantized .bqnt file.
+/// Zero quantization cost — packed bytes go straight from mmap to GPU.
+pub fn load_linear_weight_bqnt(
+    bqnt: &MmapBqnt,
+    name: &str,
+    device: DeviceId,
+) -> Result<LinearWeight, ModelError> {
+    let entry = bqnt.entry(name)
+        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    let format = code_to_format(entry.format)
+        .ok_or_else(|| ModelError::MissingWeight(format!("{name}: unknown format code {}", entry.format)))?;
+    let data = bqnt.tensor_data(name)
+        .ok_or_else(|| ModelError::MissingWeight(format!("{name}: data out of bounds")))?;
+
+    match format {
+        WeightFormat::Bf16 => {
+            let n_elements = entry.out_features as usize * entry.in_features as usize;
+            let bf16_data: &[u16] = unsafe {
+                std::slice::from_raw_parts(data.as_ptr() as *const u16, n_elements)
+            };
+            let mut buf = DeviceBuffer::<u16>::alloc(device, n_elements)?;
+            buf.copy_from_host(bf16_data)?;
+            Ok(LinearWeight::Bf16(buf))
+        }
+        _ => {
+            let mut buf = DeviceBuffer::<u8>::alloc(device, data.len())?;
+            buf.copy_from_host(data)?;
+            Ok(LinearWeight::Packed(PackedWeights {
+                data: buf,
+                format,
+                out_dim: entry.out_features as usize,
+                in_dim: entry.in_features as usize,
+            }))
+        }
+    }
+}
+
+/// Load a bf16 weight (non-quantized, e.g. layernorm) from .bqnt file.
+/// Falls back to safetensors if not found in bqnt (norms, biases may not be quantized).
+pub fn load_weight_bf16_bqnt(
+    bqnt: &MmapBqnt,
+    name: &str,
+    device: DeviceId,
+    expected_len: usize,
+) -> Result<DeviceBuffer<u16>, ModelError> {
+    if let Some(data) = bqnt.tensor_data(name) {
+        assert_eq!(data.len(), expected_len * 2,
+            "bqnt weight {name}: expected {} bytes, got {}", expected_len * 2, data.len());
+        let bf16_data: &[u16] = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u16, expected_len)
+        };
+        let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
+        buf.copy_from_host(bf16_data)?;
+        Ok(buf)
+    } else {
+        Err(ModelError::MissingWeight(name.to_string()))
+    }
+}
+
 /// Load all MoE weights for a single layer (gate, experts, shared expert).
 pub fn load_moe_weights(
     st: &SafeTensorSet,
