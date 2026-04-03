@@ -7,12 +7,9 @@
 // Each instruction specifies an operation and how many "virtual blocks" it needs.
 // Physical blocks loop over virtual blocks: for (vb = blockIdx.x; vb < grid_x; vb += gridDim.x)
 
-// Instruction layout (128 bytes, 16 uint64s):
-//   [0]:  opcode (low 32) | grid_x (high 32)  — grid_x = number of virtual blocks
-//   [1]:  arg0 (pointer or scalar)
-//   [2]:  arg1
-//   [3]:  arg2
-//   [4]:  arg3
+// Instruction layout (136 bytes, 17 uint64s):
+//   [0]:  opcode (low 31) | FLAG_NO_SYNC (bit 31) | grid_x (high 32)
+//   [1..16]: up to 16 argument slots (pointers or packed scalars)
 //   [5]:  arg4
 //   [6]:  arg5
 //   [7]:  arg6
@@ -348,7 +345,7 @@ __device__ void op_rmsnorm_wx(const u64* inst, u32 vblock) {
     const float* input_base = inst_fptr(inst, 2);
     const unsigned short* weight = inst_u16ptr(inst, 3);
     int hidden_size = inst_int(inst, 4);
-    float eps = __int_as_float(inst_int(inst, 5));
+    float eps = inst_float(inst, 5);
 
     // vblock = batch index (same as op_rmsnorm)
     float* output = output_base + (long long)vblock * hidden_size;
@@ -425,32 +422,7 @@ __device__ void op_gdn_gate(const u64* inst, u32 vblock) {
 }
 
 // OP_GDN_RECUR: gated delta rule recurrence (one block per head)
-// args: [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b, [6]=state|output_packed
-//   state and output are packed: state_ptr = arg6, output_ptr = arg6 + state_size
-//   Actually, let's use two args: [6]=state, [7-low]=output (but we only have 7 slots)
-//   Re-pack: arg6 = state_ptr, we need output ptr too.
-//   Solution: use inst[7] for additional args
-// args: [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b_and_key_dim, [6]=state, [7-low]=output
-//   b_and_key_dim: low 32 = key_dim, high 32 = value_dim... no, b is a pointer.
-//   We need 8 args but only have 7 slots (inst[1]..inst[7]).
-//   Let's pack key_dim and value_dim into one u64: low32=key_dim, high32=value_dim
-//   and use: [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b, [6]=state, [7]=output
-//   dims passed as grid_x encoding... no.
-//   Actually we have inst[0..7] = 8 slots. inst[0] is opcode|grid_x.
-//   So inst[1]..inst[7] = 7 arg slots. We need: q,k,v,gate,b,state,output + key_dim,value_dim = 9 values.
-//   Pack dims: key_dim|value_dim into a single u64.
-//   Use: [1]=q, [2]=k, [3]=v, [4]=gate_and_b_packed, [5]=state, [6]=output, [7]=dims
-//   gate_and_b_packed: low 64 bits... no, these are pointers.
-//   Better: increase instruction size to 12 u64s (96 bytes). Still cache-line friendly.
-//   OR: for complex ops, use an indirection — args point to a separate args buffer.
-//   Simplest: make instruction 16 u64s (128 bytes = 2 cache lines). Plenty of room.
-
-// Let me redesign: 128-byte instructions (16 x u64)
-// [0]: opcode (low32) | grid_x (high32)
-// [1..15]: up to 15 argument slots
-
-// For GDN recurrent:
-// [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b, [6]=state, [7]=output, [8]=key_dim, [9]=value_dim
+// args: [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b, [6]=state, [7]=output, [8]=key_dim, [9]=value_dim
 __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
     const float* q = inst_fptr(inst, 1);
     const float* k = inst_fptr(inst, 2);
@@ -1047,7 +1019,7 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
 
     // Single-pass online softmax with register V accumulation
     // acc[] holds one element per strided position; head_dim/block_size must be <= 4
-    if (head_dim > 4 * block_size) __builtin_trap();
+    if (head_dim > 4 * block_size) return; // head_dim too large for fixed acc[4] array
     float m = -1e30f, d = 0.0f;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (int t = 0; t < seq_len; t++) {
@@ -1537,7 +1509,7 @@ __device__ void op_attn_prefill(const u64* inst, u32 vblock) {
     int block_size = blockDim.x;
 
     // Online softmax with register V accumulation (same as op_gqa_attn)
-    if (head_dim > 4 * block_size) __builtin_trap();
+    if (head_dim > 4 * block_size) return; // head_dim too large for fixed acc[4] array
     float m = -1e30f, d = 0.0f;
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 

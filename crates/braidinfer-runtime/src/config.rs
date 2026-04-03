@@ -402,6 +402,6 @@ impl ModelConfig {
     }
 
     pub fn num_recurrent_layers(&self) -> usize {
-        self.layers.iter().filter(|l| l.layer_type != LayerType::Attention).count()
+        self.layers.iter().filter(|l| matches!(l.layer_type, LayerType::Gdn | LayerType::Mamba2)).count()
     }
 }

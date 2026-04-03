@@ -77,12 +77,6 @@ pub enum LayerWeights {
     MoeFfn(MoeFfnLayerWeights),
 }
 
-/// Combined layer: recurrent/attention weights + FFN weights (dense or MoE)
-pub struct FullLayerWeights {
-    pub layer: LayerWeights,
-    pub ffn: FfnWeights,
-}
-
 /// Dense FFN weights (gate_proj + up_proj + down_proj)
 pub struct DenseFfnWeights {
     pub gate_proj: LinearWeight,
@@ -104,11 +98,6 @@ pub struct MoeWeights {
     pub expert_intermediate_size: usize,
 }
 
-/// Per-layer FFN weights: either dense or MoE
-pub enum FfnWeights {
-    Dense(DenseFfnWeights),
-    MoE(MoeWeights),
-}
 
 pub struct GdnState {
     pub recurrent: DeviceBuffer<f32>, // [16, 128, 128]
