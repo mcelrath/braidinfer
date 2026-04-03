@@ -23,6 +23,7 @@ const SKIP_PATTERNS: &[&str] = &[
     "layernorm.weight", "norm.weight",
     "A_log", "dt_bias",
     "in_proj_a.weight", "in_proj_b.weight",
+    "conv1d.weight", "conv1d.bias",
 ];
 
 fn should_skip(name: &str) -> bool {
