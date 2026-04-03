@@ -122,6 +122,9 @@ pub struct DistributedMoeWeights {
     pub gate_up_expert_stride: usize,
     pub down_expert_stride: usize,
     pub gate_up_row_stride: usize,
+    // GPU 0 uses original packed buffer (no extra copy)
+    pub gpu0_gate_up_base: *const u8,
+    pub gpu0_down_base: *const u8,
 }
 
 pub struct GdnState {
@@ -866,13 +869,31 @@ pub fn distribute_moe_weights_from_ref(
             }
         }
 
-        expert_buffers.push(GpuExpertBuffer {
-            device,
-            gate_up: DeviceBuffer::<u8>::alloc(device, n * gate_up_expert_stride)?,
-            down: DeviceBuffer::<u8>::alloc(device, n * down_expert_stride)?,
-            local_expert_count: n,
-            slot_map,
-        });
+        if gpu == 0 {
+            // GPU 0: use original packed buffer directly (no extra allocation).
+            // slot_map maps global expert_id → global expert_id (identity for GPU 0 experts).
+            let mut slot_map_identity = vec![None; ne];
+            for e in 0..ne {
+                if expert_device[e] == 0 {
+                    slot_map_identity[e] = Some(e); // global index = slot (original layout)
+                }
+            }
+            expert_buffers.push(GpuExpertBuffer {
+                device,
+                gate_up: DeviceBuffer::<u8>::alloc(device, 0)?, // placeholder — dispatch uses moe.expert_gate_up
+                down: DeviceBuffer::<u8>::alloc(device, 0)?,
+                local_expert_count: n,
+                slot_map: slot_map_identity,
+            });
+        } else {
+            expert_buffers.push(GpuExpertBuffer {
+                device,
+                gate_up: DeviceBuffer::<u8>::alloc(device, n * gate_up_expert_stride)?,
+                down: DeviceBuffer::<u8>::alloc(device, n * down_expert_stride)?,
+                local_expert_count: n,
+                slot_map,
+            });
+        }
     }
 
     // Copy expert weights from GPU 0's packed buffer to per-GPU buffers
@@ -881,57 +902,35 @@ pub fn distribute_moe_weights_from_ref(
 
     for e in 0..ne {
         let gpu = expert_device[e];
+        if gpu == 0 { continue; } // GPU 0 uses original packed buffer
+
         let local_slot = expert_buffers[gpu].slot_map[e].unwrap();
         let dst_device = DeviceId(gpu as u32);
 
-        // gate_up: copy one expert's worth of bytes
+        // gate_up: P2P copy from GPU 0 to target GPU
         let src_offset = e * gate_up_expert_stride;
         let dst_offset = local_slot * gate_up_expert_stride;
-        if gpu == 0 {
-            // D2D copy within GPU 0
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                    src_gate_up.add(src_offset) as *const std::ffi::c_void,
-                    gate_up_expert_stride,
-                    braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                );
-            }
-        } else {
-            // P2P copy from GPU 0 to target GPU
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpyPeer(
-                    expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                    dst_device.0 as i32,
-                    src_gate_up.add(src_offset) as *const std::ffi::c_void,
-                    0, // src device = GPU 0
-                    gate_up_expert_stride,
-                );
-            }
+        unsafe {
+            braidinfer_hip::ffi::hipMemcpyPeer(
+                expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                dst_device.0 as i32,
+                src_gate_up.add(src_offset) as *const std::ffi::c_void,
+                0, // src device = GPU 0
+                gate_up_expert_stride,
+            );
         }
 
-        // down: same pattern
+        // down: P2P copy
         let src_offset = e * down_expert_stride;
         let dst_offset = local_slot * down_expert_stride;
-        if gpu == 0 {
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                    src_down.add(src_offset) as *const std::ffi::c_void,
-                    down_expert_stride,
-                    braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                );
-            }
-        } else {
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpyPeer(
-                    expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                    dst_device.0 as i32,
-                    src_down.add(src_offset) as *const std::ffi::c_void,
-                    0,
-                    down_expert_stride,
-                );
-            }
+        unsafe {
+            braidinfer_hip::ffi::hipMemcpyPeer(
+                expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                dst_device.0 as i32,
+                src_down.add(src_offset) as *const std::ffi::c_void,
+                0,
+                down_expert_stride,
+            );
         }
     }
 
@@ -947,6 +946,8 @@ pub fn distribute_moe_weights_from_ref(
         gate_up_expert_stride,
         down_expert_stride,
         gate_up_row_stride,
+        gpu0_gate_up_base: src_gate_up,
+        gpu0_down_base: src_down,
     })
 }
 

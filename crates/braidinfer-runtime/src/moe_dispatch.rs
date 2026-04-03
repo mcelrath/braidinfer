@@ -117,6 +117,18 @@ pub fn dispatch_moe_layer(
             worker.activation_in.as_ptr()
         };
 
+        // Weight base pointers: GPU 0 uses original packed buffer, others use per-GPU buffer
+        let gate_up_base: *const u8 = if gpu == 0 {
+            moe.gpu0_gate_up_base
+        } else {
+            buf.gate_up.as_ptr()
+        };
+        let down_base: *const u8 = if gpu == 0 {
+            moe.gpu0_down_base
+        } else {
+            buf.down.as_ptr()
+        };
+
         for &(expert_id, weight) in &per_gpu[gpu] {
             let local_slot = buf.slot_map[expert_id]
                 .expect("expert not on expected GPU");
@@ -125,19 +137,18 @@ pub fn dispatch_moe_layer(
             let down_offset = local_slot * moe.down_expert_stride;
 
             if moe.has_gate_proj {
-                // SwiGLU: gate + up + silu_mul + down
                 let gate_byte_offset = gate_up_offset;
                 let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
 
                 kernels.linear_proj.forward_packed_ptr(
                     worker.scratch_gate.as_ptr() as *mut f32,
-                    unsafe { buf.gate_up.as_ptr().add(gate_byte_offset) },
+                    unsafe { gate_up_base.add(gate_byte_offset) },
                     input_ptr, eis as u32, hs as u32,
                     "linear_proj_pcg32_q4", &worker.compute_stream,
                 )?;
                 kernels.linear_proj.forward_packed_ptr(
                     worker.scratch_up.as_ptr() as *mut f32,
-                    unsafe { buf.gate_up.as_ptr().add(up_byte_offset) },
+                    unsafe { gate_up_base.add(up_byte_offset) },
                     input_ptr, eis as u32, hs as u32,
                     "linear_proj_pcg32_q4", &worker.compute_stream,
                 )?;
@@ -165,7 +176,7 @@ pub fn dispatch_moe_layer(
             // down_proj → scratch_gate (reuse as scratch for down output)
             kernels.linear_proj.forward_packed_ptr(
                 worker.scratch_gate.as_ptr() as *mut f32,
-                unsafe { buf.down.as_ptr().add(down_offset) },
+                unsafe { down_base.add(down_offset) },
                 worker.scratch_act.as_ptr(),
                 hs as u32, eis as u32,
                 "linear_proj_pcg32_q4", &worker.compute_stream,
