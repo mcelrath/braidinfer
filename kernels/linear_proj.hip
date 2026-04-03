@@ -68,76 +68,85 @@ extern "C" __global__ void linear_proj_f32(
 
 // Matrix-vector multiply with rnf4_g128 quantized weights.
 // Weight layout per row: groups of 128 elements, each group is 132 bytes:
-//   [64B idx1_packed | 2B absmax1_f16 | 64B idx2_packed | 2B absmax2_f16]
+//   [64B idx1_packed | 2B absmax1_bf16 | 64B idx2_packed | 2B absmax2_bf16]
 // idx packed: 2 values per byte, low nibble first.
 // Dequant: value = NF4_TABLE[idx1] * absmax1 + NF4_TABLE[idx2] * absmax2
 //
 // row_stride = num_groups_per_row * 132 bytes
 // num_groups_per_row = ceil(in_dim / 128)
+//
+// Optimization: threads spread across elements within groups.
+// Input cached in shared memory. 16-byte vectorized weight loads.
+// 256 threads handle 128 elements/group × num_groups cooperatively.
 
 extern "C" __global__ void linear_proj_rnf4_g128(
     float* __restrict__ output,
-    const unsigned char* __restrict__ weight,  // packed rnf4 data
+    const unsigned char* __restrict__ weight,
     const float* __restrict__ input,
     const int out_dim,
     const int in_dim
 ) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
-    const int stride = blockDim.x;
 
     if (row >= out_dim) return;
 
-    const int group_size = 128;
-    const int group_bytes = 132;  // 64 + 2 + 64 + 2
-    const int num_groups = (in_dim + group_size - 1) / group_size;
-    const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+    const int GROUP_SIZE = 128;
+    const int GROUP_BYTES = 132;
+    const int num_groups = (in_dim + GROUP_SIZE - 1) / GROUP_SIZE;
+    const unsigned char* row_data = weight + (long long)row * num_groups * GROUP_BYTES;
+
+    // Cache input in shared memory (max ~16KB for 4096 elements)
+    extern __shared__ float sh_input[];
+    for (int i = tid; i < in_dim; i += blockDim.x) {
+        sh_input[i] = input[i];
+    }
+    __syncthreads();
 
     float acc = 0.0f;
 
-    // Each thread processes multiple groups
-    for (int g = tid; g < num_groups; g += stride) {
-        const unsigned char* gp = row_data + g * group_bytes;
-        const unsigned char* idx1_packed = gp;
+    // Process element pairs (2 elements per byte).
+    // Total pairs = in_dim/2. Thread tid handles pairs tid, tid+256, ...
+    const int n_pairs = in_dim / 2;
+    for (int pair = tid; pair < n_pairs; pair += blockDim.x) {
+        int g = (pair * 2) / GROUP_SIZE;
+        int i = (pair * 2) % GROUP_SIZE;  // even index within group
+        int byte_idx = i / 2;
+
+        const unsigned char* gp = row_data + g * GROUP_BYTES;
+        unsigned char b1 = gp[byte_idx];
+        unsigned char b2 = gp[66 + byte_idx];
+
         float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
-        const unsigned char* idx2_packed = gp + 66;
         float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
 
-        int base = g * group_size;
-        int count = min(group_size, in_dim - base);
+        // Low nibble = even element, high nibble = odd element
+        float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+        float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
 
-        for (int i = 0; i < count; i += 2) {
-            unsigned char byte1 = idx1_packed[i / 2];
-            unsigned char byte2 = idx2_packed[i / 2];
-
-            int i1_lo = byte1 & 0xF;
-            int i1_hi = (byte1 >> 4) & 0xF;
-            int i2_lo = byte2 & 0xF;
-            int i2_hi = (byte2 >> 4) & 0xF;
-
-            float v0 = NF4_TABLE[i1_lo] * absmax1 + NF4_TABLE[i2_lo] * absmax2;
-            acc += v0 * input[base + i];
-
-            if (i + 1 < count) {
-                float v1 = NF4_TABLE[i1_hi] * absmax1 + NF4_TABLE[i2_hi] * absmax2;
-                acc += v1 * input[base + i + 1];
-            }
-        }
+        int base = pair * 2;
+        acc += v0 * sh_input[base] + v1 * sh_input[base + 1];
     }
 
-    __shared__ float shared[256];
-    shared[tid] = acc;
+    // Wave32 reduction (RDNA3 default wavefront)
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset);
+    }
+
+    // Cross-wave reduction via shared memory (256 threads = 8 waves of 32)
+    // wave_sums stored after input cache in shared memory
+    float* wave_sums = sh_input + in_dim;
+    if ((tid & 31) == 0) {
+        wave_sums[tid >> 5] = acc;
+    }
     __syncthreads();
 
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared[tid] += shared[tid + s];
+    if (tid < 8) {
+        acc = wave_sums[tid];
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            acc += __shfl_down(acc, offset);
         }
-        __syncthreads();
-    }
-
-    if (tid == 0) {
-        output[row] = shared[0];
+        if (tid == 0) output[row] = acc;
     }
 }
 

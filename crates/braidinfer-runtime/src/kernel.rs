@@ -230,10 +230,12 @@ impl LinearProjKernel {
         ];
 
         let block_size = 256u32;
+        // Shared memory: input cache (in_dim * 4 bytes) + wave reduction (8 * 4 bytes)
+        let shared_bytes = (in_dim as u32) * 4 + 8 * 4;
         func.launch(
             (out_dim, 1, 1),
             (block_size, 1, 1),
-            256 * 4,
+            shared_bytes,
             stream,
             &mut args,
         )
@@ -264,10 +266,11 @@ impl LinearProjKernel {
             std::ptr::addr_of_mut!(id).cast(),
         ];
         let block_size = 256u32;
+        let shared_bytes = in_dim * 4 + 8 * 4;
         func.launch(
             (out_dim, 1, 1),
             (block_size, 1, 1),
-            256 * 4,
+            shared_bytes,
             stream,
             &mut args,
         )
