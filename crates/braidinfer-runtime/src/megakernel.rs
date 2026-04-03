@@ -1628,11 +1628,12 @@ impl MegakernelProgram {
             instructions.push(inst);
         } else {
             // Unfused path for quantized weights (decode n=1 only)
-            // D2D_COPY: hidden → residual
+            // D2D_COPY: hidden → residual (NO_SYNC: RMSNorm reads hidden, not residual)
             let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
             inst.set_output_ptr(1, act.residual.as_ptr());
             inst.set_ptr(2, act.hidden.as_ptr());
             inst.set_int(3, hs as i32);
+            inst.set_no_sync();
             instructions.push(inst);
 
             // RMSNorm: hidden → normed
@@ -1644,13 +1645,14 @@ impl MegakernelProgram {
             inst.set_float(5, eps);
             instructions.push(inst);
 
-            // Gate: normed → ffn_gate
+            // Gate: normed → ffn_gate (NO_SYNC: up_proj reads same normed, writes different buf)
             let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
             emit_linear_proj(&mut inst, w_gate, 2);
             inst.set_output_ptr(1, act.ffn_gate.as_ptr());
             inst.set_ptr(3, act.normed.as_ptr());
             inst.set_int(4, is as i32);
             inst.set_int(5, hs as i32);
+            inst.set_no_sync();
             instructions.push(inst);
 
             // Up: normed → ffn_up
