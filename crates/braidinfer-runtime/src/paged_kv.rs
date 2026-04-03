@@ -139,7 +139,8 @@ impl PageAllocator {
 
     /// Return a slot to the free-list.
     pub fn free(&mut self, slot: u32) {
-        debug_assert!((slot as usize) < self.capacity as usize);
+        assert!((slot as usize) < self.capacity as usize, "page slot {} >= capacity {}", slot, self.capacity);
+        assert!(!self.free_list.contains(&slot), "double-free of page slot {}", slot);
         self.free_list.push(slot);
     }
 

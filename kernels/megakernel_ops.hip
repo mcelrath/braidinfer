@@ -107,7 +107,7 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
         for (int t = 0; t < B_TILE; t++) acc[t] = 0.0f;
 
         for (int vi = tid; vi < vec_count; vi += stride) {
-            ull2 wv = w_vec[vi];
+            ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
             unsigned short ws[8];
             __builtin_memcpy(ws, &wv, 16);
             float wf[8];

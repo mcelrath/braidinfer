@@ -87,6 +87,9 @@ impl MegakernelProgram {
         let shared_mem = if has_moe { 1024u32 * 4 } else { 256u32 * 4 * 2 };
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        // Cap at 192 blocks (2/CU): empirically optimal for virtual block loop.
+        // Higher counts increase cooperative launch overhead without improving throughput
+        // since the virtual block loop already distributes work across all blocks.
         let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();
@@ -288,6 +291,9 @@ impl MegakernelProgram {
         let shared_mem = (256u32 * 4 * 2).max((cfg.hidden_size as u32) * 4);
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        // Cap at 192 blocks (2/CU): empirically optimal for virtual block loop.
+        // Higher counts increase cooperative launch overhead without improving throughput
+        // since the virtual block loop already distributes work across all blocks.
         let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();

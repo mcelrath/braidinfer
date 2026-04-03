@@ -74,6 +74,10 @@ impl Model {
                 pinned.push(ptr);
             }
         }
+        if pinned.len() < shard_ptrs.len() {
+            eprintln!("Warning: {}/{} safetensor shards failed hipHostRegister (slower DMA fallback)",
+                shard_ptrs.len() - pinned.len(), shard_ptrs.len());
+        }
 
         // Discover tensor name prefix by finding "layers.0." in tensor names.
         // Prefer prefixes containing "model" to avoid matching MTP/draft heads.
