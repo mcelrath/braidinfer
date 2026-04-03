@@ -99,6 +99,35 @@ pub struct MoeWeights {
 }
 
 
+/// Per-GPU expert weight buffer for distributed MoE.
+pub struct GpuExpertBuffer {
+    pub device: DeviceId,
+    pub gate_up: DeviceBuffer<u8>,       // packed expert weights on this GPU
+    pub down: DeviceBuffer<u8>,          // packed down_proj weights on this GPU
+    pub local_expert_count: usize,       // how many experts on this GPU
+    /// Maps global expert_id → local slot index (None if not on this GPU).
+    /// Indexed by global expert_id, len = num_experts.
+    pub slot_map: Vec<Option<usize>>,
+}
+
+/// Distributed MoE weights across multiple GPUs.
+pub struct DistributedMoeWeights {
+    pub gate: DeviceBuffer<u16>,                    // GPU 0 only: router weights
+    pub expert_buffers: Vec<GpuExpertBuffer>,       // [num_devices]
+    pub expert_device: Vec<usize>,                  // [num_experts] → device index
+    pub shared_expert: Option<DenseFfnWeights>,     // GPU 0 only
+    pub shared_expert_gate: Option<DeviceBuffer<u16>>, // GPU 0 only
+    pub has_gate_proj: bool,
+    pub score_correction_bias: Option<Vec<f32>>,
+    pub score_correction_bias_gpu: Option<DeviceBuffer<f32>>, // GPU 0
+    pub num_experts: usize,
+    pub expert_intermediate_size: usize,
+    // Byte strides for addressing within per-GPU buffers
+    pub gate_up_expert_stride: usize,  // bytes per expert in gate_up
+    pub down_expert_stride: usize,     // bytes per expert in down
+    pub gate_up_row_stride: usize,     // bytes per row in gate_up
+}
+
 pub struct GdnState {
     pub recurrent: DeviceBuffer<f32>, // [16, 128, 128]
 }

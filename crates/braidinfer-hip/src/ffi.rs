@@ -141,4 +141,19 @@ unsafe extern "C" {
         src_device: c_int,
         size: usize,
     ) -> hipError_t;
+    pub fn hipMemcpyPeerAsync(
+        dst: *mut c_void,
+        dst_device: c_int,
+        src: *const c_void,
+        src_device: c_int,
+        size: usize,
+        stream: hipStream_t,
+    ) -> hipError_t;
+
+    // Stream-event synchronization
+    pub fn hipStreamWaitEvent(
+        stream: hipStream_t,
+        event: hipEvent_t,
+        flags: c_uint,
+    ) -> hipError_t;
 }

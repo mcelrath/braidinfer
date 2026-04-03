@@ -28,6 +28,7 @@ fn main() {
                 "-std=c++17",
                 "-ffp-contract=fast",  // Aggressive FMA fusion for performance
                 "-mwavefrontsize64", // Required for WMMA (V_WMMA_F32_16X16X16_F16)
+                "-DHIP_API_PER_THREAD_DEFAULT_STREAM", // Avoids deadlock with persistent kernels
                 &format!("-I{}", kernel_dir.display()), // For opcodes.h
                 "-o",
             ])
