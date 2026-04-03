@@ -86,8 +86,9 @@ extern "C" __global__ void linear_proj_rnf4_g128(
 ) {
     const int base_row = blockIdx.x * ROWS_PER_BLOCK;
     const int tid = threadIdx.x;
-    const int sub_tid = tid % 64;    // thread within sub-group (64 threads per row)
-    const int sub_row = tid / 64;    // which of the 4 rows this thread handles
+    const int THREADS_PER_ROW = blockDim.x / ROWS_PER_BLOCK; // 32
+    const int sub_tid = tid % THREADS_PER_ROW;
+    const int sub_row = tid / THREADS_PER_ROW;
 
     const int GROUP_SIZE = 128;
     const int GROUP_BYTES = 132;
@@ -108,9 +109,9 @@ extern "C" __global__ void linear_proj_rnf4_g128(
     const unsigned char* row_data = weight + row * row_stride;
     float acc = 0.0f;
 
-    // 64 threads per row, each processes element pairs strided
+    // 64 threads per row process element pairs strided across all groups
     const int n_pairs = in_dim / 2;
-    for (int pair = sub_tid; pair < n_pairs; pair += 64) {
+    for (int pair = sub_tid; pair < n_pairs; pair += THREADS_PER_ROW) {
         int g = (pair * 2) / GROUP_SIZE;
         int i = (pair * 2) % GROUP_SIZE;
         int byte_idx = i / 2;
@@ -129,13 +130,10 @@ extern "C" __global__ void linear_proj_rnf4_g128(
         acc += v0 * sh_input[base] + v1 * sh_input[base + 1];
     }
 
-    // Wave32 reduction within the 64-thread sub-group
-    // First reduce within wave (32 threads)
+    // Wave32 reduction within 64-thread sub-group (2 waves)
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_down(acc, offset);
     }
-
-    // Cross-wave within sub-group: 64 threads = 2 waves
     float* wave_sums = sh_input + in_dim + sub_row * 2;
     if (sub_tid == 0) wave_sums[0] = acc;
     if (sub_tid == 32) wave_sums[1] = acc;
