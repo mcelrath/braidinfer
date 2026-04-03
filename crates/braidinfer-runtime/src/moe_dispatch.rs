@@ -162,7 +162,7 @@ pub fn dispatch_moe_layer(
                 // relu²: up + relu²
                 kernels.linear_proj.forward_packed_ptr(
                     worker.scratch_up.as_ptr() as *mut f32,
-                    unsafe { buf.gate_up.as_ptr().add(gate_up_offset) },
+                    unsafe { gate_up_base.add(gate_up_offset) },
                     input_ptr, eis as u32, hs as u32,
                     "linear_proj_pcg32_q4", &worker.compute_stream,
                 )?;
