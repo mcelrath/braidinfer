@@ -72,12 +72,10 @@ extern "C" __global__ void linear_proj_f32(
 // idx packed: 2 values per byte, low nibble first.
 // Dequant: value = NF4_TABLE[idx1] * absmax1 + NF4_TABLE[idx2] * absmax2
 //
-// row_stride = num_groups_per_row * 132 bytes
-// num_groups_per_row = ceil(in_dim / 128)
-//
-// Optimization: threads spread across elements within groups.
-// Input cached in shared memory. 16-byte vectorized weight loads.
-// 256 threads handle 128 elements/group × num_groups cooperatively.
+// Optimization: 4 rows per block, input cached in shared memory,
+// pair processing (2 elements per byte), wave32 shuffle reduction.
+
+#define ROWS_PER_BLOCK 4
 
 extern "C" __global__ void linear_proj_rnf4_g128(
     float* __restrict__ output,
@@ -86,31 +84,35 @@ extern "C" __global__ void linear_proj_rnf4_g128(
     const int out_dim,
     const int in_dim
 ) {
-    const int row = blockIdx.x;
+    const int base_row = blockIdx.x * ROWS_PER_BLOCK;
     const int tid = threadIdx.x;
-
-    if (row >= out_dim) return;
+    const int sub_tid = tid % 64;    // thread within sub-group (64 threads per row)
+    const int sub_row = tid / 64;    // which of the 4 rows this thread handles
 
     const int GROUP_SIZE = 128;
     const int GROUP_BYTES = 132;
     const int num_groups = (in_dim + GROUP_SIZE - 1) / GROUP_SIZE;
-    const unsigned char* row_data = weight + (long long)row * num_groups * GROUP_BYTES;
+    const long long row_stride = (long long)num_groups * GROUP_BYTES;
 
-    // Cache input in shared memory (max ~16KB for 4096 elements)
-    extern __shared__ float sh_input[];
+    // Cache input in shared memory (shared across all 4 rows)
+    extern __shared__ float sh[];
+    float* sh_input = sh;
     for (int i = tid; i < in_dim; i += blockDim.x) {
         sh_input[i] = input[i];
     }
     __syncthreads();
 
+    int row = base_row + sub_row;
+    if (row >= out_dim) return;
+
+    const unsigned char* row_data = weight + row * row_stride;
     float acc = 0.0f;
 
-    // Process element pairs (2 elements per byte).
-    // Total pairs = in_dim/2. Thread tid handles pairs tid, tid+256, ...
+    // 64 threads per row, each processes element pairs strided
     const int n_pairs = in_dim / 2;
-    for (int pair = tid; pair < n_pairs; pair += blockDim.x) {
+    for (int pair = sub_tid; pair < n_pairs; pair += 64) {
         int g = (pair * 2) / GROUP_SIZE;
-        int i = (pair * 2) % GROUP_SIZE;  // even index within group
+        int i = (pair * 2) % GROUP_SIZE;
         int byte_idx = i / 2;
 
         const unsigned char* gp = row_data + g * GROUP_BYTES;
@@ -120,7 +122,6 @@ extern "C" __global__ void linear_proj_rnf4_g128(
         float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
         float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
 
-        // Low nibble = even element, high nibble = odd element
         float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
         float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
 
@@ -128,27 +129,24 @@ extern "C" __global__ void linear_proj_rnf4_g128(
         acc += v0 * sh_input[base] + v1 * sh_input[base + 1];
     }
 
-    // Wave32 reduction (RDNA3 default wavefront)
+    // Wave32 reduction within the 64-thread sub-group
+    // First reduce within wave (32 threads)
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_down(acc, offset);
     }
 
-    // Cross-wave reduction via shared memory (256 threads = 8 waves of 32)
-    // wave_sums stored after input cache in shared memory
-    float* wave_sums = sh_input + in_dim;
-    if ((tid & 31) == 0) {
-        wave_sums[tid >> 5] = acc;
-    }
+    // Cross-wave within sub-group: 64 threads = 2 waves
+    float* wave_sums = sh_input + in_dim + sub_row * 2;
+    if (sub_tid == 0) wave_sums[0] = acc;
+    if (sub_tid == 32) wave_sums[1] = acc;
     __syncthreads();
 
-    if (tid < 8) {
-        acc = wave_sums[tid];
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            acc += __shfl_down(acc, offset);
-        }
-        if (tid == 0) output[row] = acc;
+    if (sub_tid == 0) {
+        output[row] = wave_sums[0] + wave_sums[1];
     }
 }
+
+#undef ROWS_PER_BLOCK
 
 
 // Matrix-vector multiply with PcG32Q4 (asymmetric 4-bit, group_size=32) quantized weights.

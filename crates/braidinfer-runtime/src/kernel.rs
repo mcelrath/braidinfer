@@ -230,10 +230,12 @@ impl LinearProjKernel {
         ];
 
         let block_size = 256u32;
-        // Shared memory: input cache (in_dim * 4 bytes) + wave reduction (8 * 4 bytes)
-        let shared_bytes = (in_dim as u32) * 4 + 8 * 4;
+        let rows_per_block = if func_name == "linear_proj_rnf4_g128" { 4u32 } else { 1 };
+        let grid = (out_dim + rows_per_block - 1) / rows_per_block;
+        // Shared memory: input cache (in_dim * 4 bytes) + wave reduction (rows_per_block * 2 * 4 bytes)
+        let shared_bytes = (in_dim as u32) * 4 + rows_per_block * 2 * 4;
         func.launch(
-            (out_dim, 1, 1),
+            (grid, 1, 1),
             (block_size, 1, 1),
             shared_bytes,
             stream,
@@ -266,9 +268,11 @@ impl LinearProjKernel {
             std::ptr::addr_of_mut!(id).cast(),
         ];
         let block_size = 256u32;
-        let shared_bytes = in_dim * 4 + 8 * 4;
+        let rows_per_block = if func_name == "linear_proj_rnf4_g128" { 4u32 } else { 1 };
+        let grid = (out_dim + rows_per_block - 1) / rows_per_block;
+        let shared_bytes = in_dim * 4 + rows_per_block * 2 * 4;
         func.launch(
-            (out_dim, 1, 1),
+            (grid, 1, 1),
             (block_size, 1, 1),
             shared_bytes,
             stream,
