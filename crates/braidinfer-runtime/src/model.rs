@@ -185,9 +185,9 @@ impl Model {
             if *layer_type == LayerType::Mamba2 {
                 // Mamba2 SSM layer (Nemotron-H 'M' layers)
                 let hs = config.hidden_size;
-                let (nh, hd, _sd, ck, _ng, cd, dt_min, dt_max_val, dt_floor) = match &config.recurrent_kind {
-                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim, dt_min, dt_max, dt_floor } =>
-                        (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim, *dt_min, *dt_max, *dt_floor),
+                let (nh, hd, _sd, ck, _ng, cd) = match &config.recurrent_kind {
+                    RecurrentLayerKind::Mamba2 { num_heads, head_dim, state_dim, conv_kernel, n_groups, conv_dim, .. } =>
+                        (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim),
                     _ => panic!("Mamba2 layer but no Mamba2 recurrent config"),
                 };
                 let intermediate = nh * hd;
@@ -202,26 +202,7 @@ impl Model {
                     in_proj: load_lw(&format!("{p}mixer.in_proj.weight"), in_proj_size, hs)?,
                     conv1d_weight: load_weight_bf16(&st, &format!("{p}mixer.conv1d.weight"), device, cd * ck)?,
                     conv1d_bias: load_weight_f32(&st, &format!("{p}mixer.conv1d.bias"), device, cd)?,
-                    dt_bias: {
-                        // HF _init_weights generates dt_bias as inv_softplus of
-                        // uniform(time_step_min, time_step_max) in log space.
-                        // The safetensors dt_bias is NOT loaded by HF (overwritten by _init_weights).
-                        // We replicate HF's init: dt = exp(uniform * (log(max)-log(min)) + log(min))
-                        // then inv_softplus: bias = dt + log(1 - exp(-dt))
-                        // dt_min, dt_max_val, dt_floor come from config (time_step_min/max/floor)
-                        let log_range = dt_max_val.ln() - dt_min.ln();
-                        // Use deterministic sequence based on layer index
-                        let mut dt_host = vec![0.0f32; nh];
-                        for h in 0..nh {
-                            // Simple hash for deterministic pseudo-random
-                            let t = ((i * 1000 + h) as f32 * 0.6180339887).fract();
-                            let dt_val = (t * log_range + dt_min.ln()).exp().max(dt_floor);
-                            dt_host[h] = dt_val + (1.0 - (-dt_val).exp()).ln(); // inv_softplus
-                        }
-                        let mut dt_buf = DeviceBuffer::<f32>::alloc(device, nh)?;
-                        dt_buf.copy_from_host(&dt_host)?;
-                        dt_buf
-                    },
+                    dt_bias: load_weight_f32(&st, &format!("{p}mixer.dt_bias"), device, nh)?,
                     a_log: load_weight_f32(&st, &format!("{p}mixer.A_log"), device, nh)?,
                     d: load_weight_f32(&st, &format!("{p}mixer.D"), device, nh)?,
                     norm_weight: load_weight_f32(&st, &format!("{p}mixer.norm.weight"), device, intermediate)?,
