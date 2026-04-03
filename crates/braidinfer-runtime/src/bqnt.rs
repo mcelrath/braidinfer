@@ -287,6 +287,20 @@ impl MmapBqnt {
         self.header.n_tensors
     }
 
+    /// Read model_name from JSON metadata.
+    pub fn model_name(&self) -> Option<String> {
+        // Read metadata directly from mmap
+        let start = self.header.metadata_offset as usize;
+        let end = start + self.header.metadata_size as usize;
+        if end <= self.mmap.len() {
+            let json_str = std::str::from_utf8(&self.mmap[start..end]).ok()?;
+            let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+            v.get("model_name").and_then(|v| v.as_str()).map(|s| s.to_string())
+        } else {
+            None
+        }
+    }
+
     /// Look up a tensor entry by name.
     pub fn entry(&self, name: &str) -> Option<&TensorEntry> {
         self.header.get(name)

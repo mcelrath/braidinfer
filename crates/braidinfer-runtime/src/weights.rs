@@ -478,12 +478,23 @@ pub fn load_moe_weights(
     ffn_type: &FfnType,
     device: DeviceId,
     wq: WeightQuantMode,
+    bqnt: Option<&MmapBqnt>,
 ) -> Result<MoeWeights, ModelError> {
     let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = ffn_type
         else { unreachable!("load_moe_weights called on non-MoE layer") };
     let ne = *num_experts;
     let eis = *expert_intermediate_size;
     let hs = config.hidden_size;
+
+    // Helper: try bqnt first, then safetensors
+    let load_lw = |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
+        if let Some(b) = bqnt {
+            if let Ok(lw) = load_linear_weight_bqnt(b, name, device) {
+                return Ok(lw);
+            }
+        }
+        load_linear_weight(st, name, device, out_dim, in_dim, wq)
+    };
 
     // Router gate: try mlp.gate, gate (Nemotron), block_sparse_moe.gate, mlp.router (always bf16)
     let gate_name = [
@@ -496,7 +507,11 @@ pub fn load_moe_weights(
     let gate = load_weight_bf16(st, &gate_name, device, ne * hs)?;
 
     // Detect whether experts have gate_proj (SwiGLU) or just up_proj (relu²)
-    let has_gate_proj = [
+    // Check per-expert gate_proj OR fused gate_up_proj (which implies SwiGLU)
+    let fused_name_check = format!("{prefix}mlp.experts.gate_up_proj");
+    let has_fused_gate_up = st.tensor_data(&fused_name_check).is_ok()
+        || bqnt.map_or(false, |b| b.entry(&fused_name_check).is_some());
+    let has_gate_proj = has_fused_gate_up || [
         format!("{prefix}mlp.experts.0.gate_proj.weight"),
         format!("{prefix}experts.0.gate_proj.weight"),
         format!("{prefix}block_sparse_moe.experts.0.w1.weight"),
@@ -509,9 +524,12 @@ pub fn load_moe_weights(
         weight_format_for(&format!("{prefix}experts.0.up_proj.weight"), wq)
     };
 
-    // Expert gate+up: try fused tensor, else per-expert fuse on host
+    // Expert gate+up: try bqnt fused, then safetensors fused, else per-expert fuse on host
     let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
-    let expert_gate_up = if st.tensor_data(&fused_name).is_ok() {
+    let bqnt_fused = bqnt.and_then(|b| load_linear_weight_bqnt(b, &fused_name, device).ok());
+    let expert_gate_up = if let Some(lw) = bqnt_fused {
+        lw
+    } else if st.tensor_data(&fused_name).is_ok() {
         load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
     } else if has_gate_proj {
         // SwiGLU: fuse gate_proj + up_proj per expert
@@ -534,6 +552,37 @@ pub fn load_moe_weights(
         host_bf16_to_linear_weight(&host_buf, ne * 2 * eis, hs, expert_fmt, device)?
     } else {
         // No gate_proj (relu² activation): load only up_proj per expert
+        // Try bqnt per-expert concatenation first
+        let first_up_name = [
+            format!("{prefix}experts.0.up_proj.weight"),
+            format!("{prefix}mlp.experts.0.up_proj.weight"),
+        ].into_iter().find(|n| bqnt.map_or(false, |b| b.entry(n).is_some()) || st.tensor_data(n).is_ok());
+        let bqnt_per_expert = first_up_name.as_ref().and_then(|_| bqnt).and_then(|b| {
+            // Try to concatenate per-expert packed bytes from bqnt
+            let first_name = [
+                format!("{prefix}experts.0.up_proj.weight"),
+                format!("{prefix}mlp.experts.0.up_proj.weight"),
+            ].into_iter().find(|n| b.entry(n).is_some())?;
+            let first_entry = b.entry(&first_name)?;
+            let per_expert_bytes = first_entry.data_bytes as usize;
+            let mut packed = vec![0u8; ne * per_expert_bytes];
+            for e in 0..ne {
+                let name = first_name.replace(".0.", &format!(".{e}."));
+                let data = b.tensor_data(&name)?;
+                packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+            }
+            let fmt = code_to_format(first_entry.format)?;
+            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
+            buf.copy_from_host(&packed).ok()?;
+            Some(LinearWeight::Packed(PackedWeights {
+                data: buf, format: fmt,
+                out_dim: ne * first_entry.out_features as usize,
+                in_dim: first_entry.in_features as usize,
+            }))
+        });
+        if let Some(lw) = bqnt_per_expert {
+            lw
+        } else {
         let expert_elems = eis * hs;
         let mut host_buf = vec![0u16; ne * expert_elems];
         for e in 0..ne {
@@ -549,13 +598,42 @@ pub fn load_moe_weights(
         }
         // Store as expert_gate_up with size eis (not 2*eis) — dispatch must handle this
         host_bf16_to_linear_weight(&host_buf, ne * eis, hs, expert_fmt, device)?
-    };
+    }};
 
-    // Expert down: try fused tensor, else per-expert load
+    // Expert down: try bqnt fused, then safetensors fused, else per-expert load
     let down_name = format!("{prefix}mlp.experts.down_proj");
-    let expert_down = if st.tensor_data(&down_name).is_ok() {
+    let bqnt_down = bqnt.and_then(|b| load_linear_weight_bqnt(b, &down_name, device).ok());
+    let expert_down = if let Some(lw) = bqnt_down {
+        lw
+    } else if st.tensor_data(&down_name).is_ok() {
         load_linear_weight(st, &down_name, device, ne * hs, eis, wq)?
     } else {
+        // Try bqnt per-expert concatenation for down_proj
+        let bqnt_per_expert_down = bqnt.and_then(|b| {
+            let first_name = [
+                format!("{prefix}mlp.experts.0.down_proj.weight"),
+                format!("{prefix}experts.0.down_proj.weight"),
+            ].into_iter().find(|n| b.entry(n).is_some())?;
+            let first_entry = b.entry(&first_name)?;
+            let per_expert_bytes = first_entry.data_bytes as usize;
+            let mut packed = vec![0u8; ne * per_expert_bytes];
+            for e in 0..ne {
+                let name = first_name.replace(".0.", &format!(".{e}."));
+                let data = b.tensor_data(&name)?;
+                packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+            }
+            let fmt = code_to_format(first_entry.format)?;
+            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
+            buf.copy_from_host(&packed).ok()?;
+            Some(LinearWeight::Packed(PackedWeights {
+                data: buf, format: fmt,
+                out_dim: ne * first_entry.out_features as usize,
+                in_dim: first_entry.in_features as usize,
+            }))
+        });
+        if let Some(lw) = bqnt_per_expert_down {
+            lw
+        } else {
         let expert_elems_d = hs * eis;
         let mut host_buf_d = vec![0u16; ne * expert_elems_d];
         for e in 0..ne {
@@ -571,7 +649,7 @@ pub fn load_moe_weights(
             host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
         }
         host_bf16_to_linear_weight(&host_buf_d, ne * hs, eis, expert_fmt, device)?
-    };
+    }};
 
     // Shared expert (optional)
     let shared_expert = if *num_shared > 0 {
@@ -591,15 +669,15 @@ pub fn load_moe_weights(
             format!("{prefix}shared_experts.gate_proj.weight"),
         ]);
         let gate_proj = if let Ok(name) = se_gate_name {
-            load_linear_weight(st, &name, device, sis, hs, wq)?
+            load_lw(&name, sis, hs)?
         } else {
             // No gate_proj (relu² models) — allocate dummy
             LinearWeight::Bf16(DeviceBuffer::<u16>::alloc(device, 0)?)
         };
         Some(DenseFfnWeights {
             gate_proj,
-            up_proj: load_linear_weight(st, &se_up_name, device, sis, hs, wq)?,
-            down_proj: load_linear_weight(st, &se_down_name, device, hs, sis, wq)?,
+            up_proj: load_lw(&se_up_name, sis, hs)?,
+            down_proj: load_lw(&se_down_name, hs, sis)?,
         })
     } else { None };
 

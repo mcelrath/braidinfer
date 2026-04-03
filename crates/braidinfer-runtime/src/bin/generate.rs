@@ -31,6 +31,22 @@ fn main() {
     let raw_mode = std::env::var("RAW").is_ok();
 
     let model_path = std::env::var("MODEL").ok()
+        .or_else(|| {
+            // Auto-resolve model dir from BQNT_PATH metadata
+            std::env::var("BQNT_PATH").ok().and_then(|bqnt_path| {
+                let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(std::path::Path::new(&bqnt_path)).ok()?;
+                let model_name = bqnt.model_name()?;
+                let hf_name = model_name.replace('/', "--");
+                let cache_dir = dirs::home_dir()?
+                    .join(".cache/huggingface/hub")
+                    .join(format!("models--{hf_name}"))
+                    .join("snapshots");
+                std::fs::read_dir(&cache_dir).ok()?
+                    .filter_map(|e| e.ok())
+                    .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .map(|e| e.path().to_string_lossy().to_string())
+            })
+        })
         .unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
     let model_dir = Path::new(&model_path);
     if !model_dir.exists() {

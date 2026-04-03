@@ -246,7 +246,7 @@ impl Model {
                 } else {
                     format!("{p}mlp.")
                 };
-                moe_weights_vec[i] = Some(load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq)?);
+                moe_weights_vec[i] = Some(load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?);
             } else if config.layers[i].layer_type == LayerType::Attention {
                 let hs = config.hidden_size;
                 let q_mult = if has_output_gate { 2 } else { 1 };
@@ -305,7 +305,7 @@ impl Model {
 
                 // Load MoE weights if this layer uses MoE FFN
                 if is_moe {
-                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq)?);
+                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?);
                 }
             } else {
                 let nh = config.linear_num_heads;
@@ -363,7 +363,7 @@ impl Model {
 
                 // Load MoE weights for GDN layers with MoE FFN (e.g. Qwen3.5-122B)
                 if is_moe {
-                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq)?);
+                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?);
                 }
             }
         }
@@ -1025,11 +1025,25 @@ impl Model {
                 &mut self.activations.moe_expert_out, &self.activations.moe_expert_act,
                 hs as u32, se_is as u32, &self.stream)?;
 
-            // Add shared expert output to accumulated FFN output (weight=1.0)
+            // Apply shared expert gate: sigmoid(gate @ input) * shared_output
+            let se_weight = if let Some(ref gate_buf) = moe.shared_expert_gate {
+                // Compute sigmoid(gate @ normed_input) on CPU
+                self.stream.synchronize()?;
+                let mut normed = vec![0.0f32; hs];
+                self.activations.normed.copy_to_host(&mut normed)?;
+                let mut gate_w = vec![0u16; hs];
+                gate_buf.copy_to_host(&mut gate_w)?;
+                let dot: f32 = normed.iter().zip(gate_w.iter())
+                    .map(|(&x, &w)| x * f32::from_bits((w as u32) << 16))
+                    .sum();
+                1.0 / (1.0 + (-dot).exp()) // sigmoid
+            } else {
+                1.0
+            };
             self.kernels.residual_add.weighted_accumulate(
                 &mut self.activations.ffn_down,
                 &self.activations.moe_expert_out,
-                1.0,
+                se_weight,
                 hs as u32, &self.stream)?;
         }
 

@@ -154,8 +154,13 @@ fn main() {
             }
 
             let ndim = shape.len() as u32;
-            let out_dim = shape[0];
-            let in_dim: usize = shape[1..].iter().product();
+            // For 3D fused expert tensors [ne, inner, hidden], reshape to [ne*inner, hidden]
+            // so quantization groups align with per-row dequantization in GPU kernels.
+            let (out_dim, in_dim) = if ndim == 3 {
+                (shape[0] * shape[1], shape[2])
+            } else {
+                (shape[0], shape[1..].iter().product())
+            };
             let n_elements = out_dim * in_dim;
             total_params += n_elements as u64;
 
@@ -212,10 +217,17 @@ fn main() {
         0.0
     };
 
+    // Include model config for self-contained bqnt files
+    let config_json: serde_json::Value = std::fs::read_to_string(model_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+
     let metadata = json!({
         "model_name": model_name,
         "quantizer_version": "braidinfer-bqnt-v1",
         "default_format": format_str,
+        "model_config": config_json,
         "quantization_stats": {
             "total_params": total_params,
             "quantized_params": quantized_params,

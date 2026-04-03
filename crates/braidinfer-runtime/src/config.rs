@@ -277,7 +277,9 @@ impl ModelConfig {
         let gate_type = if model_type == "nemotron_h" {
             // Nemotron-H uses sigmoid scoring (not softmax) with correction bias
             GateType::Sigmoid { routed_scaling_factor: rsf }
-        } else if get_bool("norm_topk_prob").unwrap_or(false) {
+        } else if get_bool("norm_topk_prob").unwrap_or(false)
+            || model_type.starts_with("qwen3_5") {
+            // Qwen3.5 MoE always renormalizes top-k weights (no config flag)
             GateType::NormTopK { routed_scaling_factor: rsf }
         } else { GateType::Softmax };
         let num_experts = get_usize("num_experts")
@@ -287,7 +289,9 @@ impl ModelConfig {
         let num_active_experts = get_usize("num_experts_per_tok")
             .or(get_usize("num_selected_experts"))
             .unwrap_or(0);
-        let num_shared_experts = get_usize("n_shared_experts").unwrap_or(0);
+        let num_shared_experts = get_usize("n_shared_experts")
+            .or_else(|| if get_usize("shared_expert_intermediate_size").unwrap_or(0) > 0 { Some(1) } else { None })
+            .unwrap_or(0);
         let expert_intermediate_size = get_usize("moe_intermediate_size").unwrap_or(intermediate_size);
         let shared_expert_intermediate_size = get_usize("moe_shared_expert_intermediate_size")
             .or(get_usize("shared_expert_intermediate_size"))
