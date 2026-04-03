@@ -664,6 +664,14 @@ impl Model {
 
         if dbg {
             self.stream.synchronize()?;
+            let state = &self.mamba2_states[mamba2_idx];
+            let ssm_n = state.ssm.len();
+            let mut ssm_buf = vec![0.0f32; ssm_n];
+            state.ssm.copy_to_host(&mut ssm_buf)?;
+            let ssm_max = ssm_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let ssm_mean = ssm_buf.iter().map(|x| x.abs()).sum::<f32>() / ssm_n as f32;
+            eprintln!("  M2.L0 ssm_state: n={ssm_n} max_abs={ssm_max:.4e} mean_abs={ssm_mean:.4e}");
+
             let n = self.activations.mamba2_ssm_out.len();
             let mut buf = vec![0.0f32; n];
             self.activations.mamba2_ssm_out.copy_to_host(&mut buf)?;
@@ -671,14 +679,12 @@ impl Model {
             eprintln!("  M2.L0 ssm_out: max_abs={max_abs:.4e}, first5={:.4?}", &buf[..5]);
         }
 
-        // 6. rmsnorm_gated: normed_out = rmsnorm(ssm_out) * silu(gate)
-        // Mamba2 uses per-group norm (group_size=512, n_groups=8).
-        // The rmsnorm_gated kernel applies weight[0..group_size] per group,
-        // but Mamba2 needs weight[g*group_size..(g+1)*group_size] per group.
-        // Launch one kernel per group with offset pointers.
+        // 6. rmsnorm_gated: normed_out = rmsnorm(ssm_out * silu(gate)) * weight
+        // Mamba2/Nemotron uses norm_before_gate=False: norm the gated product.
+        // Per-group norm (group_size = intermediate / n_groups).
         let group_size = (nh * hd / ng) as u32;
         {
-            let func = self.kernels.rmsnorm_gated.module.get_function("rmsnorm_gated_f32")?;
+            let func = self.kernels.rmsnorm_gated.module.get_function("rmsnorm_gated_post_f32")?;
             for g in 0..ng {
                 let off = g * group_size as usize;
                 let mut out_p: *mut std::ffi::c_void = unsafe { self.activations.mamba2_conv_out.as_mut_ptr().add(off).cast() };
