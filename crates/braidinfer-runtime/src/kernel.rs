@@ -1710,3 +1710,60 @@ impl SelectiveStateUpdateKernel {
         )
     }
 }
+
+/// GPU-side MoE gate: top-k expert selection + weight computation.
+/// Replaces CPU round-trip (sync + copy + softmax/topk).
+pub struct MoeGateKernel {
+    module: Module,
+    _device: DeviceId,
+}
+
+impl MoeGateKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = kernel_dir().join("moe_gate.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, _device: device })
+    }
+
+    /// Run GPU-side top-k selection + weight computation.
+    /// gate_mode: 0=softmax, 1=norm_topk, 2=sigmoid
+    /// correction_bias_ptr: raw device pointer, or null if no bias.
+    pub fn forward(
+        &self,
+        scores: &DeviceBuffer<f32>,
+        expert_ids: &mut DeviceBuffer<i32>,
+        expert_weights: &mut DeviceBuffer<f32>,
+        correction_bias_ptr: *const f32,
+        num_experts: u32,
+        k: u32,
+        gate_mode: u32,
+        routed_scaling_factor: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("moe_gate_topk")?;
+
+        let mut s_ptr: *const c_void = scores.as_ptr().cast();
+        let mut id_ptr: *mut c_void = expert_ids.as_mut_ptr().cast();
+        let mut w_ptr: *mut c_void = expert_weights.as_mut_ptr().cast();
+        let mut bias_ptr: *const c_void = correction_bias_ptr.cast();
+        let mut ne = num_experts as i32;
+        let mut kk = k as i32;
+        let mut gm = gate_mode as i32;
+        let mut rsf = routed_scaling_factor;
+
+        let mut args: [*mut c_void; 8] = [
+            std::ptr::addr_of_mut!(s_ptr).cast(),
+            std::ptr::addr_of_mut!(id_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(bias_ptr).cast(),
+            std::ptr::addr_of_mut!(ne).cast(),
+            std::ptr::addr_of_mut!(kk).cast(),
+            std::ptr::addr_of_mut!(gm).cast(),
+            std::ptr::addr_of_mut!(rsf).cast(),
+        ];
+
+        // shared mem: 1024 floats (512 for selection + 512 for raw scores)
+        let shared_mem = 1024 * 4;
+        func.launch((1, 1, 1), (256, 1, 1), shared_mem, stream, &mut args)
+    }
+}

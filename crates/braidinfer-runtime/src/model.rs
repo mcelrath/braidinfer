@@ -462,6 +462,12 @@ impl Model {
             moe_scores: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
                 FfnType::MoE { num_experts, .. } => Some(*num_experts), _ => None
             }).max().unwrap_or(1))?,
+            moe_expert_ids: DeviceBuffer::<i32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
+                FfnType::MoE { num_active, .. } => Some(*num_active), _ => None
+            }).max().unwrap_or(1))?,
+            moe_expert_weights: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
+                FfnType::MoE { num_active, .. } => Some(*num_active), _ => None
+            }).max().unwrap_or(1))?,
             moe_expert_gate: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
                 FfnType::MoE { expert_intermediate_size, shared_intermediate_size, .. } =>
                     Some((*expert_intermediate_size).max(*shared_intermediate_size)), _ => None
@@ -811,73 +817,37 @@ impl Model {
             &self.activations.normed,
             ne as u32, hs as u32, &self.stream,
         )?;
+
+        let (k, gate_type) = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { num_active, gate_type, .. } => (*num_active, gate_type.clone()),
+            _ => unreachable!(),
+        };
+
+        // 3. GPU-side top-k selection + weight computation (replaces CPU round-trip)
+        let (gate_mode, rsf) = match &gate_type {
+            GateType::Softmax => (0u32, 1.0f32),
+            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
+            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
+        };
+        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
+            .map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        self.kernels.moe_gate.forward(
+            &self.activations.moe_scores,
+            &mut self.activations.moe_expert_ids,
+            &mut self.activations.moe_expert_weights,
+            bias_ptr,
+            ne as u32, k as u32, gate_mode, rsf,
+            &self.stream,
+        )?;
+
+        // Read back k expert_ids + k weights (small copy, replaces num_experts float copy + CPU work)
         self.stream.synchronize()?;
+        let mut expert_ids = vec![0i32; k];
+        let mut expert_weights = vec![0.0f32; k];
+        self.activations.moe_expert_ids.copy_to_host(&mut expert_ids)?;
+        self.activations.moe_expert_weights.copy_to_host(&mut expert_weights)?;
 
-        // 3. Read scores to CPU and do top-k selection
-        let mut scores = vec![0.0f32; ne];
-        self.activations.moe_scores.copy_to_host(&mut scores)?;
-
-        let k = match &self.config.layers[layer_idx].ffn_type {
-            FfnType::MoE { num_active, .. } => *num_active,
-            _ => unreachable!(),
-        };
-
-        // Score transformation depends on gate type
-        let gate_type = match &self.config.layers[layer_idx].ffn_type {
-            FfnType::MoE { gate_type, .. } => gate_type.clone(),
-            _ => unreachable!(),
-        };
-
-        let topk = match &gate_type {
-            GateType::Sigmoid { .. } => {
-                // Sigmoid scoring (Nemotron): sigmoid(logits) for weights,
-                // sigmoid(logits) + correction_bias for expert SELECTION only
-                let sigmoid_scores: Vec<f32> = scores.iter().map(|&s| 1.0 / (1.0 + (-s).exp())).collect();
-                // Selection uses biased scores
-                let mut selection_scores = sigmoid_scores.clone();
-                if let Some(ref bias) = moe.score_correction_bias {
-                    for (s, b) in selection_scores.iter_mut().zip(bias.iter()) {
-                        *s += b;
-                    }
-                }
-                let mut indexed: Vec<(usize, f32)> = selection_scores.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                // Weights come from UN-BIASED sigmoid scores
-                let topk: Vec<(usize, f32)> = indexed[..k].iter()
-                    .map(|&(id, _)| (id, sigmoid_scores[id])).collect();
-                topk
-            }
-            _ => {
-                // Softmax scoring (+ optional correction bias for selection)
-                if let Some(ref bias) = moe.score_correction_bias {
-                    for (s, b) in scores.iter_mut().zip(bias.iter()) {
-                        *s += b;
-                    }
-                }
-                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                let exp_sum: f32 = scores.iter().map(|&s| (s - max_s).exp()).sum();
-                let probs: Vec<f32> = scores.iter().map(|&s| (s - max_s).exp() / exp_sum).collect();
-                let mut indexed: Vec<(usize, f32)> = probs.iter().enumerate().map(|(i, &p)| (i, p)).collect();
-                indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                indexed[..k].to_vec()
-            }
-        };
-
-        let (weights, scaling) = match &gate_type {
-            GateType::NormTopK { routed_scaling_factor } | GateType::Sigmoid { routed_scaling_factor } => {
-                // NormTopK/Sigmoid: renormalize selected weights to sum to 1, then scale
-                let sum: f32 = topk.iter().map(|(_, w)| w).sum();
-                let w: Vec<f32> = topk.iter().map(|(_, w)| w / sum).collect();
-                (w, *routed_scaling_factor)
-            }
-            GateType::Softmax => {
-                // Standard softmax: use raw probabilities (don't renormalize)
-                let w: Vec<f32> = topk.iter().map(|(_, w)| *w).collect();
-                (w, 1.0)
-            }
-        };
-
-        // 4. Zero accumulation buffer on GPU (no CPU round-trip)
+        // 4. Zero accumulation buffer on GPU
         unsafe {
             let rc = braidinfer_hip::ffi::hipMemsetAsync(
                 self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
@@ -890,13 +860,14 @@ impl Model {
 
         // Debug MoE routing
         if self.debug_nan && layer_idx <= 3 {
-            eprintln!("  MoE L{layer_idx}: topk={:?} weights={:?} scaling={scaling:.4}",
-                topk.iter().map(|(id,_)| *id).collect::<Vec<_>>(), &weights);
+            eprintln!("  MoE L{layer_idx}: topk={:?} weights={:?}",
+                &expert_ids, &expert_weights);
         }
 
         // 5. For each selected expert: run FFN and GPU-accumulate
-        for (j, &(expert_id, _)) in topk.iter().enumerate() {
-            let w = weights[j] * scaling;
+        for j in 0..k {
+            let expert_id = expert_ids[j] as usize;
+            let w = expert_weights[j];
 
             let down_offset = moe.expert_down.row_byte_offset_dim(expert_id * hs, eis);
 

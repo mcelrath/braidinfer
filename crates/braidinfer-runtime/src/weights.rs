@@ -12,8 +12,8 @@ use crate::config::*;
 use crate::kernel::{
     ArgmaxKernel, CausalConv1dUpdateKernel, EmbeddingKernel, FfnFusedKernel, GdnGateKernel,
     GdnRecurrentStepV2Kernel, GqaAttentionKernel, LinearProjKernel, LmHeadKernel,
-    MRoPEKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel,
-    RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
+    MRoPEKernel, MoeGateKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel,
+    RmsNormGatedKernel, RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
 };
 pub use crate::quant::{WeightFormat, PackedWeights, WeightQuantMode, LinearWeight, quantize_rnf4_g128, quantize_pc_g32_q4};
 
@@ -99,6 +99,7 @@ pub struct MoeWeights {
     pub shared_expert_gate: Option<DeviceBuffer<u16>>, // [1, hidden_size] gate for shared expert
     pub has_gate_proj: bool,                          // false for relu² (Nemotron), true for SwiGLU
     pub score_correction_bias: Option<Vec<f32>>,      // [num_experts] f32, added to scores before top-k
+    pub score_correction_bias_gpu: Option<DeviceBuffer<f32>>, // GPU copy of correction_bias
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
 }
@@ -168,6 +169,8 @@ pub struct ActivationBuffers {
     pub gdn_conv_out_v: DeviceBuffer<f32>, // [nh*vd]
     // MoE scratch buffers (pre-allocated to avoid hipMalloc in hot path)
     pub moe_scores: DeviceBuffer<f32>,        // [max_num_experts]
+    pub moe_expert_ids: DeviceBuffer<i32>,    // [max_k] — GPU-side top-k output
+    pub moe_expert_weights: DeviceBuffer<f32>, // [max_k] — GPU-side top-k weights
     pub moe_expert_gate: DeviceBuffer<f32>,   // [max_expert_intermediate_size]
     pub moe_expert_up: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
     pub moe_expert_act: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
@@ -200,6 +203,7 @@ pub struct AllKernels {
     pub ffn_fused: FfnFusedKernel,
     pub ssm_update: SelectiveStateUpdateKernel,
     pub argmax: ArgmaxKernel,
+    pub moe_gate: MoeGateKernel,
 }
 
 
@@ -223,6 +227,7 @@ impl AllKernels {
             ffn_fused: FfnFusedKernel::load(device)?,
             ssm_update: SelectiveStateUpdateKernel::load(device)?,
             argmax: ArgmaxKernel::load(device)?,
+            moe_gate: MoeGateKernel::load(device)?,
         })
     }
 }
@@ -701,8 +706,15 @@ pub fn load_moe_weights(
         Some(data)
     } else { None };
 
+    let score_correction_bias_gpu = if let Some(ref bias) = score_correction_bias {
+        let mut buf = DeviceBuffer::<f32>::alloc(device, ne)?;
+        buf.copy_from_host(bias)?;
+        Some(buf)
+    } else { None };
+
     Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate,
-        num_experts: ne, expert_intermediate_size: eis, has_gate_proj, score_correction_bias })
+        num_experts: ne, expert_intermediate_size: eis, has_gate_proj, score_correction_bias,
+        score_correction_bias_gpu })
 }
 
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.

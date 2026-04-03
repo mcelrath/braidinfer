@@ -1700,13 +1700,14 @@ __device__ void op_kv_quantize(const u64* inst, u32 vblock) {
 
 // OP_MOE_GATE: Router top-k expert selection from pre-computed scores.
 // Assumes scores already computed via OP_LINEAR_PROJ (hidden @ gate^T → [num_experts]).
-// This kernel does: top-k selection + softmax/norm_topk + write expert_ids and weights.
+// This kernel does: top-k selection + softmax/sigmoid/norm_topk + write expert_ids and weights.
 // args: [1]=scores (float*, [num_experts] — output of linear_proj)
 //       [2]=expert_ids (int*, [k] — output)
 //       [3]=expert_weights (float*, [k] — output)
 //       [4]=num_experts, [5]=k (top-k count)
-//       [6]=gate_mode (0=softmax, 1=norm_topk)
-//       [7]=routed_scaling_factor (float, used for norm_topk)
+//       [6]=gate_mode (0=softmax, 1=norm_topk, 2=sigmoid)
+//       [7]=routed_scaling_factor (float)
+//       [8]=correction_bias (float* or NULL — added to scores before selection)
 // grid_x = 1 (single block processes one token's routing)
 __device__ void op_moe_gate(const u64* inst, u32 vblock) {
     if (vblock > 0) return;
@@ -1717,58 +1718,71 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
     int k = inst_int(inst, 5);
     int gate_mode = inst_int(inst, 6);
     float scaling = inst_float(inst, 7);
+    const float* correction_bias = inst_fptr(inst, 8);
 
     int tid = threadIdx.x;
     int stride = blockDim.x;
 
     extern __shared__ float shmem[];
-    float* sh_scores = shmem;           // [num_experts]
-    int* sh_ids = (int*)(shmem + 256);  // [k] — top-k indices
+    float* sh_sel = shmem;           // [512] — selection scores (biased)
+    float* sh_raw = shmem + 512;     // [512] — raw scores (for weight computation)
 
     // Load scores into shared memory
     for (int i = tid; i < num_experts; i += stride) {
-        sh_scores[i] = scores[i];
+        float s = scores[i];
+        if (gate_mode == 2) {
+            float sig = 1.0f / (1.0f + expf(-s));
+            sh_raw[i] = sig;
+            sh_sel[i] = correction_bias ? sig + correction_bias[i] : sig;
+        } else {
+            sh_raw[i] = s;
+            sh_sel[i] = correction_bias ? s + correction_bias[i] : s;
+        }
     }
     __syncthreads();
 
-    // Top-k selection (thread 0 does sequential selection — k is small, typically 2-22)
-    if (tid == 0) {
-        for (int j = 0; j < k; j++) {
-            float best = -1e30f;
-            int best_idx = 0;
-            for (int i = 0; i < num_experts; i++) {
-                if (sh_scores[i] > best) {
-                    best = sh_scores[i];
-                    best_idx = i;
-                }
+    if (tid != 0) return;
+
+    // Top-k selection from sh_sel
+    int ids[32];
+    for (int j = 0; j < k; j++) {
+        float best = -1e30f;
+        int best_idx = 0;
+        for (int i = 0; i < num_experts; i++) {
+            if (sh_sel[i] > best) {
+                best = sh_sel[i];
+                best_idx = i;
             }
-            sh_ids[j] = best_idx;
-            expert_ids[j] = best_idx;
-            sh_scores[best_idx] = -1e30f; // mask selected
         }
+        ids[j] = best_idx;
+        expert_ids[j] = best_idx;
+        sh_sel[best_idx] = -1e30f;
     }
-    __syncthreads();
 
-    // Compute weights: softmax over selected experts
-    if (tid == 0) {
-        // Reload original scores for selected experts
-        float selected[32]; // max k=32 (largest is Nemotron top-22)
-        float max_score = -1e30f;
+    // Compute weights from raw scores of selected experts
+    if (gate_mode == 2) {
+        // Sigmoid: renormalize + scale
+        float sum = 0.0f;
+        for (int j = 0; j < k; j++) sum += sh_raw[ids[j]];
         for (int j = 0; j < k; j++) {
-            selected[j] = scores[expert_ids[j]];
-            if (selected[j] > max_score) max_score = selected[j];
+            expert_weights[j] = (sh_raw[ids[j]] / sum) * scaling;
         }
-
-        // Softmax
+    } else {
+        // Softmax over selected experts' raw scores
+        float selected[32];
+        float max_s = -1e30f;
+        for (int j = 0; j < k; j++) {
+            selected[j] = sh_raw[ids[j]];
+            if (selected[j] > max_s) max_s = selected[j];
+        }
         float sum = 0.0f;
         for (int j = 0; j < k; j++) {
-            selected[j] = expf(selected[j] - max_score);
+            selected[j] = expf(selected[j] - max_s);
             sum += selected[j];
         }
+        float scale = (gate_mode == 1) ? scaling : 1.0f;
         for (int j = 0; j < k; j++) {
-            float w = selected[j] / sum;
-            if (gate_mode == 1) w *= scaling; // norm_topk: multiply by routed_scaling_factor
-            expert_weights[j] = w;
+            expert_weights[j] = (selected[j] / sum) * scale;
         }
     }
 }
