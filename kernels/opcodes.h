@@ -34,3 +34,4 @@
 #define OP_SSM_UPDATE   29  // Mamba2 selective state update
 #define OP_FFN_GATE_UP_RNF4  30  // Fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights)
 #define OP_FFN_DOWN_RES_RNF4 31  // Fused down_proj + residual add (rnf4 weights)
+#define OP_SIGMOID_WEIGHTED_ADD 32  // output[i] += sigmoid(scalar[0]) * input[i]

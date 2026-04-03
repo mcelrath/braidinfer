@@ -587,6 +587,23 @@ __device__ void op_residual_add(const u64* inst, u32 vblock) {
     if (idx < size) output[idx] = a[idx] + b[idx];
 }
 
+// OP_SIGMOID_WEIGHTED_ADD: output[i] += sigmoid(scalar[0]) * input[i]
+// args: [1]=output (float*, [size]), [2]=scalar (float*, [1] — dot product to sigmoid),
+//       [3]=input (float*, [size]), [4]=size
+// Used for shared expert gating: output = ffn_down, scalar = gate@normed, input = shared_expert_out
+__device__ void op_sigmoid_weighted_add(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* scalar = inst_fptr(inst, 2);
+    const float* input = inst_fptr(inst, 3);
+    int size = inst_int(inst, 4);
+
+    int idx = vblock * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float w = 1.0f / (1.0f + expf(-scalar[0]));
+        output[idx] += w * input[idx];
+    }
+}
+
 // OP_FFN_GATE_UP: fused RMSNorm + gate_proj + up_proj + SiLU*up
 // args: [1]=scratch, [2]=input, [3]=rms_weight, [4]=w_gate, [5]=w_up,
 //       [6]=hidden_size, [7]=intermediate_size, [8]=eps, [9]=batch_size (0/1=single)
@@ -1787,9 +1804,227 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
     }
 }
 
-// MoE FFN: Reuse OP_FFN_GATE_UP + OP_FFN_DOWN_RES per expert.
-// The megakernel compiler emits k iterations with per-expert weight ptrs.
-// No dedicated OP_MOE_FFN kernel needed for single-GPU.
+// OP_MOE_FFN: Fused MoE FFN for all k experts in a single megakernel op.
+// Loops over k selected experts using expert_ids from OP_MOE_GATE output.
+// Each expert: gate_proj + up_proj + silu_mul (or relu²) + down_proj + weighted accumulate.
+// Internal grid.sync() between matmul phases (all blocks cooperate on each matmul).
+//
+// args: [1]=expert_ids (int*, [k]), [2]=expert_weights (float*, [k]),
+//       [3]=input (float*, [hs] — normed), [4]=output (float*, [hs] — accumulation, zeroed by this op),
+//       [5]=gate_up_base (u8*), [6]=gate_up_expert_stride (bytes),
+//       [7]=down_base (u8*), [8]=down_expert_stride (bytes),
+//       [9]=k (num active), [10]=(hs | eis<<16), [11]=flags (bit0: has_gate_proj, bit1: relu_sq),
+//       [12]=scratch_gate (float*, [eis]), [13]=scratch_up (float*, [eis]),
+//       [14]=scratch_act (float*, [eis]), [15]=scratch_out (float*, [hs]),
+//       [16]=gate_up_row_stride (bytes per row — for computing gate vs up offset within one expert)
+//
+// Weight format: PcG32Q4 (group_size=32, 20 bytes/group). Other formats use fallback path.
+// grid_x should be max(eis, hs) to give enough virtual blocks for all matmuls.
+template<typename GridGroup>
+__device__ void op_moe_ffn(const u64* inst, GridGroup& grid) {
+    const int* expert_ids = (const int*)(inst[1]);
+    const float* expert_weights = inst_fptr(inst, 2);
+    const float* input = inst_fptr(inst, 3);
+    float* output = inst_fptr(inst, 4);
+    const unsigned char* gate_up_base = (const unsigned char*)inst_ptr(inst, 5);
+    long long gate_up_expert_stride = (long long)inst[6];
+    const unsigned char* down_base = (const unsigned char*)inst_ptr(inst, 7);
+    long long down_expert_stride = (long long)inst[8];
+    int k = inst_int(inst, 9);
+    int packed_dims = inst_int(inst, 10);
+    int hs = packed_dims & 0xFFFF;
+    int eis = (packed_dims >> 16) & 0xFFFF;
+    int flags = inst_int(inst, 11);
+    bool has_gate_proj = flags & 1;
+    bool relu_sq = flags & 2;
+    float* scratch_gate = inst_fptr(inst, 12);
+    float* scratch_up = inst_fptr(inst, 13);
+    float* scratch_act = inst_fptr(inst, 14);
+    float* scratch_out = inst_fptr(inst, 15);
+    long long gate_up_row_stride = (long long)inst[16];
+
+    int tid = threadIdx.x;
+
+    // Zero output buffer (all blocks cooperate)
+    for (int i = blockIdx.x * blockDim.x + tid; i < hs; i += gridDim.x * blockDim.x) {
+        output[i] = 0.0f;
+    }
+    grid.sync();
+
+    // PcG32Q4 matmul helper (inline): row_data points to group data, dot with input
+    // Returns dot product for one output row, reduced to thread 0.
+    // Caller provides row_data, in_dim; result is in thread 0's return value.
+
+    for (int ei = 0; ei < k; ei++) {
+        int eid = expert_ids[ei];
+        float w = expert_weights[ei];
+
+        const unsigned char* expert_gate_up = gate_up_base + eid * gate_up_expert_stride;
+        const unsigned char* expert_down = down_base + eid * down_expert_stride;
+
+        // --- Gate proj (or up-only for relu²): expert_gate_up @ input → scratch_gate/scratch_up ---
+        if (has_gate_proj) {
+            // Gate proj: first eis rows of this expert's gate_up weight
+            // Each virtual block = one output row
+            for (int row = (int)blockIdx.x; row < eis; row += (int)gridDim.x) {
+                const int group_size = 32;
+                const int group_bytes = 20;
+                const int num_groups = (hs + group_size - 1) / group_size;
+                const unsigned char* row_data = expert_gate_up + (long long)row * gate_up_row_stride;
+                float acc = 0.0f;
+                for (int g = tid; g < num_groups; g += (int)blockDim.x) {
+                    const unsigned char* gp = row_data + g * group_bytes;
+                    float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+                    float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                    int base = g * group_size;
+                    int count = min(group_size, hs - base);
+                    for (int i = 0; i < count; i += 2) {
+                        unsigned char byte = gp[i / 2];
+                        float v0 = (float)(byte & 0xF) * sc + mn;
+                        float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                        acc += v0 * input[base + i] + v1 * input[base + i + 1];
+                    }
+                }
+                // Wave32 reduction
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    acc += __shfl_down(acc, offset);
+                extern __shared__ float shared[];
+                if ((tid & 31) == 0) shared[tid >> 5] = acc;
+                __syncthreads();
+                if (tid < 8) {
+                    acc = shared[tid];
+                    for (int offset = 4; offset > 0; offset >>= 1)
+                        acc += __shfl_down(acc, offset);
+                    if (tid == 0) scratch_gate[row] = acc;
+                }
+            }
+            grid.sync();
+
+            // Up proj: next eis rows
+            for (int row = (int)blockIdx.x; row < eis; row += (int)gridDim.x) {
+                const int group_size = 32;
+                const int group_bytes = 20;
+                const int num_groups = (hs + group_size - 1) / group_size;
+                const unsigned char* row_data = expert_gate_up + (long long)(eis + row) * gate_up_row_stride;
+                float acc = 0.0f;
+                for (int g = tid; g < num_groups; g += (int)blockDim.x) {
+                    const unsigned char* gp = row_data + g * group_bytes;
+                    float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+                    float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                    int base = g * group_size;
+                    int count = min(group_size, hs - base);
+                    for (int i = 0; i < count; i += 2) {
+                        unsigned char byte = gp[i / 2];
+                        float v0 = (float)(byte & 0xF) * sc + mn;
+                        float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                        acc += v0 * input[base + i] + v1 * input[base + i + 1];
+                    }
+                }
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    acc += __shfl_down(acc, offset);
+                extern __shared__ float shared[];
+                if ((tid & 31) == 0) shared[tid >> 5] = acc;
+                __syncthreads();
+                if (tid < 8) {
+                    acc = shared[tid];
+                    for (int offset = 4; offset > 0; offset >>= 1)
+                        acc += __shfl_down(acc, offset);
+                    if (tid == 0) scratch_up[row] = acc;
+                }
+            }
+            grid.sync();
+
+            // SiLU(gate) * up → scratch_act
+            for (int i = (int)blockIdx.x * (int)blockDim.x + tid; i < eis; i += (int)gridDim.x * (int)blockDim.x) {
+                float g = scratch_gate[i];
+                float silu_g = g / (1.0f + expf(-g));
+                scratch_act[i] = silu_g * scratch_up[i];
+            }
+        } else {
+            // relu² path: up_proj only (eis rows), then relu²
+            for (int row = (int)blockIdx.x; row < eis; row += (int)gridDim.x) {
+                const int group_size = 32;
+                const int group_bytes = 20;
+                const int num_groups = (hs + group_size - 1) / group_size;
+                const unsigned char* row_data = expert_gate_up + (long long)row * gate_up_row_stride;
+                float acc = 0.0f;
+                for (int g = tid; g < num_groups; g += (int)blockDim.x) {
+                    const unsigned char* gp = row_data + g * group_bytes;
+                    float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+                    float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                    int base = g * group_size;
+                    int count = min(group_size, hs - base);
+                    for (int i = 0; i < count; i += 2) {
+                        unsigned char byte = gp[i / 2];
+                        float v0 = (float)(byte & 0xF) * sc + mn;
+                        float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                        acc += v0 * input[base + i] + v1 * input[base + i + 1];
+                    }
+                }
+                for (int offset = 16; offset > 0; offset >>= 1)
+                    acc += __shfl_down(acc, offset);
+                extern __shared__ float shared[];
+                if ((tid & 31) == 0) shared[tid >> 5] = acc;
+                __syncthreads();
+                if (tid < 8) {
+                    acc = shared[tid];
+                    for (int offset = 4; offset > 0; offset >>= 1)
+                        acc += __shfl_down(acc, offset);
+                    if (tid == 0) scratch_up[row] = acc;
+                }
+            }
+            grid.sync();
+
+            // relu²: output[i] = relu(x)^2
+            for (int i = (int)blockIdx.x * (int)blockDim.x + tid; i < eis; i += (int)gridDim.x * (int)blockDim.x) {
+                float x = scratch_up[i];
+                float r = x > 0.0f ? x : 0.0f;
+                scratch_act[i] = r * r;
+            }
+        }
+        grid.sync();
+
+        // Down proj: expert_down @ scratch_act → scratch_out [hs]
+        for (int row = (int)blockIdx.x; row < hs; row += (int)gridDim.x) {
+            const int group_size = 32;
+            const int group_bytes = 20;
+            const int num_groups = (eis + group_size - 1) / group_size;
+            const unsigned char* row_data = expert_down + (long long)row * (long long)(num_groups * group_bytes);
+            float acc = 0.0f;
+            for (int g = tid; g < num_groups; g += (int)blockDim.x) {
+                const unsigned char* gp = row_data + g * group_bytes;
+                float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+                float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                int base = g * group_size;
+                int count = min(group_size, eis - base);
+                for (int i = 0; i < count; i += 2) {
+                    unsigned char byte = gp[i / 2];
+                    float v0 = (float)(byte & 0xF) * sc + mn;
+                    float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                    acc += v0 * scratch_act[base + i] + v1 * scratch_act[base + i + 1];
+                }
+            }
+            for (int offset = 16; offset > 0; offset >>= 1)
+                acc += __shfl_down(acc, offset);
+            extern __shared__ float shared[];
+            if ((tid & 31) == 0) shared[tid >> 5] = acc;
+            __syncthreads();
+            if (tid < 8) {
+                acc = shared[tid];
+                for (int offset = 4; offset > 0; offset >>= 1)
+                    acc += __shfl_down(acc, offset);
+                if (tid == 0) scratch_out[row] = acc;
+            }
+        }
+        grid.sync();
+
+        // Weighted accumulate: output += w * scratch_out
+        for (int i = (int)blockIdx.x * (int)blockDim.x + tid; i < hs; i += (int)gridDim.x * (int)blockDim.x) {
+            output[i] += w * scratch_out[i];
+        }
+        grid.sync();
+    }
+}
 
 // ============================================================
 // Main megakernel entry point
@@ -1849,6 +2084,14 @@ __device__ void dump_instruction_output(
             break;
         case OP_OUTPUT_GATE:
             size = inst_int(inst, 4); // size
+            break;
+        case OP_MOE_GATE:
+            output = inst_fptr(inst, 3); // expert_weights
+            size = inst_int(inst, 5);    // k
+            break;
+        case OP_MOE_FFN:
+            output = inst_fptr(inst, 4); // ffn_down (accumulated output)
+            size = inst_int(inst, 10) & 0xFFFF; // hs
             break;
         default:
             return;  // Skip non-compute ops
@@ -1912,6 +2155,17 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
 
         if (opcode == OP_HALT) break;
 
+        // OP_MOE_FFN manages its own blocks and grid.sync() internally
+        if (opcode == OP_MOE_FFN) {
+            op_moe_ffn(inst, grid);
+            // op_moe_ffn does its own grid.sync(); skip outer sync
+            if (dump_base) {
+                dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
+                grid.sync();
+            }
+            continue;
+        }
+
         // Virtual block loop: each physical block handles multiple virtual blocks
         for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
             switch (opcode) {
@@ -1943,6 +2197,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_SILU_MUL:   op_silu_mul(inst, vb); break;
                 case OP_FFN_GATE_UP_RNF4:  op_ffn_gate_up_rnf4(inst, vb); break;
                 case OP_FFN_DOWN_RES_RNF4: op_ffn_down_res_rnf4(inst, vb); break;
+                case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
                 default: break;
             }
         }

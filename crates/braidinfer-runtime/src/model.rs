@@ -1499,8 +1499,9 @@ impl Model {
 
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-        if has_moe || self.trace.is_some() {
+        let has_mamba2 = self.config.layers.iter().any(|l| l.layer_type == crate::config::LayerType::Mamba2);
+        // Mamba2 layers not yet in megakernel — fall back to kernel-by-kernel
+        if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
 

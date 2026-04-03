@@ -56,6 +56,23 @@ impl LinearWeight {
         }
     }
 
+    /// Get raw data pointer (u8) for any weight format.
+    /// For bf16: cast u16* to u8*. For packed: direct data pointer.
+    pub fn raw_data_ptr(&self) -> *const u8 {
+        match self {
+            LinearWeight::Bf16(buf) => buf.as_ptr() as *const u8,
+            LinearWeight::Packed(pw) => pw.data.as_ptr(),
+        }
+    }
+
+    /// Get weight format.
+    pub fn weight_format(&self) -> WeightFormat {
+        match self {
+            LinearWeight::Bf16(_) => WeightFormat::Bf16,
+            LinearWeight::Packed(pw) => pw.format,
+        }
+    }
+
     /// Number of logical elements (out_dim * in_dim).
     pub fn num_elements(&self) -> usize {
         match self {
