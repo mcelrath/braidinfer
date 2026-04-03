@@ -309,6 +309,7 @@ __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
     const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
 
     float acc = 0.0f;
+    // Each thread processes whole groups (20 bytes = 1 cache line, sequential access)
     for (int g = tid; g < num_groups; g += stride) {
         const unsigned char* gp = row_data + g * group_bytes;
         float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
@@ -319,22 +320,25 @@ __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
         for (int i = 0; i < count; i += 2) {
             unsigned char byte = gp[i / 2];
             float v0 = (float)(byte & 0xF) * sc + mn;
-            acc += v0 * input[base + i];
-            if (i + 1 < count) {
-                float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
-                acc += v1 * input[base + i + 1];
-            }
+            float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+            acc += v0 * input[base + i] + v1 * input[base + i + 1];
         }
     }
 
-    extern __shared__ float shared[];
-    shared[tid] = acc;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
+    // Wave32 reduction + cross-wave
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_down(acc, offset);
     }
-    if (tid == 0) output[row] = shared[0];
+    extern __shared__ float shared[];
+    if ((tid & 31) == 0) shared[tid >> 5] = acc;
+    __syncthreads();
+    if (tid < 8) {
+        acc = shared[tid];
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            acc += __shfl_down(acc, offset);
+        }
+        if (tid == 0) output[row] = acc;
+    }
 }
 
 // OP_RMSNORM_WX: y = x * w / sqrt(mean(x^2) + eps) — standard w*x variant (Llama, OLMoE)
