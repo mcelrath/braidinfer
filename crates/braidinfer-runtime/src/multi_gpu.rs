@@ -95,6 +95,7 @@ impl MultiGpuContext {
         for i in 0..num_devices {
             let device = DeviceId(i as u32);
             Device::set_current(device)?;
+            eprintln!("Multi-GPU: allocating buffers on GPU {i} (hs={hidden_size}, eis={max_expert_is})");
             workers.push(GpuWorker {
                 device,
                 compute_stream: Stream::new(device)?,

@@ -507,6 +507,63 @@ impl Model {
                 crate::trace::TraceWriter::open(&path).ok()
             }),
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
+            multi_gpu: None,
+            distributed_moe: Vec::new(),
+            worker_kernels: Vec::new(),
         })
+    }
+
+    /// Enable multi-GPU expert parallel dispatch.
+    /// Distributes MoE expert weights across available GPUs (round-robin).
+    /// Must be called after load, before first decode_step.
+    pub fn enable_multi_gpu(&mut self) -> Result<(), ModelError> {
+        let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+        if !has_moe {
+            eprintln!("Multi-GPU: model has no MoE layers, skipping");
+            return Ok(());
+        }
+
+        let max_eis = self.config.layers.iter().filter_map(|l| match &l.ffn_type {
+            FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size),
+            _ => None,
+        }).max().unwrap_or(1);
+
+        let ctx = crate::multi_gpu::MultiGpuContext::init(self.config.hidden_size, max_eis)?;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => { eprintln!("Multi-GPU: only 1 device, skipping"); return Ok(()); }
+        };
+
+        // Load worker kernels on each device
+        let mut worker_kernels = Vec::with_capacity(ctx.num_devices);
+        for i in 0..ctx.num_devices {
+            eprintln!("Multi-GPU: loading kernels on GPU {i}");
+            worker_kernels.push(crate::moe_dispatch::WorkerKernels::load(DeviceId(i as u32))?);
+        }
+        braidinfer_hip::device::Device::set_current(DeviceId(0))?;
+
+        // Distribute MoE weights across GPUs
+        let num_devices = ctx.num_devices;
+        let hs = self.config.hidden_size;
+        // Build distributed weight views from existing moe_weights.
+        // The original moe_weights are KEPT (for gate, shared expert, bias on GPU 0).
+        // distributed_moe holds per-GPU expert buffer copies.
+        let mut distributed = Vec::with_capacity(self.config.num_layers);
+        for i in 0..self.config.num_layers {
+            if let Some(ref moe) = self.moe_weights[i] {
+                let dist = crate::weights::distribute_moe_weights_from_ref(
+                    moe, num_devices, hs,
+                )?;
+                distributed.push(Some(dist));
+            } else {
+                distributed.push(None);
+            }
+        }
+
+        self.multi_gpu = Some(ctx);
+        self.distributed_moe = distributed;
+        self.worker_kernels = worker_kernels;
+        eprintln!("Multi-GPU: expert weights distributed across {num_devices} GPUs");
+        Ok(())
     }
 }

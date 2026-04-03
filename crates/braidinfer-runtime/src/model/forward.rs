@@ -312,7 +312,27 @@ impl Model {
             &self.stream,
         )?;
 
-        // Read back k expert_ids + k weights (small copy, replaces num_experts float copy + CPU work)
+        // Multi-GPU path: dispatch routed experts across GPUs
+        let used_multi_gpu = if self.multi_gpu.is_some() && !self.distributed_moe.is_empty() {
+            if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
+                let mgpu = self.multi_gpu.as_mut().unwrap();
+                crate::moe_dispatch::dispatch_moe_layer(
+                    mgpu,
+                    &self.worker_kernels,
+                    dist_moe,
+                    &self.activations.normed,
+                    &mut self.activations.ffn_down,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_expert_weights,
+                    k, hs, eis,
+                    &self.stream,
+                )?;
+                true
+            } else { false }
+        } else { false };
+
+        if !used_multi_gpu {
+        // Single-GPU path: read back expert_ids + weights, dispatch locally
         self.stream.synchronize()?;
         let mut expert_ids = vec![0i32; k];
         let mut expert_weights = vec![0.0f32; k];
@@ -414,7 +434,9 @@ impl Model {
             )?;
         }
 
-        // 6. Shared expert (always-on, added to output)
+        } // end if !used_multi_gpu
+
+        // 6. Shared expert (always-on, added to output — runs on GPU 0 for both paths)
         if let Some(ref se) = moe.shared_expert {
             let se_is = match &self.config.layers[layer_idx].ffn_type {
                 FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } =>

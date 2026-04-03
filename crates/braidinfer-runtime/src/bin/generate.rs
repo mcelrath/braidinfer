@@ -60,6 +60,11 @@ fn main() {
     let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN").ok().and_then(|v| v.parse().ok());
     let mut model = Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
+    // Enable multi-GPU if NUM_GPUS > 1 or MULTI_GPU is set
+    if std::env::var("MULTI_GPU").is_ok() {
+        model.enable_multi_gpu().expect("enable multi-GPU");
+    }
+
     let (vram_used, vram_total) = vram_usage_mb();
     eprintln!("VRAM after load: {:.0}/{:.0} MB", vram_used, vram_total);
     eprintln!("max_seq_len: {}", model.config().max_seq_len);

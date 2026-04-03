@@ -41,6 +41,10 @@ pub struct Model {
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) trace: Option<crate::trace::TraceWriter>,
     pub(crate) debug_nan: bool,
+    // Multi-GPU expert parallel (None for single-GPU)
+    pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
+    pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,
+    pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
 }
 
 // ---- Model impl ----
@@ -82,8 +86,9 @@ impl Model {
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let has_mamba2 = self.config.layers.iter().any(|l| l.layer_type == crate::config::LayerType::Mamba2);
-        // Mamba2 layers not yet in megakernel — fall back to kernel-by-kernel
-        if has_mamba2 || self.trace.is_some() {
+        let is_multi_gpu = self.multi_gpu.is_some();
+        // Mamba2, multi-GPU MoE, and trace mode use kernel-by-kernel path
+        if has_mamba2 || self.trace.is_some() || is_multi_gpu {
             return self.decode_step_moe(token_id, position);
         }
 

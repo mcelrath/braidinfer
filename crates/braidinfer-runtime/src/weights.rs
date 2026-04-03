@@ -110,22 +110,18 @@ pub struct GpuExpertBuffer {
     pub slot_map: Vec<Option<usize>>,
 }
 
-/// Distributed MoE weights across multiple GPUs.
+/// Distributed expert weight buffers across GPUs.
+/// Gate, shared expert, and metadata stay in MoeWeights on GPU 0.
+/// This struct holds only the per-GPU expert copies.
 pub struct DistributedMoeWeights {
-    pub gate: DeviceBuffer<u16>,                    // GPU 0 only: router weights
     pub expert_buffers: Vec<GpuExpertBuffer>,       // [num_devices]
     pub expert_device: Vec<usize>,                  // [num_experts] → device index
-    pub shared_expert: Option<DenseFfnWeights>,     // GPU 0 only
-    pub shared_expert_gate: Option<DeviceBuffer<u16>>, // GPU 0 only
     pub has_gate_proj: bool,
-    pub score_correction_bias: Option<Vec<f32>>,
-    pub score_correction_bias_gpu: Option<DeviceBuffer<f32>>, // GPU 0
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
-    // Byte strides for addressing within per-GPU buffers
-    pub gate_up_expert_stride: usize,  // bytes per expert in gate_up
-    pub down_expert_stride: usize,     // bytes per expert in down
-    pub gate_up_row_stride: usize,     // bytes per row in gate_up
+    pub gate_up_expert_stride: usize,
+    pub down_expert_stride: usize,
+    pub gate_up_row_stride: usize,
 }
 
 pub struct GdnState {
@@ -824,5 +820,133 @@ pub fn compute_inv_freq(rope_dim: usize, rope_theta: f32) -> Vec<f32> {
             1.0 / rope_theta.powf(exp)
         })
         .collect()
+}
+
+/// Distribute expert weights from single-GPU MoeWeights across multiple GPUs (round-robin).
+/// Expert `e` goes to GPU `e % num_devices`.
+/// Gate, shared expert, and bias remain in the original MoeWeights on GPU 0.
+pub fn distribute_moe_weights_from_ref(
+    moe: &MoeWeights,
+    num_devices: usize,
+    hs: usize,
+) -> Result<DistributedMoeWeights, ModelError> {
+    use braidinfer_hip::device::Device;
+
+    let ne = moe.num_experts;
+    let eis = moe.expert_intermediate_size;
+
+    // Compute byte strides
+    let gate_up_rows_per_expert = if moe.has_gate_proj { 2 * eis } else { eis };
+    let gate_up_expert_stride = moe.expert_gate_up.row_byte_offset_dim(gate_up_rows_per_expert, hs);
+    let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
+    let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
+
+    // Count experts per GPU
+    let mut expert_device = vec![0usize; ne];
+    let mut counts = vec![0usize; num_devices];
+    for e in 0..ne {
+        let gpu = e % num_devices;
+        expert_device[e] = gpu;
+        counts[gpu] += 1;
+    }
+
+    // Allocate per-GPU buffers and build slot maps
+    let mut expert_buffers = Vec::with_capacity(num_devices);
+    for gpu in 0..num_devices {
+        let device = DeviceId(gpu as u32);
+        Device::set_current(device)?;
+
+        let n = counts[gpu];
+        let mut slot_map = vec![None; ne];
+        let mut slot = 0;
+        for e in 0..ne {
+            if expert_device[e] == gpu {
+                slot_map[e] = Some(slot);
+                slot += 1;
+            }
+        }
+
+        expert_buffers.push(GpuExpertBuffer {
+            device,
+            gate_up: DeviceBuffer::<u8>::alloc(device, n * gate_up_expert_stride)?,
+            down: DeviceBuffer::<u8>::alloc(device, n * down_expert_stride)?,
+            local_expert_count: n,
+            slot_map,
+        });
+    }
+
+    // Copy expert weights from GPU 0's packed buffer to per-GPU buffers
+    let src_gate_up = moe.expert_gate_up.raw_data_ptr();
+    let src_down = moe.expert_down.raw_data_ptr();
+
+    for e in 0..ne {
+        let gpu = expert_device[e];
+        let local_slot = expert_buffers[gpu].slot_map[e].unwrap();
+        let dst_device = DeviceId(gpu as u32);
+
+        // gate_up: copy one expert's worth of bytes
+        let src_offset = e * gate_up_expert_stride;
+        let dst_offset = local_slot * gate_up_expert_stride;
+        if gpu == 0 {
+            // D2D copy within GPU 0
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpy(
+                    expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                    src_gate_up.add(src_offset) as *const std::ffi::c_void,
+                    gate_up_expert_stride,
+                    braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                );
+            }
+        } else {
+            // P2P copy from GPU 0 to target GPU
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyPeer(
+                    expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                    dst_device.0 as i32,
+                    src_gate_up.add(src_offset) as *const std::ffi::c_void,
+                    0, // src device = GPU 0
+                    gate_up_expert_stride,
+                );
+            }
+        }
+
+        // down: same pattern
+        let src_offset = e * down_expert_stride;
+        let dst_offset = local_slot * down_expert_stride;
+        if gpu == 0 {
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpy(
+                    expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                    src_down.add(src_offset) as *const std::ffi::c_void,
+                    down_expert_stride,
+                    braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                );
+            }
+        } else {
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyPeer(
+                    expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                    dst_device.0 as i32,
+                    src_down.add(src_offset) as *const std::ffi::c_void,
+                    0,
+                    down_expert_stride,
+                );
+            }
+        }
+    }
+
+    // Restore GPU 0 context
+    Device::set_current(DeviceId(0))?;
+
+    Ok(DistributedMoeWeights {
+        expert_buffers,
+        expert_device,
+        has_gate_proj: moe.has_gate_proj,
+        num_experts: ne,
+        expert_intermediate_size: eis,
+        gate_up_expert_stride,
+        down_expert_stride,
+        gate_up_row_stride,
+    })
 }
 
