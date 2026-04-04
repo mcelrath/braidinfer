@@ -947,37 +947,63 @@ pub fn distribute_moe_weights_from_ref(
     let src_gate_up = moe.expert_gate_up.raw_data_ptr();
     let src_down = moe.expert_down.raw_data_ptr();
 
+    // Host-staged copy: GPU 0 → host → target GPU.
+    // hipMemcpyPeer uses SDMA which PERMISSION_FAULTs on RDNA3 PCIe.
+    let max_expert_bytes = gate_up_expert_stride.max(down_expert_stride);
+    let mut host_buf = vec![0u8; max_expert_bytes];
+
     for e in 0..ne {
         let gpu = expert_device[e];
         if gpu == 0 { continue; } // GPU 0 uses original packed buffer
 
         let local_slot = expert_buffers[gpu].slot_map[e].unwrap();
-        let dst_device = DeviceId(gpu as u32);
 
-        // gate_up: P2P copy from GPU 0 to target GPU
+        // gate_up: GPU 0 → host → target GPU
         let src_offset = e * gate_up_expert_stride;
         let dst_offset = local_slot * gate_up_expert_stride;
+        Device::set_current(DeviceId(0))?;
         unsafe {
-            braidinfer_hip::ffi::hipMemcpyPeer(
-                expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                dst_device.0 as i32,
+            let rc = braidinfer_hip::ffi::hipMemcpy(
+                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
                 src_gate_up.add(src_offset) as *const std::ffi::c_void,
-                0, // src device = GPU 0
                 gate_up_expert_stride,
+                braidinfer_hip::ffi::hipMemcpyDeviceToHost,
             );
+            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
+        }
+        Device::set_current(DeviceId(gpu as u32))?;
+        unsafe {
+            let rc = braidinfer_hip::ffi::hipMemcpy(
+                expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                host_buf.as_ptr() as *const std::ffi::c_void,
+                gate_up_expert_stride,
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+            );
+            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
         }
 
-        // down: P2P copy
+        // down: GPU 0 → host → target GPU
         let src_offset = e * down_expert_stride;
         let dst_offset = local_slot * down_expert_stride;
+        Device::set_current(DeviceId(0))?;
         unsafe {
-            braidinfer_hip::ffi::hipMemcpyPeer(
-                expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                dst_device.0 as i32,
+            let rc = braidinfer_hip::ffi::hipMemcpy(
+                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
                 src_down.add(src_offset) as *const std::ffi::c_void,
-                0,
                 down_expert_stride,
+                braidinfer_hip::ffi::hipMemcpyDeviceToHost,
             );
+            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
+        }
+        Device::set_current(DeviceId(gpu as u32))?;
+        unsafe {
+            let rc = braidinfer_hip::ffi::hipMemcpy(
+                expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
+                host_buf.as_ptr() as *const std::ffi::c_void,
+                down_expert_stride,
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+            );
+            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
         }
     }
 
