@@ -73,6 +73,15 @@ unsafe extern "C" {
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
+    /// Non-blocking check: hipSuccess if all work complete, hipErrorNotReady if still running.
+    pub fn hipStreamQuery(stream: hipStream_t) -> hipError_t;
+
+    // Mapped host memory
+    pub fn hipHostGetDevicePointer(
+        device_ptr: *mut *mut c_void,
+        host_ptr: *mut c_void,
+        flags: c_uint,
+    ) -> hipError_t;
 
     // Module / kernel management
     pub fn hipModuleLoad(module: *mut hipModule_t, fname: *const c_char) -> hipError_t;

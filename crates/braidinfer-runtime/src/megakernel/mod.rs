@@ -1,5 +1,5 @@
 use braidinfer_core::types::DeviceId;
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::HipResult;
@@ -10,6 +10,27 @@ use crate::trace::TraceWriter;
 
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
 pub const CHUNK_TOKENS: usize = 64;
+
+/// Mapped host memory flags for CPU↔megakernel synchronization at MoE barriers.
+/// Both pointers are in hipHostMallocMapped memory (GPU-accessible via GART, MTYPE_UC).
+pub struct MoeBarrierState {
+    /// GPU writes `layer_idx + 1` here when ready for dispatch; CPU resets to 0 after reading.
+    pub barrier: MappedHostBuffer<u32>,
+    /// CPU writes 1 here after dispatch; GPU resets to 0 before continuing.
+    pub resume: MappedHostBuffer<u32>,
+}
+
+impl MoeBarrierState {
+    pub fn new() -> HipResult<Self> {
+        let barrier = MappedHostBuffer::<u32>::alloc(1)?;
+        let resume = MappedHostBuffer::<u32>::alloc(1)?;
+        unsafe {
+            *barrier.host_ptr() = 0;
+            *resume.host_ptr() = 0;
+        }
+        Ok(MoeBarrierState { barrier, resume })
+    }
+}
 
 // Opcode constants — auto-generated from kernels/opcodes.h (single source of truth)
 include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
@@ -98,6 +119,11 @@ pub struct MegakernelProgram {
     pub(crate) dump_buffer: Option<DeviceBuffer<u8>>,        // slot data
     pub(crate) dump_counter: Option<DeviceBuffer<i32>>,       // atomic slot counter
     pub(crate) dump_capacity: i32,
+    // Multi-GPU MoE barrier: OP_BARRIER instructions park here; CPU dispatches, resumes
+    pub(crate) moe_barrier: Option<MoeBarrierState>,
+    /// (instruction_idx, layer_idx) for each OP_BARRIER in the program.
+    /// CPU dispatch loop uses layer_idx to look up DistributedMoeWeights.
+    pub(crate) barrier_layer_map: Vec<(usize, usize)>,
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
 }
@@ -273,6 +299,11 @@ impl MegakernelProgram {
         tw.close().expect("failed to close dump trace file");
         eprintln!("Megakernel dump: {} instructions written to {}", slots.len(), path);
         Ok(())
+    }
+
+    /// Reference to the MoE barrier state (for the CPU dispatch loop in decode_step_megakernel_moe).
+    pub fn moe_barrier(&self) -> Option<&MoeBarrierState> {
+        self.moe_barrier.as_ref()
     }
 
     /// Execute the megakernel program.

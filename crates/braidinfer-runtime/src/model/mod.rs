@@ -46,6 +46,8 @@ pub struct Model {
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
+    // Multi-GPU megakernel: dense layers run in megakernel; MoE layers use CPU-dispatch via OP_BARRIER
+    pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
 }
 
 // ---- Model impl ----
@@ -88,9 +90,13 @@ impl Model {
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let has_mamba2 = self.config.layers.iter().any(|l| l.layer_type == crate::config::LayerType::Mamba2);
         let is_multi_gpu = self.multi_gpu.is_some();
-        // Mamba2, multi-GPU MoE, and trace mode use kernel-by-kernel path
-        if has_mamba2 || self.trace.is_some() || is_multi_gpu {
+        // Mamba2 and trace mode use kernel-by-kernel path
+        if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
+        }
+        // Multi-GPU MoE: use megakernel for dense layers, OP_BARRIER for expert dispatch
+        if is_multi_gpu {
+            return self.decode_step_megakernel_moe(token_id, position);
         }
 
         // Dense models: use megakernel (handles bf16 + quantized weights, both RMSNorm variants)
@@ -121,6 +127,76 @@ impl Model {
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
 
+        self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// Multi-GPU megakernel MoE decode step.
+    /// Dense layers (embedding, attention, GDN, norms, lm_head) run in the persistent megakernel.
+    /// MoE layers use OP_BARRIER: megakernel parks, CPU dispatches expert FFN, megakernel resumes.
+    fn decode_step_megakernel_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        // Lazy-init multi-GPU megakernel
+        if self.megakernel_multi_gpu.is_none() {
+            let mk = MegakernelProgram::compile_multi_gpu(self)
+                .map_err(ModelError::Hip)?;
+            self.megakernel_multi_gpu = Some(mk);
+        }
+
+        let mk = self.megakernel_multi_gpu.as_mut().unwrap();
+        mk.update_step(token_id, position, &self.stream)
+            .map_err(ModelError::Hip)?;
+        mk.execute(&self.stream)
+            .map_err(ModelError::Hip)?;
+
+        // CPU dispatch loop: service OP_BARRIER interrupts until megakernel completes
+        let barrier_ptr = mk.moe_barrier()
+            .expect("multi-GPU megakernel must have MoeBarrierState")
+            .barrier.host_ptr();
+        let resume_ptr = mk.moe_barrier().unwrap().resume.host_ptr();
+
+        loop {
+            let layer_code = unsafe { std::ptr::read_volatile(barrier_ptr) };
+            if layer_code == 0 {
+                if self.stream.is_idle() { break; }
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let layer_idx = (layer_code - 1) as usize;
+
+            // Dispatch multi-GPU expert FFN for this layer
+            if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
+                let (k, eis) = match &self.config.layers[layer_idx].ffn_type {
+                    crate::model::FfnType::MoE { num_active, expert_intermediate_size, .. } =>
+                        (*num_active, *expert_intermediate_size),
+                    _ => panic!("OP_BARRIER on non-MoE layer {}", layer_idx),
+                };
+                let mgpu = self.multi_gpu.as_mut().unwrap();
+                crate::moe_dispatch::dispatch_moe_layer(
+                    mgpu,
+                    &self.worker_kernels,
+                    dist_moe,
+                    &self.activations.normed,
+                    &mut self.activations.ffn_down,
+                    &self.activations.moe_expert_ids,
+                    &self.activations.moe_expert_weights,
+                    k,
+                    self.config.hidden_size,
+                    eis,
+                    &self.stream,
+                ).map_err(ModelError::Hip)?;
+            }
+
+            // Reset barrier flag, signal resume
+            unsafe { std::ptr::write_volatile(barrier_ptr, 0u32); }
+            unsafe { std::ptr::write_volatile(resume_ptr, 1u32); }
+        }
+
+        self.stream.synchronize().map_err(ModelError::Hip)?;
+
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)
+            .map_err(ModelError::Hip)?;
         self.seq_len = position + 1;
         Ok(logits)
     }

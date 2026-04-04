@@ -17,7 +17,7 @@ use super::{OP_RMSNORM, OP_LINEAR_PROJ, OP_CONV1D, OP_GDN_GATE, OP_GDN_RECUR,
     OP_ATTN_PAGED, OP_ATTN_PREFILL, OP_DEINTERLEAVE, OP_KV_QUANTIZE, OP_ATTN_PAGED_Q,
     OP_MOE_GATE, OP_MOE_FFN, OP_LINEAR_PROJ_RNF4, OP_LINEAR_PROJ_PCG32, OP_RMSNORM_WX,
     OP_SILU_MUL, OP_FFN_GATE_UP_RNF4, OP_FFN_DOWN_RES_RNF4,
-    OP_SIGMOID_WEIGHTED_ADD};
+    OP_SIGMOID_WEIGHTED_ADD, OP_BARRIER};
 
 fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight, ptr_slot: usize) {
     use crate::model::{LinearWeight, WeightFormat};
@@ -58,14 +58,30 @@ enum AttentionVariant<'a> {
 
 impl MegakernelProgram {
     pub fn compile(model: &Model) -> HipResult<Self> {
-        Self::compile_inner(model, false)
+        Self::compile_inner(model, false, false)
     }
 
     pub fn compile_paged(model: &Model) -> HipResult<Self> {
-        Self::compile_inner(model, true)
+        Self::compile_inner(model, true, false)
     }
 
-    fn compile_inner(model: &Model, paged: bool) -> HipResult<Self> {
+    /// Compile for multi-GPU MoE models. MoE layers emit OP_BARRIER instead of OP_MOE_FFN.
+    /// The CPU dispatch loop (decode_step_megakernel_moe) handles expert dispatch per barrier.
+    pub fn compile_multi_gpu(model: &Model) -> HipResult<Self> {
+        let mut prog = Self::compile_inner(model, false, true)?;
+        let barrier_state = super::MoeBarrierState::new()?;
+        // Patch barrier flag pointers into all OP_BARRIER instructions
+        let bflag_dev = barrier_state.barrier.device_ptr() as u64;
+        let rflag_dev = barrier_state.resume.device_ptr() as u64;
+        for &(inst_idx, _layer_idx) in &prog.barrier_layer_map {
+            prog.instructions[inst_idx].words[1] = bflag_dev;
+            prog.instructions[inst_idx].words[2] = rflag_dev;
+        }
+        prog.moe_barrier = Some(barrier_state);
+        Ok(prog)
+    }
+
+    fn compile_inner(model: &Model, paged: bool, multi_gpu: bool) -> HipResult<Self> {
         let cfg = &model.config;
         let device = model.device;
         let act = &model.activations;
@@ -97,6 +113,7 @@ impl MegakernelProgram {
         let mut gqa_attn_inst_indices = Vec::new();
         let mut kv_write_indices = Vec::new();
         let mut kv_base_ptrs = Vec::new();
+        let mut barrier_layer_map: Vec<(usize, usize)> = Vec::new();
 
         let hs = cfg.hidden_size;
         let nh_gdn = cfg.linear_num_heads;
@@ -184,11 +201,19 @@ impl MegakernelProgram {
                     Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
                 }
                 crate::model::FfnType::MoE { .. } => {
-                    Self::compile_moe_ffn(
-                        cfg, layer_i, &model.layers[layer_i],
-                        model.moe_weights[layer_i].as_ref().unwrap(),
-                        act, &mut instructions,
-                    );
+                    if multi_gpu {
+                        let moe = model.moe_weights[layer_i].as_ref().unwrap();
+                        let barrier_inst_idx = Self::compile_moe_ffn_multi_gpu(
+                            cfg, layer_i, &model.layers[layer_i], moe, act, &mut instructions,
+                        );
+                        barrier_layer_map.push((barrier_inst_idx, layer_i));
+                    } else {
+                        Self::compile_moe_ffn(
+                            cfg, layer_i, &model.layers[layer_i],
+                            model.moe_weights[layer_i].as_ref().unwrap(),
+                            act, &mut instructions,
+                        );
+                    }
                 }
                 crate::model::FfnType::None => {
                     // No FFN for this layer (Nemotron M/* layers)
@@ -267,6 +292,8 @@ impl MegakernelProgram {
             dump_capacity: 0,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
+            moe_barrier: None,
+            barrier_layer_map,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -661,6 +688,8 @@ impl MegakernelProgram {
             dump_capacity: 0,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
+            moe_barrier: None,
+            barrier_layer_map: Vec::new(),
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1774,5 +1803,102 @@ impl MegakernelProgram {
         inst.set_ptr(3, act.ffn_down.as_ptr());
         inst.set_int(4, hs as i32);
         instructions.push(inst);
+    }
+
+    /// Multi-GPU variant: emit norm + gate proj + OP_MOE_GATE + OP_BARRIER.
+    /// CPU dispatch loop handles expert FFN; megakernel resumes for shared expert + residual.
+    /// Returns the instruction index of the emitted OP_BARRIER.
+    ///
+    /// Note: barrier_flag_ptr and resume_flag_ptr are patched in after MoeBarrierState is
+    /// allocated (in compile_multi_gpu). Initially zero; patched by execute_multi_gpu().
+    fn compile_moe_ffn_multi_gpu(
+        cfg: &ModelConfig,
+        layer_idx: usize,
+        layer: &LayerWeights,
+        moe: &crate::model::MoeWeights,
+        act: &ActivationBuffers,
+        instructions: &mut Vec<Instruction>,
+    ) -> usize {
+        use crate::model::{FfnType, GateType};
+        let hs = cfg.hidden_size;
+        let eps = cfg.rms_norm_eps;
+
+        let (k, gate_type, ne) = match &cfg.layers[layer_idx].ffn_type {
+            FfnType::MoE { num_active, gate_type, num_experts, .. } =>
+                (*num_active, gate_type.clone(), *num_experts),
+            _ => unreachable!(),
+        };
+
+        let norm_ptr = match layer {
+            LayerWeights::Attention(w) => w.post_norm.as_ptr(),
+            LayerWeights::Gdn(w) => w.post_norm.as_ptr(),
+            LayerWeights::MoeFfn(w) => w.input_norm.as_ptr(),
+            _ => panic!("no norm weight for MoE FFN layer"),
+        };
+
+        // D2D_COPY: hidden → residual
+        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+        inst.set_output_ptr(1, act.residual.as_ptr());
+        inst.set_ptr(2, act.hidden.as_ptr());
+        inst.set_int(3, hs as i32);
+        inst.set_no_sync();
+        instructions.push(inst);
+
+        // RMSNorm: hidden → normed
+        let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
+        inst.set_output_ptr(1, act.normed.as_ptr());
+        inst.set_ptr(2, act.hidden.as_ptr());
+        inst.set_ptr(3, norm_ptr);
+        inst.set_int(4, hs as i32);
+        inst.set_float(5, eps);
+        instructions.push(inst);
+
+        // Gate projection: normed → moe_scores[num_experts]
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, ne as u32);
+        inst.set_output_ptr(1, act.moe_scores.as_ptr());
+        inst.set_ptr(2, moe.gate.as_ptr());
+        inst.set_ptr(3, act.normed.as_ptr());
+        inst.set_int(4, ne as i32);
+        inst.set_int(5, hs as i32);
+        instructions.push(inst);
+
+        // OP_MOE_GATE: top-k selection
+        let (gate_mode, rsf) = match &gate_type {
+            GateType::Softmax => (0u32, 1.0f32),
+            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
+            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
+        };
+        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
+            .map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
+        let mut inst = Instruction::new(OP_MOE_GATE, 1);
+        inst.set_ptr(1, act.moe_scores.as_ptr());
+        inst.set_ptr(2, act.moe_expert_ids.as_ptr());
+        inst.set_ptr(3, act.moe_expert_weights.as_ptr());
+        inst.set_int(4, ne as i32);
+        inst.set_int(5, k as i32);
+        inst.set_int(6, gate_mode as i32);
+        inst.set_float(7, rsf);
+        inst.set_ptr(8, bias_ptr);
+        instructions.push(inst);
+
+        // OP_BARRIER: park megakernel, CPU dispatches expert FFN into act.ffn_down, then resumes.
+        // barrier_flag_ptr and resume_flag_ptr are null here; patched in execute_multi_gpu().
+        let barrier_inst_idx = instructions.len();
+        let mut inst = Instruction::new(OP_BARRIER, 1);  // grid_x=1: only block 0 runs op_barrier
+        inst.set_ptr(1, std::ptr::null::<u32>());  // barrier_flag — patched per-execute
+        inst.set_ptr(2, std::ptr::null::<u32>());  // resume_flag — patched per-execute
+        inst.set_int(3, layer_idx as i32);
+        instructions.push(inst);
+
+        // After barrier: residual add (ffn_down written by CPU dispatch + optional shared expert)
+        // ffn_down is zeroed by dispatch_moe_layer before accumulating expert outputs.
+        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+        inst.set_output_ptr(1, act.hidden.as_ptr());
+        inst.set_ptr(2, act.residual.as_ptr());
+        inst.set_ptr(3, act.ffn_down.as_ptr());
+        inst.set_int(4, hs as i32);
+        instructions.push(inst);
+
+        barrier_inst_idx
     }
 }

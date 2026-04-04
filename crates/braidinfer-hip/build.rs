@@ -66,6 +66,7 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=amdhip64");
     println!("cargo:rerun-if-changed={}", kernel_dir.join("bf16_utils.h").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join("opcodes.h").display());
+    println!("cargo:rerun-if-changed={}", kernel_dir.join("megakernel_moe_barrier.hip").display());
     println!("cargo:rerun-if-changed=build.rs");
 
     // Generate opcodes.rs from opcodes.h (single source of truth)

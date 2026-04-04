@@ -62,6 +62,7 @@ __device__ __forceinline__ float inst_float(const u64* inst, int idx) {
 
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
+#include "megakernel_moe_barrier.hip"
 
 // ============================================================
 // Main megakernel entry point
@@ -235,6 +236,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_FFN_GATE_UP_RNF4:  op_ffn_gate_up_rnf4(inst, vb); break;
                 case OP_FFN_DOWN_RES_RNF4: op_ffn_down_res_rnf4(inst, vb); break;
                 case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
+                case OP_BARRIER:     op_barrier(inst, vb); break;
                 default: break;
             }
         }

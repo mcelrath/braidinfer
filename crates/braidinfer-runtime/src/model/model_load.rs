@@ -525,6 +525,7 @@ impl Model {
             multi_gpu: None,
             distributed_moe: Vec::new(),
             worker_kernels: Vec::new(),
+            megakernel_multi_gpu: None,
         })
     }
 

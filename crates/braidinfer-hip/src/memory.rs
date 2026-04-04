@@ -155,6 +155,69 @@ impl<T> PinnedBuffer<T> {
     }
 }
 
+/// Mapped host buffer: accessible from both CPU (host_ptr) and GPU (device_ptr).
+/// Uses hipHostMallocMapped which maps the allocation into the GPU address space.
+/// Reads/writes are coherent: GPU accesses go through GART (MTYPE_UC, no L2 caching).
+/// Use for barrier flags and small shared state between CPU and a running GPU kernel.
+pub struct MappedHostBuffer<T> {
+    host_ptr: *mut T,
+    device_ptr: *mut T,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+// Mapped memory is host memory, safe to share across threads
+unsafe impl<T: Send> Send for MappedHostBuffer<T> {}
+unsafe impl<T: Sync> Sync for MappedHostBuffer<T> {}
+
+impl<T> MappedHostBuffer<T> {
+    pub fn alloc(len: usize) -> HipResult<Self> {
+        let size = len * std::mem::size_of::<T>();
+        let mut host_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        error::check(unsafe {
+            ffi::hipHostMalloc(&mut host_ptr, size, ffi::hipHostMallocMapped)
+        })?;
+        let mut device_ptr: *mut std::ffi::c_void = ptr::null_mut();
+        error::check(unsafe {
+            ffi::hipHostGetDevicePointer(&mut device_ptr, host_ptr, 0)
+        })?;
+        Ok(MappedHostBuffer {
+            host_ptr: host_ptr.cast(),
+            device_ptr: device_ptr.cast(),
+            len,
+            _marker: PhantomData,
+        })
+    }
+
+    /// CPU-side pointer. Use for direct CPU reads/writes.
+    pub fn host_ptr(&self) -> *mut T {
+        self.host_ptr
+    }
+
+    /// GPU-side pointer. Pass this to kernels via instruction slots.
+    pub fn device_ptr(&self) -> *const T {
+        self.device_ptr as *const T
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
+impl<T> Drop for MappedHostBuffer<T> {
+    fn drop(&mut self) {
+        if !self.host_ptr.is_null() {
+            let err = unsafe { ffi::hipHostFree(self.host_ptr.cast()) };
+            if err != 0 {
+                eprintln!(
+                    "braidinfer: hipHostFree failed (error {}) for mapped buffer",
+                    err,
+                );
+            }
+        }
+    }
+}
+
 impl<T> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
