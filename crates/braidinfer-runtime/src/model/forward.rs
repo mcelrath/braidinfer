@@ -315,27 +315,42 @@ impl Model {
         // Multi-GPU path: dispatch routed experts across GPUs (non-megakernel path)
         let used_multi_gpu = if self.multi_gpu.is_some() && !self.distributed_moe.is_empty() {
             if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
-                // Populate normed_stage from normed (safe: no cooperative kernel running here)
-                let mut normed_host = vec![0.0f32; hs];
-                self.activations.normed.copy_to_host(&mut normed_host)?;
+                // D2D copy normed → normed_stage (MappedHostBuffer) on GPU 0 stream.
+                // normed_stage.host_ptr() is then CPU-visible without a sync D2H copy.
+                self.stream.synchronize()?;
+                unsafe {
+                    let rc = braidinfer_hip::ffi::hipMemcpy(
+                        self.activations.normed_stage.device_ptr() as *mut std::ffi::c_void,
+                        self.activations.normed.as_ptr() as *const std::ffi::c_void,
+                        hs * 4,
+                        braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                    );
+                    if rc != 0 { return Err(braidinfer_hip::HipError(rc).into()); }
+                }
+                let normed_host: &[f32] = unsafe {
+                    std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs)
+                };
                 let mgpu = self.multi_gpu.as_mut().unwrap();
                 crate::moe_dispatch::dispatch_moe_layer_sync(
                     mgpu,
                     &self.worker_kernels,
                     dist_moe,
-                    &normed_host,
+                    normed_host,
                     &mut self.activations.ffn_down_stage,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_expert_weights,
                     k, hs, eis,
                     &self.stream,
                 )?;
-                // Copy ffn_down_stage result to ffn_down for subsequent kernels
+                // Copy ffn_down_stage (host-mapped) → ffn_down (GPU 0 VRAM) via hipMemcpy
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.activations.ffn_down_stage.host_ptr() as *const f32,
-                        self.activations.ffn_down.as_mut_ptr(), hs,
+                    let rc = braidinfer_hip::ffi::hipMemcpy(
+                        self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
+                        self.activations.ffn_down_stage.host_ptr() as *const std::ffi::c_void,
+                        hs * 4,
+                        braidinfer_hip::ffi::hipMemcpyHostToDevice,
                     );
+                    if rc != 0 { return Err(braidinfer_hip::HipError(rc).into()); }
                 }
                 true
             } else { false }
