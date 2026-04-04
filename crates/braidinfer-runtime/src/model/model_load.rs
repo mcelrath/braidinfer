@@ -603,19 +603,22 @@ impl Model {
             crate::bqnt::MmapBqnt::open(std::path::Path::new(&p)).ok()
         });
 
+        let gpu_dispatch = std::env::var("MOE_DISPATCH").map_or(false, |v| v == "gpu");
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
+                // Both paths distribute experts to all GPUs.
+                // GPU-dispatch: GPU 0 computes its experts inline in OP_MOE_DISPATCH.
+                // kbk: GPU 0 dispatches experts via CPU like any other GPU.
+                let start_gpu = 0;
                 if experts_on_gpu0 {
-                    // Experts already on GPU 0 — copy to per-GPU buffers
                     let dist = crate::weights::distribute_moe_weights_from_ref(
-                        moe, num_devices, hs,
+                        moe, num_devices, hs, start_gpu,
                     )?;
                     distributed.push(Some(dist));
                 } else if let Some(ref b) = bqnt {
-                    // Experts not on GPU 0 — load directly from bqnt to per-GPU buffers
                     let dist = crate::weights::distribute_moe_weights_from_bqnt(
-                        moe, b, i, &self.weight_prefix, num_devices, hs,
+                        moe, b, i, &self.weight_prefix, num_devices, hs, start_gpu,
                     )?;
                     distributed.push(Some(dist));
                 } else {
@@ -629,10 +632,8 @@ impl Model {
 
         self.distributed_moe = distributed;
         self.worker_kernels = worker_kernels;
-        eprintln!("Multi-GPU: expert weights distributed across {num_devices} GPUs");
+        eprintln!("Multi-GPU: experts distributed across all {num_devices} GPUs");
 
-        // GPU-initiated dispatch: launch persistent worker kernels if MOE_DISPATCH=gpu
-        let gpu_dispatch = std::env::var("MOE_DISPATCH").map_or(false, |v| v == "gpu");
         if gpu_dispatch {
             eprintln!("Multi-GPU: launching GPU-initiated dispatch (persistent workers)");
             let wq = crate::multi_gpu::MoeWorkQueue::init(

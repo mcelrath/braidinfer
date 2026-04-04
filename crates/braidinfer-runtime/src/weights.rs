@@ -875,10 +875,12 @@ pub fn compute_inv_freq(rope_dim: usize, rope_theta: f32) -> Vec<f32> {
 /// Distribute expert weights from single-GPU MoeWeights across multiple GPUs (round-robin).
 /// Expert `e` goes to GPU `e % num_devices`.
 /// Gate, shared expert, and bias remain in the original MoeWeights on GPU 0.
+/// `start_gpu`: first GPU to receive experts (0 for kbk, 1 for gpu-dispatch).
 pub fn distribute_moe_weights_from_ref(
     moe: &MoeWeights,
     num_devices: usize,
     hs: usize,
+    start_gpu: usize,
 ) -> Result<DistributedMoeWeights, ModelError> {
     use braidinfer_hip::device::Device;
 
@@ -891,11 +893,12 @@ pub fn distribute_moe_weights_from_ref(
     let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
     let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
 
-    // Round-robin across ALL GPUs (kbk path doesn't use cooperative megakernel).
+    // Round-robin across GPUs start_gpu..num_devices-1.
+    let worker_count = num_devices - start_gpu;
     let mut expert_device = vec![0usize; ne];
     let mut counts = vec![0usize; num_devices];
     for e in 0..ne {
-        let gpu = e % num_devices;
+        let gpu = start_gpu + (e % worker_count);
         expert_device[e] = gpu;
         counts[gpu] += 1;
     }
@@ -1005,6 +1008,7 @@ pub fn distribute_moe_weights_from_ref(
 
 /// Load expert weights directly from bqnt to per-GPU buffers.
 /// For models too large for single GPU (e.g. 122B).
+/// `start_gpu`: first GPU to receive experts (0 for kbk, 1 for gpu-dispatch).
 pub fn distribute_moe_weights_from_bqnt(
     moe: &MoeWeights,
     bqnt: &crate::bqnt::MmapBqnt,
@@ -1012,6 +1016,7 @@ pub fn distribute_moe_weights_from_bqnt(
     prefix: &str,
     num_devices: usize,
     hs: usize,
+    start_gpu: usize,
 ) -> Result<DistributedMoeWeights, ModelError> {
     use braidinfer_hip::device::Device;
 
@@ -1046,12 +1051,12 @@ pub fn distribute_moe_weights_from_bqnt(
     let groups_per_row = (hs + 31) / 32;
     let gate_up_row_stride = groups_per_row * 20;
 
-    // Round-robin assignment across ALL GPUs. The kbk multi-GPU path doesn't use
-    // the cooperative megakernel, so GPU 0 is free to run experts.
+    // Round-robin across GPUs start_gpu..num_devices-1.
+    let worker_count = num_devices - start_gpu;
     let mut expert_device = vec![0usize; ne];
     let mut counts = vec![0usize; num_devices];
     for e in 0..ne {
-        let gpu = e % num_devices;
+        let gpu = start_gpu + (e % worker_count);
         expert_device[e] = gpu;
         counts[gpu] += 1;
     }

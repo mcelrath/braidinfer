@@ -108,49 +108,60 @@ impl MegakernelProgram {
     /// Compile for GPU-initiated MoE dispatch. Emits OP_MOE_DISPATCH instead of OP_BARRIER.
     /// Workers are persistent kernels that poll the work queue — no CPU in the dispatch loop.
     pub fn compile_gpu_dispatch(model: &Model, work_queue: &crate::multi_gpu::MoeWorkQueue) -> HipResult<Self> {
+        use crate::model::FfnType;
         let mut prog = Self::compile_inner(model, false, true)?;
 
-        // Replace OP_BARRIER instructions with OP_MOE_DISPATCH
         let wq_ptr = work_queue.work_item_ptr() as u64;
         let os_ptr = work_queue.output_slots_ptr() as u64;
         let num_workers = work_queue.num_workers as u64;
+        let total_gpus = (num_workers + 1) as u64; // workers + GPU 0
         let hs = work_queue.hidden_size as u64;
         let act = &model.activations;
         let ffn_down_stage_ptr = act.ffn_down_stage.as_write_ptr() as u64;
+        let expert_ids_ptr = act.moe_expert_ids.as_ptr() as u64;
+        let expert_weights_ptr = act.moe_expert_weights.as_ptr() as u64;
 
+        // GPU 0 scratch buffers (reuse from PrefillBuffers if available, else activations)
+        let scratch_gate = act.moe_expert_gate.as_write_ptr() as u64;
+        let scratch_up = act.moe_expert_up.as_write_ptr() as u64;
+        let scratch_act = act.moe_expert_act.as_write_ptr() as u64;
+
+        // GPU 0 worker config (allocated and uploaded by MoeWorkQueue::init)
+        let gpu0_config_ptr = work_queue.gpu0_config_ptr() as u64;
+
+        // Allocate host-mapped seq counter
+        let seq_counter = braidinfer_hip::MappedHostBuffer::<u32>::alloc(1)?;
+        let seq_counter_ptr = seq_counter.as_ptr() as u64;
+
+        // Replace OP_BARRIER instructions with OP_MOE_DISPATCH
         for &(inst_idx, layer_idx) in &prog.barrier_layer_map {
+            let (k, eis, has_gate) = match &model.config.layers[layer_idx].ffn_type {
+                FfnType::MoE { num_active, expert_intermediate_size, .. } =>
+                    (*num_active, *expert_intermediate_size, if model.moe_weights[layer_idx].as_ref().map_or(true, |m| m.has_gate_proj) { 1u64 } else { 0u64 }),
+                _ => panic!("OP_BARRIER on non-MoE layer {layer_idx}"),
+            };
+
             let inst = &mut prog.instructions[inst_idx];
             inst.words[0] = (inst.words[0] & !0xFFFF) | (OP_MOE_DISPATCH as u64);
             inst.words[1] = wq_ptr;
             inst.words[2] = os_ptr;
-            inst.words[3] = ffn_down_stage_ptr; // final_output → ffn_down_stage
-            inst.words[4] = num_workers;
-            inst.words[5] = hs;
-            // seq_num (words[6]) set per-dispatch at runtime — see note below
-            inst.words[7] = layer_idx as u64;
+            inst.words[3] = ffn_down_stage_ptr;
+            inst.words[4] = expert_ids_ptr;
+            inst.words[5] = expert_weights_ptr;
+            inst.words[6] = seq_counter_ptr;
+            inst.words[7] = (num_workers << 32) | hs;
+            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64);
+            inst.words[9] = ((eis as u64) << 32) | has_gate;
+            inst.words[10] = act.normed.as_ptr() as u64;
+            inst.words[11] = gpu0_config_ptr;
+            inst.words[12] = scratch_gate;
+            inst.words[13] = scratch_up;
+            inst.words[14] = scratch_act;
+            inst.words[15] = total_gpus;
         }
 
-        // Pre-populate static work queue fields
-        let wq = work_queue.work_item_ptr();
-        unsafe {
-            let wq_item = &mut *(wq as *mut crate::multi_gpu::MoeWorkItemRust);
-            wq_item.hidden_size = model.config.hidden_size as u32;
-            wq_item.activation_ptr = act.normed.as_ptr() as u64;
-            wq_item.output_slots_ptr = os_ptr;
-            wq_item.num_workers = num_workers as u32;
-            // expert_intermediate_size, has_gate_proj, num_active are set per-layer
-            // by OP_MOE_GATE writing expert_ids/weights directly
-        }
-
-        // Note: seq_num in instructions is set statically per-compile. Each OP_MOE_DISPATCH
-        // gets a unique seq starting from 1. Workers check seq > last_seen.
-        let mut seq = 1u32;
-        for &(inst_idx, _) in &prog.barrier_layer_map {
-            prog.instructions[inst_idx].words[6] = seq as u64;
-            seq += 1;
-        }
-        // Store total seq count for re-dispatch on next token
-        prog.moe_dispatch_seq_count = Some(seq - 1);
+        prog.moe_dispatch_seq_count = Some(prog.barrier_layer_map.len() as u32);
+        std::mem::forget(seq_counter);
 
         Ok(prog)
     }
