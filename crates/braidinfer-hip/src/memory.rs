@@ -83,6 +83,44 @@ impl<T> DeviceBuffer<T> {
     }
 }
 
+/// Copy `len` bytes from a device pointer to a host slice.
+pub fn memcpy_d2h(dst: &mut [u8], src: *const u8, len: usize) -> HipResult<()> {
+    assert!(dst.len() >= len, "destination buffer too small");
+    error::check(unsafe {
+        ffi::hipMemcpy(
+            dst.as_mut_ptr().cast(),
+            src.cast(),
+            len,
+            ffi::hipMemcpyDeviceToHost,
+        )
+    })
+}
+
+/// Copy `len` bytes from a host slice to a device pointer.
+pub fn memcpy_h2d(dst: *mut u8, src: &[u8], len: usize) -> HipResult<()> {
+    assert!(src.len() >= len, "source buffer too small");
+    error::check(unsafe {
+        ffi::hipMemcpy(
+            dst.cast(),
+            src.as_ptr().cast(),
+            len,
+            ffi::hipMemcpyHostToDevice,
+        )
+    })
+}
+
+/// Copy `len` bytes between two device pointers (same or different GPU).
+pub fn memcpy_d2d(dst: *mut u8, src: *const u8, len: usize) -> HipResult<()> {
+    error::check(unsafe {
+        ffi::hipMemcpy(
+            dst.cast(),
+            src.cast(),
+            len,
+            ffi::hipMemcpyDeviceToDevice,
+        )
+    })
+}
+
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {

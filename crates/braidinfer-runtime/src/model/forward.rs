@@ -318,15 +318,11 @@ impl Model {
                 // D2D copy normed → normed_stage (MappedHostBuffer) on GPU 0 stream.
                 // normed_stage.host_ptr() is then CPU-visible without a sync D2H copy.
                 self.stream.synchronize()?;
-                unsafe {
-                    let rc = braidinfer_hip::ffi::hipMemcpy(
-                        self.activations.normed_stage.device_ptr() as *mut std::ffi::c_void,
-                        self.activations.normed.as_ptr() as *const std::ffi::c_void,
-                        hs * 4,
-                        braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                    );
-                    if rc != 0 { return Err(braidinfer_hip::HipError(rc).into()); }
-                }
+                braidinfer_hip::memory::memcpy_d2d(
+                    self.activations.normed_stage.as_write_ptr() as *mut u8,
+                    self.activations.normed.as_ptr() as *const u8,
+                    hs * 4,
+                )?;
                 let normed_host: &[f32] = unsafe {
                     std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs)
                 };
@@ -342,16 +338,12 @@ impl Model {
                     k, hs, eis,
                     &self.stream,
                 )?;
-                // Copy ffn_down_stage (host-mapped) → ffn_down (GPU 0 VRAM) via hipMemcpy
-                unsafe {
-                    let rc = braidinfer_hip::ffi::hipMemcpy(
-                        self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
-                        self.activations.ffn_down_stage.host_ptr() as *const std::ffi::c_void,
-                        hs * 4,
-                        braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                    );
-                    if rc != 0 { return Err(braidinfer_hip::HipError(rc).into()); }
-                }
+                // Copy ffn_down_stage (host-mapped) → ffn_down (GPU 0 VRAM)
+                braidinfer_hip::memory::memcpy_h2d(
+                    self.activations.ffn_down.as_write_ptr() as *mut u8,
+                    unsafe { std::slice::from_raw_parts(self.activations.ffn_down_stage.host_ptr() as *const u8, hs * 4) },
+                    hs * 4,
+                )?;
                 true
             } else { false }
         } else { false };

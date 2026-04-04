@@ -962,49 +962,27 @@ pub fn distribute_moe_weights_from_ref(
         let src_offset = e * gate_up_expert_stride;
         let dst_offset = local_slot * gate_up_expert_stride;
         Device::set_current(DeviceId(0))?;
-        unsafe {
-            let rc = braidinfer_hip::ffi::hipMemcpy(
-                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                src_gate_up.add(src_offset) as *const std::ffi::c_void,
-                gate_up_expert_stride,
-                braidinfer_hip::ffi::hipMemcpyDeviceToHost,
-            );
-            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
-        }
+        braidinfer_hip::memory::memcpy_d2h(
+            &mut host_buf, unsafe { src_gate_up.add(src_offset) }, gate_up_expert_stride,
+        )?;
         Device::set_current(DeviceId(gpu as u32))?;
-        unsafe {
-            let rc = braidinfer_hip::ffi::hipMemcpy(
-                expert_buffers[gpu].gate_up.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                host_buf.as_ptr() as *const std::ffi::c_void,
-                gate_up_expert_stride,
-                braidinfer_hip::ffi::hipMemcpyHostToDevice,
-            );
-            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
-        }
+        braidinfer_hip::memory::memcpy_h2d(
+            unsafe { expert_buffers[gpu].gate_up.as_write_ptr().add(dst_offset) },
+            &host_buf, gate_up_expert_stride,
+        )?;
 
         // down: GPU 0 → host → target GPU
         let src_offset = e * down_expert_stride;
         let dst_offset = local_slot * down_expert_stride;
         Device::set_current(DeviceId(0))?;
-        unsafe {
-            let rc = braidinfer_hip::ffi::hipMemcpy(
-                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
-                src_down.add(src_offset) as *const std::ffi::c_void,
-                down_expert_stride,
-                braidinfer_hip::ffi::hipMemcpyDeviceToHost,
-            );
-            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
-        }
+        braidinfer_hip::memory::memcpy_d2h(
+            &mut host_buf, unsafe { src_down.add(src_offset) }, down_expert_stride,
+        )?;
         Device::set_current(DeviceId(gpu as u32))?;
-        unsafe {
-            let rc = braidinfer_hip::ffi::hipMemcpy(
-                expert_buffers[gpu].down.as_ptr().add(dst_offset) as *mut std::ffi::c_void,
-                host_buf.as_ptr() as *const std::ffi::c_void,
-                down_expert_stride,
-                braidinfer_hip::ffi::hipMemcpyHostToDevice,
-            );
-            if rc != 0 { return Err(ModelError::Hip(braidinfer_hip::HipError(rc))); }
-        }
+        braidinfer_hip::memory::memcpy_h2d(
+            unsafe { expert_buffers[gpu].down.as_write_ptr().add(dst_offset) },
+            &host_buf, down_expert_stride,
+        )?;
     }
 
     // Restore GPU 0 context
