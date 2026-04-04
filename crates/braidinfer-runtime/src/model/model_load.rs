@@ -556,6 +556,8 @@ impl Model {
             distributed_moe: Vec::new(),
             worker_kernels: Vec::new(),
             megakernel_multi_gpu: None,
+            moe_work_queue: None,
+            megakernel_gpu_dispatch: None,
         })
     }
 
@@ -625,10 +627,21 @@ impl Model {
             }
         }
 
-        self.multi_gpu = Some(ctx);
         self.distributed_moe = distributed;
         self.worker_kernels = worker_kernels;
         eprintln!("Multi-GPU: expert weights distributed across {num_devices} GPUs");
+
+        // GPU-initiated dispatch: launch persistent worker kernels if MOE_DISPATCH=gpu
+        let gpu_dispatch = std::env::var("MOE_DISPATCH").map_or(false, |v| v == "gpu");
+        if gpu_dispatch {
+            eprintln!("Multi-GPU: launching GPU-initiated dispatch (persistent workers)");
+            let wq = crate::multi_gpu::MoeWorkQueue::init(
+                &ctx, &self.distributed_moe, hs, max_eis,
+            )?;
+            self.moe_work_queue = Some(wq);
+        }
+
+        self.multi_gpu = Some(ctx);
         Ok(())
     }
 }

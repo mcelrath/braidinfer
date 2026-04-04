@@ -359,6 +359,24 @@ struct MoeWorkerConfigRust {
     entries: [MoeExpertEntryRust; 256],
 }
 
+/// Rust-side mirror of MoeWorkItem from moe_work_queue.h.
+#[repr(C)]
+pub struct MoeWorkItemRust {
+    pub seq_num: u32,
+    pub layer_idx: u32,
+    pub num_active: u32,
+    pub hidden_size: u32,
+    pub expert_intermediate_size: u32,
+    pub has_gate_proj: u32,
+    pub num_workers: u32,
+    pub _pad0: u32,
+    pub expert_ids: [i32; 32],
+    pub expert_weights: [f32; 32],
+    pub activation_ptr: u64,
+    pub output_slots_ptr: u64,
+    pub ack_flags: [u32; 8],
+}
+
 #[repr(C)]
 struct MoeExpertEntryRust {
     global_expert_id: u32,

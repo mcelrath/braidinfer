@@ -17,7 +17,7 @@ use super::{OP_RMSNORM, OP_LINEAR_PROJ, OP_CONV1D, OP_GDN_GATE, OP_GDN_RECUR,
     OP_ATTN_PAGED, OP_ATTN_PREFILL, OP_DEINTERLEAVE, OP_KV_QUANTIZE, OP_ATTN_PAGED_Q,
     OP_MOE_GATE, OP_MOE_FFN, OP_LINEAR_PROJ_RNF4, OP_LINEAR_PROJ_PCG32, OP_RMSNORM_WX,
     OP_SILU_MUL, OP_FFN_GATE_UP_RNF4, OP_FFN_DOWN_RES_RNF4,
-    OP_SIGMOID_WEIGHTED_ADD, OP_BARRIER};
+    OP_SIGMOID_WEIGHTED_ADD, OP_BARRIER, OP_MOE_DISPATCH};
 
 fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight, ptr_slot: usize) {
     use crate::model::{LinearWeight, WeightFormat};
@@ -102,6 +102,56 @@ impl MegakernelProgram {
             prog.instructions[inst_idx].words[2] = rflag_dev;
         }
         prog.moe_barrier = Some(barrier_state);
+        Ok(prog)
+    }
+
+    /// Compile for GPU-initiated MoE dispatch. Emits OP_MOE_DISPATCH instead of OP_BARRIER.
+    /// Workers are persistent kernels that poll the work queue — no CPU in the dispatch loop.
+    pub fn compile_gpu_dispatch(model: &Model, work_queue: &crate::multi_gpu::MoeWorkQueue) -> HipResult<Self> {
+        let mut prog = Self::compile_inner(model, false, true)?;
+
+        // Replace OP_BARRIER instructions with OP_MOE_DISPATCH
+        let wq_ptr = work_queue.work_item_ptr() as u64;
+        let os_ptr = work_queue.output_slots_ptr() as u64;
+        let num_workers = work_queue.num_workers as u64;
+        let hs = work_queue.hidden_size as u64;
+        let act = &model.activations;
+        let ffn_down_stage_ptr = act.ffn_down_stage.as_write_ptr() as u64;
+
+        for &(inst_idx, layer_idx) in &prog.barrier_layer_map {
+            let inst = &mut prog.instructions[inst_idx];
+            inst.words[0] = (inst.words[0] & !0xFFFF) | (OP_MOE_DISPATCH as u64);
+            inst.words[1] = wq_ptr;
+            inst.words[2] = os_ptr;
+            inst.words[3] = ffn_down_stage_ptr; // final_output → ffn_down_stage
+            inst.words[4] = num_workers;
+            inst.words[5] = hs;
+            // seq_num (words[6]) set per-dispatch at runtime — see note below
+            inst.words[7] = layer_idx as u64;
+        }
+
+        // Pre-populate static work queue fields
+        let wq = work_queue.work_item_ptr();
+        unsafe {
+            let wq_item = &mut *(wq as *mut crate::multi_gpu::MoeWorkItemRust);
+            wq_item.hidden_size = model.config.hidden_size as u32;
+            wq_item.activation_ptr = act.normed.as_ptr() as u64;
+            wq_item.output_slots_ptr = os_ptr;
+            wq_item.num_workers = num_workers as u32;
+            // expert_intermediate_size, has_gate_proj, num_active are set per-layer
+            // by OP_MOE_GATE writing expert_ids/weights directly
+        }
+
+        // Note: seq_num in instructions is set statically per-compile. Each OP_MOE_DISPATCH
+        // gets a unique seq starting from 1. Workers check seq > last_seen.
+        let mut seq = 1u32;
+        for &(inst_idx, _) in &prog.barrier_layer_map {
+            prog.instructions[inst_idx].words[6] = seq as u64;
+            seq += 1;
+        }
+        // Store total seq count for re-dispatch on next token
+        prog.moe_dispatch_seq_count = Some(seq - 1);
+
         Ok(prog)
     }
 
@@ -318,6 +368,7 @@ impl MegakernelProgram {
             head_dim_attn: cfg.head_dim,
             moe_barrier: None,
             barrier_layer_map,
+            moe_dispatch_seq_count: None,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -650,6 +701,7 @@ impl MegakernelProgram {
             head_dim_attn: cfg.head_dim,
             moe_barrier: None,
             barrier_layer_map: Vec::new(),
+            moe_dispatch_seq_count: None,
             _not_send: std::marker::PhantomData,
         })
     }

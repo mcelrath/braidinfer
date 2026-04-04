@@ -48,6 +48,10 @@ pub struct Model {
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
     // Multi-GPU megakernel: dense layers run in megakernel; MoE layers use CPU-dispatch via OP_BARRIER
     pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
+    // GPU-initiated MoE dispatch: persistent worker kernels + host-mapped work queue
+    pub(crate) moe_work_queue: Option<crate::multi_gpu::MoeWorkQueue>,
+    // Megakernel compiled with OP_MOE_DISPATCH (replaces OP_BARRIER)
+    pub(crate) megakernel_gpu_dispatch: Option<MegakernelProgram>,
 }
 
 // ---- Model impl ----
@@ -90,11 +94,16 @@ impl Model {
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let has_mamba2 = self.config.layers.iter().any(|l| l.layer_type == crate::config::LayerType::Mamba2);
         let is_multi_gpu = self.multi_gpu.is_some();
-        // Mamba2, trace mode, and multi-GPU MoE use kernel-by-kernel path.
-        // Multi-GPU MoE: the megakernel's cooperative kernel occupies all GPU 0 SMs,
-        // requiring OP_BARRIER round-trips for each MoE layer. The barrier overhead
-        // exceeds the kernel-launch savings — kbk is ~44% faster (2.6 vs 1.8 tok/s on 122B).
-        if has_mamba2 || self.trace.is_some() || is_multi_gpu {
+        // Mamba2 and trace mode always use kernel-by-kernel path.
+        if has_mamba2 || self.trace.is_some() {
+            return self.decode_step_moe(token_id, position);
+        }
+        // Multi-GPU: use GPU-initiated dispatch if work queue available,
+        // otherwise fall back to kbk (CPU-orchestrated).
+        if is_multi_gpu {
+            if self.moe_work_queue.is_some() {
+                return self.decode_step_gpu_dispatch(token_id, position);
+            }
             return self.decode_step_moe(token_id, position);
         }
 
@@ -122,6 +131,34 @@ impl Model {
                 mk.disable_dump()?;
             }
         }
+
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
+
+        self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// GPU-initiated MoE dispatch: megakernel runs dense layers on GPU 0,
+    /// OP_MOE_DISPATCH triggers persistent workers on all GPUs, no CPU in loop.
+    fn decode_step_gpu_dispatch(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        // Lazy-init: compile megakernel with OP_MOE_DISPATCH and launch workers
+        if self.megakernel_gpu_dispatch.is_none() {
+            let wq = self.moe_work_queue.as_ref().unwrap();
+            let mk = MegakernelProgram::compile_gpu_dispatch(self, wq)
+                .map_err(ModelError::Hip)?;
+            self.megakernel_gpu_dispatch = Some(mk);
+        }
+
+        let mk = self.megakernel_gpu_dispatch.as_mut().unwrap();
+        mk.update_step(token_id, position, &self.stream)
+            .map_err(ModelError::Hip)?;
+        mk.execute(&self.stream)
+            .map_err(ModelError::Hip)?;
+
+        // No CPU dispatch loop needed — OP_MOE_DISPATCH handles everything on GPU.
+        // Megakernel execute() returns only when all instructions complete.
+        self.stream.synchronize().map_err(ModelError::Hip)?;
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;

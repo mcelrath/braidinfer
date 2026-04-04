@@ -123,6 +123,8 @@ pub struct MegakernelProgram {
     /// (instruction_idx, layer_idx) for each OP_BARRIER in the program.
     /// CPU dispatch loop uses layer_idx to look up DistributedMoeWeights.
     pub(crate) barrier_layer_map: Vec<(usize, usize)>,
+    /// Number of OP_MOE_DISPATCH instructions (for seq_num reset between tokens).
+    pub(crate) moe_dispatch_seq_count: Option<u32>,
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
 }
