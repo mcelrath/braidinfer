@@ -181,8 +181,11 @@ impl<T> MappedHostBuffer<T> {
         error::check(unsafe {
             ffi::hipHostGetDevicePointer(&mut device_ptr, host_ptr, 0)
         })?;
+        // Zero-initialize: hipHostMalloc does not guarantee zeroed memory.
+        let typed_ptr = host_ptr.cast::<T>();
+        unsafe { ptr::write_bytes(typed_ptr, 0, len); }
         Ok(MappedHostBuffer {
-            host_ptr: host_ptr.cast(),
+            host_ptr: typed_ptr,
             device_ptr: device_ptr.cast(),
             len,
             _marker: PhantomData,
@@ -197,6 +200,16 @@ impl<T> MappedHostBuffer<T> {
     /// GPU-side pointer. Pass this to kernels via instruction slots.
     pub fn device_ptr(&self) -> *const T {
         self.device_ptr as *const T
+    }
+
+    /// GPU-side pointer alias (matches DeviceBuffer::as_ptr for uniform kernel code).
+    pub fn as_ptr(&self) -> *const T {
+        self.device_ptr as *const T
+    }
+
+    /// Mutable GPU-side pointer alias (matches DeviceBuffer::as_mut_ptr).
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.device_ptr
     }
 
     pub fn len(&self) -> usize {

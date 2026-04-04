@@ -196,8 +196,8 @@ impl MoeGateKernel {
     pub fn forward(
         &self,
         scores: &DeviceBuffer<f32>,
-        expert_ids: &mut DeviceBuffer<i32>,
-        expert_weights: &mut DeviceBuffer<f32>,
+        expert_ids_ptr: *mut i32,
+        expert_weights_ptr: *mut f32,
         correction_bias_ptr: *const f32,
         num_experts: u32,
         k: u32,
@@ -208,8 +208,8 @@ impl MoeGateKernel {
         let func = self.module.get_function("moe_gate_topk")?;
 
         let mut s_ptr: *const c_void = scores.as_ptr().cast();
-        let mut id_ptr: *mut c_void = expert_ids.as_mut_ptr().cast();
-        let mut w_ptr: *mut c_void = expert_weights.as_mut_ptr().cast();
+        let mut id_ptr: *mut c_void = expert_ids_ptr.cast();
+        let mut w_ptr: *mut c_void = expert_weights_ptr.cast();
         let mut bias_ptr: *const c_void = correction_bias_ptr.cast();
         let mut ne = num_experts as i32;
         let mut kk = k as i32;

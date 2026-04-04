@@ -305,39 +305,51 @@ impl Model {
             .map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
         self.kernels.moe_gate.forward(
             &self.activations.moe_scores,
-            &mut self.activations.moe_expert_ids,
-            &mut self.activations.moe_expert_weights,
+            self.activations.moe_expert_ids.as_mut_ptr(),
+            self.activations.moe_expert_weights.as_mut_ptr(),
             bias_ptr,
             ne as u32, k as u32, gate_mode, rsf,
             &self.stream,
         )?;
 
-        // Multi-GPU path: dispatch routed experts across GPUs
+        // Multi-GPU path: dispatch routed experts across GPUs (non-megakernel path)
         let used_multi_gpu = if self.multi_gpu.is_some() && !self.distributed_moe.is_empty() {
             if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
+                // Populate normed_stage from normed (safe: no cooperative kernel running here)
+                let mut normed_host = vec![0.0f32; hs];
+                self.activations.normed.copy_to_host(&mut normed_host)?;
                 let mgpu = self.multi_gpu.as_mut().unwrap();
-                crate::moe_dispatch::dispatch_moe_layer(
+                crate::moe_dispatch::dispatch_moe_layer_sync(
                     mgpu,
                     &self.worker_kernels,
                     dist_moe,
-                    &self.activations.normed,
-                    &mut self.activations.ffn_down,
+                    &normed_host,
+                    &mut self.activations.ffn_down_stage,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_expert_weights,
                     k, hs, eis,
                     &self.stream,
                 )?;
+                // Copy ffn_down_stage result to ffn_down for subsequent kernels
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.activations.ffn_down_stage.host_ptr() as *const f32,
+                        self.activations.ffn_down.as_mut_ptr(), hs,
+                    );
+                }
                 true
             } else { false }
         } else { false };
 
         if !used_multi_gpu {
-        // Single-GPU path: read back expert_ids + weights, dispatch locally
+        // Single-GPU path: read back expert_ids + weights via host pointer (no hipMemcpy)
         self.stream.synchronize()?;
-        let mut expert_ids = vec![0i32; k];
-        let mut expert_weights = vec![0.0f32; k];
-        self.activations.moe_expert_ids.copy_to_host(&mut expert_ids)?;
-        self.activations.moe_expert_weights.copy_to_host(&mut expert_weights)?;
+        let expert_ids: Vec<i32> = unsafe {
+            std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k).to_vec()
+        };
+        let expert_weights: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k).to_vec()
+        };
 
         // 4. Zero accumulation buffer on GPU
         unsafe {

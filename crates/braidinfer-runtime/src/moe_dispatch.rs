@@ -1,10 +1,16 @@
 //! Event-based multi-GPU MoE expert dispatch.
-//! CPU reads expert_ids from GPU 0, broadcasts activation to worker GPUs,
-//! launches expert FFN in parallel, gathers results back to GPU 0.
+//! CPU reads expert_ids from MappedHostBuffer (no hipMemcpy on GPU 0), broadcasts
+//! activation to worker GPUs, launches expert FFN in parallel, gathers results back.
+//!
+//! KEY CONSTRAINT: During OP_BARRIER, the cooperative megakernel occupies ALL GPU 0 SMs.
+//! ANY hipMemcpy on GPU 0 or any GPU 0 kernel launch will deadlock.
+//! Solution: all CPU↔GPU communication uses MappedHostBuffer (GART/pinned memory).
+//! Worker GPU (GPU 1..N-1) compute is fine; only GPU 0 is off-limits.
+//! Experts are distributed only to GPUs 1..N-1 (see distribute_moe_weights_from_*).
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::Device;
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::MappedHostBuffer;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{ffi, HipResult};
 
@@ -32,31 +38,34 @@ impl WorkerKernels {
     }
 }
 
-/// Dispatch one MoE layer across multiple GPUs.
+/// Dispatch one MoE layer across worker GPUs (GPU 1..N-1).
 ///
-/// Assumes: OP_MOE_GATE has already run on GPU 0, producing expert_ids and weights
-/// in the activation buffers. This function handles the expert FFN + accumulation.
+/// Called from OP_BARRIER handler. GPU 0 cooperative megakernel is parked (spinning).
+/// NO hipMemcpy on GPU 0. NO GPU 0 kernel launches. All data via MappedHostBuffer.
+///
+/// normed_stage: CPU-readable copy of normed activation (populated by OP_D2D_COPY before barrier)
+/// ffn_down_stage: CPU writes gathered results; megakernel reads via device_ptr after resume
 pub fn dispatch_moe_layer(
     ctx: &mut MultiGpuContext,
     worker_kernels: &[WorkerKernels],
     moe: &DistributedMoeWeights,
-    normed: &DeviceBuffer<f32>,
-    ffn_down: &mut DeviceBuffer<f32>,
-    moe_expert_ids: &DeviceBuffer<i32>,
-    moe_expert_weights: &DeviceBuffer<f32>,
+    normed_stage: &MappedHostBuffer<f32>,
+    ffn_down_stage: &mut MappedHostBuffer<f32>,
+    moe_expert_ids: &MappedHostBuffer<i32>,
+    moe_expert_weights: &MappedHostBuffer<f32>,
     k: usize,
     hs: usize,
     eis: usize,
-    stream0: &Stream,
 ) -> HipResult<()> {
-    // 1. Read expert_ids + weights from GPU 0
-    stream0.synchronize()?;
-    let mut expert_ids = vec![0i32; k];
-    let mut expert_weights = vec![0.0f32; k];
-    moe_expert_ids.copy_to_host(&mut expert_ids)?;
-    moe_expert_weights.copy_to_host(&mut expert_weights)?;
-
-    // 2. Group experts by GPU
+    // 1. Read expert_ids + weights via host pointer (no hipMemcpy on GPU 0).
+    // OP_MOE_GATE wrote these to GART memory before OP_BARRIER; they're CPU-visible now.
+    let expert_ids: &[i32] = unsafe {
+        std::slice::from_raw_parts(moe_expert_ids.host_ptr() as *const i32, k)
+    };
+    let expert_weights: &[f32] = unsafe {
+        std::slice::from_raw_parts(moe_expert_weights.host_ptr() as *const f32, k)
+    };
+    // 2. Group experts by GPU (only GPUs 1..N-1 have experts)
     let num_devices = ctx.num_devices;
     let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_devices];
     for j in 0..k {
@@ -65,8 +74,13 @@ pub fn dispatch_moe_layer(
         per_gpu[gpu].push((eid, expert_weights[j]));
     }
 
-    // 3. Zero output buffers
-    for gpu in 0..num_devices {
+    // 3. Zero ffn_down_stage on CPU (no GPU 0 compute allowed during barrier)
+    unsafe {
+        std::ptr::write_bytes(ffn_down_stage.host_ptr(), 0, hs);
+    }
+
+    // 4. Zero per-worker output buffers
+    for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &ctx.workers[gpu];
         Device::set_current(worker.device)?;
@@ -77,57 +91,36 @@ pub fn dispatch_moe_layer(
             );
         }
     }
-    Device::set_current(DeviceId(0))?;
-    unsafe {
-        ffi::hipMemsetAsync(
-            ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
-            0, hs * 4, stream0.raw(),
-        );
-    }
 
-    // 4. Broadcast activation from GPU 0 to worker GPUs
+    // 5. Broadcast activation from normed_stage (GART memory, CPU has already read it)
+    // to worker GPU activation_in buffers via host-staged copy.
+    // normed_stage was populated by OP_D2D_COPY before OP_BARRIER.
+    let act_host: &[f32] = unsafe {
+        std::slice::from_raw_parts(normed_stage.host_ptr() as *const f32, hs)
+    };
     for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
-        let worker = &ctx.workers[gpu];
-        MultiGpuContext::memcpy_peer_async(
-            worker.activation_in.as_ptr() as *mut std::ffi::c_void, worker.device,
-            normed.as_ptr() as *const std::ffi::c_void, DeviceId(0),
-            hs * 4, &worker.transfer_stream,
-        )?;
-        worker.broadcast_done.record(&worker.transfer_stream)?;
+        let device = ctx.workers[gpu].device;
+        Device::set_current(device)?;
+        ctx.workers[gpu].activation_in.copy_from_host(act_host)?;
+        ctx.workers[gpu].broadcast_done.record(&ctx.workers[gpu].transfer_stream)?;
     }
 
-    // 5. Launch expert FFN on each GPU
-    for gpu in 0..num_devices {
+    // 6. Launch expert FFN on each worker GPU (GPU 1..N-1 only)
+    for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
 
         let worker = &mut ctx.workers[gpu];
         let kernels = &worker_kernels[gpu];
         let buf = &moe.expert_buffers[gpu];
 
-        if gpu > 0 {
-            MultiGpuContext::stream_wait_event(&worker.compute_stream, &worker.broadcast_done)?;
-        }
-
+        MultiGpuContext::stream_wait_event(&worker.compute_stream, &worker.broadcast_done)?;
         Device::set_current(worker.device)?;
 
-        let input_ptr: *const f32 = if gpu == 0 {
-            normed.as_ptr()
-        } else {
-            worker.activation_in.as_ptr()
-        };
+        let input_ptr: *const f32 = worker.activation_in.as_ptr();
 
-        // Weight base pointers: GPU 0 uses original packed buffer, others use per-GPU buffer
-        let gate_up_base: *const u8 = if gpu == 0 {
-            moe.gpu0_gate_up_base
-        } else {
-            buf.gate_up.as_ptr()
-        };
-        let down_base: *const u8 = if gpu == 0 {
-            moe.gpu0_down_base
-        } else {
-            buf.down.as_ptr()
-        };
+        let gate_up_base: *const u8 = buf.gate_up.as_ptr();
+        let down_base: *const u8 = buf.down.as_ptr();
 
         for &(expert_id, weight) in &per_gpu[gpu] {
             let local_slot = buf.slot_map[expert_id]
@@ -159,7 +152,7 @@ pub fn dispatch_moe_layer(
                     eis as u32, &worker.compute_stream,
                 )?;
             } else {
-                // relu²: up + relu²
+                // relu²
                 kernels.linear_proj.forward_packed_ptr(
                     worker.scratch_up.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(gate_up_offset) },
@@ -173,7 +166,6 @@ pub fn dispatch_moe_layer(
                 )?;
             }
 
-            // down_proj → scratch_gate (reuse as scratch for down output)
             kernels.linear_proj.forward_packed_ptr(
                 worker.scratch_gate.as_ptr() as *mut f32,
                 unsafe { down_base.add(down_offset) },
@@ -182,10 +174,9 @@ pub fn dispatch_moe_layer(
                 "linear_proj_pcg32_q4", &worker.compute_stream,
             )?;
 
-            // weighted accumulate: expert_out += weight * down_output
             kernels.residual_add.weighted_accumulate(
                 &mut worker.expert_out,
-                &worker.scratch_gate, // reused as down_proj output
+                &worker.scratch_gate,
                 weight,
                 hs as u32, &worker.compute_stream,
             )?;
@@ -194,45 +185,173 @@ pub fn dispatch_moe_layer(
         worker.compute_done.record(&worker.compute_stream)?;
     }
 
-    // 6. Gather: copy worker expert_out to GPU 0 and accumulate into ffn_down
-    Device::set_current(DeviceId(0))?;
-
-    // GPU 0's local results: ffn_down += expert_out[0]
-    if !per_gpu[0].is_empty() {
-        MultiGpuContext::stream_wait_event(stream0, &ctx.workers[0].compute_done)?;
-        worker_kernels[0].residual_add.weighted_accumulate(
-            ffn_down,
-            &ctx.workers[0].expert_out,
-            1.0,
-            hs as u32, stream0,
-        )?;
-    }
-
-    // Remote results: P2P copy then accumulate (sequentially through gather_stream)
+    // 7. Gather: CPU waits for each worker, then hipMemcpy worker.expert_out → host → accumulate.
+    // hipMemcpy from worker GPU to CPU is safe (only synchronizes worker GPU, not GPU 0).
+    let mut gather_buf = vec![0.0f32; hs];
     for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &ctx.workers[gpu];
 
-        MultiGpuContext::stream_wait_event(&ctx.gather_stream, &worker.compute_done)?;
+        // CPU-side wait for worker compute (hipEventSynchronize blocks CPU thread, not GPU 0)
+        worker.compute_done.synchronize()?;
 
-        // P2P copy worker's expert_out → GPU 0's workers[0].activation_in (reuse as gather buf)
-        MultiGpuContext::memcpy_peer_async(
-            ctx.workers[0].activation_in.as_ptr() as *mut std::ffi::c_void, DeviceId(0),
-            worker.expert_out.as_ptr() as *const std::ffi::c_void, worker.device,
-            hs * 4, &ctx.gather_stream,
-        )?;
+        // hipMemcpy from worker GPU to CPU (safe: does NOT sync GPU 0)
+        Device::set_current(worker.device)?;
+        unsafe {
+            let rc = ffi::hipMemcpy(
+                gather_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                worker.expert_out.as_ptr() as *const std::ffi::c_void,
+                hs * 4,
+                ffi::hipMemcpyDeviceToHost,
+            );
+            if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+        }
 
-        // Wait for copy, then accumulate on main stream
-        ctx.gather_done.record(&ctx.gather_stream)?;
-        MultiGpuContext::stream_wait_event(stream0, &ctx.gather_done)?;
-
-        worker_kernels[0].residual_add.weighted_accumulate(
-            ffn_down,
-            &ctx.workers[0].activation_in,
-            1.0,
-            hs as u32, stream0,
-        )?;
+        // CPU accumulate into ffn_down_stage (no GPU involved)
+        let out: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(ffn_down_stage.host_ptr(), hs)
+        };
+        for i in 0..hs {
+            out[i] += gather_buf[i];
+        }
     }
 
+    Device::set_current(DeviceId(0))?;
+    Ok(())
+}
+
+/// Non-megakernel multi-GPU dispatch (called from decode_step_moe / moe_ffn_forward).
+/// No cooperative kernel is running, so hipMemcpy on GPU 0 is safe.
+/// Populates ffn_down_stage; caller copies to ffn_down if needed.
+pub fn dispatch_moe_layer_sync(
+    ctx: &mut MultiGpuContext,
+    worker_kernels: &[WorkerKernels],
+    moe: &DistributedMoeWeights,
+    normed_host: &[f32],
+    ffn_down_stage: &mut MappedHostBuffer<f32>,
+    moe_expert_ids: &MappedHostBuffer<i32>,
+    moe_expert_weights: &MappedHostBuffer<f32>,
+    k: usize,
+    hs: usize,
+    eis: usize,
+    stream0: &Stream,
+) -> HipResult<()> {
+    // In non-megakernel mode, GPU 0 is idle; just call the barrier-safe version
+    // after copying normed to normed_stage manually.
+    let _ = stream0; // unused — included for call-site clarity
+    // Re-use a temporary MappedHostBuffer or just write directly
+    // We can't easily reuse normed_stage here without it, so just inline the logic.
+    // Actually: just use same logic, normed_host is already available.
+
+    let expert_ids: &[i32] = unsafe {
+        std::slice::from_raw_parts(moe_expert_ids.host_ptr() as *const i32, k)
+    };
+    let expert_weights: &[f32] = unsafe {
+        std::slice::from_raw_parts(moe_expert_weights.host_ptr() as *const f32, k)
+    };
+
+    let num_devices = ctx.num_devices;
+    let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_devices];
+    for j in 0..k {
+        let eid = expert_ids[j] as usize;
+        let gpu = moe.expert_device[eid];
+        per_gpu[gpu].push((eid, expert_weights[j]));
+    }
+
+    unsafe { std::ptr::write_bytes(ffn_down_stage.host_ptr(), 0, hs); }
+
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        let worker = &ctx.workers[gpu];
+        Device::set_current(worker.device)?;
+        unsafe {
+            ffi::hipMemsetAsync(
+                worker.expert_out.as_ptr() as *mut std::ffi::c_void,
+                0, hs * 4, worker.compute_stream.raw(),
+            );
+        }
+        ctx.workers[gpu].activation_in.copy_from_host(normed_host)?;
+        ctx.workers[gpu].broadcast_done.record(&ctx.workers[gpu].transfer_stream)?;
+    }
+
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        let worker = &mut ctx.workers[gpu];
+        let kernels = &worker_kernels[gpu];
+        let buf = &moe.expert_buffers[gpu];
+        MultiGpuContext::stream_wait_event(&worker.compute_stream, &worker.broadcast_done)?;
+        Device::set_current(worker.device)?;
+        let input_ptr = worker.activation_in.as_ptr();
+        let gate_up_base = buf.gate_up.as_ptr();
+        let down_base = buf.down.as_ptr();
+
+        for &(expert_id, weight) in &per_gpu[gpu] {
+            let local_slot = buf.slot_map[expert_id].expect("expert not on expected GPU");
+            let gate_up_offset = local_slot * moe.gate_up_expert_stride;
+            let down_offset = local_slot * moe.down_expert_stride;
+
+            if moe.has_gate_proj {
+                let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
+                kernels.linear_proj.forward_packed_ptr(
+                    worker.scratch_gate.as_ptr() as *mut f32,
+                    unsafe { gate_up_base.add(gate_up_offset) },
+                    input_ptr, eis as u32, hs as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                )?;
+                kernels.linear_proj.forward_packed_ptr(
+                    worker.scratch_up.as_ptr() as *mut f32,
+                    unsafe { gate_up_base.add(up_byte_offset) },
+                    input_ptr, eis as u32, hs as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                )?;
+                kernels.silu_mul.forward(
+                    &mut worker.scratch_act, &worker.scratch_gate, &worker.scratch_up,
+                    eis as u32, &worker.compute_stream,
+                )?;
+            } else {
+                kernels.linear_proj.forward_packed_ptr(
+                    worker.scratch_up.as_ptr() as *mut f32,
+                    unsafe { gate_up_base.add(gate_up_offset) },
+                    input_ptr, eis as u32, hs as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                )?;
+                kernels.silu_mul.relu_squared(
+                    &mut worker.scratch_act, &worker.scratch_up,
+                    eis as u32, &worker.compute_stream,
+                )?;
+            }
+
+            kernels.linear_proj.forward_packed_ptr(
+                worker.scratch_gate.as_ptr() as *mut f32,
+                unsafe { down_base.add(down_offset) },
+                worker.scratch_act.as_ptr(),
+                hs as u32, eis as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+            )?;
+            kernels.residual_add.weighted_accumulate(
+                &mut worker.expert_out, &worker.scratch_gate,
+                weight, hs as u32, &worker.compute_stream,
+            )?;
+        }
+        worker.compute_done.record(&worker.compute_stream)?;
+    }
+
+    let mut gather_buf = vec![0.0f32; hs];
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        let worker = &ctx.workers[gpu];
+        worker.compute_done.synchronize()?;
+        Device::set_current(worker.device)?;
+        unsafe {
+            let rc = ffi::hipMemcpy(
+                gather_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                worker.expert_out.as_ptr() as *const std::ffi::c_void,
+                hs * 4, ffi::hipMemcpyDeviceToHost,
+            );
+            if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+        }
+        let out: &mut [f32] = unsafe {
+            std::slice::from_raw_parts_mut(ffn_down_stage.host_ptr(), hs)
+        };
+        for i in 0..hs { out[i] += gather_buf[i]; }
+    }
+
+    Device::set_current(DeviceId(0))?;
     Ok(())
 }

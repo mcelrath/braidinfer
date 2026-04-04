@@ -157,7 +157,9 @@ impl Model {
         loop {
             let layer_code = unsafe { std::ptr::read_volatile(barrier_ptr) };
             if layer_code == 0 {
-                if self.stream.is_idle() { break; }
+                if self.stream.is_idle() {
+                    break;
+                }
                 std::hint::spin_loop();
                 continue;
             }
@@ -176,18 +178,21 @@ impl Model {
                     mgpu,
                     &self.worker_kernels,
                     dist_moe,
-                    &self.activations.normed,
-                    &mut self.activations.ffn_down,
+                    &self.activations.normed_stage,
+                    &mut self.activations.ffn_down_stage,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_expert_weights,
                     k,
                     self.config.hidden_size,
                     eis,
-                    &self.stream,
                 ).map_err(ModelError::Hip)?;
             }
 
-            // Reset barrier flag, signal resume
+            // Reset barrier flag, signal resume.
+            // sfence: flush all CPU WC (write-combining) buffers for ffn_down_stage to GART
+            // before GPU reads them in OP_RESIDUAL_ADD after resume.
+            #[cfg(target_arch = "x86_64")]
+            unsafe { std::arch::x86_64::_mm_sfence(); }
             unsafe { std::ptr::write_volatile(barrier_ptr, 0u32); }
             unsafe { std::ptr::write_volatile(resume_ptr, 1u32); }
         }
@@ -505,9 +510,14 @@ impl Model {
         let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
         let has_quant = self.config.weight_quant != WeightQuantMode::Bf16;
         if has_moe || has_quant {
+            let is_multi_gpu = self.multi_gpu.is_some();
             let mut logits = vec![];
             for (i, &tok) in tokens.iter().enumerate() {
-                logits = self.decode_step_moe(tok, i as u32)?;
+                logits = if is_multi_gpu {
+                    self.decode_step_megakernel_moe(tok, i as u32)?
+                } else {
+                    self.decode_step_moe(tok, i as u32)?
+                };
             }
             return Ok(logits);
         }

@@ -1823,9 +1823,9 @@ impl MegakernelProgram {
         let hs = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
 
-        let (k, gate_type, ne) = match &cfg.layers[layer_idx].ffn_type {
-            FfnType::MoE { num_active, gate_type, num_experts, .. } =>
-                (*num_active, gate_type.clone(), *num_experts),
+        let (k, gate_type, ne, eis) = match &cfg.layers[layer_idx].ffn_type {
+            FfnType::MoE { num_active, gate_type, num_experts, expert_intermediate_size, .. } =>
+                (*num_active, gate_type.clone(), *num_experts, *expert_intermediate_size),
             _ => unreachable!(),
         };
 
@@ -1862,7 +1862,16 @@ impl MegakernelProgram {
         inst.set_int(5, hs as i32);
         instructions.push(inst);
 
-        // OP_MOE_GATE: top-k selection
+        // D2D_COPY: normed → normed_stage (GART/pinned memory, CPU-readable without hipMemcpy)
+        // Must happen before OP_BARRIER so CPU can read activation for worker broadcast.
+        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+        inst.set_output_ptr(1, act.normed_stage.as_ptr() as *const f32);
+        inst.set_ptr(2, act.normed.as_ptr());
+        inst.set_int(3, hs as i32);
+        inst.set_no_sync();
+        instructions.push(inst);
+
+        // OP_MOE_GATE: top-k selection; writes to moe_expert_ids/weights (GART memory, CPU-readable)
         let (gate_mode, rsf) = match &gate_type {
             GateType::Softmax => (0u32, 1.0f32),
             GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
@@ -1881,7 +1890,7 @@ impl MegakernelProgram {
         inst.set_ptr(8, bias_ptr);
         instructions.push(inst);
 
-        // OP_BARRIER: park megakernel, CPU dispatches expert FFN into act.ffn_down, then resumes.
+        // OP_BARRIER: park megakernel, CPU dispatches expert FFN into act.ffn_down_stage, then resumes.
         // barrier_flag_ptr and resume_flag_ptr are null here; patched in execute_multi_gpu().
         let barrier_inst_idx = instructions.len();
         let mut inst = Instruction::new(OP_BARRIER, 1);  // grid_x=1: only block 0 runs op_barrier
@@ -1890,12 +1899,95 @@ impl MegakernelProgram {
         inst.set_int(3, layer_idx as i32);
         instructions.push(inst);
 
-        // After barrier: residual add (ffn_down written by CPU dispatch + optional shared expert)
-        // ffn_down is zeroed by dispatch_moe_layer before accumulating expert outputs.
+        // After barrier: compute shared expert (if present) and add to ffn_down_stage.
+        // GPU 0 has all SMs available again after resume.
+        if let Some(ref se) = moe.shared_expert {
+            let se_is = match &cfg.layers[layer_idx].ffn_type {
+                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } =>
+                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size },
+                _ => eis,
+            };
+
+            if moe.has_gate_proj {
+                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
+                emit_linear_proj(&mut inst, &se.gate_proj, 2);
+                inst.set_output_ptr(1, act.moe_expert_gate.as_ptr());
+                inst.set_ptr(3, act.normed.as_ptr());
+                inst.set_int(4, se_is as i32);
+                inst.set_int(5, hs as i32);
+                inst.set_no_sync();
+                instructions.push(inst);
+
+                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
+                emit_linear_proj(&mut inst, &se.up_proj, 2);
+                inst.set_output_ptr(1, act.moe_expert_up.as_ptr());
+                inst.set_ptr(3, act.normed.as_ptr());
+                inst.set_int(4, se_is as i32);
+                inst.set_int(5, hs as i32);
+                instructions.push(inst);
+
+                let mut inst = Instruction::new(OP_SILU_MUL, div_ceil(se_is as u32, 256));
+                inst.set_output_ptr(1, act.moe_expert_act.as_ptr());
+                inst.set_ptr(2, act.moe_expert_gate.as_ptr());
+                inst.set_ptr(3, act.moe_expert_up.as_ptr());
+                inst.set_int(4, se_is as i32);
+                instructions.push(inst);
+            } else {
+                // relu² shared expert — not yet supported in megakernel multi-GPU path.
+                // Only affects models without gate_proj (e.g. Nemotron), which use Mamba2
+                // and are handled by a different path. Skip down_proj for now.
+                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
+                emit_linear_proj(&mut inst, &se.up_proj, 2);
+                inst.set_output_ptr(1, act.moe_expert_up.as_ptr());
+                inst.set_ptr(3, act.normed.as_ptr());
+                inst.set_int(4, se_is as i32);
+                inst.set_int(5, hs as i32);
+                instructions.push(inst);
+                // TODO(braidinfer-xsz): add OP_RELU_SQ opcode; for now skip shared expert down_proj on relu² models
+                return barrier_inst_idx;
+            }
+
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+            emit_linear_proj(&mut inst, &se.down_proj, 2);
+            inst.set_output_ptr(1, act.moe_expert_out.as_ptr());
+            inst.set_ptr(3, act.moe_expert_act.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_int(5, se_is as i32);
+            instructions.push(inst);
+
+            // Add shared expert output into ffn_down_stage
+            if let Some(ref gate_buf) = moe.shared_expert_gate {
+                let mut inst = Instruction::new(OP_LINEAR_PROJ, 1);
+                inst.set_output_ptr(1, act.moe_scores.as_ptr());
+                inst.set_ptr(2, gate_buf.as_ptr());
+                inst.set_ptr(3, act.normed.as_ptr());
+                inst.set_int(4, 1i32);
+                inst.set_int(5, hs as i32);
+                instructions.push(inst);
+
+                let mut inst = Instruction::new(OP_SIGMOID_WEIGHTED_ADD, div_ceil(hs as u32, 256));
+                inst.set_output_ptr(1, act.ffn_down_stage.as_ptr() as *const f32);
+                inst.set_ptr(2, act.moe_scores.as_ptr());
+                inst.set_ptr(3, act.moe_expert_out.as_ptr());
+                inst.set_int(4, hs as i32);
+                instructions.push(inst);
+            } else {
+                // No gate: ffn_down_stage += shared_expert_out
+                let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+                inst.set_output_ptr(1, act.ffn_down_stage.as_ptr() as *const f32);
+                inst.set_ptr(2, act.ffn_down_stage.as_ptr() as *const f32);
+                inst.set_ptr(3, act.moe_expert_out.as_ptr());
+                inst.set_int(4, hs as i32);
+                instructions.push(inst);
+            }
+        }
+
+        // Final residual: hidden = residual + ffn_down_stage
+        // ffn_down_stage contains: gathered worker expert outputs (CPU-written) + shared expert
         let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
         inst.set_output_ptr(1, act.hidden.as_ptr());
         inst.set_ptr(2, act.residual.as_ptr());
-        inst.set_ptr(3, act.ffn_down.as_ptr());
+        inst.set_ptr(3, act.ffn_down_stage.as_ptr() as *const f32);
         inst.set_int(4, hs as i32);
         instructions.push(inst);
 

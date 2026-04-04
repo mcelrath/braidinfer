@@ -2,6 +2,7 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::Device;
+use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{ffi, HipResult};
 use braidinfer_hip::memory::DeviceBuffer;
@@ -50,6 +51,8 @@ pub struct GpuWorker {
     pub scratch_gate: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
     pub scratch_up: DeviceBuffer<f32>,      // [max_expert_intermediate_size]
     pub scratch_act: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
+    // Compute-path P2P copy kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe)
+    pub peer_copy_module: Module,
 }
 
 /// Multi-GPU context for expert parallel dispatch.
@@ -80,8 +83,8 @@ impl MultiGpuContext {
                 }
                 if can_access != 0 {
                     let rc = unsafe { ffi::hipDeviceEnablePeerAccess(j as i32, 0) };
-                    // Ignore "already enabled" errors
-                    if rc != 0 && rc != ffi::hipErrorInvalidDevice {
+                    // Ignore "already enabled" and "invalid device" (P2P not supported on this topology)
+                    if rc != 0 && rc != ffi::hipErrorInvalidDevice && rc != ffi::hipErrorPeerAccessAlreadyEnabled {
                         eprintln!("Warning: hipDeviceEnablePeerAccess({i}→{j}) failed: rc={rc}");
                     }
                 } else {
@@ -107,6 +110,7 @@ impl MultiGpuContext {
                 scratch_gate: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
                 scratch_up: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
                 scratch_act: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
+                peer_copy_module: Module::load(device, &crate::kernel::kernel_dir().join("peer_copy.hsaco"))?,
             });
         }
 
@@ -125,19 +129,22 @@ impl MultiGpuContext {
         }))
     }
 
-    /// Async P2P copy: src buffer on src_device → dst buffer on dst_device.
-    pub fn memcpy_peer_async(
-        dst: *mut std::ffi::c_void, dst_device: DeviceId,
-        src: *const std::ffi::c_void, src_device: DeviceId,
-        size: usize, stream: &Stream,
+    /// Async P2P copy using compute kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe).
+    /// Launched on `stream` from the source device. `dst` must be peer-accessible from src_device.
+    pub fn peer_copy_async(
+        dst: *mut u8, src: *const u8,
+        size: usize, peer_copy_module: &Module, stream: &Stream,
     ) -> HipResult<()> {
-        braidinfer_hip::error::check(unsafe {
-            ffi::hipMemcpyPeerAsync(
-                dst, dst_device.0 as i32,
-                src, src_device.0 as i32,
-                size, stream.raw(),
-            )
-        })
+        let func = peer_copy_module.get_function("peer_copy_kernel")?;
+        let threads = 256usize;
+        let blocks = (size + threads - 1) / threads;
+        let n = size as u64;
+        let mut args: [*mut std::ffi::c_void; 3] = [
+            &dst as *const _ as *mut std::ffi::c_void,
+            &src as *const _ as *mut std::ffi::c_void,
+            &n   as *const _ as *mut std::ffi::c_void,
+        ];
+        func.launch((blocks as u32, 1, 1), (threads as u32, 1, 1), 0, stream, &mut args)
     }
 
     /// Make a stream wait for an event (cross-stream synchronization).

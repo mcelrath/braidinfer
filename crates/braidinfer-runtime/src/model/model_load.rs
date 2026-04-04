@@ -64,21 +64,25 @@ impl Model {
 
         // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
         // Costs ~300ms upfront to fault in pages, but saves ~500ms on weight copies.
+        // Skip when bqnt is present: linear weights come from bqnt, not safetensors,
+        // so pinning 200+GB of safetensors shards would wastefully fault in pages.
         // Some models have mmap regions that fail hipHostRegister (non-page-aligned etc.);
         // track which succeeded so we only unregister those.
-        let shard_ptrs: Vec<(*mut std::ffi::c_void, usize)> = st.shard_mmaps()
-            .map(|m| (m.as_ptr() as *mut std::ffi::c_void, m.len()))
-            .collect();
         let mut pinned: Vec<*mut std::ffi::c_void> = Vec::new();
-        for &(ptr, len) in &shard_ptrs {
-            let rc = unsafe { ffi::hipHostRegister(ptr, len, 0) };
-            if rc == 0 {
-                pinned.push(ptr);
+        if bqnt.is_none() {
+            let shard_ptrs: Vec<(*mut std::ffi::c_void, usize)> = st.shard_mmaps()
+                .map(|m| (m.as_ptr() as *mut std::ffi::c_void, m.len()))
+                .collect();
+            for &(ptr, len) in &shard_ptrs {
+                let rc = unsafe { ffi::hipHostRegister(ptr, len, 0) };
+                if rc == 0 {
+                    pinned.push(ptr);
+                }
             }
-        }
-        if pinned.len() < shard_ptrs.len() {
-            eprintln!("Warning: {}/{} safetensor shards failed hipHostRegister (slower DMA fallback)",
-                shard_ptrs.len() - pinned.len(), shard_ptrs.len());
+            if pinned.len() < shard_ptrs.len() {
+                eprintln!("Warning: {}/{} safetensor shards failed hipHostRegister (slower DMA fallback)",
+                    shard_ptrs.len() - pinned.len(), shard_ptrs.len());
+            }
         }
 
         // Discover tensor name prefix by finding "layers.0." in tensor names.
@@ -449,12 +453,16 @@ impl Model {
             moe_scores: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
                 FfnType::MoE { num_experts, .. } => Some(*num_experts), _ => None
             }).max().unwrap_or(1))?,
-            moe_expert_ids: DeviceBuffer::<i32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
-                FfnType::MoE { num_active, .. } => Some(*num_active), _ => None
-            }).max().unwrap_or(1))?,
-            moe_expert_weights: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
-                FfnType::MoE { num_active, .. } => Some(*num_active), _ => None
-            }).max().unwrap_or(1))?,
+            normed_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(hs)?,
+            ffn_down_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(hs)?,
+            moe_expert_ids: braidinfer_hip::memory::MappedHostBuffer::<i32>::alloc(
+                config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { num_active, .. } => Some(*num_active), _ => None
+                }).max().unwrap_or(1))?,
+            moe_expert_weights: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(
+                config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { num_active, .. } => Some(*num_active), _ => None
+                }).max().unwrap_or(1))?,
             moe_expert_gate: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
                 FfnType::MoE { expert_intermediate_size, shared_intermediate_size, .. } =>
                     Some((*expert_intermediate_size).max(*shared_intermediate_size)), _ => None

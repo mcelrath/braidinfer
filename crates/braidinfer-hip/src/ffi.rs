@@ -15,7 +15,8 @@ pub const hipSuccess: hipError_t = 0;
 pub const hipErrorInvalidValue: hipError_t = 1;
 pub const hipErrorOutOfMemory: hipError_t = 2;
 pub const hipErrorNotInitialized: hipError_t = 3;
-pub const hipErrorInvalidDevice: hipError_t = 100;
+pub const hipErrorInvalidDevice: hipError_t = 101;
+pub const hipErrorPeerAccessAlreadyEnabled: hipError_t = 704;
 
 pub const hipMemcpyHostToDevice: c_uint = 1;
 pub const hipMemcpyDeviceToHost: c_uint = 2;

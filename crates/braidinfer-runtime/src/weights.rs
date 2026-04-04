@@ -2,7 +2,7 @@
 //! Extracted from model.rs for maintainability.
 
 use braidinfer_core::types::DeviceId;
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{ffi, HipResult};
 use braidinfer_core::safetensors::SafeTensorSet;
@@ -184,10 +184,14 @@ pub struct ActivationBuffers {
     pub gdn_conv_out_q: DeviceBuffer<f32>, // [nh*kd]
     pub gdn_conv_out_k: DeviceBuffer<f32>, // [nh*kd]
     pub gdn_conv_out_v: DeviceBuffer<f32>, // [nh*vd]
+    // Multi-GPU barrier staging: written by megakernel before OP_BARRIER, read by CPU dispatch.
+    // MappedHostBuffer = GPU-writable (GART/uncached) + CPU-readable without hipMemcpy.
+    pub normed_stage: MappedHostBuffer<f32>,     // [hidden_size] — copy of normed for CPU broadcast
+    pub ffn_down_stage: MappedHostBuffer<f32>,   // [hidden_size] — CPU writes gathered expert output
     // MoE scratch buffers (pre-allocated to avoid hipMalloc in hot path)
     pub moe_scores: DeviceBuffer<f32>,        // [max_num_experts]
-    pub moe_expert_ids: DeviceBuffer<i32>,    // [max_k] — GPU-side top-k output
-    pub moe_expert_weights: DeviceBuffer<f32>, // [max_k] — GPU-side top-k weights
+    pub moe_expert_ids: MappedHostBuffer<i32>,    // [max_k] — GPU writes, CPU reads via host_ptr
+    pub moe_expert_weights: MappedHostBuffer<f32>, // [max_k] — GPU writes, CPU reads via host_ptr
     pub moe_expert_gate: DeviceBuffer<f32>,   // [max_expert_intermediate_size]
     pub moe_expert_up: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
     pub moe_expert_act: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
@@ -887,11 +891,14 @@ pub fn distribute_moe_weights_from_ref(
     let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
     let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
 
-    // Count experts per GPU
+    // Count experts per GPU.
+    // In multi-GPU mode (num_devices > 1), GPU 0 runs the cooperative megakernel and has
+    // all SMs occupied during OP_BARRIER. Assign experts only to GPUs 1..N-1.
+    let worker_count = if num_devices > 1 { num_devices - 1 } else { 1 };
     let mut expert_device = vec![0usize; ne];
     let mut counts = vec![0usize; num_devices];
     for e in 0..ne {
-        let gpu = e % num_devices;
+        let gpu = if num_devices > 1 { 1 + (e % worker_count) } else { 0 };
         expert_device[e] = gpu;
         counts[gpu] += 1;
     }
@@ -1038,11 +1045,13 @@ pub fn distribute_moe_weights_from_bqnt(
     let groups_per_row = (hs + 31) / 32;
     let gate_up_row_stride = groups_per_row * 20;
 
-    // Round-robin assignment
+    // Round-robin assignment across worker GPUs (GPU 1..N-1 only in multi-GPU mode).
+    // GPU 0 runs the cooperative megakernel during OP_BARRIER — no experts there.
+    let worker_count = if num_devices > 1 { num_devices - 1 } else { 1 };
     let mut expert_device = vec![0usize; ne];
     let mut counts = vec![0usize; num_devices];
     for e in 0..ne {
-        let gpu = e % num_devices;
+        let gpu = if num_devices > 1 { 1 + (e % worker_count) } else { 0 };
         expert_device[e] = gpu;
         counts[gpu] += 1;
     }
@@ -1141,7 +1150,7 @@ pub fn distribute_moe_weights_from_bqnt(
     }
 
     Device::set_current(DeviceId(0))?;
-    eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per GPU)", ne / num_devices);
+    eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per worker GPU, {} worker GPUs)", ne / worker_count, worker_count);
 
     let gpu0_gu = expert_buffers[0].gate_up.as_ptr();
     let gpu0_d = expert_buffers[0].down.as_ptr();

@@ -204,6 +204,15 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             continue;
         }
 
+        // OP_BARRIER: block 0 thread 0 signals CPU and spins; all other blocks wait at grid.sync().
+        // Must be outside the virtual block loop so blocks 1..N-1 can reach grid.sync() immediately
+        // while block 0 spins. After CPU resumes block 0, block 0 also calls grid.sync() to reunite.
+        if (opcode == OP_BARRIER) {
+            op_barrier(inst, blockIdx.x);
+            grid.sync();
+            continue;
+        }
+
         // Virtual block loop: each physical block handles multiple virtual blocks
         for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
             switch (opcode) {
@@ -236,7 +245,6 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_FFN_GATE_UP_RNF4:  op_ffn_gate_up_rnf4(inst, vb); break;
                 case OP_FFN_DOWN_RES_RNF4: op_ffn_down_res_rnf4(inst, vb); break;
                 case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
-                case OP_BARRIER:     op_barrier(inst, vb); break;
                 default: break;
             }
         }

@@ -30,24 +30,39 @@ fn main() {
 
     let raw_mode = std::env::var("RAW").is_ok();
 
-    let model_path = std::env::var("MODEL").ok()
-        .or_else(|| {
+    fn resolve_hf_dir(bqnt_path: &str) -> Option<String> {
+        let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(std::path::Path::new(bqnt_path)).ok()?;
+        let model_name = bqnt.model_name()?;
+        let hf_name = model_name.replace('/', "--");
+        let cache_dir = dirs::home_dir()?
+            .join(".cache/huggingface/hub")
+            .join(format!("models--{hf_name}"))
+            .join("snapshots");
+        std::fs::read_dir(&cache_dir).ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path().to_string_lossy().to_string())
+    }
+
+    // If MODEL ends with .bqnt, use it as BQNT_PATH and resolve HF dir for tokenizer
+    let (model_path, bqnt_override) = match std::env::var("MODEL").ok() {
+        Some(ref p) if p.ends_with(".bqnt") => {
+            let hf_dir = resolve_hf_dir(p).unwrap_or_else(|| {
+                eprintln!("Could not resolve HF cache dir for {p}");
+                std::process::exit(1);
+            });
+            (hf_dir, Some(p.clone()))
+        }
+        Some(p) => (p, None),
+        None => {
             // Auto-resolve model dir from BQNT_PATH metadata
-            std::env::var("BQNT_PATH").ok().and_then(|bqnt_path| {
-                let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(std::path::Path::new(&bqnt_path)).ok()?;
-                let model_name = bqnt.model_name()?;
-                let hf_name = model_name.replace('/', "--");
-                let cache_dir = dirs::home_dir()?
-                    .join(".cache/huggingface/hub")
-                    .join(format!("models--{hf_name}"))
-                    .join("snapshots");
-                std::fs::read_dir(&cache_dir).ok()?
-                    .filter_map(|e| e.ok())
-                    .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                    .map(|e| e.path().to_string_lossy().to_string())
-            })
-        })
-        .unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+            let from_bqnt = std::env::var("BQNT_PATH").ok().and_then(|p| resolve_hf_dir(&p));
+            (from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()), None)
+        }
+    };
+    if let Some(ref bqnt_path) = bqnt_override {
+        unsafe { std::env::set_var("BQNT_PATH", bqnt_path); }
+    }
     let model_dir = Path::new(&model_path);
     if !model_dir.exists() {
         eprintln!("Model not found at {}", model_path);
