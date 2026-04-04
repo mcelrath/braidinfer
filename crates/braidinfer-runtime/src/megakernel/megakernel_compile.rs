@@ -38,20 +38,8 @@ fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight,
     }
 }
 
-/// Returns true if the weight format supports batched OP_LINEAR_PROJ (slot 6 = n).
-/// Only bf16 OP_LINEAR_PROJ supports batching; PCG32 and RNF4 variants do not.
-fn weight_supports_batch(weight: &crate::model::LinearWeight) -> bool {
-    use crate::model::{LinearWeight, WeightFormat};
-    match weight {
-        LinearWeight::Bf16(_) => true,
-        LinearWeight::Packed(pw) => pw.format == WeightFormat::Bf16,
-    }
-}
-
-/// Emit a batched linear projection: for bf16 weights uses a single batched instruction,
-/// for quantized weights (PCG32/RNF4) loops over tokens since those kernels lack batch support.
-/// `output` and `input` are base pointers to [N × out_dim] and [N × in_dim] buffers.
-/// `no_sync`: if true, set_no_sync on emitted instructions (except the last in a loop).
+/// Emit a batched linear projection. For bf16, uses single batched instruction.
+/// For quantized (PCG32/RNF4), emits per-token loop (kernel batching TODO: braidinfer-xxy).
 fn emit_batched_linear_proj(
     weight: &crate::model::LinearWeight,
     output: *const f32,
@@ -62,7 +50,9 @@ fn emit_batched_linear_proj(
     no_sync: bool,
     instructions: &mut Vec<Instruction>,
 ) {
-    if weight_supports_batch(weight) {
+    use crate::model::LinearWeight;
+    let supports_batch = matches!(weight, LinearWeight::Bf16(_));
+    if supports_batch {
         let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
         inst.set_output_ptr(1, output);
         emit_linear_proj(&mut inst, weight, 2);
@@ -82,7 +72,6 @@ fn emit_batched_linear_proj(
             inst.set_ptr(3, in_t);
             inst.set_int(4, out_dim as i32);
             inst.set_int(5, in_dim as i32);
-            // Last token in loop: sync if caller didn't ask for no_sync
             if no_sync || t + 1 < n { inst.set_no_sync(); }
             instructions.push(inst);
         }

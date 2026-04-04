@@ -167,11 +167,13 @@ __device__ void op_silu_mul(const u64* inst, u32 vblock) {
 // Each thread handles in_dim/512 pairs (2 elements each). No shared memory for input
 // (read from global — L2 cached after first row in this block).
 __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
+    float* output_base = inst_fptr(inst, 1);
     const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
-    const float* input = inst_fptr(inst, 3);
+    const float* input_base = inst_fptr(inst, 3);
     int out_dim = inst_int(inst, 4);
     int in_dim = inst_int(inst, 5);
+    int batch = inst_int(inst, 6);
+    if (batch <= 1) batch = 1;
 
     int row = vblock;
     if (row >= out_dim) return;
@@ -183,44 +185,75 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
     const int num_groups = (in_dim + group_size - 1) / group_size;
     const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
     const int num_pairs = in_dim / 2;
-
-    float acc = 0.0f;
-    for (int pair = tid; pair < num_pairs; pair += block_size) {
-        int elem = pair * 2;
-        int g = elem / group_size;
-        int local_pair = (elem % group_size) / 2;
-
-        const unsigned char* gp = row_data + g * group_bytes;
-        float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
-        float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
-
-        unsigned char b1 = gp[local_pair];
-        unsigned char b2 = gp[66 + local_pair];
-
-        float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
-        float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
-
-        acc += v0 * input[elem] + v1 * input[elem + 1];
-    }
-
-    // Warp-level reduction
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down(acc, offset);
-    }
-
-    // Cross-warp reduction via shared memory
     extern __shared__ float shared[];
-    if ((tid & 31) == 0) {
-        shared[tid >> 5] = acc;
-    }
-    __syncthreads();
 
-    if (tid < 8) {
-        acc = shared[tid];
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            acc += __shfl_down(acc, offset);
+    if (batch == 1) {
+        // Single-token fast path
+        float acc = 0.0f;
+        for (int pair = tid; pair < num_pairs; pair += block_size) {
+            int elem = pair * 2;
+            int g = elem / group_size;
+            int local_pair = (elem % group_size) / 2;
+            const unsigned char* gp = row_data + g * group_bytes;
+            float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+            float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+            unsigned char b1 = gp[local_pair];
+            unsigned char b2 = gp[66 + local_pair];
+            float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+            float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+            acc += v0 * input_base[elem] + v1 * input_base[elem + 1];
         }
-        if (tid == 0) output[row] = acc;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if ((tid & 31) == 0) shared[tid >> 5] = acc;
+        __syncthreads();
+        if (tid < 8) {
+            acc = shared[tid];
+            for (int offset = 4; offset > 0; offset >>= 1)
+                acc += __shfl_down(acc, offset);
+            if (tid == 0) output_base[row] = acc;
+        }
+        return;
+    }
+
+    // Batched path: tile over batch, dequant weight pairs once per tile
+    for (int b0 = 0; b0 < batch; b0 += B_TILE) {
+        int tile_end = (b0 + B_TILE < batch) ? b0 + B_TILE : batch;
+        int tile_size = tile_end - b0;
+
+        float acc[B_TILE];
+        #pragma unroll
+        for (int t = 0; t < B_TILE; t++) acc[t] = 0.0f;
+
+        for (int pair = tid; pair < num_pairs; pair += block_size) {
+            int elem = pair * 2;
+            int g = elem / group_size;
+            int local_pair = (elem % group_size) / 2;
+            const unsigned char* gp = row_data + g * group_bytes;
+            float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+            float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+            unsigned char b1 = gp[local_pair];
+            unsigned char b2 = gp[66 + local_pair];
+            float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+            float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+
+            for (int t = 0; t < tile_size; t++) {
+                const float* inp = input_base + (long long)(b0 + t) * in_dim;
+                acc[t] += v0 * inp[elem] + v1 * inp[elem + 1];
+            }
+        }
+
+        // Reduce via shared memory (same pattern as bf16 batched path)
+        for (int t = 0; t < tile_size; t++) {
+            shared[tid] = acc[t];
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared[tid] += shared[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
+            __syncthreads();
+        }
     }
 }
 
@@ -228,11 +261,13 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
 // args: [1]=output, [2]=weight (packed pcg32), [3]=input, [4]=out_dim, [5]=in_dim
 // Weight layout per row: groups of 32 elements, each 20 bytes.
 __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
+    float* output_base = inst_fptr(inst, 1);
     const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
-    const float* input = inst_fptr(inst, 3);
+    const float* input_base = inst_fptr(inst, 3);
     int out_dim = inst_int(inst, 4);
     int in_dim = inst_int(inst, 5);
+    int batch = inst_int(inst, 6);
+    if (batch <= 1) batch = 1;
 
     int row = vblock;
     if (row >= out_dim) return;
@@ -243,37 +278,63 @@ __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
     const int group_bytes = 20;
     const int num_groups = (in_dim + group_size - 1) / group_size;
     const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
-
-    float acc = 0.0f;
-    // Each thread processes whole groups (20 bytes = 1 cache line, sequential access)
-    for (int g = tid; g < num_groups; g += stride) {
-        const unsigned char* gp = row_data + g * group_bytes;
-        float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
-        float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
-
-        int base = g * group_size;
-        int count = min(group_size, in_dim - base);
-        for (int i = 0; i < count; i += 2) {
-            unsigned char byte = gp[i / 2];
-            float v0 = (float)(byte & 0xF) * sc + mn;
-            float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
-            acc += v0 * input[base + i] + v1 * input[base + i + 1];
-        }
-    }
-
-    // Wave32 reduction + cross-wave
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down(acc, offset);
-    }
     extern __shared__ float shared[];
-    if ((tid & 31) == 0) shared[tid >> 5] = acc;
-    __syncthreads();
-    if (tid < 8) {
-        acc = shared[tid];
-        for (int offset = 4; offset > 0; offset >>= 1) {
-            acc += __shfl_down(acc, offset);
+
+    if (batch == 1) {
+        // Single-token fast path
+        float acc = 0.0f;
+        for (int g = tid; g < num_groups; g += stride) {
+            const unsigned char* gp = row_data + g * group_bytes;
+            float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+            float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+            int base = g * group_size;
+            int count = min(group_size, in_dim - base);
+            for (int i = 0; i < count; i += 2) {
+                unsigned char byte = gp[i / 2];
+                float v0 = (float)(byte & 0xF) * sc + mn;
+                float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                acc += v0 * input_base[base + i] + v1 * input_base[base + i + 1];
+            }
         }
-        if (tid == 0) output[row] = acc;
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if ((tid & 31) == 0) shared[tid >> 5] = acc;
+        __syncthreads();
+        if (tid < 8) {
+            acc = shared[tid];
+            for (int offset = 4; offset > 0; offset >>= 1)
+                acc += __shfl_down(acc, offset);
+            if (tid == 0) output_base[row] = acc;
+        }
+        return;
+    }
+
+    // Batched path: loop over batch, reuse single-token logic per element
+    for (int b = 0; b < batch; b++) {
+        const float* input = input_base + (long long)b * in_dim;
+        float acc = 0.0f;
+        for (int g = tid; g < num_groups; g += stride) {
+            const unsigned char* gp = row_data + g * group_bytes;
+            float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+            float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+            int base = g * group_size;
+            int count = min(group_size, in_dim - base);
+            for (int i = 0; i < count; i += 2) {
+                unsigned char byte = gp[i / 2];
+                float v0 = (float)(byte & 0xF) * sc + mn;
+                float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                acc += v0 * input[base + i] + v1 * input[base + i + 1];
+            }
+        }
+        // Reduce via shared memory
+        shared[tid] = acc;
+        __syncthreads();
+        for (int s = stride / 2; s > 0; s >>= 1) {
+            if (tid < s) shared[tid] += shared[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) output_base[(long long)b * out_dim + row] = shared[0];
+        __syncthreads();
     }
 }
 
