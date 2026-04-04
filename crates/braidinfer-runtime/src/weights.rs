@@ -1143,6 +1143,8 @@ pub fn distribute_moe_weights_from_bqnt(
     Device::set_current(DeviceId(0))?;
     eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per GPU)", ne / num_devices);
 
+    let gpu0_gu = expert_buffers[0].gate_up.as_ptr();
+    let gpu0_d = expert_buffers[0].down.as_ptr();
     Ok(DistributedMoeWeights {
         expert_buffers,
         expert_device,
@@ -1152,7 +1154,7 @@ pub fn distribute_moe_weights_from_bqnt(
         gate_up_expert_stride: gu_bytes_per_expert,
         down_expert_stride: down_bytes_per_expert,
         gate_up_row_stride,
-        gpu0_gate_up_base: std::ptr::null(),
-        gpu0_down_base: std::ptr::null(),
+        gpu0_gate_up_base: gpu0_gu,
+        gpu0_down_base: gpu0_d,
     })
 }
