@@ -341,6 +341,24 @@ impl Model {
             } else { false }
         } else { false };
 
+        // Trace: MoE routing (after gate, before expert FFN)
+        if self.trace.is_some() {
+            self.stream.synchronize()?;
+            let mut normed_buf = vec![0.0f32; hs];
+            self.activations.normed.copy_to_host(&mut normed_buf)?;
+            self.trace.as_mut().unwrap().write_checkpoint(
+                &format!("L{layer_idx}.moe_normed"), &normed_buf);
+
+            let ids = unsafe { std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr(), k) };
+            let ids_f32: Vec<f32> = ids.iter().map(|&x| x as f32).collect();
+            self.trace.as_mut().unwrap().write_checkpoint(
+                &format!("L{layer_idx}.moe_expert_ids"), &ids_f32);
+
+            let weights = unsafe { std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr(), k) };
+            self.trace.as_mut().unwrap().write_checkpoint(
+                &format!("L{layer_idx}.moe_expert_weights"), weights);
+        }
+
         if !used_multi_gpu {
         // Single-GPU path: read back expert_ids + weights via host pointer (no hipMemcpy)
         self.stream.synchronize()?;
@@ -513,6 +531,15 @@ impl Model {
             self.activations.ffn_down.copy_to_host(&mut buf)?;
             let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             eprintln!("  MoE L{layer_idx} ffn_down(len={ffn_len}) max_abs={max_abs:.4}");
+        }
+
+        // Trace: ffn_down after expert accumulation + shared expert (before residual)
+        if self.trace.is_some() {
+            self.stream.synchronize()?;
+            let mut buf = vec![0.0f32; hs];
+            self.activations.ffn_down.copy_to_host(&mut buf)?;
+            self.trace.as_mut().unwrap().write_checkpoint(
+                &format!("L{layer_idx}.moe_ffn_down"), &buf);
         }
 
         // 7. Residual add: hidden = residual + ffn_down

@@ -166,6 +166,27 @@ impl Model {
 
             let layer_idx = (layer_code - 1) as usize;
 
+            // Trace: capture normed_stage and expert routing before dispatch
+            if self.trace.is_some() {
+                let hs = self.config.hidden_size;
+                let normed = unsafe { std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs) };
+                self.trace.as_mut().unwrap().write_checkpoint(
+                    &format!("L{layer_idx}.moe_normed"), normed);
+
+                let k = match &self.config.layers[layer_idx].ffn_type {
+                    FfnType::MoE { num_active, .. } => *num_active,
+                    _ => 1,
+                };
+                let ids = unsafe { std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr(), k) };
+                let ids_f32: Vec<f32> = ids.iter().map(|&x| x as f32).collect();
+                self.trace.as_mut().unwrap().write_checkpoint(
+                    &format!("L{layer_idx}.moe_expert_ids"), &ids_f32);
+
+                let weights = unsafe { std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr(), k) };
+                self.trace.as_mut().unwrap().write_checkpoint(
+                    &format!("L{layer_idx}.moe_expert_weights"), weights);
+            }
+
             // Dispatch multi-GPU expert FFN for this layer
             if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
                 let (k, eis) = match &self.config.layers[layer_idx].ffn_type {
@@ -188,6 +209,14 @@ impl Model {
                 ).map_err(ModelError::Hip)?;
             }
 
+            // Trace: capture ffn_down_stage after expert dispatch (before resume)
+            if self.trace.is_some() {
+                let hs = self.config.hidden_size;
+                let ffn_down = unsafe { std::slice::from_raw_parts(self.activations.ffn_down_stage.host_ptr(), hs) };
+                self.trace.as_mut().unwrap().write_checkpoint(
+                    &format!("L{layer_idx}.moe_ffn_down"), ffn_down);
+            }
+
             // Reset barrier flag, signal resume.
             // sfence: flush all CPU WC (write-combining) buffers for ffn_down_stage to GART
             // before GPU reads them in OP_RESIDUAL_ADD after resume.
@@ -202,6 +231,14 @@ impl Model {
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)
             .map_err(ModelError::Hip)?;
+
+        if self.trace.is_some() {
+            let mut buf = vec![0.0f32; self.config.hidden_size];
+            self.activations.hidden.copy_to_host(&mut buf).map_err(ModelError::Hip)?;
+            self.trace.as_mut().unwrap().write_checkpoint("final_hidden", &buf);
+            self.trace.as_mut().unwrap().write_checkpoint("logits_top", &logits[..logits.len().min(100)]);
+        }
+
         self.seq_len = position + 1;
         Ok(logits)
     }
@@ -382,7 +419,10 @@ impl Model {
         self.activations.logits.copy_to_host(&mut logits)?;
 
         if self.trace.is_some() {
-            // Capture final_norm hidden state
+            let mut hid_buf = vec![0.0f32; self.config.hidden_size];
+            self.activations.hidden.copy_to_host(&mut hid_buf)?;
+            self.trace.as_mut().unwrap().write_checkpoint("final_hidden", &hid_buf);
+
             let mut norm_buf = vec![0.0f32; self.config.hidden_size];
             self.activations.normed.copy_to_host(&mut norm_buf)?;
             self.trace.as_mut().unwrap().write_checkpoint("final_norm", &norm_buf);
