@@ -5,6 +5,7 @@ pub mod kernel;
 pub mod megakernel;
 pub mod model;
 pub mod moe_dispatch;
+pub mod persistent_dispatch;
 pub mod multi_gpu;
 pub mod paged_kv;
 pub mod weights;

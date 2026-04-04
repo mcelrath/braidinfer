@@ -48,10 +48,8 @@ pub struct Model {
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
     // Multi-GPU megakernel: dense layers run in megakernel; MoE layers use CPU-dispatch via OP_BARRIER
     pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
-    // GPU-initiated MoE dispatch: persistent worker kernels + host-mapped work queue
-    pub(crate) moe_work_queue: Option<crate::multi_gpu::MoeWorkQueue>,
-    // Megakernel compiled with OP_MOE_DISPATCH (replaces OP_BARRIER)
-    pub(crate) megakernel_gpu_dispatch: Option<MegakernelProgram>,
+    // CPU-scheduled persistent workers (czl): replaces megakernel for multi-GPU
+    pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
 }
 
 // ---- Model impl ----
@@ -98,12 +96,9 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU: use GPU-initiated dispatch if work queue available,
-        // otherwise fall back to kbk (CPU-orchestrated).
+        // Multi-GPU: use persistent workers if available, otherwise kbk.
         if is_multi_gpu {
-            if self.moe_work_queue.is_some() {
-                return self.decode_step_gpu_dispatch(token_id, position);
-            }
+            // TODO(czl): persistent worker dispatch path
             return self.decode_step_moe(token_id, position);
         }
 
@@ -134,148 +129,6 @@ impl Model {
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
-
-        self.seq_len = position + 1;
-        Ok(logits)
-    }
-
-    /// GPU-initiated MoE dispatch: megakernel runs dense layers on GPU 0,
-    /// OP_MOE_DISPATCH triggers persistent workers on all GPUs, no CPU in loop.
-    fn decode_step_gpu_dispatch(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        // Lazy-init: compile megakernel with OP_MOE_DISPATCH and launch workers
-        if self.megakernel_gpu_dispatch.is_none() {
-            let wq = self.moe_work_queue.as_ref().unwrap();
-            let mk = MegakernelProgram::compile_gpu_dispatch(self, wq)
-                .map_err(ModelError::Hip)?;
-            self.megakernel_gpu_dispatch = Some(mk);
-        }
-
-        let mk = self.megakernel_gpu_dispatch.as_mut().unwrap();
-        mk.update_step(token_id, position, &self.stream)
-            .map_err(ModelError::Hip)?;
-        mk.execute(&self.stream)
-            .map_err(ModelError::Hip)?;
-
-        // No CPU dispatch loop needed — OP_MOE_DISPATCH handles everything on GPU.
-        // Megakernel execute() returns only when all instructions complete.
-        self.stream.synchronize().map_err(ModelError::Hip)?;
-
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.activations.logits.copy_to_host(&mut logits)?;
-
-        self.seq_len = position + 1;
-        Ok(logits)
-    }
-
-    /// Multi-GPU megakernel MoE decode step.
-    /// CURRENTLY UNUSED — kbk path is faster (7.0 vs 1.8 tok/s on 122B).
-    /// Retained for future GPU-initiated dispatch (braidinfer-ygg) which will replace
-    /// OP_BARRIER with host-mapped work queue polling (~5µs vs ~738µs per MoE layer).
-    #[allow(dead_code)]
-    fn decode_step_megakernel_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        // Lazy-init multi-GPU megakernel
-        if self.megakernel_multi_gpu.is_none() {
-            let mk = MegakernelProgram::compile_multi_gpu(self)
-                .map_err(ModelError::Hip)?;
-            self.megakernel_multi_gpu = Some(mk);
-        }
-
-        let mk = self.megakernel_multi_gpu.as_mut().unwrap();
-        mk.update_step(token_id, position, &self.stream)
-            .map_err(ModelError::Hip)?;
-        mk.execute(&self.stream)
-            .map_err(ModelError::Hip)?;
-
-        // CPU dispatch loop: service OP_BARRIER interrupts until megakernel completes
-        let barrier_ptr = mk.moe_barrier()
-            .expect("multi-GPU megakernel must have MoeBarrierState")
-            .barrier.host_ptr();
-        let resume_ptr = mk.moe_barrier().unwrap().resume.host_ptr();
-
-        loop {
-            let layer_code = unsafe { std::ptr::read_volatile(barrier_ptr) };
-            if layer_code == 0 {
-                if self.stream.is_idle() {
-                    break;
-                }
-                std::hint::spin_loop();
-                continue;
-            }
-
-            let layer_idx = (layer_code - 1) as usize;
-
-            // Trace: capture normed_stage and expert routing before dispatch
-            if self.trace.is_some() {
-                let hs = self.config.hidden_size;
-                let normed = unsafe { std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs) };
-                self.trace.as_mut().unwrap().write_checkpoint(
-                    &format!("L{layer_idx}.moe_normed"), normed);
-
-                let k = match &self.config.layers[layer_idx].ffn_type {
-                    FfnType::MoE { num_active, .. } => *num_active,
-                    _ => 1,
-                };
-                let ids = unsafe { std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr(), k) };
-                let ids_f32: Vec<f32> = ids.iter().map(|&x| x as f32).collect();
-                self.trace.as_mut().unwrap().write_checkpoint(
-                    &format!("L{layer_idx}.moe_expert_ids"), &ids_f32);
-
-                let weights = unsafe { std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr(), k) };
-                self.trace.as_mut().unwrap().write_checkpoint(
-                    &format!("L{layer_idx}.moe_expert_weights"), weights);
-            }
-
-            // Dispatch multi-GPU expert FFN for this layer
-            if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
-                let (k, eis) = match &self.config.layers[layer_idx].ffn_type {
-                    crate::model::FfnType::MoE { num_active, expert_intermediate_size, .. } =>
-                        (*num_active, *expert_intermediate_size),
-                    _ => panic!("OP_BARRIER on non-MoE layer {}", layer_idx),
-                };
-                let mgpu = self.multi_gpu.as_mut().unwrap();
-                crate::moe_dispatch::dispatch_moe_layer(
-                    mgpu,
-                    &self.worker_kernels,
-                    dist_moe,
-                    &self.activations.normed_stage,
-                    &mut self.activations.ffn_down_stage,
-                    &self.activations.moe_expert_ids,
-                    &self.activations.moe_expert_weights,
-                    k,
-                    self.config.hidden_size,
-                    eis,
-                ).map_err(ModelError::Hip)?;
-            }
-
-            // Trace: capture ffn_down_stage after expert dispatch (before resume)
-            if self.trace.is_some() {
-                let hs = self.config.hidden_size;
-                let ffn_down = unsafe { std::slice::from_raw_parts(self.activations.ffn_down_stage.host_ptr(), hs) };
-                self.trace.as_mut().unwrap().write_checkpoint(
-                    &format!("L{layer_idx}.moe_ffn_down"), ffn_down);
-            }
-
-            // Reset barrier flag, signal resume.
-            // sfence: flush all CPU WC (write-combining) buffers for ffn_down_stage to GART
-            // before GPU reads them in OP_RESIDUAL_ADD after resume.
-            #[cfg(target_arch = "x86_64")]
-            unsafe { std::arch::x86_64::_mm_sfence(); }
-            unsafe { std::ptr::write_volatile(barrier_ptr, 0u32); }
-            unsafe { std::ptr::write_volatile(resume_ptr, 1u32); }
-        }
-
-        self.stream.synchronize().map_err(ModelError::Hip)?;
-
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.activations.logits.copy_to_host(&mut logits)
-            .map_err(ModelError::Hip)?;
-
-        if self.trace.is_some() {
-            let mut buf = vec![0.0f32; self.config.hidden_size];
-            self.activations.hidden.copy_to_host(&mut buf).map_err(ModelError::Hip)?;
-            self.trace.as_mut().unwrap().write_checkpoint("final_hidden", &buf);
-            self.trace.as_mut().unwrap().write_checkpoint("logits_top", &logits[..logits.len().min(100)]);
-        }
 
         self.seq_len = position + 1;
         Ok(logits)
