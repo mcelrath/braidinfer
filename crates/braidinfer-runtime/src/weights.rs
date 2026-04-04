@@ -1001,7 +1001,7 @@ pub fn distribute_moe_weights_from_bqnt(
     moe: &MoeWeights,
     bqnt: &crate::bqnt::MmapBqnt,
     layer_idx: usize,
-    _config: &ModelConfig,
+    prefix: &str,
     num_devices: usize,
     hs: usize,
 ) -> Result<DistributedMoeWeights, ModelError> {
@@ -1012,24 +1012,24 @@ pub fn distribute_moe_weights_from_bqnt(
     let has_gate_proj = moe.has_gate_proj;
 
     // Check for fused gate_up_proj tensor
-    let fused_name = format!("model.layers.{layer_idx}.mlp.experts.gate_up_proj");
+    let fused_name = format!("{prefix}layers.{layer_idx}.mlp.experts.gate_up_proj");
     let has_fused = bqnt.entry(&fused_name).is_some();
 
     // Get byte sizes per expert from bqnt entries
     let (gu_bytes_per_expert, down_bytes_per_expert) = if has_fused {
         let entry = bqnt.entry(&fused_name).unwrap();
         let gu_total = entry.data_bytes as usize;
-        let down_name = format!("model.layers.{layer_idx}.mlp.experts.down_proj");
+        let down_name = format!("{prefix}layers.{layer_idx}.mlp.experts.down_proj");
         let down_entry = bqnt.entry(&down_name)
             .ok_or_else(|| ModelError::MissingWeight(down_name))?;
         (gu_total / ne, down_entry.data_bytes as usize / ne)
     } else {
-        let first_up = format!("model.layers.{layer_idx}.mlp.experts.0.up_proj.weight");
+        let first_up = format!("{prefix}layers.{layer_idx}.mlp.experts.0.up_proj.weight");
         let entry = bqnt.entry(&first_up)
             .ok_or_else(|| ModelError::MissingWeight(first_up))?;
         let up_bytes = entry.data_bytes as usize;
         let gu = if has_gate_proj { up_bytes * 2 } else { up_bytes };
-        let first_down = format!("model.layers.{layer_idx}.mlp.experts.0.down_proj.weight");
+        let first_down = format!("{prefix}layers.{layer_idx}.mlp.experts.0.down_proj.weight");
         let down_entry = bqnt.entry(&first_down)
             .ok_or_else(|| ModelError::MissingWeight(first_down))?;
         (gu, down_entry.data_bytes as usize)
@@ -1074,7 +1074,7 @@ pub fn distribute_moe_weights_from_bqnt(
     if has_fused {
         let gu_data = bqnt.tensor_data(&fused_name)
             .ok_or_else(|| ModelError::MissingWeight(fused_name.clone()))?;
-        let down_name = format!("model.layers.{layer_idx}.mlp.experts.down_proj");
+        let down_name = format!("{prefix}layers.{layer_idx}.mlp.experts.down_proj");
         let down_data = bqnt.tensor_data(&down_name)
             .ok_or_else(|| ModelError::MissingWeight(down_name))?;
 
@@ -1108,8 +1108,8 @@ pub fn distribute_moe_weights_from_bqnt(
 
             // gate_up
             if has_gate_proj {
-                let gate_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight");
-                let up_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.up_proj.weight");
+                let gate_name = format!("{prefix}layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight");
+                let up_name = format!("{prefix}layers.{layer_idx}.mlp.experts.{e}.up_proj.weight");
                 let g = bqnt.tensor_data(&gate_name).ok_or_else(|| ModelError::MissingWeight(gate_name))?;
                 let u = bqnt.tensor_data(&up_name).ok_or_else(|| ModelError::MissingWeight(up_name))?;
                 let dst = unsafe { expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) };
@@ -1118,7 +1118,7 @@ pub fn distribute_moe_weights_from_bqnt(
                     braidinfer_hip::ffi::hipMemcpy(dst.add(g.len()) as *mut _, u.as_ptr() as *const _, u.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice);
                 }
             } else {
-                let up_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.up_proj.weight");
+                let up_name = format!("{prefix}layers.{layer_idx}.mlp.experts.{e}.up_proj.weight");
                 let u = bqnt.tensor_data(&up_name).ok_or_else(|| ModelError::MissingWeight(up_name))?;
                 unsafe {
                     braidinfer_hip::ffi::hipMemcpy(
@@ -1129,7 +1129,7 @@ pub fn distribute_moe_weights_from_bqnt(
             }
 
             // down
-            let down_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.down_proj.weight");
+            let down_name = format!("{prefix}layers.{layer_idx}.mlp.experts.{e}.down_proj.weight");
             let d = bqnt.tensor_data(&down_name).ok_or_else(|| ModelError::MissingWeight(down_name))?;
             unsafe {
                 braidinfer_hip::ffi::hipMemcpy(

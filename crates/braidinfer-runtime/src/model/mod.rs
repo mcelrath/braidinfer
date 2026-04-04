@@ -41,6 +41,7 @@ pub struct Model {
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) trace: Option<crate::trace::TraceWriter>,
     pub(crate) debug_nan: bool,
+    pub(crate) weight_prefix: String,  // tensor name prefix (e.g. "model.language_model.")
     // Multi-GPU expert parallel (None for single-GPU)
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,

@@ -521,6 +521,7 @@ impl Model {
                 crate::trace::TraceWriter::open(&path).ok()
             }),
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
+            weight_prefix: prefix.clone(),
             multi_gpu: None,
             distributed_moe: Vec::new(),
             worker_kernels: Vec::new(),
@@ -581,7 +582,7 @@ impl Model {
                 } else if let Some(ref b) = bqnt {
                     // Experts not on GPU 0 — load directly from bqnt to per-GPU buffers
                     let dist = crate::weights::distribute_moe_weights_from_bqnt(
-                        moe, b, i, &self.config, num_devices, hs,
+                        moe, b, i, &self.weight_prefix, num_devices, hs,
                     )?;
                     distributed.push(Some(dist));
                 } else {
