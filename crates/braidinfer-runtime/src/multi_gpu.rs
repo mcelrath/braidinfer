@@ -165,8 +165,8 @@ impl MultiGpuContext {
 pub struct MoeWorkQueue {
     /// Host-mapped work item (512 bytes). GPU 0 megakernel writes, workers poll.
     pub work_item: MappedHostBuffer<u8>,
-    /// Per-GPU output slots on GPU 0 VRAM: [total_gpus * hidden_size].
-    pub output_slots: DeviceBuffer<f32>,
+    /// Per-GPU output slots (host-mapped for cross-GPU accessibility): [total_gpus * hidden_size].
+    pub output_slots: MappedHostBuffer<f32>,
     /// Per-worker shutdown flags (host-mapped).
     pub shutdown_flags: Vec<MappedHostBuffer<u32>>,
     pub seq_counter: u32,
@@ -199,8 +199,8 @@ impl MoeWorkQueue {
         Device::set_current(DeviceId(0))?;
         let work_item = MappedHostBuffer::<u8>::alloc(512)?;
 
-        // Per-GPU output slots on GPU 0 (index 0 = GPU 0's result, 1..N-1 = workers)
-        let output_slots = DeviceBuffer::<f32>::alloc(DeviceId(0), total_gpus * hidden_size)?;
+        // Per-GPU output slots (host-mapped — accessible from all GPUs via GART)
+        let output_slots = MappedHostBuffer::<f32>::alloc(total_gpus * hidden_size)?;
 
         // Per-worker shutdown flags
         let mut shutdown_flags = Vec::with_capacity(num_workers);
@@ -361,9 +361,9 @@ impl MoeWorkQueue {
         self.gpu0_config.as_ptr()
     }
 
-    /// Get device pointer to output slots on GPU 0.
+    /// Get device pointer to output slots (host-mapped, accessible from all GPUs).
     pub fn output_slots_ptr(&self) -> *mut f32 {
-        self.output_slots.as_write_ptr()
+        self.output_slots.device_ptr() as *mut f32
     }
 
     /// Increment and return next sequence number.

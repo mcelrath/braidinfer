@@ -152,7 +152,9 @@ impl MegakernelProgram {
             inst.words[7] = (num_workers << 32) | hs;
             inst.words[8] = ((layer_idx as u64) << 32) | (k as u64);
             inst.words[9] = ((eis as u64) << 32) | has_gate;
-            inst.words[10] = act.normed.as_ptr() as u64;
+            // Use normed_stage (MappedHostBuffer) — accessible from all GPUs via host-mapped
+            // memory. Direct P2P reads from GPU 0 VRAM cause PERMISSION_FAULT on RDNA3.
+            inst.words[10] = act.normed_stage.as_ptr() as u64;
             inst.words[11] = gpu0_config_ptr;
             inst.words[12] = scratch_gate;
             inst.words[13] = scratch_up;
