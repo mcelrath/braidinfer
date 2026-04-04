@@ -131,8 +131,10 @@ impl Model {
     }
 
     /// Multi-GPU megakernel MoE decode step.
-    /// Dense layers (embedding, attention, GDN, norms, lm_head) run in the persistent megakernel.
-    /// MoE layers use OP_BARRIER: megakernel parks, CPU dispatches expert FFN, megakernel resumes.
+    /// CURRENTLY UNUSED — kbk path is faster (7.0 vs 1.8 tok/s on 122B).
+    /// Retained for future GPU-initiated dispatch (braidinfer-ygg) which will replace
+    /// OP_BARRIER with host-mapped work queue polling (~5µs vs ~738µs per MoE layer).
+    #[allow(dead_code)]
     fn decode_step_megakernel_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         // Lazy-init multi-GPU megakernel
         if self.megakernel_multi_gpu.is_none() {
@@ -549,14 +551,9 @@ impl Model {
         let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
         let has_quant = self.config.weight_quant != WeightQuantMode::Bf16;
         if has_moe || has_quant {
-            let is_multi_gpu = self.multi_gpu.is_some();
             let mut logits = vec![];
             for (i, &tok) in tokens.iter().enumerate() {
-                logits = if is_multi_gpu {
-                    self.decode_step_megakernel_moe(tok, i as u32)?
-                } else {
-                    self.decode_step_moe(tok, i as u32)?
-                };
+                logits = self.decode_step_moe(tok, i as u32)?;
             }
             return Ok(logits);
         }
