@@ -149,6 +149,10 @@ pub struct PrefillBuffers {
     pub attn_out: DeviceBuffer<f32>,     // [N × nqh × hd]
     pub gated_out: DeviceBuffer<f32>,    // [N × nqh × hd]
     pub out_proj: DeviceBuffer<f32>,     // [N × hidden_size]
+    // Single-token scratch for quantized FFN unfused path (Q4 prefill)
+    pub ffn_gate_scratch: DeviceBuffer<f32>, // [intermediate_size]
+    pub ffn_up_scratch: DeviceBuffer<f32>,   // [intermediate_size]
+    pub ffn_down_scratch: DeviceBuffer<f32>, // [hidden_size]
 }
 
 impl PrefillBuffers {
@@ -182,6 +186,9 @@ impl PrefillBuffers {
             attn_out: DeviceBuffer::alloc(device, n * nqh * hd)?,
             gated_out: DeviceBuffer::alloc(device, n * nqh * hd)?,
             out_proj: DeviceBuffer::alloc(device, n * hs)?,
+            ffn_gate_scratch: DeviceBuffer::alloc(device, is)?,
+            ffn_up_scratch: DeviceBuffer::alloc(device, is)?,
+            ffn_down_scratch: DeviceBuffer::alloc(device, hs)?,
         })
     }
 }
