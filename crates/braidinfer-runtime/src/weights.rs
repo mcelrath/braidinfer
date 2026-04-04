@@ -502,6 +502,33 @@ pub fn load_moe_weights(
     wq: WeightQuantMode,
     bqnt: Option<&MmapBqnt>,
 ) -> Result<MoeWeights, ModelError> {
+    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, false)
+}
+
+/// Load MoE weights, optionally skipping expert weights (for multi-GPU direct loading).
+/// When skip_experts=true, expert_gate_up and expert_down are empty placeholders.
+pub fn load_moe_weights_lite(
+    st: &SafeTensorSet,
+    prefix: &str,
+    config: &ModelConfig,
+    ffn_type: &FfnType,
+    device: DeviceId,
+    wq: WeightQuantMode,
+    bqnt: Option<&MmapBqnt>,
+) -> Result<MoeWeights, ModelError> {
+    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, true)
+}
+
+fn load_moe_weights_inner(
+    st: &SafeTensorSet,
+    prefix: &str,
+    config: &ModelConfig,
+    ffn_type: &FfnType,
+    device: DeviceId,
+    wq: WeightQuantMode,
+    bqnt: Option<&MmapBqnt>,
+    skip_experts: bool,
+) -> Result<MoeWeights, ModelError> {
     let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = ffn_type
         else { unreachable!("load_moe_weights called on non-MoE layer") };
     let ne = *num_experts;
@@ -545,6 +572,19 @@ pub fn load_moe_weights(
         // Try Nemotron naming: experts.0.up_proj.weight (under mixer. prefix)
         weight_format_for(&format!("{prefix}experts.0.up_proj.weight"), wq)
     };
+
+    // Expert weights: skip when loading lite (multi-GPU loads directly to per-GPU buffers)
+    let (expert_gate_up, expert_down) = if skip_experts {
+        let empty_gu = LinearWeight::Packed(PackedWeights {
+            data: DeviceBuffer::<u8>::alloc(device, 0)?,
+            format: WeightFormat::PcG32Q4, out_dim: 0, in_dim: 0,
+        });
+        let empty_d = LinearWeight::Packed(PackedWeights {
+            data: DeviceBuffer::<u8>::alloc(device, 0)?,
+            format: WeightFormat::PcG32Q4, out_dim: 0, in_dim: 0,
+        });
+        (empty_gu, empty_d)
+    } else {
 
     // Expert gate+up: try bqnt fused, then safetensors fused, else per-expert fuse on host
     let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
@@ -622,7 +662,7 @@ pub fn load_moe_weights(
         host_bf16_to_linear_weight(&host_buf, ne * eis, hs, expert_fmt, device)?
     }};
 
-    // Expert down: try bqnt fused, then safetensors fused, else per-expert load
+    // --- Expert down ---
     let down_name = format!("{prefix}mlp.experts.down_proj");
     let bqnt_down = bqnt.and_then(|b| load_linear_weight_bqnt(b, &down_name, device).ok());
     let expert_down = if let Some(lw) = bqnt_down {
@@ -672,6 +712,9 @@ pub fn load_moe_weights(
         }
         host_bf16_to_linear_weight(&host_buf_d, ne * hs, eis, expert_fmt, device)?
     }};
+
+    (expert_gate_up, expert_down)
+    }; // end else (skip_experts)
 
     // Shared expert (optional)
     let shared_expert = if *num_shared > 0 {
@@ -951,3 +994,165 @@ pub fn distribute_moe_weights_from_ref(
     })
 }
 
+
+/// Load expert weights directly from bqnt to per-GPU buffers.
+/// For models too large for single GPU (e.g. 122B).
+pub fn distribute_moe_weights_from_bqnt(
+    moe: &MoeWeights,
+    bqnt: &crate::bqnt::MmapBqnt,
+    layer_idx: usize,
+    _config: &ModelConfig,
+    num_devices: usize,
+    hs: usize,
+) -> Result<DistributedMoeWeights, ModelError> {
+    use braidinfer_hip::device::Device;
+
+    let ne = moe.num_experts;
+    let eis = moe.expert_intermediate_size;
+    let has_gate_proj = moe.has_gate_proj;
+
+    // Check for fused gate_up_proj tensor
+    let fused_name = format!("model.layers.{layer_idx}.mlp.experts.gate_up_proj");
+    let has_fused = bqnt.entry(&fused_name).is_some();
+
+    // Get byte sizes per expert from bqnt entries
+    let (gu_bytes_per_expert, down_bytes_per_expert) = if has_fused {
+        let entry = bqnt.entry(&fused_name).unwrap();
+        let gu_total = entry.data_bytes as usize;
+        let down_name = format!("model.layers.{layer_idx}.mlp.experts.down_proj");
+        let down_entry = bqnt.entry(&down_name)
+            .ok_or_else(|| ModelError::MissingWeight(down_name))?;
+        (gu_total / ne, down_entry.data_bytes as usize / ne)
+    } else {
+        let first_up = format!("model.layers.{layer_idx}.mlp.experts.0.up_proj.weight");
+        let entry = bqnt.entry(&first_up)
+            .ok_or_else(|| ModelError::MissingWeight(first_up))?;
+        let up_bytes = entry.data_bytes as usize;
+        let gu = if has_gate_proj { up_bytes * 2 } else { up_bytes };
+        let first_down = format!("model.layers.{layer_idx}.mlp.experts.0.down_proj.weight");
+        let down_entry = bqnt.entry(&first_down)
+            .ok_or_else(|| ModelError::MissingWeight(first_down))?;
+        (gu, down_entry.data_bytes as usize)
+    };
+
+    let groups_per_row = (hs + 31) / 32;
+    let gate_up_row_stride = groups_per_row * 20;
+
+    // Round-robin assignment
+    let mut expert_device = vec![0usize; ne];
+    let mut counts = vec![0usize; num_devices];
+    for e in 0..ne {
+        let gpu = e % num_devices;
+        expert_device[e] = gpu;
+        counts[gpu] += 1;
+    }
+
+    // Allocate per-GPU buffers
+    let mut expert_buffers = Vec::with_capacity(num_devices);
+    for gpu in 0..num_devices {
+        let device = DeviceId(gpu as u32);
+        Device::set_current(device)?;
+        let n = counts[gpu];
+        let mut slot_map = vec![None; ne];
+        let mut slot = 0;
+        for e in 0..ne {
+            if expert_device[e] == gpu {
+                slot_map[e] = Some(slot);
+                slot += 1;
+            }
+        }
+        expert_buffers.push(GpuExpertBuffer {
+            device,
+            gate_up: DeviceBuffer::<u8>::alloc(device, n * gu_bytes_per_expert)?,
+            down: DeviceBuffer::<u8>::alloc(device, n * down_bytes_per_expert)?,
+            local_expert_count: n,
+            slot_map,
+        });
+    }
+
+    // Load from bqnt host memory directly to per-GPU buffers
+    if has_fused {
+        let gu_data = bqnt.tensor_data(&fused_name)
+            .ok_or_else(|| ModelError::MissingWeight(fused_name.clone()))?;
+        let down_name = format!("model.layers.{layer_idx}.mlp.experts.down_proj");
+        let down_data = bqnt.tensor_data(&down_name)
+            .ok_or_else(|| ModelError::MissingWeight(down_name))?;
+
+        for e in 0..ne {
+            let gpu = expert_device[e];
+            let slot = expert_buffers[gpu].slot_map[e].unwrap();
+            Device::set_current(DeviceId(gpu as u32))?;
+
+            let gu_src = &gu_data[e * gu_bytes_per_expert..(e + 1) * gu_bytes_per_expert];
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpy(
+                    expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) as *mut _,
+                    gu_src.as_ptr() as *const _, gu_bytes_per_expert,
+                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                );
+            }
+            let d_src = &down_data[e * down_bytes_per_expert..(e + 1) * down_bytes_per_expert];
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpy(
+                    expert_buffers[gpu].down.as_ptr().add(slot * down_bytes_per_expert) as *mut _,
+                    d_src.as_ptr() as *const _, down_bytes_per_expert,
+                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                );
+            }
+        }
+    } else {
+        for e in 0..ne {
+            let gpu = expert_device[e];
+            let slot = expert_buffers[gpu].slot_map[e].unwrap();
+            Device::set_current(DeviceId(gpu as u32))?;
+
+            // gate_up
+            if has_gate_proj {
+                let gate_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.gate_proj.weight");
+                let up_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.up_proj.weight");
+                let g = bqnt.tensor_data(&gate_name).ok_or_else(|| ModelError::MissingWeight(gate_name))?;
+                let u = bqnt.tensor_data(&up_name).ok_or_else(|| ModelError::MissingWeight(up_name))?;
+                let dst = unsafe { expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) };
+                unsafe {
+                    braidinfer_hip::ffi::hipMemcpy(dst as *mut _, g.as_ptr() as *const _, g.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice);
+                    braidinfer_hip::ffi::hipMemcpy(dst.add(g.len()) as *mut _, u.as_ptr() as *const _, u.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice);
+                }
+            } else {
+                let up_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.up_proj.weight");
+                let u = bqnt.tensor_data(&up_name).ok_or_else(|| ModelError::MissingWeight(up_name))?;
+                unsafe {
+                    braidinfer_hip::ffi::hipMemcpy(
+                        expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) as *mut _,
+                        u.as_ptr() as *const _, u.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                    );
+                }
+            }
+
+            // down
+            let down_name = format!("model.layers.{layer_idx}.mlp.experts.{e}.down_proj.weight");
+            let d = bqnt.tensor_data(&down_name).ok_or_else(|| ModelError::MissingWeight(down_name))?;
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpy(
+                    expert_buffers[gpu].down.as_ptr().add(slot * down_bytes_per_expert) as *mut _,
+                    d.as_ptr() as *const _, d.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice,
+                );
+            }
+        }
+    }
+
+    Device::set_current(DeviceId(0))?;
+    eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per GPU)", ne / num_devices);
+
+    Ok(DistributedMoeWeights {
+        expert_buffers,
+        expert_device,
+        has_gate_proj,
+        num_experts: ne,
+        expert_intermediate_size: eis,
+        gate_up_expert_stride: gu_bytes_per_expert,
+        down_expert_stride: down_bytes_per_expert,
+        gate_up_row_stride,
+        gpu0_gate_up_base: std::ptr::null(),
+        gpu0_down_base: std::ptr::null(),
+    })
+}

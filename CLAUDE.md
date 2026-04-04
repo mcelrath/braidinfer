@@ -60,6 +60,11 @@ Use `Bash run_in_background=true` and `timeout=600000`. The launch script waits 
 | Short timeouts (`--timeout 60`) when GPUs are busy | GPUs may be busy for hours; use `--timeout 43200` |
 | Checking VRAM to see if GPUs are "almost free" | The script polls automatically; don't second-guess it |
 | Trying different `HIP_VISIBLE_DEVICES` values | The script selects the best GPU; manual selection conflicts |
+| Killing processes that hold GPU VRAM | Other sessions/services depend on those processes. NEVER kill. |
+| Using `fuser` to find GPU process owners | Same as rocm-smi — don't probe GPU state manually |
+| Asking the user to kill processes for GPU access | Just queue with launch-gpu.py and wait. GPUs free eventually. |
+
+**If GPUs are busy**: Queue your command with `launch-gpu.py --timeout 43200` and WAIT. Do not investigate what's using them, do not ask to kill processes, do not probe VRAM. The script handles everything. Other users and services share these GPUs and their work is equally important.
 
 **If the script doesn't support what you need**: STOP. Do not bypass. Tell the user.
 

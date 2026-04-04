@@ -41,6 +41,8 @@ impl Model {
             _ => WeightQuantMode::Bf16,
         };
 
+        let multi_gpu = std::env::var("MULTI_GPU").is_ok();
+
         let st = SafeTensorSet::open_directory(model_dir)?;
 
         // Check for pre-quantized .bqnt file (set BQNT_PATH env var)
@@ -200,7 +202,11 @@ impl Model {
                 } else {
                     format!("{p}mlp.")
                 };
-                moe_weights_vec[i] = Some(load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?);
+                moe_weights_vec[i] = Some(if multi_gpu {
+                    load_moe_weights_lite(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                } else {
+                    load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                });
             } else if config.layers[i].layer_type == LayerType::Attention {
                 let hs = config.hidden_size;
                 let q_mult = if has_output_gate { 2 } else { 1 };
@@ -259,7 +265,11 @@ impl Model {
 
                 // Load MoE weights if this layer uses MoE FFN
                 if is_moe {
-                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?);
+                    moe_weights_vec[i] = Some(if multi_gpu {
+                        load_moe_weights_lite(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    } else {
+                        load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    });
                 }
             } else {
                 let nh = config.linear_num_heads;
@@ -317,7 +327,11 @@ impl Model {
 
                 // Load MoE weights for GDN layers with MoE FFN (e.g. Qwen3.5-122B)
                 if is_moe {
-                    moe_weights_vec[i] = Some(load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?);
+                    moe_weights_vec[i] = Some(if multi_gpu {
+                        load_moe_weights_lite(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    } else {
+                        load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    });
                 }
             }
         }
@@ -545,16 +559,35 @@ impl Model {
         // Distribute MoE weights across GPUs
         let num_devices = ctx.num_devices;
         let hs = self.config.hidden_size;
-        // Build distributed weight views from existing moe_weights.
-        // The original moe_weights are KEPT (for gate, shared expert, bias on GPU 0).
-        // distributed_moe holds per-GPU expert buffer copies.
+
+        // Check if expert weights were loaded (single-GPU) or skipped (multi-GPU lite load)
+        let experts_on_gpu0 = self.moe_weights.iter().any(|m| {
+            m.as_ref().map_or(false, |moe| moe.expert_gate_up.raw_data_ptr() != std::ptr::null())
+        });
+
+        let bqnt = std::env::var("BQNT_PATH").ok().and_then(|p| {
+            crate::bqnt::MmapBqnt::open(std::path::Path::new(&p)).ok()
+        });
+
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
-                let dist = crate::weights::distribute_moe_weights_from_ref(
-                    moe, num_devices, hs,
-                )?;
-                distributed.push(Some(dist));
+                if experts_on_gpu0 {
+                    // Experts already on GPU 0 — copy to per-GPU buffers
+                    let dist = crate::weights::distribute_moe_weights_from_ref(
+                        moe, num_devices, hs,
+                    )?;
+                    distributed.push(Some(dist));
+                } else if let Some(ref b) = bqnt {
+                    // Experts not on GPU 0 — load directly from bqnt to per-GPU buffers
+                    let dist = crate::weights::distribute_moe_weights_from_bqnt(
+                        moe, b, i, &self.config, num_devices, hs,
+                    )?;
+                    distributed.push(Some(dist));
+                } else {
+                    return Err(ModelError::MissingWeight(
+                        "Multi-GPU requires BQNT_PATH for direct expert loading".into()));
+                }
             } else {
                 distributed.push(None);
             }
