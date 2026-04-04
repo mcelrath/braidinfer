@@ -50,32 +50,16 @@ fn emit_batched_linear_proj(
     no_sync: bool,
     instructions: &mut Vec<Instruction>,
 ) {
-    use crate::model::LinearWeight;
-    let supports_batch = matches!(weight, LinearWeight::Bf16(_));
-    if supports_batch {
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
-        inst.set_output_ptr(1, output);
-        emit_linear_proj(&mut inst, weight, 2);
-        inst.set_ptr(3, input);
-        inst.set_int(4, out_dim as i32);
-        inst.set_int(5, in_dim as i32);
-        inst.set_int(6, n as i32);
-        if no_sync { inst.set_no_sync(); }
-        instructions.push(inst);
-    } else {
-        for t in 0..n {
-            let out_t = unsafe { output.add(t * out_dim) };
-            let in_t = unsafe { input.add(t * in_dim) };
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
-            inst.set_output_ptr(1, out_t);
-            emit_linear_proj(&mut inst, weight, 2);
-            inst.set_ptr(3, in_t);
-            inst.set_int(4, out_dim as i32);
-            inst.set_int(5, in_dim as i32);
-            if no_sync || t + 1 < n { inst.set_no_sync(); }
-            instructions.push(inst);
-        }
-    }
+    // All weight formats support batched projection via slot 6
+    let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
+    inst.set_output_ptr(1, output);
+    emit_linear_proj(&mut inst, weight, 2);
+    inst.set_ptr(3, input);
+    inst.set_int(4, out_dim as i32);
+    inst.set_int(5, in_dim as i32);
+    inst.set_int(6, n as i32);
+    if no_sync { inst.set_no_sync(); }
+    instructions.push(inst);
 }
 
 /// Choose RMSNorm opcode based on model config.
