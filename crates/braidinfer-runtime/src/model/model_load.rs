@@ -144,6 +144,25 @@ impl Model {
         };
         let final_norm_weight = load_weight_bf16(&st, &norm_name, device, config.hidden_size)?;
 
+        // Per-layer quantization control: WEIGHT_QUANT_LAYERS=0-11,20-31 restricts Q4 to those layers
+        let quant_layers: Option<std::collections::HashSet<usize>> = std::env::var("WEIGHT_QUANT_LAYERS").ok().map(|s| {
+            let mut set = std::collections::HashSet::new();
+            for part in s.split(',') {
+                let part = part.trim();
+                if let Some((a, b)) = part.split_once('-') {
+                    if let (Ok(start), Ok(end)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                        for i in start..=end { set.insert(i); }
+                    }
+                } else if let Ok(n) = part.parse::<usize>() {
+                    set.insert(n);
+                }
+            }
+            eprintln!("WEIGHT_QUANT_LAYERS: quantizing {} layers: {:?}", set.len(), {
+                let mut v: Vec<_> = set.iter().copied().collect(); v.sort(); v
+            });
+            set
+        });
+
         // Per-layer weights
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut moe_weights_vec: Vec<Option<MoeWeights>> = (0..config.num_layers).map(|_| None).collect();
@@ -151,11 +170,14 @@ impl Model {
             let p = format!("{prefix}layers.{i}.");
             let is_moe = matches!(config.layers[i].ffn_type, FfnType::MoE { .. });
             let wq = config.weight_quant;
-            // Helper: load linear weight, trying bqnt first if available
+            let use_quant = quant_layers.as_ref().map_or(true, |s| s.contains(&i));
+            // Helper: load linear weight, trying bqnt first if available and layer is quantized
             let load_lw = |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
-                if let Some(ref b) = bqnt {
-                    if let Ok(lw) = crate::weights::load_linear_weight_bqnt(b, name, device) {
-                        return Ok(lw);
+                if use_quant {
+                    if let Some(ref b) = bqnt {
+                        if let Ok(lw) = crate::weights::load_linear_weight_bqnt(b, name, device) {
+                            return Ok(lw);
+                        }
                     }
                 }
                 load_linear_weight(&st, name, device, out_dim, in_dim, wq)
