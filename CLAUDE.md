@@ -113,6 +113,33 @@ create a review epic with beads for larger items, expert-review the epic, then i
 | **Post-sprint / periodic** | After 5+ commits or when user says "what's next" | `software-architect` | Full codebase review. Creates findings epic if >3 issues found. |
 | **Code quality** | After any commit touching >100 lines | `/simplify` | Review changed code for reuse, quality, efficiency. Fix inline. |
 
+### Activation Trace Requirement
+
+**New GPU kernels or megakernel opcodes must pass trace comparison before commit.**
+
+Generate a reference trace, apply the change, generate a test trace, compare:
+```bash
+# Reference (before change):
+TRACE=ref.bin MODEL=qwen35_2b.q4.bqnt RAW=1 MAX_TOKENS=1 \
+  python3 scripts/launch-gpu.py --timeout 300 -- target/release/generate "Hello"
+
+# Test (after change):
+TRACE=test.bin MODEL=qwen35_2b.q4.bqnt RAW=1 MAX_TOKENS=1 \
+  python3 scripts/launch-gpu.py --timeout 300 -- target/release/generate "Hello"
+
+# Compare:
+python3 scripts/compare_traces.py ref.bin test.bin
+```
+
+For quantization changes, use the bisection tool:
+```bash
+python3 scripts/bisect_quant.py --ref ref.bin --model model.q4.bqnt \
+  --num-layers 36 --prompt "Hello"
+```
+
+Per-layer quantization control: `WEIGHT_QUANT_LAYERS=0-11,20-31` restricts Q4 to
+those layers (rest load bf16). Useful for isolating which layer diverges.
+
 ### Review Process
 
 1. **Plan**: Write plan → `expert-review` (run_in_background=True) → wait for APPROVED
