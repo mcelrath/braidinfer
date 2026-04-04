@@ -235,8 +235,8 @@ pub fn dispatch_moe_layer(
     Ok(())
 }
 
-/// Non-megakernel multi-GPU dispatch (called from decode_step_moe / moe_ffn_forward).
-/// No cooperative kernel is running, so hipMemcpy on GPU 0 is safe.
+/// Kernel-by-kernel multi-GPU dispatch (called from decode_step_moe / moe_ffn_forward).
+/// No cooperative kernel running — GPU 0 is free to run experts alongside GPUs 1..N-1.
 /// Populates ffn_down_stage; caller copies to ffn_down if needed.
 pub fn dispatch_moe_layer_sync(
     ctx: &mut MultiGpuContext,
@@ -275,7 +275,7 @@ pub fn dispatch_moe_layer_sync(
 
     unsafe { std::ptr::write_bytes(ffn_down_stage.host_ptr(), 0, hs); }
 
-    for gpu in 1..num_devices {
+    for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &ctx.workers[gpu];
         Device::set_current(worker.device)?;
@@ -296,7 +296,7 @@ pub fn dispatch_moe_layer_sync(
         worker.broadcast_done.record(&worker.transfer_stream)?;
     }
 
-    for gpu in 1..num_devices {
+    for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &mut ctx.workers[gpu];
         let kernels = &worker_kernels[gpu];
@@ -354,8 +354,8 @@ pub fn dispatch_moe_layer_sync(
         worker.compute_done.record(&worker.compute_stream)?;
     }
 
-    // Async gather: overlap D2H transfers from all workers
-    for gpu in 1..num_devices {
+    // Async gather: overlap D2H transfers from all GPUs
+    for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &ctx.workers[gpu];
         Device::set_current(worker.device)?;
@@ -371,7 +371,7 @@ pub fn dispatch_moe_layer_sync(
         }
         worker.transfer_done.record(&worker.transfer_stream)?;
     }
-    for gpu in 1..num_devices {
+    for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         ctx.workers[gpu].transfer_done.synchronize()?;
         let src: &[f32] = unsafe {

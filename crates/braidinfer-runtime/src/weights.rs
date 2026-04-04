@@ -891,14 +891,11 @@ pub fn distribute_moe_weights_from_ref(
     let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
     let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
 
-    // Count experts per GPU.
-    // In multi-GPU mode (num_devices > 1), GPU 0 runs the cooperative megakernel and has
-    // all SMs occupied during OP_BARRIER. Assign experts only to GPUs 1..N-1.
-    let worker_count = if num_devices > 1 { num_devices - 1 } else { 1 };
+    // Round-robin across ALL GPUs (kbk path doesn't use cooperative megakernel).
     let mut expert_device = vec![0usize; ne];
     let mut counts = vec![0usize; num_devices];
     for e in 0..ne {
-        let gpu = if num_devices > 1 { 1 + (e % worker_count) } else { 0 };
+        let gpu = e % num_devices;
         expert_device[e] = gpu;
         counts[gpu] += 1;
     }
@@ -1045,13 +1042,12 @@ pub fn distribute_moe_weights_from_bqnt(
     let groups_per_row = (hs + 31) / 32;
     let gate_up_row_stride = groups_per_row * 20;
 
-    // Round-robin assignment across worker GPUs (GPU 1..N-1 only in multi-GPU mode).
-    // GPU 0 runs the cooperative megakernel during OP_BARRIER — no experts there.
-    let worker_count = if num_devices > 1 { num_devices - 1 } else { 1 };
+    // Round-robin assignment across ALL GPUs. The kbk multi-GPU path doesn't use
+    // the cooperative megakernel, so GPU 0 is free to run experts.
     let mut expert_device = vec![0usize; ne];
     let mut counts = vec![0usize; num_devices];
     for e in 0..ne {
-        let gpu = if num_devices > 1 { 1 + (e % worker_count) } else { 0 };
+        let gpu = e % num_devices;
         expert_device[e] = gpu;
         counts[gpu] += 1;
     }
@@ -1150,7 +1146,7 @@ pub fn distribute_moe_weights_from_bqnt(
     }
 
     Device::set_current(DeviceId(0))?;
-    eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per worker GPU, {} worker GPUs)", ne / worker_count, worker_count);
+    eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per GPU, {} GPUs)", ne / num_devices, num_devices);
 
     let gpu0_gu = expert_buffers[0].gate_up.as_ptr();
     let gpu0_d = expert_buffers[0].down.as_ptr();
