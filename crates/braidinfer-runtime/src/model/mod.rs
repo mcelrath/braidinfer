@@ -90,13 +90,12 @@ impl Model {
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let has_mamba2 = self.config.layers.iter().any(|l| l.layer_type == crate::config::LayerType::Mamba2);
         let is_multi_gpu = self.multi_gpu.is_some();
-        // Mamba2 and trace mode use kernel-by-kernel path
-        if has_mamba2 || self.trace.is_some() {
+        // Mamba2, trace mode, and multi-GPU MoE use kernel-by-kernel path.
+        // Multi-GPU MoE: the megakernel's cooperative kernel occupies all GPU 0 SMs,
+        // requiring OP_BARRIER round-trips for each MoE layer. The barrier overhead
+        // exceeds the kernel-launch savings — kbk is ~44% faster (2.6 vs 1.8 tok/s on 122B).
+        if has_mamba2 || self.trace.is_some() || is_multi_gpu {
             return self.decode_step_moe(token_id, position);
-        }
-        // Multi-GPU MoE: use megakernel for dense layers, OP_BARRIER for expert dispatch
-        if is_multi_gpu {
-            return self.decode_step_megakernel_moe(token_id, position);
         }
 
         // Dense models: use megakernel (handles bf16 + quantized weights, both RMSNorm variants)
