@@ -6,11 +6,40 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use safetensors::SafeTensors;
+use safetensors::{Dtype, SafeTensors};
 use serde_json::json;
 
 use braidinfer_runtime::bqnt::BqntWriter;
 use braidinfer_runtime::quant::{self, WeightFormat};
+
+/// Convert FP8_E4M3 byte to f32.
+/// E4M3: 1 sign, 4 exponent (bias=7), 3 mantissa. Max ±448, min subnormal 2^-9.
+fn fp8_e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let exp = (b >> 3) & 0xF;
+    let mant = b & 0x7;
+    if exp == 0xF && mant == 0x7 {
+        return f32::NAN;
+    }
+    let val = if exp == 0 {
+        (mant as f32 / 8.0) * (1.0 / 64.0)
+    } else {
+        (1.0 + mant as f32 / 8.0) * f32::from_bits(((exp as u32 + 120) & 0xFF) << 23)
+    };
+    if sign == 1 { -val } else { val }
+}
+
+/// Convert f32 to bf16 (truncate lower 16 bits of mantissa, round-to-nearest-even).
+fn f32_to_bf16(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let round = ((bits >> 16) & 1) + 0x7FFF;
+    ((bits + round) >> 16) as u16
+}
+
+/// Convert bf16 bits to f32.
+fn bf16_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
 
 /// Patterns for tensors that must stay bf16 (router weights).
 const BF16_PATTERNS: &[&str] = &[
@@ -24,6 +53,7 @@ const SKIP_PATTERNS: &[&str] = &[
     "A_log", "dt_bias",
     "in_proj_a.weight", "in_proj_b.weight",
     "conv1d.weight", "conv1d.bias",
+    "qscale_weight", "qscale_act",  // FP8 per-tensor scales (scalar metadata)
 ];
 
 fn should_skip(name: &str) -> bool {
@@ -169,8 +199,13 @@ fn main() {
             let fmt = if should_bf16(name) {
                 WeightFormat::Bf16
             } else if is_mixed {
-                // Mixed: MLP + attention at Q4, GDN at Q8
-                if name.contains("mlp.") || name.contains("self_attn") {
+                // Mixed: MLP/experts at Q4, attention/GDN at Q8 (RNF4)
+                // MLA attention (wq_a, wq_b, wkv_a, wkv_b, wo) → RNF4
+                // Standard attention (self_attn.*_proj) → RNF4
+                // Expert FFN (experts.*.w1/w2/w3, mlp.*) → Q4
+                // Shared experts → Q4
+                if name.contains("experts.") || name.contains("shared_expert")
+                    || name.contains("mlp.") {
                     WeightFormat::PcG32Q4
                 } else {
                     WeightFormat::Rnf4G128
@@ -179,17 +214,91 @@ fn main() {
                 default_format
             };
 
-            // Get bf16 data
+            // Get weight data as bf16, handling FP8 dequantization if needed
             let raw = tensor.data();
-            let bf16_slice: &[u16] = unsafe {
-                std::slice::from_raw_parts(raw.as_ptr() as *const u16, n_elements)
+            let dtype = tensor.dtype();
+
+            let (bf16_data, bf16_slice): (Option<Vec<u16>>, &[u16]) = match dtype {
+                Dtype::BF16 => {
+                    let slice = unsafe {
+                        std::slice::from_raw_parts(raw.as_ptr() as *const u16, n_elements)
+                    };
+                    (None, slice)
+                }
+                Dtype::F16 => {
+                    // F16 -> BF16: convert via f32
+                    let f16_slice = unsafe {
+                        std::slice::from_raw_parts(raw.as_ptr() as *const u16, n_elements)
+                    };
+                    let converted: Vec<u16> = f16_slice.iter().map(|&bits| {
+                        // f16: 1 sign, 5 exp (bias=15), 10 mantissa
+                        let sign = ((bits >> 15) & 1) as u32;
+                        let exp = ((bits >> 10) & 0x1F) as u32;
+                        let mant = (bits & 0x3FF) as u32;
+                        let f32_bits = if exp == 0 {
+                            if mant == 0 { sign << 31 }
+                            else { // subnormal f16 -> normalize for f32
+                                let f = f32::from_bits((mant as u32) << 13) * f32::from_bits(0x33800000);
+                                (sign << 31) | (f.to_bits() & 0x7FFFFFFF)
+                            }
+                        } else if exp == 0x1F {
+                            (sign << 31) | 0x7F800000 | (mant << 13) // inf/nan
+                        } else {
+                            (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+                        };
+                        f32_to_bf16(f32::from_bits(f32_bits))
+                    }).collect();
+                    let ptr = converted.as_ptr();
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, n_elements) };
+                    (Some(converted), slice)
+                }
+                Dtype::F8_E4M3 => {
+                    // FP8 E4M3 -> BF16: dequantize each byte, apply qscale
+                    let fp8_bytes: &[u8] = &raw[..n_elements];
+
+                    // Look up per-tensor scale (qscale_weight)
+                    let scale_name = format!(
+                        "{}.qscale_weight",
+                        name.rsplit_once('.').map(|(prefix, _)| prefix).unwrap_or(name)
+                    );
+                    let scale: f32 = safetensors.tensor(&scale_name).ok()
+                        .and_then(|st| {
+                            let sd = st.data();
+                            if st.dtype() == Dtype::BF16 && sd.len() >= 2 {
+                                Some(bf16_to_f32(u16::from_le_bytes([sd[0], sd[1]])))
+                            } else if st.dtype() == Dtype::F32 && sd.len() >= 4 {
+                                Some(f32::from_le_bytes([sd[0], sd[1], sd[2], sd[3]]))
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(1.0);
+
+                    let converted: Vec<u16> = fp8_bytes.iter().map(|&b| {
+                        f32_to_bf16(fp8_e4m3_to_f32(b) * scale)
+                    }).collect();
+                    let ptr = converted.as_ptr();
+                    let slice = unsafe { std::slice::from_raw_parts(ptr, n_elements) };
+                    (Some(converted), slice)
+                }
+                other => {
+                    eprintln!("  Skipping {name}: unsupported dtype {other:?}");
+                    total_params -= n_elements as u64;
+                    continue;
+                }
             };
 
             // Quantize
             let packed = match fmt {
                 WeightFormat::Bf16 => {
                     bf16_params += n_elements as u64;
-                    raw.to_vec()
+                    // Store as bf16 bytes
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            bf16_slice.as_ptr() as *const u8,
+                            n_elements * 2,
+                        )
+                    }.to_vec()
                 }
                 WeightFormat::PcG32Q4 => {
                     quantized_params += n_elements as u64;
@@ -200,6 +309,7 @@ fn main() {
                     quant::quantize_rnf4_g128(bf16_slice, out_dim, in_dim)
                 }
             };
+            drop(bf16_data); // free conversion buffer
 
             writer.write_tensor(name, fmt, out_dim as u32, in_dim as u32, ndim, &packed)
                 .unwrap_or_else(|e| panic!("Failed to write tensor {name}: {e}"));
@@ -218,10 +328,16 @@ fn main() {
         0.0
     };
 
-    // Include model config for self-contained bqnt files
+    // Include model config for self-contained bqnt files.
+    // Try config.json (HuggingFace), fall back to params.json (Mistral native).
     let config_json: serde_json::Value = std::fs::read_to_string(model_dir.join("config.json"))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
+        .or_else(|| {
+            std::fs::read_to_string(model_dir.join("params.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        })
         .unwrap_or(serde_json::Value::Null);
 
     let metadata = json!({
