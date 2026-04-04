@@ -38,6 +38,57 @@ fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight,
     }
 }
 
+/// Returns true if the weight format supports batched OP_LINEAR_PROJ (slot 6 = n).
+/// Only bf16 OP_LINEAR_PROJ supports batching; PCG32 and RNF4 variants do not.
+fn weight_supports_batch(weight: &crate::model::LinearWeight) -> bool {
+    use crate::model::{LinearWeight, WeightFormat};
+    match weight {
+        LinearWeight::Bf16(_) => true,
+        LinearWeight::Packed(pw) => pw.format == WeightFormat::Bf16,
+    }
+}
+
+/// Emit a batched linear projection: for bf16 weights uses a single batched instruction,
+/// for quantized weights (PCG32/RNF4) loops over tokens since those kernels lack batch support.
+/// `output` and `input` are base pointers to [N × out_dim] and [N × in_dim] buffers.
+/// `no_sync`: if true, set_no_sync on emitted instructions (except the last in a loop).
+fn emit_batched_linear_proj(
+    weight: &crate::model::LinearWeight,
+    output: *const f32,
+    input: *const f32,
+    out_dim: usize,
+    in_dim: usize,
+    n: usize,
+    no_sync: bool,
+    instructions: &mut Vec<Instruction>,
+) {
+    if weight_supports_batch(weight) {
+        let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
+        inst.set_output_ptr(1, output);
+        emit_linear_proj(&mut inst, weight, 2);
+        inst.set_ptr(3, input);
+        inst.set_int(4, out_dim as i32);
+        inst.set_int(5, in_dim as i32);
+        inst.set_int(6, n as i32);
+        if no_sync { inst.set_no_sync(); }
+        instructions.push(inst);
+    } else {
+        for t in 0..n {
+            let out_t = unsafe { output.add(t * out_dim) };
+            let in_t = unsafe { input.add(t * in_dim) };
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
+            inst.set_output_ptr(1, out_t);
+            emit_linear_proj(&mut inst, weight, 2);
+            inst.set_ptr(3, in_t);
+            inst.set_int(4, out_dim as i32);
+            inst.set_int(5, in_dim as i32);
+            // Last token in loop: sync if caller didn't ask for no_sync
+            if no_sync || t + 1 < n { inst.set_no_sync(); }
+            instructions.push(inst);
+        }
+    }
+}
+
 /// Choose RMSNorm opcode based on model config.
 fn rmsnorm_opcode(one_plus_w: bool) -> u32 {
     if one_plus_w { OP_RMSNORM } else { OP_RMSNORM_WX }
@@ -411,55 +462,28 @@ impl MegakernelProgram {
                 }
 
                 // QKV projection (batch=N)
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, conv_dim as u32);
-                    inst.set_output_ptr(1, prefill_bufs.qkv.as_ptr());
-                    emit_linear_proj(&mut inst, &w.w_qkv, 2);
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, conv_dim as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
+                emit_batched_linear_proj(
+                    &w.w_qkv, prefill_bufs.qkv.as_ptr(), prefill_bufs.normed.as_ptr(),
+                    conv_dim, hs, n, true, &mut instructions,
+                );
 
-                // a projection (batch=N) — nvh_gdn outputs (per value head)
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh_gdn as u32);
-                    inst.set_output_ptr(1, prefill_bufs.a_proj.as_ptr());
-                    emit_linear_proj(&mut inst, &w.w_a, 2);
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, nvh_gdn as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
+                // a projection (batch=N)
+                emit_batched_linear_proj(
+                    &w.w_a, prefill_bufs.a_proj.as_ptr(), prefill_bufs.normed.as_ptr(),
+                    nvh_gdn, hs, n, true, &mut instructions,
+                );
 
                 // b projection (batch=N)
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh_gdn as u32);
-                    inst.set_output_ptr(1, prefill_bufs.b_proj.as_ptr());
-                    emit_linear_proj(&mut inst, &w.w_b, 2);
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, nvh_gdn as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    inst.set_no_sync();
-                    instructions.push(inst);
-                }
+                emit_batched_linear_proj(
+                    &w.w_b, prefill_bufs.b_proj.as_ptr(), prefill_bufs.normed.as_ptr(),
+                    nvh_gdn, hs, n, true, &mut instructions,
+                );
 
                 // z projection (batch=N) — SYNC before sequential part
-                {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, (nvh_gdn * vd) as u32);
-                    inst.set_output_ptr(1, prefill_bufs.z_proj.as_ptr());
-                    emit_linear_proj(&mut inst, &w.w_z, 2);
-                    inst.set_ptr(3, prefill_bufs.normed.as_ptr());
-                    inst.set_int(4, (nvh_gdn * vd) as i32);
-                    inst.set_int(5, hs as i32);
-                    inst.set_int(6, n as i32);
-                    instructions.push(inst);
-                }
+                emit_batched_linear_proj(
+                    &w.w_z, prefill_bufs.z_proj.as_ptr(), prefill_bufs.normed.as_ptr(),
+                    nvh_gdn * vd, hs, n, false, &mut instructions,
+                );
 
                 // --- Sequential per-token: conv1d, gate, recurrence, norm, output, residual ---
                 let q_dim = nh_gdn * kd;
@@ -719,38 +743,18 @@ impl MegakernelProgram {
 
         // 2. Q(+gate), K, V projections
         let q_mult = if cfg.has_output_gate { 2 } else { 1 };
-        {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nqh * hd * q_mult) as u32);
-            inst.set_output_ptr(1, q_gate_attn_ptr);
-            emit_linear_proj(&mut inst, &w.w_q_gate, 2);
-            inst.set_ptr(3, normed_ptr);
-            inst.set_int(4, (nqh * hd * q_mult) as i32);
-            inst.set_int(5, hs as i32);
-            if n > 1 { inst.set_int(6, n as i32); }
-            inst.set_no_sync();
-            instructions.push(inst);
-        }
-        {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-            inst.set_output_ptr(1, k_attn_ptr);
-            emit_linear_proj(&mut inst, &w.w_k, 2);
-            inst.set_ptr(3, normed_ptr);
-            inst.set_int(4, (nkh * hd) as i32);
-            inst.set_int(5, hs as i32);
-            if n > 1 { inst.set_int(6, n as i32); }
-            inst.set_no_sync();
-            instructions.push(inst);
-        }
-        {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, (nkh * hd) as u32);
-            inst.set_output_ptr(1, v_attn_ptr);
-            emit_linear_proj(&mut inst, &w.w_v, 2);
-            inst.set_ptr(3, normed_ptr);
-            inst.set_int(4, (nkh * hd) as i32);
-            inst.set_int(5, hs as i32);
-            if n > 1 { inst.set_int(6, n as i32); }
-            instructions.push(inst);
-        }
+        emit_batched_linear_proj(
+            &w.w_q_gate, q_gate_attn_ptr, normed_ptr,
+            nqh * hd * q_mult, hs, n, true, instructions,
+        );
+        emit_batched_linear_proj(
+            &w.w_k, k_attn_ptr, normed_ptr,
+            nkh * hd, hs, n, true, instructions,
+        );
+        emit_batched_linear_proj(
+            &w.w_v, v_attn_ptr, normed_ptr,
+            nkh * hd, hs, n, false, instructions,
+        );
 
         // 3. Deinterleave Q+gate → Q, gate (only for gated Q models like Qwen3.5)
         if !cfg.has_output_gate {
@@ -1096,16 +1100,10 @@ impl MegakernelProgram {
         };
 
         // 11. Output projection + residual
-        {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-            inst.set_output_ptr(1, out_proj_ptr);
-            emit_linear_proj(&mut inst, &w.w_o, 2);
-            inst.set_ptr(3, final_attn_ptr);
-            inst.set_int(4, hs as i32);
-            inst.set_int(5, (nqh * hd) as i32);
-            if n > 1 { inst.set_int(6, n as i32); }
-            instructions.push(inst);
-        }
+        emit_batched_linear_proj(
+            &w.w_o, out_proj_ptr, final_attn_ptr,
+            hs, nqh * hd, n, false, instructions,
+        );
         if n > 1 {
             // Batched residual: hidden = hidden + out_proj (N tokens)
             let total = n * hs;
