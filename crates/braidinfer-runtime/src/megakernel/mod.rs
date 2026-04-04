@@ -57,10 +57,9 @@ impl Instruction {
         self.words[idx] = ptr as u64;
     }
 
-    /// Set a slot to a GPU output pointer. Uses *const T because DeviceBuffer
-    /// pointers are stable addresses — the GPU writes through them regardless
-    /// of Rust borrow state. Named distinctly from set_ptr for documentation.
-    pub(crate) fn set_output_ptr<T>(&mut self, idx: usize, ptr: *const T) {
+    /// Set a slot to a GPU output pointer (GPU writes through this pointer).
+    /// Callers should use DeviceBuffer::as_write_ptr() to get *mut T from &self.
+    pub(crate) fn set_output_ptr<T>(&mut self, idx: usize, ptr: *mut T) {
         self.words[idx] = ptr as u64;
     }
 

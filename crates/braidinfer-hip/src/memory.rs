@@ -34,6 +34,12 @@ impl<T> DeviceBuffer<T> {
         self.ptr
     }
 
+    /// Returns *mut T from &self for GPU instruction packing: the GPU writes
+    /// through this pointer at execution time, but compilation only has &self.
+    pub fn as_write_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -209,6 +215,11 @@ impl<T> MappedHostBuffer<T> {
 
     /// Mutable GPU-side pointer alias (matches DeviceBuffer::as_mut_ptr).
     pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.device_ptr
+    }
+
+    /// Returns *mut T from &self for GPU instruction packing (see DeviceBuffer::as_write_ptr).
+    pub fn as_write_ptr(&self) -> *mut T {
         self.device_ptr
     }
 
