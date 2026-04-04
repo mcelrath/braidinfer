@@ -213,6 +213,13 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             continue;
         }
 
+        // OP_MOE_DISPATCH: GPU-initiated MoE — triggers workers, polls acks, sums results.
+        // Manages its own grid.sync() internally.
+        if (opcode == OP_MOE_DISPATCH) {
+            op_moe_dispatch(inst, grid);
+            continue;
+        }
+
         // Virtual block loop: each physical block handles multiple virtual blocks
         for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
             switch (opcode) {

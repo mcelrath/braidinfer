@@ -5,7 +5,7 @@ use braidinfer_hip::device::Device;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{ffi, HipResult};
-use braidinfer_hip::memory::{DeviceBuffer, PinnedBuffer};
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer, PinnedBuffer};
 
 /// Opaque HIP event wrapper. NOT Send — pinned to creation device.
 pub struct HipEvent {
@@ -158,4 +158,211 @@ impl MultiGpuContext {
             ffi::hipStreamWaitEvent(stream.raw(), event.raw(), 0)
         })
     }
+}
+
+/// GPU-initiated MoE work queue: host-mapped memory shared between GPU 0 megakernel
+/// and persistent worker kernels on GPUs 1..N-1.
+pub struct MoeWorkQueue {
+    /// Host-mapped work item (512 bytes). GPU 0 megakernel writes, workers poll.
+    pub work_item: MappedHostBuffer<u8>,
+    /// Per-worker output slots on GPU 0 VRAM: [num_workers * hidden_size].
+    pub output_slots: DeviceBuffer<f32>,
+    /// Per-worker shutdown flags (host-mapped).
+    pub shutdown_flags: Vec<MappedHostBuffer<u32>>,
+    /// Sequence counter (incremented per MoE layer dispatch).
+    pub seq_counter: u32,
+    /// Worker streams (one per GPU, persistent kernel launched on these).
+    pub worker_streams: Vec<Stream>,
+    /// Worker config device buffers (one per GPU).
+    pub worker_configs: Vec<DeviceBuffer<u8>>,
+    /// Worker kernel modules.
+    pub worker_modules: Vec<Module>,
+    pub num_workers: usize,
+    pub hidden_size: usize,
+}
+
+impl MoeWorkQueue {
+    /// Initialize and launch persistent worker kernels.
+    pub fn init(
+        ctx: &MultiGpuContext,
+        dist_moe_layers: &[Option<crate::weights::DistributedMoeWeights>],
+        hidden_size: usize,
+        expert_intermediate_size: usize,
+    ) -> HipResult<Self> {
+        let num_workers = ctx.num_devices;
+
+        // Allocate host-mapped work item (512 bytes)
+        Device::set_current(DeviceId(0))?;
+        let work_item = MappedHostBuffer::<u8>::alloc(512)?;
+
+        // Per-worker output slots on GPU 0
+        let output_slots = DeviceBuffer::<f32>::alloc(DeviceId(0), num_workers * hidden_size)?;
+
+        // Per-worker shutdown flags
+        let mut shutdown_flags = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            let flag = MappedHostBuffer::<u32>::alloc(1)?;
+            shutdown_flags.push(flag);
+        }
+
+        // Build worker configs and launch persistent kernels
+        let mut worker_streams = Vec::with_capacity(num_workers);
+        let mut worker_configs = Vec::with_capacity(num_workers);
+        let mut worker_modules = Vec::with_capacity(num_workers);
+
+        let kernel_dir = crate::kernel::kernel_dir();
+
+        // Find the first MoE layer to get expert layout
+        let first_moe = dist_moe_layers.iter()
+            .find_map(|x| x.as_ref())
+            .expect("MoeWorkQueue::init called without MoE layers");
+
+        for gpu in 0..num_workers {
+            let device = DeviceId(gpu as u32);
+            Device::set_current(device)?;
+
+            // Build MoeWorkerConfig for this GPU
+            let gate_up_row_stride = first_moe.gate_up_row_stride;
+            // Down projection has in_dim=expert_intermediate_size
+            let down_groups_per_row = (expert_intermediate_size + 31) / 32;
+            let down_row_stride = down_groups_per_row * 20;
+            let mut config_bytes = vec![0u8; std::mem::size_of::<MoeWorkerConfigRust>()];
+            let config = unsafe { &mut *(config_bytes.as_mut_ptr() as *mut MoeWorkerConfigRust) };
+            config.my_gpu_id = gpu as u32;
+            config.num_experts_local = first_moe.expert_buffers[gpu].local_expert_count as u32;
+            config.gate_up_row_stride = gate_up_row_stride as u32;
+            config.down_row_stride = down_row_stride as u32;
+            config.hidden_size = hidden_size as u32;
+            config.expert_intermediate_size = expert_intermediate_size as u32;
+
+            // Populate expert entries from all MoE layers (use first layer's layout)
+            let buf = &first_moe.expert_buffers[gpu];
+            for eid in 0..first_moe.num_experts {
+                if first_moe.expert_device[eid] != gpu { continue; }
+                let slot = buf.slot_map[eid].expect("expert slot missing");
+                let gu_offset = slot * first_moe.gate_up_expert_stride;
+                let d_offset = slot * first_moe.down_expert_stride;
+                config.entries[eid].global_expert_id = eid as u32;
+                config.entries[eid].gate_up_ptr = unsafe { buf.gate_up.as_ptr().add(gu_offset) } as u64;
+                config.entries[eid].down_ptr = unsafe { buf.down.as_ptr().add(d_offset) } as u64;
+            }
+
+            // Upload config to device memory
+            let mut config_buf = DeviceBuffer::<u8>::alloc(device, config_bytes.len())?;
+            config_buf.copy_from_host(&config_bytes)?;
+            worker_configs.push(config_buf);
+
+            // Create stream and load module
+            let stream = Stream::new(device)?;
+            let module = Module::load(device, &kernel_dir.join("moe_worker.hsaco"))?;
+            worker_streams.push(stream);
+            worker_modules.push(module);
+        }
+
+        // Launch persistent worker kernels
+        for gpu in 0..num_workers {
+            let device = DeviceId(gpu as u32);
+            Device::set_current(device)?;
+
+            let func = worker_modules[gpu].get_function("moe_worker_kernel")?;
+            let worker = &ctx.workers[gpu];
+
+            let mut wq_ptr = work_item.as_ptr() as *mut std::ffi::c_void;
+            let mut sf_ptr = shutdown_flags[gpu].as_ptr() as *mut std::ffi::c_void;
+            let mut cfg_ptr = worker_configs[gpu].as_ptr() as *mut std::ffi::c_void;
+            let mut act_ptr = worker.activation_in.as_ptr() as *mut std::ffi::c_void;
+            let mut sg_ptr = worker.scratch_gate.as_ptr() as *mut std::ffi::c_void;
+            let mut su_ptr = worker.scratch_up.as_ptr() as *mut std::ffi::c_void;
+            let mut sa_ptr = worker.scratch_act.as_ptr() as *mut std::ffi::c_void;
+            let mut eo_ptr = worker.expert_out.as_ptr() as *mut std::ffi::c_void;
+
+            let mut args: [*mut std::ffi::c_void; 8] = [
+                std::ptr::addr_of_mut!(wq_ptr).cast(),
+                std::ptr::addr_of_mut!(sf_ptr).cast(),
+                std::ptr::addr_of_mut!(cfg_ptr).cast(),
+                std::ptr::addr_of_mut!(act_ptr).cast(),
+                std::ptr::addr_of_mut!(sg_ptr).cast(),
+                std::ptr::addr_of_mut!(su_ptr).cast(),
+                std::ptr::addr_of_mut!(sa_ptr).cast(),
+                std::ptr::addr_of_mut!(eo_ptr).cast(),
+            ];
+
+            // Use max occupancy blocks for cooperative kernel
+            let num_blocks = 192u32; // Same as megakernel
+            let shared_mem = 256 * 4; // 256 floats for reduction
+
+            func.launch_cooperative(
+                (num_blocks, 1, 1),
+                (256, 1, 1),
+                shared_mem,
+                &worker_streams[gpu],
+                &mut args,
+            )?;
+
+            eprintln!("  GPU {gpu}: persistent worker kernel launched ({num_blocks} blocks)");
+        }
+
+        Ok(MoeWorkQueue {
+            work_item,
+            output_slots,
+            shutdown_flags,
+            seq_counter: 0,
+            worker_streams,
+            worker_configs,
+            worker_modules,
+            num_workers,
+            hidden_size,
+        })
+    }
+
+    /// Get host pointer to work item (for megakernel instruction packing).
+    pub fn work_item_ptr(&self) -> *mut u8 {
+        self.work_item.host_ptr() as *mut u8
+    }
+
+    /// Get device pointer to output slots on GPU 0.
+    pub fn output_slots_ptr(&self) -> *mut f32 {
+        self.output_slots.as_write_ptr()
+    }
+
+    /// Increment and return next sequence number.
+    pub fn next_seq(&mut self) -> u32 {
+        self.seq_counter += 1;
+        self.seq_counter
+    }
+}
+
+impl Drop for MoeWorkQueue {
+    fn drop(&mut self) {
+        // Signal all workers to shut down
+        for flag in &self.shutdown_flags {
+            unsafe { std::ptr::write_volatile(flag.host_ptr(), 1u32); }
+        }
+        // Wait for workers to exit
+        for (i, stream) in self.worker_streams.iter().enumerate() {
+            let _ = Device::set_current(DeviceId(i as u32));
+            let _ = stream.synchronize();
+        }
+    }
+}
+
+/// Rust-side mirror of MoeWorkerConfig from moe_work_queue.h.
+#[repr(C)]
+struct MoeWorkerConfigRust {
+    my_gpu_id: u32,
+    num_experts_local: u32,
+    gate_up_row_stride: u32,
+    down_row_stride: u32,
+    hidden_size: u32,
+    expert_intermediate_size: u32,
+    _pad: [u32; 2],
+    entries: [MoeExpertEntryRust; 256],
+}
+
+#[repr(C)]
+struct MoeExpertEntryRust {
+    global_expert_id: u32,
+    _pad: u32,
+    gate_up_ptr: u64,
+    down_ptr: u64,
 }
