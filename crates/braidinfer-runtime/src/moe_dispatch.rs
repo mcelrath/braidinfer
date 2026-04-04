@@ -92,18 +92,24 @@ pub fn dispatch_moe_layer(
         }
     }
 
-    // 5. Broadcast activation from normed_stage (GART memory, CPU has already read it)
-    // to worker GPU activation_in buffers via host-staged copy.
-    // normed_stage was populated by OP_D2D_COPY before OP_BARRIER.
-    let act_host: &[f32] = unsafe {
-        std::slice::from_raw_parts(normed_stage.host_ptr() as *const f32, hs)
-    };
+    // 5. Async broadcast: activation from normed_stage (GART) to each worker's activation_in.
+    // Uses hipMemcpyAsync on each worker's transfer_stream for overlapped H2D transfers.
+    let act_host: *const std::ffi::c_void = normed_stage.host_ptr() as *const std::ffi::c_void;
     for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
-        let device = ctx.workers[gpu].device;
-        Device::set_current(device)?;
-        ctx.workers[gpu].activation_in.copy_from_host(act_host)?;
-        ctx.workers[gpu].broadcast_done.record(&ctx.workers[gpu].transfer_stream)?;
+        let worker = &ctx.workers[gpu];
+        Device::set_current(worker.device)?;
+        unsafe {
+            let rc = ffi::hipMemcpyAsync(
+                worker.activation_in.as_ptr() as *mut std::ffi::c_void,
+                act_host,
+                hs * 4,
+                ffi::hipMemcpyHostToDevice,
+                worker.transfer_stream.raw(),
+            );
+            if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+        }
+        worker.broadcast_done.record(&worker.transfer_stream)?;
     }
 
     // 6. Launch expert FFN on each worker GPU (GPU 1..N-1 only)
@@ -185,34 +191,43 @@ pub fn dispatch_moe_layer(
         worker.compute_done.record(&worker.compute_stream)?;
     }
 
-    // 7. Gather: CPU waits for each worker, then hipMemcpy worker.expert_out → host → accumulate.
-    // hipMemcpy from worker GPU to CPU is safe (only synchronizes worker GPU, not GPU 0).
-    let mut gather_buf = vec![0.0f32; hs];
+    // 7. Async gather: overlap D2H transfers from all workers via hipMemcpyAsync on
+    //    each worker's transfer_stream. SDMA engine handles these independently of GPU 0
+    //    compute SMs (which are parked in cooperative megakernel during OP_BARRIER).
     for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &ctx.workers[gpu];
-
-        // CPU-side wait for worker compute (hipEventSynchronize blocks CPU thread, not GPU 0)
-        worker.compute_done.synchronize()?;
-
-        // hipMemcpy from worker GPU to CPU (safe: does NOT sync GPU 0)
         Device::set_current(worker.device)?;
+
+        // transfer_stream waits for compute to finish on this worker
+        MultiGpuContext::stream_wait_event(&worker.transfer_stream, &worker.compute_done)?;
+
+        // Async D2H into pre-allocated pinned host buffer (overlaps across workers)
         unsafe {
-            let rc = ffi::hipMemcpy(
-                gather_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            let rc = ffi::hipMemcpyAsync(
+                worker.gather_host.as_ptr() as *mut std::ffi::c_void,
                 worker.expert_out.as_ptr() as *const std::ffi::c_void,
                 hs * 4,
                 ffi::hipMemcpyDeviceToHost,
+                worker.transfer_stream.raw(),
             );
             if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
         }
+        worker.transfer_done.record(&worker.transfer_stream)?;
+    }
 
-        // CPU accumulate into ffn_down_stage (no GPU involved)
+    // Wait for all transfers, then CPU-accumulate into ffn_down_stage
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        ctx.workers[gpu].transfer_done.synchronize()?;
+        let src: &[f32] = unsafe {
+            std::slice::from_raw_parts(ctx.workers[gpu].gather_host.as_ptr(), hs)
+        };
         let out: &mut [f32] = unsafe {
             std::slice::from_raw_parts_mut(ffn_down_stage.host_ptr(), hs)
         };
         for i in 0..hs {
-            out[i] += gather_buf[i];
+            out[i] += src[i];
         }
     }
 
@@ -269,9 +284,16 @@ pub fn dispatch_moe_layer_sync(
                 worker.expert_out.as_ptr() as *mut std::ffi::c_void,
                 0, hs * 4, worker.compute_stream.raw(),
             );
+            let rc = ffi::hipMemcpyAsync(
+                worker.activation_in.as_ptr() as *mut std::ffi::c_void,
+                normed_host.as_ptr() as *const std::ffi::c_void,
+                hs * 4,
+                ffi::hipMemcpyHostToDevice,
+                worker.transfer_stream.raw(),
+            );
+            if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
         }
-        ctx.workers[gpu].activation_in.copy_from_host(normed_host)?;
-        ctx.workers[gpu].broadcast_done.record(&ctx.workers[gpu].transfer_stream)?;
+        worker.broadcast_done.record(&worker.transfer_stream)?;
     }
 
     for gpu in 1..num_devices {
@@ -332,24 +354,33 @@ pub fn dispatch_moe_layer_sync(
         worker.compute_done.record(&worker.compute_stream)?;
     }
 
-    let mut gather_buf = vec![0.0f32; hs];
+    // Async gather: overlap D2H transfers from all workers
     for gpu in 1..num_devices {
         if per_gpu[gpu].is_empty() { continue; }
         let worker = &ctx.workers[gpu];
-        worker.compute_done.synchronize()?;
         Device::set_current(worker.device)?;
+        MultiGpuContext::stream_wait_event(&worker.transfer_stream, &worker.compute_done)?;
         unsafe {
-            let rc = ffi::hipMemcpy(
-                gather_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            let rc = ffi::hipMemcpyAsync(
+                worker.gather_host.as_ptr() as *mut std::ffi::c_void,
                 worker.expert_out.as_ptr() as *const std::ffi::c_void,
                 hs * 4, ffi::hipMemcpyDeviceToHost,
+                worker.transfer_stream.raw(),
             );
             if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
         }
+        worker.transfer_done.record(&worker.transfer_stream)?;
+    }
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        ctx.workers[gpu].transfer_done.synchronize()?;
+        let src: &[f32] = unsafe {
+            std::slice::from_raw_parts(ctx.workers[gpu].gather_host.as_ptr(), hs)
+        };
         let out: &mut [f32] = unsafe {
             std::slice::from_raw_parts_mut(ffn_down_stage.host_ptr(), hs)
         };
-        for i in 0..hs { out[i] += gather_buf[i]; }
+        for i in 0..hs { out[i] += src[i]; }
     }
 
     Device::set_current(DeviceId(0))?;

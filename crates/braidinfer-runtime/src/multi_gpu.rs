@@ -5,7 +5,7 @@ use braidinfer_hip::device::Device;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{ffi, HipResult};
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, PinnedBuffer};
 
 /// Opaque HIP event wrapper. NOT Send — pinned to creation device.
 pub struct HipEvent {
@@ -51,8 +51,11 @@ pub struct GpuWorker {
     pub scratch_gate: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
     pub scratch_up: DeviceBuffer<f32>,      // [max_expert_intermediate_size]
     pub scratch_act: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
+    pub transfer_done: HipEvent,   // signaled after D2H gather completes
     // Compute-path P2P copy kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe)
     pub peer_copy_module: Module,
+    // Pre-allocated pinned host buffer for async gather (hipHostMalloc for true async DMA)
+    pub gather_host: PinnedBuffer<f32>,
 }
 
 /// Multi-GPU context for expert parallel dispatch.
@@ -110,7 +113,9 @@ impl MultiGpuContext {
                 scratch_gate: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
                 scratch_up: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
                 scratch_act: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
+                transfer_done: HipEvent::new()?,
                 peer_copy_module: Module::load(device, &crate::kernel::kernel_dir().join("peer_copy.hsaco"))?,
+                gather_host: PinnedBuffer::<f32>::alloc(hidden_size)?,
             });
         }
 
