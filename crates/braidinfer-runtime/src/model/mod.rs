@@ -264,18 +264,30 @@ impl Model {
         mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
         let hs = self.config.hidden_size;
+        let num_gpus = self.persistent_workers.as_ref().unwrap().num_gpus();
+        #[allow(non_snake_case)]
+        let OP_EXPERT_FFN: u32 = 35;
+
+        // Collect per-GPU buffer pointers once
+        let gpu_ptrs: Vec<_> = (0..num_gpus).map(|gpu| {
+            let w = &self.multi_gpu.as_ref().unwrap().workers[gpu];
+            (w.scratch_gate.as_write_ptr() as u64,
+             w.scratch_up.as_write_ptr() as u64,
+             w.scratch_act.as_write_ptr() as u64)
+        }).collect();
+        let ffn_down_stage_ptr = self.activations.ffn_down_stage.as_write_ptr() as u64;
 
         // Split instruction stream at OP_BARRIER markers into segments.
-        // Each segment is dispatched as a batch to GPU 0's worker.
-        // At OP_BARRIER: shutdown worker, kbk MoE dispatch, relaunch.
+        // Dense segments batched to GPU 0. At OP_BARRIER: build per-GPU expert
+        // FFN batches, dispatch to all GPUs in parallel via persistent workers.
         let mut segment: Vec<Instruction> = Vec::new();
 
         for inst in mk.instructions.iter() {
             let opcode = inst.words[0] & 0x7FFFFFFF;
-            if opcode == 16 { break; } // OP_HALT
+            if opcode == 16 { break; }
 
-            if opcode == 33 { // OP_BARRIER
-                // Flush pending segment as batch
+            if opcode == 33 { // OP_BARRIER — MoE dispatch point
+                // Flush pending dense segment to GPU 0
                 if !segment.is_empty() {
                     let dispatch = self.persistent_workers.as_mut().unwrap();
                     for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
@@ -291,44 +303,117 @@ impl Model {
                     _ => panic!("OP_BARRIER on non-MoE layer"),
                 };
 
-                // Shutdown persistent worker for kbk MoE
-                self.persistent_workers.as_mut().unwrap().shutdown();
-
-                braidinfer_hip::memory::memcpy_d2d(
-                    self.activations.normed_stage.as_write_ptr() as *mut u8,
-                    self.activations.normed.as_ptr() as *const u8,
-                    hs * 4,
-                )?;
-                let normed_host: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs)
+                // Read expert routing from host-mapped memory
+                let expert_ids: &[i32] = unsafe {
+                    std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k)
                 };
-                if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
-                    let mgpu = self.multi_gpu.as_mut().unwrap();
-                    crate::moe_dispatch::dispatch_moe_layer_sync(
-                        mgpu, &self.worker_kernels, dist_moe,
-                        normed_host, &mut self.activations.ffn_down_stage,
-                        &self.activations.moe_expert_ids,
-                        &self.activations.moe_expert_weights,
-                        k, hs, eis, &self.stream,
-                    ).map_err(ModelError::Hip)?;
-                }
-                braidinfer_hip::memory::memcpy_h2d(
-                    self.activations.ffn_down.as_write_ptr() as *mut u8,
-                    unsafe { std::slice::from_raw_parts(self.activations.ffn_down_stage.host_ptr() as *const u8, hs * 4) },
-                    hs * 4,
-                )?;
+                let expert_weights: &[f32] = unsafe {
+                    std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k)
+                };
+                let dist_moe = self.distributed_moe[layer_idx].as_ref()
+                    .expect("missing distributed MoE weights");
 
-                // Relaunch
-                let shared_mem = 1024u32 * 4 + 256;
-                self.persistent_workers.as_mut().unwrap().relaunch(shared_mem)
-                    .map_err(ModelError::Hip)?;
+                // D2D_COPY normed → normed_stage on GPU 0 (for all GPUs to read)
+                {
+                    let mut copy_inst = Instruction::new(17, (hs as u32 + 255) / 256);
+                    copy_inst.words[1] = self.activations.normed_stage.as_write_ptr() as u64;
+                    copy_inst.words[2] = self.activations.normed.as_ptr() as u64;
+                    copy_inst.words[3] = hs as u64;
+                    self.persistent_workers.as_mut().unwrap().dispatch_batch(0, &[copy_inst]);
+                }
+                let act_ptr = self.activations.normed_stage.as_ptr() as u64;
+
+                // Zero ffn_down_stage
+                unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }
+
+                // Group experts by GPU
+                let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_gpus];
+                for j in 0..k {
+                    let eid = expert_ids[j] as usize;
+                    per_gpu[dist_moe.expert_device[eid]].push((eid, expert_weights[j]));
+                }
+
+                // Build per-GPU OP_EXPERT_FFN instruction batches
+                let mut gpu_batches: Vec<(usize, Vec<Instruction>)> = Vec::new();
+                for gpu in 0..num_gpus {
+                    if per_gpu[gpu].is_empty() { continue; }
+                    let (sg, su, sa) = gpu_ptrs[gpu];
+                    let mut batch = Vec::new();
+
+                    for &(eid, ew) in &per_gpu[gpu] {
+                        let buf = &dist_moe.expert_buffers[gpu];
+                        let slot = buf.slot_map[eid].expect("expert not on GPU");
+                        let gu_offset = slot * dist_moe.gate_up_expert_stride;
+                        let d_offset = slot * dist_moe.down_expert_stride;
+                        let gate_up_ptr = unsafe { buf.gate_up.as_ptr().add(gu_offset) } as u64;
+                        let down_ptr = unsafe { buf.down.as_ptr().add(d_offset) } as u64;
+
+                        let mut inst = Instruction::new(OP_EXPERT_FFN, 0);
+                        inst.words[1] = sg;
+                        inst.words[2] = su;
+                        inst.words[3] = sa;
+                        inst.words[4] = ffn_down_stage_ptr; // accumulate directly
+                        inst.words[5] = gate_up_ptr;
+                        inst.words[6] = down_ptr;
+                        inst.words[7] = act_ptr;
+                        inst.words[8] = ((eis as u64) << 32) | (hs as u64);
+                        inst.words[9] = dist_moe.gate_up_row_stride as u64;
+                        inst.words[10] = if dist_moe.has_gate_proj { 1 } else { 0 };
+                        inst.words[11] = ew.to_bits() as u64;
+                        batch.push(inst);
+                    }
+                    gpu_batches.push((gpu, batch));
+                }
+
+                // Dispatch all GPU batches in parallel (fire all, wait all)
+                let dispatch = self.persistent_workers.as_mut().unwrap();
+                let mut pending: Vec<(usize, u32)> = Vec::new();
+                for (gpu, batch) in &gpu_batches {
+                    // Write batch to GPU's work queue without waiting
+                    let w = &mut dispatch.workers[*gpu];
+                    let q_ptr = w.queue.host_ptr() as *mut crate::persistent_dispatch::WorkerQueueLayout;
+                    for (i, inst) in batch.iter().enumerate() {
+                        let offset = i * crate::megakernel::INST_SIZE;
+                        for j in 0..crate::megakernel::INST_SIZE {
+                            unsafe {
+                                std::ptr::write_volatile(
+                                    std::ptr::addr_of_mut!((*q_ptr).inst[offset + j]),
+                                    inst.words[j],
+                                );
+                            }
+                        }
+                    }
+                    unsafe {
+                        std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).num_instructions), batch.len() as u32);
+                    }
+                    w.seq_counter += 1;
+                    let seq = w.seq_counter;
+                    unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
+                    pending.push((*gpu, seq));
+                }
+                // Wait for ALL GPUs to complete their expert batches
+                for &(gpu, seq) in &pending {
+                    dispatch.wait_ack(gpu, seq);
+                }
+
+                // Post-barrier: ffn_down_stage has accumulated results (host-mapped).
+                // Copy to ffn_down (GPU 0 VRAM) for shared expert + residual instructions.
+                {
+                    let mut copy_inst = Instruction::new(17, (hs as u32 + 255) / 256);
+                    copy_inst.words[1] = self.activations.ffn_down.as_write_ptr() as u64;
+                    copy_inst.words[2] = ffn_down_stage_ptr;
+                    copy_inst.words[3] = hs as u64;
+                    // Don't batch this — it's a single instruction
+                    self.persistent_workers.as_mut().unwrap().dispatch_batch(0, &[copy_inst]);
+                }
+
                 continue;
             }
 
             segment.push(inst.clone());
         }
 
-        // Flush final segment (post-last-barrier to LM head)
+        // Flush final segment
         if !segment.is_empty() {
             let dispatch = self.persistent_workers.as_mut().unwrap();
             for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
