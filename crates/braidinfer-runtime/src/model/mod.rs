@@ -273,17 +273,6 @@ impl Model {
         mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
         let hs = self.config.hidden_size;
-        let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-        #[allow(non_snake_case)]
-        let OP_EXPERT_FFN: u32 = 35;
-
-        // Collect per-GPU buffer pointers once
-        let gpu_ptrs: Vec<_> = (0..num_gpus).map(|gpu| {
-            let w = &self.multi_gpu.as_ref().unwrap().workers[gpu];
-            (w.scratch_gate.as_write_ptr() as u64,
-             w.scratch_up.as_write_ptr() as u64,
-             w.scratch_act.as_write_ptr() as u64)
-        }).collect();
         let ffn_down_stage_ptr = self.activations.ffn_down_stage.as_write_ptr() as u64;
 
         // Split instruction stream at OP_BARRIER markers into segments.
@@ -312,17 +301,10 @@ impl Model {
                     _ => panic!("OP_BARRIER on non-MoE layer"),
                 };
 
-                // Read expert routing from host-mapped memory
-                let expert_ids: &[i32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k)
-                };
-                let expert_weights: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k)
-                };
                 let dist_moe = self.distributed_moe[layer_idx].as_ref()
                     .expect("missing distributed MoE weights");
 
-                // D2D_COPY normed → normed_stage on GPU 0 (for all GPUs to read)
+                // D2D_COPY normed → normed_stage on GPU 0 (CPU-readable for kbk dispatch)
                 {
                     let mut copy_inst = Instruction::new(17, (hs as u32 + 255) / 256);
                     copy_inst.words[1] = self.activations.normed_stage.as_write_ptr() as u64;
@@ -330,93 +312,26 @@ impl Model {
                     copy_inst.words[3] = hs as u64;
                     self.persistent_workers.as_mut().unwrap().dispatch_batch(0, &[copy_inst]);
                 }
-                let act_ptr = self.activations.normed_stage.as_ptr() as u64;
 
-                // Group experts by GPU
-                let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_gpus];
-                for j in 0..k {
-                    let eid = expert_ids[j] as usize;
-                    per_gpu[dist_moe.expert_device[eid]].push((eid, expert_weights[j]));
-                }
-
-                // Each GPU accumulates into its OWN output slot (no race condition).
-                // Per-GPU output slots are in moe_output_slots (host-mapped).
-                let output_slot_ptrs: Vec<u64> = (0..num_gpus).map(|gpu| {
-                    self.persistent_workers.as_ref().unwrap().moe_output_slots[gpu].as_write_ptr() as u64
-                }).collect();
-
-                // Zero per-GPU output slots
-                for gpu in 0..num_gpus {
-                    if per_gpu[gpu].is_empty() { continue; }
-                    let slot = &self.persistent_workers.as_ref().unwrap().moe_output_slots[gpu];
-                    unsafe { std::ptr::write_bytes(slot.host_ptr(), 0, hs); }
-                }
-
-                // Build per-GPU OP_EXPERT_FFN instruction batches
-                let mut gpu_batches: Vec<(usize, Vec<Instruction>)> = Vec::new();
-                for gpu in 0..num_gpus {
-                    if per_gpu[gpu].is_empty() { continue; }
-                    let (sg, su, sa) = gpu_ptrs[gpu];
-                    let mut batch = Vec::new();
-
-                    for &(eid, ew) in &per_gpu[gpu] {
-                        let buf = &dist_moe.expert_buffers[gpu];
-                        let slot = buf.slot_map[eid].expect("expert not on GPU");
-                        let gu_offset = slot * dist_moe.gate_up_expert_stride;
-                        let d_offset = slot * dist_moe.down_expert_stride;
-                        let gate_up_ptr = unsafe { buf.gate_up.as_ptr().add(gu_offset) } as u64;
-                        let down_ptr = unsafe { buf.down.as_ptr().add(d_offset) } as u64;
-
-                        let mut inst = Instruction::new(OP_EXPERT_FFN, 0);
-                        inst.words[1] = sg;
-                        inst.words[2] = su;
-                        inst.words[3] = sa;
-                        inst.words[4] = output_slot_ptrs[gpu]; // per-GPU slot (no race)
-                        inst.words[5] = gate_up_ptr;
-                        inst.words[6] = down_ptr;
-                        inst.words[7] = act_ptr;
-                        inst.words[8] = ((eis as u64) << 32) | (hs as u64);
-                        inst.words[9] = dist_moe.gate_up_row_stride as u64;
-                        inst.words[10] = if dist_moe.has_gate_proj { 1 } else { 0 };
-                        inst.words[11] = ew.to_bits() as u64;
-                        batch.push(inst);
+                // Dispatch routed experts on GPUs 1+ via kbk (hipLaunchKernel).
+                // dispatch_moe_layer natively iterates gpu in 1..num_devices — no GPU 0 access.
+                // hipMemcpyAsync/hipEventSynchronize on GPU 1-3 streams are safe: no cooperative
+                // kernel on those GPUs. hipEventSynchronize waits on a stream signal, not
+                // SyncAllStreams, so it doesn't interact with GPU 0's cooperative kernel.
+                {
+                    let mgpu = self.multi_gpu.as_mut().unwrap() as *mut crate::multi_gpu::MultiGpuContext;
+                    let wk = self.worker_kernels.as_slice() as *const [crate::moe_dispatch::WorkerKernels];
+                    let dm = dist_moe as *const crate::weights::DistributedMoeWeights;
+                    let ns = &self.activations.normed_stage as *const braidinfer_hip::memory::MappedHostBuffer<f32>;
+                    let fds = &mut self.activations.ffn_down_stage as *mut braidinfer_hip::memory::MappedHostBuffer<f32>;
+                    let ids = &self.activations.moe_expert_ids as *const braidinfer_hip::memory::MappedHostBuffer<i32>;
+                    let wts = &self.activations.moe_expert_weights as *const braidinfer_hip::memory::MappedHostBuffer<f32>;
+                    unsafe {
+                        crate::moe_dispatch::dispatch_moe_layer(
+                            &mut *mgpu, &*wk, &*dm, &*ns, &mut *fds, &*ids, &*wts,
+                            k, hs, eis,
+                        ).map_err(ModelError::Hip)?;
                     }
-                    gpu_batches.push((gpu, batch));
-                }
-
-                // Dispatch expert FFN:
-                // - GPU 0: use fat dense worker (OP_EXPERT_FFN via dispatch_batch)
-                // - GPUs 1+: use lean MoE workers (high occupancy, moe_dispatch_fire)
-                let dispatch = self.persistent_workers.as_mut().unwrap();
-                let mut moe_pending: Vec<(usize, u32)> = Vec::new();
-
-                // Dispatch expert FFN:
-                // - GPU 0: fat dense worker (OP_EXPERT_FFN)
-                // - GPUs 1+: lean MoE workers with per-block scratch (no grid.sync)
-                for (gpu, batch) in &gpu_batches {
-                    if *gpu == 0 {
-                        dispatch.dispatch_batch(0, batch);
-                    } else {
-                        let moe_idx = gpu - 1;
-                        let seq = dispatch.moe_dispatch_fire(moe_idx, batch);
-                        moe_pending.push((moe_idx, seq));
-                    }
-                }
-                for &(idx, seq) in &moe_pending {
-                    dispatch.moe_wait_ack(idx, seq);
-                }
-
-                // CPU sums per-GPU output slots into ffn_down_stage (no race — sequential)
-                unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }
-                let out: &mut [f32] = unsafe {
-                    std::slice::from_raw_parts_mut(self.activations.ffn_down_stage.host_ptr(), hs)
-                };
-                for gpu in 0..num_gpus {
-                    if per_gpu[gpu].is_empty() { continue; }
-                    let slot_data: &[f32] = unsafe {
-                        std::slice::from_raw_parts(dispatch.moe_output_slots[gpu].host_ptr(), hs)
-                    };
-                    for i in 0..hs { out[i] += slot_data[i]; }
                 }
 
                 // Copy ffn_down_stage → ffn_down for post-barrier instructions
