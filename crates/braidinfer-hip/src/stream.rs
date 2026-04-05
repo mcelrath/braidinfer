@@ -16,6 +16,16 @@ impl Stream {
         Ok(Stream { raw, device })
     }
 
+    /// Non-blocking stream: does not synchronize with the default stream.
+    /// Required for cooperative kernel streams that must not wait on other GPU work.
+    pub fn new_nonblocking(device: DeviceId) -> HipResult<Self> {
+        crate::device::Device::set_current(device)?;
+        let mut raw = std::ptr::null_mut();
+        const HIP_STREAM_NON_BLOCKING: u32 = 1;
+        error::check(unsafe { ffi::hipStreamCreateWithFlags(&mut raw, HIP_STREAM_NON_BLOCKING) })?;
+        Ok(Stream { raw, device })
+    }
+
     pub fn raw(&self) -> ffi::hipStream_t {
         self.raw
     }

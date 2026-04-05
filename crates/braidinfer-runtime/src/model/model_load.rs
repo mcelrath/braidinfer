@@ -692,10 +692,10 @@ impl Model {
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
-                // Persistent multi-GPU (PERSISTENT=1): fat cooperative worker on GPU 0 prohibits
-                // hipLaunchKernel on GPU 0 during MoE dispatch. Assign experts to GPUs 1+ only.
-                // kbk path: GPU 0 is available for expert computation; use start_gpu=0.
-                let start_gpu = if std::env::var("PERSISTENT").as_deref() == Ok("1") { 1 } else { 0 };
+                // Distribute experts starting at GPU 0 for all paths.
+                // Persistent path: GPU 0 runs OP_EXPERT_FFN via fat worker at OP_BARRIER.
+                // kbk path: GPU 0 runs experts via hipLaunchKernel (no cooperative kernel).
+                let start_gpu = 0usize;
                 if experts_on_gpu0 {
                     let dist = crate::weights::distribute_moe_weights_from_ref(
                         moe, num_devices, hs, start_gpu,

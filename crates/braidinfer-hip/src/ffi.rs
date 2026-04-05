@@ -72,6 +72,7 @@ unsafe extern "C" {
 
     // Stream management
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
+    pub fn hipStreamCreateWithFlags(stream: *mut hipStream_t, flags: u32) -> hipError_t;
     pub fn hipStreamDestroy(stream: hipStream_t) -> hipError_t;
     pub fn hipStreamSynchronize(stream: hipStream_t) -> hipError_t;
     /// Non-blocking check: hipSuccess if all work complete, hipErrorNotReady if still running.
