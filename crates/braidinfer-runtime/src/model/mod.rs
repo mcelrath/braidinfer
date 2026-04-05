@@ -108,9 +108,11 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU: kbk is fastest for MoE models (full occupancy per expert kernel).
-        // Persistent worker only helps for dense layers (no shutdown/relaunch overhead).
+        // Multi-GPU: persistent worker or kbk (PERSISTENT=1 to opt in)
         if is_multi_gpu {
+            if std::env::var("PERSISTENT").is_ok() {
+                return self.decode_step_persistent_multi_gpu(token_id, position);
+            }
             return self.decode_step_moe(token_id, position);
         }
 
@@ -260,6 +262,10 @@ impl Model {
 
         let hs = self.config.hidden_size;
         let num_gpus = self.persistent_workers.as_ref().unwrap().num_gpus();
+        let decode_start = std::time::Instant::now();
+        let mut dense_time = std::time::Duration::ZERO;
+        let mut moe_time = std::time::Duration::ZERO;
+        let mut dense_count = 0u32;
 
         for inst in mk.instructions.iter() {
             let opcode = inst.words[0] & 0x7FFFFFFF;
@@ -277,9 +283,11 @@ impl Model {
                 // Hybrid: shutdown persistent worker, kbk MoE (full GPU occupancy), relaunch.
                 // Persistent worker has 96 cooperative blocks — expert GEMV with eis=27648
                 // needs ~288 rows/block. kbk launches with optimal block count per kernel.
+                let t0 = std::time::Instant::now();
                 self.persistent_workers.as_mut().unwrap().shutdown();
+                let t_shutdown = t0.elapsed();
 
-                // kbk MoE dispatch (same as decode_step_moe path)
+                // kbk MoE dispatch
                 braidinfer_hip::memory::memcpy_d2d(
                     self.activations.normed_stage.as_write_ptr() as *mut u8,
                     self.activations.normed.as_ptr() as *const u8,
@@ -305,17 +313,27 @@ impl Model {
                     hs * 4,
                 )?;
 
-                // Relaunch persistent worker
+                let t_moe = t0.elapsed();
                 let shared_mem = 1024u32 * 4 + 256;
                 self.persistent_workers.as_mut().unwrap().relaunch(shared_mem)
                     .map_err(ModelError::Hip)?;
+                let t_total = t0.elapsed();
+                if layer_idx == 0 {
+                    eprintln!("  MoE L0: shutdown={:?} moe={:?} relaunch={:?} total={:?}",
+                        t_shutdown, t_moe - t_shutdown, t_total - t_moe, t_total);
+                }
                 continue;
             }
 
             // Regular instruction: dispatch to GPU 0's persistent worker
+            let dt = std::time::Instant::now();
             let dispatch = self.persistent_workers.as_mut().unwrap();
             dispatch.dispatch_gpu0(inst);
+            dense_time += dt.elapsed();
+            dense_count += 1;
         }
+        eprintln!("  DECODE: dense={:?} ({dense_count} inst) total={:?}",
+            dense_time, decode_start.elapsed());
 
         let logits = unsafe {
             std::slice::from_raw_parts(self.activations.logits_mapped.host_ptr(), self.config.vocab_size)
