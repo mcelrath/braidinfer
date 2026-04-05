@@ -122,6 +122,7 @@ pub struct DistributedMoeWeights {
     pub gate_up_expert_stride: usize,
     pub down_expert_stride: usize,
     pub gate_up_row_stride: usize,
+    pub weight_format: WeightFormat,
     // GPU 0 uses original packed buffer (no extra copy)
     pub gpu0_gate_up_base: *const u8,
     pub gpu0_down_base: *const u8,
@@ -1119,6 +1120,7 @@ pub fn distribute_moe_weights_from_ref(
         gate_up_expert_stride,
         down_expert_stride,
         gate_up_row_stride,
+        weight_format: moe.expert_gate_up.weight_format(),
         gpu0_gate_up_base: src_gate_up,
         gpu0_down_base: src_down,
     })
@@ -1146,6 +1148,21 @@ pub fn distribute_moe_weights_from_bqnt(
     // Check for fused gate_up_proj tensor
     let fused_name = format!("{prefix}layers.{layer_idx}.mlp.experts.gate_up_proj");
     let has_fused = bqnt.entry(&fused_name).is_some();
+
+    // Determine weight format from bqnt entry
+    let weight_format = {
+        let probe_name = if has_fused {
+            fused_name.clone()
+        } else {
+            let first_up = format!("{prefix}layers.{layer_idx}.mlp.experts.0.up_proj.weight");
+            let first_gate = format!("{prefix}layers.{layer_idx}.mlp.experts.0.gate_proj.weight");
+            if bqnt.entry(&first_gate).is_some() { first_gate } else { first_up }
+        };
+        let entry = bqnt.entry(&probe_name)
+            .ok_or_else(|| ModelError::MissingWeight(probe_name.clone()))?;
+        crate::bqnt::code_to_format(entry.format)
+            .unwrap_or(WeightFormat::PcG32Q4)
+    };
 
     // Get byte sizes per expert from bqnt entries
     let (gu_bytes_per_expert, down_bytes_per_expert) = if has_fused {
@@ -1287,6 +1304,7 @@ pub fn distribute_moe_weights_from_bqnt(
         gate_up_expert_stride: gu_bytes_per_expert,
         down_expert_stride: down_bytes_per_expert,
         gate_up_row_stride,
+        weight_format,
         gpu0_gate_up_base: gpu0_gu,
         gpu0_down_base: gpu0_d,
     })

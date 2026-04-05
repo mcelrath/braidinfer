@@ -16,7 +16,34 @@ use braidinfer_hip::{ffi, HipResult};
 
 use crate::kernel::{LinearProjKernel, SiluMulKernel, ResidualAddKernel};
 use crate::multi_gpu::MultiGpuContext;
+use crate::quant::WeightFormat;
 use crate::weights::DistributedMoeWeights;
+
+/// Dispatch a single linear projection for a packed (non-bf16) or bf16 expert weight slice.
+///
+/// For quantized formats (PcG32Q4, Rnf4G128) uses `forward_packed_ptr`.
+/// For bf16 casts the raw byte pointer to u16 and uses `forward_ptr`.
+fn dispatch_proj(
+    kernel: &crate::kernel::LinearProjKernel,
+    output: *mut f32,
+    weight_bytes: *const u8,
+    input: *const f32,
+    out_dim: u32,
+    in_dim: u32,
+    fmt: WeightFormat,
+    stream: &Stream,
+) -> HipResult<()> {
+    match fmt {
+        WeightFormat::PcG32Q4 =>
+            kernel.forward_packed_ptr(output, weight_bytes, input, out_dim, in_dim,
+                "linear_proj_pcg32_q4", stream),
+        WeightFormat::Rnf4G128 =>
+            kernel.forward_packed_ptr(output, weight_bytes, input, out_dim, in_dim,
+                "linear_proj_rnf4_g128", stream),
+        WeightFormat::Bf16 =>
+            kernel.forward_ptr(output, weight_bytes as *const u16, input, out_dim, in_dim, stream),
+    }
+}
 
 /// Per-GPU kernel modules for expert FFN execution.
 pub struct WorkerKernels {
@@ -128,6 +155,7 @@ pub fn dispatch_moe_layer(
         let gate_up_base: *const u8 = buf.gate_up.as_ptr();
         let down_base: *const u8 = buf.down.as_ptr();
 
+        let fmt = moe.weight_format;
         for &(expert_id, weight) in &per_gpu[gpu] {
             let local_slot = buf.slot_map[expert_id]
                 .expect("expert not on expected GPU");
@@ -139,17 +167,17 @@ pub fn dispatch_moe_layer(
                 let gate_byte_offset = gate_up_offset;
                 let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
 
-                kernels.linear_proj.forward_packed_ptr(
+                dispatch_proj(
+                    &kernels.linear_proj,
                     worker.scratch_gate.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(gate_byte_offset) },
-                    input_ptr, eis as u32, hs as u32,
-                    "linear_proj_pcg32_q4", &worker.compute_stream,
+                    input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream,
                 )?;
-                kernels.linear_proj.forward_packed_ptr(
+                dispatch_proj(
+                    &kernels.linear_proj,
                     worker.scratch_up.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(up_byte_offset) },
-                    input_ptr, eis as u32, hs as u32,
-                    "linear_proj_pcg32_q4", &worker.compute_stream,
+                    input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream,
                 )?;
                 kernels.silu_mul.forward(
                     &mut worker.scratch_act,
@@ -159,11 +187,11 @@ pub fn dispatch_moe_layer(
                 )?;
             } else {
                 // relu²
-                kernels.linear_proj.forward_packed_ptr(
+                dispatch_proj(
+                    &kernels.linear_proj,
                     worker.scratch_up.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(gate_up_offset) },
-                    input_ptr, eis as u32, hs as u32,
-                    "linear_proj_pcg32_q4", &worker.compute_stream,
+                    input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream,
                 )?;
                 kernels.silu_mul.relu_squared(
                     &mut worker.scratch_act,
@@ -172,12 +200,12 @@ pub fn dispatch_moe_layer(
                 )?;
             }
 
-            kernels.linear_proj.forward_packed_ptr(
+            dispatch_proj(
+                &kernels.linear_proj,
                 worker.scratch_gate.as_ptr() as *mut f32,
                 unsafe { down_base.add(down_offset) },
                 worker.scratch_act.as_ptr(),
-                hs as u32, eis as u32,
-                "linear_proj_pcg32_q4", &worker.compute_stream,
+                hs as u32, eis as u32, fmt, &worker.compute_stream,
             )?;
 
             kernels.residual_add.weighted_accumulate(
@@ -306,6 +334,7 @@ pub fn dispatch_moe_layer_sync(
         let input_ptr = worker.activation_in.as_ptr();
         let gate_up_base = buf.gate_up.as_ptr();
         let down_base = buf.down.as_ptr();
+        let fmt = moe.weight_format;
 
         for &(expert_id, weight) in &per_gpu[gpu] {
             let local_slot = buf.slot_map[expert_id].expect("expert not on expected GPU");
@@ -314,25 +343,28 @@ pub fn dispatch_moe_layer_sync(
 
             if moe.has_gate_proj {
                 let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
-                kernels.linear_proj.forward_packed_ptr(
+                dispatch_proj(
+                    &kernels.linear_proj,
                     worker.scratch_gate.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(gate_up_offset) },
-                    input_ptr, eis as u32, hs as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                    input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream,
                 )?;
-                kernels.linear_proj.forward_packed_ptr(
+                dispatch_proj(
+                    &kernels.linear_proj,
                     worker.scratch_up.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(up_byte_offset) },
-                    input_ptr, eis as u32, hs as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                    input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream,
                 )?;
                 kernels.silu_mul.forward(
                     &mut worker.scratch_act, &worker.scratch_gate, &worker.scratch_up,
                     eis as u32, &worker.compute_stream,
                 )?;
             } else {
-                kernels.linear_proj.forward_packed_ptr(
+                dispatch_proj(
+                    &kernels.linear_proj,
                     worker.scratch_up.as_ptr() as *mut f32,
                     unsafe { gate_up_base.add(gate_up_offset) },
-                    input_ptr, eis as u32, hs as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                    input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream,
                 )?;
                 kernels.silu_mul.relu_squared(
                     &mut worker.scratch_act, &worker.scratch_up,
@@ -340,11 +372,12 @@ pub fn dispatch_moe_layer_sync(
                 )?;
             }
 
-            kernels.linear_proj.forward_packed_ptr(
+            dispatch_proj(
+                &kernels.linear_proj,
                 worker.scratch_gate.as_ptr() as *mut f32,
                 unsafe { down_base.add(down_offset) },
                 worker.scratch_act.as_ptr(),
-                hs as u32, eis as u32, "linear_proj_pcg32_q4", &worker.compute_stream,
+                hs as u32, eis as u32, fmt, &worker.compute_stream,
             )?;
             kernels.residual_add.weighted_accumulate(
                 &mut worker.expert_out, &worker.scratch_gate,
