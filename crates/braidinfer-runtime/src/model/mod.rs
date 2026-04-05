@@ -108,11 +108,9 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU with persistent workers
+        // Multi-GPU: kbk is fastest for MoE models (full occupancy per expert kernel).
+        // Persistent worker only helps for dense layers (no shutdown/relaunch overhead).
         if is_multi_gpu {
-            if std::env::var("PERSISTENT").is_ok() {
-                return self.decode_step_persistent_multi_gpu(token_id, position);
-            }
             return self.decode_step_moe(token_id, position);
         }
 
@@ -276,117 +274,41 @@ impl Model {
                     _ => panic!("OP_BARRIER on non-MoE layer"),
                 };
 
-                // Zero ffn_down_stage for accumulation
-                unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }
+                // Hybrid: shutdown persistent worker, kbk MoE (full GPU occupancy), relaunch.
+                // Persistent worker has 96 cooperative blocks — expert GEMV with eis=27648
+                // needs ~288 rows/block. kbk launches with optimal block count per kernel.
+                self.persistent_workers.as_mut().unwrap().shutdown();
 
-                // Read expert routing from host-mapped memory
-                // (OP_MOE_GATE wrote expert_ids/weights before OP_BARRIER)
-                let expert_ids: &[i32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k)
+                // kbk MoE dispatch (same as decode_step_moe path)
+                braidinfer_hip::memory::memcpy_d2d(
+                    self.activations.normed_stage.as_write_ptr() as *mut u8,
+                    self.activations.normed.as_ptr() as *const u8,
+                    hs * 4,
+                )?;
+                let normed_host: &[f32] = unsafe {
+                    std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs)
                 };
-                let expert_weights: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k)
-                };
-                let dist_moe = self.distributed_moe[layer_idx].as_ref()
-                    .expect("missing distributed MoE weights");
-
-                // Group experts by GPU
-                let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_gpus];
-                for j in 0..k {
-                    let eid = expert_ids[j] as usize;
-                    per_gpu[dist_moe.expert_device[eid]].push((eid, expert_weights[j]));
+                if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
+                    let mgpu = self.multi_gpu.as_mut().unwrap();
+                    crate::moe_dispatch::dispatch_moe_layer_sync(
+                        mgpu, &self.worker_kernels, dist_moe,
+                        normed_host, &mut self.activations.ffn_down_stage,
+                        &self.activations.moe_expert_ids,
+                        &self.activations.moe_expert_weights,
+                        k, hs, eis, &self.stream,
+                    ).map_err(ModelError::Hip)?;
                 }
+                // Copy result to ffn_down for post-barrier instructions
+                braidinfer_hip::memory::memcpy_h2d(
+                    self.activations.ffn_down.as_write_ptr() as *mut u8,
+                    unsafe { std::slice::from_raw_parts(self.activations.ffn_down_stage.host_ptr() as *const u8, hs * 4) },
+                    hs * 4,
+                )?;
 
-                // D2D_COPY normed → normed_stage (host-mapped, all GPUs see it)
-                {
-                    let mut copy_inst = Instruction::new(17, (hs as u32 + 255) / 256);
-                    copy_inst.words[1] = self.activations.normed_stage.as_write_ptr() as u64;
-                    copy_inst.words[2] = self.activations.normed.as_ptr() as u64;
-                    copy_inst.words[3] = hs as u64;
-                    self.persistent_workers.as_mut().unwrap().dispatch_gpu0(&copy_inst);
-                }
-                let act_ptr = self.activations.normed_stage.as_ptr() as u64;
-
-                // Collect per-GPU buffer pointers before mutable dispatch borrow
-                let gpu_ptrs: Vec<_> = (0..num_gpus).map(|gpu| {
-                    let w = &self.multi_gpu.as_ref().unwrap().workers[gpu];
-                    let os = self.persistent_workers.as_ref().unwrap().moe_output_slots[gpu].as_write_ptr() as u64;
-                    (w.scratch_gate.as_write_ptr() as u64,
-                     w.scratch_up.as_write_ptr() as u64,
-                     w.scratch_act.as_write_ptr() as u64,
-                     w.expert_out.as_write_ptr() as u64,
-                     os)
-                }).collect();
-
-                // Dispatch OP_EXPERT_FFN to each GPU. The kernel accumulates
-                // ew * down_result directly into ffn_down_stage (host-mapped).
-                // No D2D_COPY, no CPU accumulation needed.
-                #[allow(non_snake_case)]
-                let OP_EXPERT_FFN: u32 = 35;
-                let ffn_down_stage_ptr = self.activations.ffn_down_stage.as_write_ptr() as u64;
-
-                // Build per-GPU expert instruction lists, then fire all in parallel
-                let mut fire_list: Vec<(usize, Instruction)> = Vec::new();
-                for gpu in 0..num_gpus {
-                    if per_gpu[gpu].is_empty() { continue; }
-                    let (sg, su, sa, _eo, _os) = gpu_ptrs[gpu];
-
-                    for &(eid, ew) in &per_gpu[gpu] {
-                        let buf = &dist_moe.expert_buffers[gpu];
-                        let slot = buf.slot_map[eid].expect("expert not on GPU");
-                        let gu_offset = slot * dist_moe.gate_up_expert_stride;
-                        let d_offset = slot * dist_moe.down_expert_stride;
-                        let gate_up_ptr = unsafe { buf.gate_up.as_ptr().add(gu_offset) } as u64;
-                        let down_ptr = unsafe { buf.down.as_ptr().add(d_offset) } as u64;
-
-                        let mut inst = Instruction::new(OP_EXPERT_FFN, 0);
-                        inst.words[1] = sg;
-                        inst.words[2] = su;
-                        inst.words[3] = sa;
-                        inst.words[4] = ffn_down_stage_ptr; // accumulate directly
-                        inst.words[5] = gate_up_ptr;
-                        inst.words[6] = down_ptr;
-                        inst.words[7] = act_ptr;
-                        inst.words[8] = ((eis as u64) << 32) | (hs as u64);
-                        inst.words[9] = dist_moe.gate_up_row_stride as u64;
-                        inst.words[10] = if dist_moe.has_gate_proj { 1 } else { 0 };
-                        inst.words[11] = ew.to_bits() as u64;
-                        fire_list.push((gpu, inst));
-                    }
-                }
-
-                // Dispatch expert FFNs with cross-GPU parallelism.
-                // Experts on the SAME GPU must be sequential (single work queue).
-                // Experts on DIFFERENT GPUs run in parallel (fire without waiting).
-                let dispatch = self.persistent_workers.as_mut().unwrap();
-
-                // Group fire_list by GPU, preserving order within each GPU
-                let mut per_gpu_insts: Vec<Vec<&Instruction>> = vec![Vec::new(); num_gpus];
-                for (gpu, inst) in &fire_list {
-                    per_gpu_insts[*gpu].push(inst);
-                }
-
-                // Interleave: dispatch one expert from each GPU at a time
-                let max_experts = per_gpu_insts.iter().map(|v| v.len()).max().unwrap_or(0);
-                for step in 0..max_experts {
-                    // Fire to all GPUs that have work at this step
-                    let mut pending: Vec<(usize, u32)> = Vec::new();
-                    for gpu in 0..num_gpus {
-                        if step < per_gpu_insts[gpu].len() {
-                            let seq = dispatch.dispatch_fire(gpu, per_gpu_insts[gpu][step]);
-                            pending.push((gpu, seq));
-                        }
-                    }
-                    // Wait for all GPUs to finish this step
-                    for &(gpu, seq) in &pending {
-                        dispatch.wait_ack(gpu, seq);
-                    }
-                }
-
-                // Don't copy or zero ffn_down_stage — post-barrier instructions
-                // (shared expert + residual add) still need it.
-                // The instruction stream continues with shared expert handling + residual add
-                // which read/write ffn_down_stage via its device_ptr (host-mapped).
+                // Relaunch persistent worker
+                let shared_mem = 1024u32 * 4 + 256;
+                self.persistent_workers.as_mut().unwrap().relaunch(shared_mem)
+                    .map_err(ModelError::Hip)?;
                 continue;
             }
 
