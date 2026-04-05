@@ -360,14 +360,17 @@ impl PersistentDispatch {
         }
 
         // Scratch device buffers for lean workers (must be before fat worker launch)
-        let scratch_sz = max_eis.max(1);
+        // scratch_gate needs max(max_eis, hidden_size) — used for both gate proj output (eis)
+        // and down proj output (hs). scratch_up/act only need max_eis.
+        let scratch_gate_sz = max_eis.max(hidden_size).max(1);
+        let scratch_eis_sz = max_eis.max(1);
         let mut scratch_bufs: Vec<(braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>)> = Vec::new();
         for &device in &all_devices[1..] {
             Device::set_current(device)?;
             scratch_bufs.push((
-                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?,
-                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?,
-                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?,
+                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_gate_sz)?,
+                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_eis_sz)?,
+                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_eis_sz)?,
             ));
         }
 
@@ -526,6 +529,8 @@ impl PersistentDispatch {
     pub fn moe_dispatch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
         assert!(instructions.len() <= MAX_MOE_BATCH);
         let w = &mut self.moe_workers[gpu_idx];
+        eprintln!("moe_dispatch_fire: gpu={gpu_idx} host_ptr={:p} dev_ptr={:p}",
+            w.queue.host_ptr() as *const u8, w.queue.device_ptr() as *const u8);
         let q_ptr = w.queue.host_ptr() as *mut MoeWorkerQueueLayout;
 
         for (i, inst) in instructions.iter().enumerate() {
@@ -544,6 +549,9 @@ impl PersistentDispatch {
         }
         w.seq_counter += 1;
         let seq = w.seq_counter;
+        // sfence: flush CPU write buffers before GPU reads via PCIe
+        #[cfg(target_arch = "x86_64")]
+        unsafe { std::arch::x86_64::_mm_sfence(); }
         unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
         seq
     }
@@ -551,12 +559,19 @@ impl PersistentDispatch {
     /// Wait for a MoE worker to ack.
     pub fn moe_wait_ack(&self, gpu_idx: usize, seq: u32) {
         let q_ptr = self.moe_workers[gpu_idx].queue.host_ptr() as *const MoeWorkerQueueLayout;
+        let ack_ptr = unsafe { std::ptr::addr_of!((*q_ptr).ack) };
         let start = std::time::Instant::now();
         loop {
-            let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
+            // CLFLUSH invalidates the CPU cache line so we see GPU 1's write.
+            // Without this, the CPU may read a stale cached value of ack=0.
+            #[cfg(target_arch = "x86_64")]
+            unsafe { std::arch::x86_64::_mm_clflush(ack_ptr as *const u8); }
+            let ack = unsafe { std::ptr::read_volatile(ack_ptr) };
             if ack == seq { break; }
             if start.elapsed().as_secs() > 2 {
-                panic!("moe_wait_ack timeout gpu={gpu_idx} seq={seq}");
+                let cur_seq = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).seq_num)) };
+                eprintln!("moe_wait_ack: gpu={gpu_idx} ack={ack} want={seq} queue_seq={cur_seq}");
+                panic!("moe_wait_ack timeout gpu={gpu_idx} seq={seq} ack={ack}");
             }
             std::hint::spin_loop();
         }
