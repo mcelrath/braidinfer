@@ -108,11 +108,9 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU: persistent worker or kbk (PERSISTENT=1 to opt in)
+        // Multi-GPU MoE: kbk is fastest (17.9 tok/s) — full occupancy per expert kernel.
+        // Persistent worker can't yield SMs for kbk expert launches on the same GPU.
         if is_multi_gpu {
-            if std::env::var("PERSISTENT").is_ok() {
-                return self.decode_step_persistent_multi_gpu(token_id, position);
-            }
             return self.decode_step_moe(token_id, position);
         }
 
