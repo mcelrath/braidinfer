@@ -264,33 +264,36 @@ impl Model {
         mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
         let hs = self.config.hidden_size;
-        let num_gpus = self.persistent_workers.as_ref().unwrap().num_gpus();
-        let decode_start = std::time::Instant::now();
-        let mut dense_time = std::time::Duration::ZERO;
-        let mut moe_time = std::time::Duration::ZERO;
-        let mut dense_count = 0u32;
+
+        // Split instruction stream at OP_BARRIER markers into segments.
+        // Each segment is dispatched as a batch to GPU 0's worker.
+        // At OP_BARRIER: shutdown worker, kbk MoE dispatch, relaunch.
+        let mut segment: Vec<Instruction> = Vec::new();
 
         for inst in mk.instructions.iter() {
             let opcode = inst.words[0] & 0x7FFFFFFF;
             if opcode == 16 { break; } // OP_HALT
 
-            if opcode == 33 { // OP_BARRIER — MoE dispatch point
-                let layer_idx = inst.words[3] as usize;
+            if opcode == 33 { // OP_BARRIER
+                // Flush pending segment as batch
+                if !segment.is_empty() {
+                    let dispatch = self.persistent_workers.as_mut().unwrap();
+                    for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                        dispatch.dispatch_batch(0, chunk);
+                    }
+                    segment.clear();
+                }
 
+                let layer_idx = inst.words[3] as usize;
                 let (k, eis) = match &self.config.layers[layer_idx].ffn_type {
                     crate::model::FfnType::MoE { num_active, expert_intermediate_size, .. } =>
                         (*num_active, *expert_intermediate_size),
                     _ => panic!("OP_BARRIER on non-MoE layer"),
                 };
 
-                // Hybrid: shutdown persistent worker, kbk MoE (full GPU occupancy), relaunch.
-                // Persistent worker has 96 cooperative blocks — expert GEMV with eis=27648
-                // needs ~288 rows/block. kbk launches with optimal block count per kernel.
-                let t0 = std::time::Instant::now();
+                // Shutdown persistent worker for kbk MoE
                 self.persistent_workers.as_mut().unwrap().shutdown();
-                let t_shutdown = t0.elapsed();
 
-                // kbk MoE dispatch
                 braidinfer_hip::memory::memcpy_d2d(
                     self.activations.normed_stage.as_write_ptr() as *mut u8,
                     self.activations.normed.as_ptr() as *const u8,
@@ -309,34 +312,29 @@ impl Model {
                         k, hs, eis, &self.stream,
                     ).map_err(ModelError::Hip)?;
                 }
-                // Copy result to ffn_down for post-barrier instructions
                 braidinfer_hip::memory::memcpy_h2d(
                     self.activations.ffn_down.as_write_ptr() as *mut u8,
                     unsafe { std::slice::from_raw_parts(self.activations.ffn_down_stage.host_ptr() as *const u8, hs * 4) },
                     hs * 4,
                 )?;
 
-                let t_moe = t0.elapsed();
+                // Relaunch
                 let shared_mem = 1024u32 * 4 + 256;
                 self.persistent_workers.as_mut().unwrap().relaunch(shared_mem)
                     .map_err(ModelError::Hip)?;
-                let t_total = t0.elapsed();
-                if layer_idx == 0 {
-                    eprintln!("  MoE L0: shutdown={:?} moe={:?} relaunch={:?} total={:?}",
-                        t_shutdown, t_moe - t_shutdown, t_total - t_moe, t_total);
-                }
                 continue;
             }
 
-            // Regular instruction: dispatch to GPU 0's persistent worker
-            let dt = std::time::Instant::now();
-            let dispatch = self.persistent_workers.as_mut().unwrap();
-            dispatch.dispatch_gpu0(inst);
-            dense_time += dt.elapsed();
-            dense_count += 1;
+            segment.push(inst.clone());
         }
-        eprintln!("  DECODE: dense={:?} ({dense_count} inst) total={:?}",
-            dense_time, decode_start.elapsed());
+
+        // Flush final segment (post-last-barrier to LM head)
+        if !segment.is_empty() {
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                dispatch.dispatch_batch(0, chunk);
+            }
+        }
 
         let logits = unsafe {
             std::slice::from_raw_parts(self.activations.logits_mapped.host_ptr(), self.config.vocab_size)
