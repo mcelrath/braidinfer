@@ -102,6 +102,11 @@ pub struct MoeGpuWorker {
     pub stream: Stream,
     pub module: Module,
     pub seq_counter: u32,
+    // Per-block scratch buffers: [num_blocks * max_eis] for gate/up/act
+    pub scratch_gate: braidinfer_hip::DeviceBuffer<f32>,
+    pub scratch_up:   braidinfer_hip::DeviceBuffer<f32>,
+    pub scratch_act:  braidinfer_hip::DeviceBuffer<f32>,
+    pub num_blocks: u32,
 }
 
 /// Persistent dispatch context: manages worker kernels on all GPUs.
@@ -201,6 +206,10 @@ impl PersistentDispatch {
 
                 moe_workers.push(MoeGpuWorker {
                     device, queue, stream, module, seq_counter: 0,
+                    scratch_gate: braidinfer_hip::DeviceBuffer::<f32>::alloc(device, 1)?,
+                    scratch_up:   braidinfer_hip::DeviceBuffer::<f32>::alloc(device, 1)?,
+                    scratch_act:  braidinfer_hip::DeviceBuffer::<f32>::alloc(device, 1)?,
+                    num_blocks: num_blocks,
                 });
             }
         }
@@ -329,7 +338,7 @@ impl PersistentDispatch {
     /// Multi-GPU init: fat dense worker on gpu0, lean MoE workers on GPUs 1+.
     /// CRITICAL ordering: ALL hipHostMalloc allocations BEFORE any cooperative kernel launch.
     /// hipHostGetDevicePointer stalls with running cooperative kernels.
-    pub fn init_multi_gpu(gpu0: DeviceId, all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize) -> HipResult<Self> {
+    pub fn init_multi_gpu(gpu0: DeviceId, all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize, max_eis: usize) -> HipResult<Self> {
         let kernel_dir = crate::kernel::kernel_dir();
         let moe_shared_mem = 256u32 * 4;
         let moe_queue_size = std::mem::size_of::<MoeWorkerQueueLayout>();
@@ -381,9 +390,24 @@ impl PersistentDispatch {
             Device::set_current(device)?;
             let stream = Stream::new(device)?;
             let func = moe_modules[i].get_function("moe_gemv_worker")?;
-            let mut q = moe_queues[i].device_ptr() as *mut std::ffi::c_void;
-            let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
-            func.launch_cooperative((96, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
+            // Per-block scratch: 96 blocks × max_eis floats each
+            let num_blocks = 384u32; // test: 4 args at 384 blocks (same as 1-arg that worked)
+            let scratch_sz = num_blocks as usize * max_eis.max(1);
+            let scratch_gate = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?;
+            let scratch_up   = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?;
+            let scratch_act  = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?;
+
+            let mut q  = moe_queues[i].device_ptr() as *mut std::ffi::c_void;
+            let mut sg = scratch_gate.as_write_ptr() as *mut std::ffi::c_void;
+            let mut su = scratch_up.as_write_ptr()   as *mut std::ffi::c_void;
+            let mut sa = scratch_act.as_write_ptr()  as *mut std::ffi::c_void;
+            let mut args = [
+                std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>(),
+                std::ptr::addr_of_mut!(sg).cast::<std::ffi::c_void>(),
+                std::ptr::addr_of_mut!(su).cast::<std::ffi::c_void>(),
+                std::ptr::addr_of_mut!(sa).cast::<std::ffi::c_void>(),
+            ];
+            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
                 .map_err(|e| { eprintln!("  GPU {}: lean MoE launch FAILED: {:?}", device.0, e); e })?;
             moe_workers.push(MoeGpuWorker {
                 device,
@@ -391,6 +415,10 @@ impl PersistentDispatch {
                 stream,
                 module: moe_modules.remove(0),
                 seq_counter: 0,
+                scratch_gate,
+                scratch_up,
+                scratch_act,
+                num_blocks,
             });
         }
 

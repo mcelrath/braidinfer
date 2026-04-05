@@ -245,9 +245,12 @@ impl Model {
             let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
             let shared_mem = 1024u32 * 4 + 256;
             let hs = self.config.hidden_size;
-            // GPU 0: fat dense worker. GPUs 1+: lean MoE workers only.
+            let max_eis = self.config.layers.iter().filter_map(|l| match &l.ffn_type {
+                crate::model::FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size),
+                _ => None,
+            }).max().unwrap_or(0);
             let all_devices: Vec<_> = (0..num_gpus).map(|i| braidinfer_core::types::DeviceId(i as u32)).collect();
-            let dispatch = PersistentDispatch::init_multi_gpu(self.device, &all_devices, shared_mem, hs)
+            let dispatch = PersistentDispatch::init_multi_gpu(self.device, &all_devices, shared_mem, hs, max_eis)
                 .map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
 
@@ -383,13 +386,21 @@ impl Model {
                 let dispatch = self.persistent_workers.as_mut().unwrap();
                 let mut moe_pending: Vec<(usize, u32)> = Vec::new();
 
-                // All experts dispatched to GPU 0's fat worker.
-                // GPU 1+ lean workers are dummy (ack only) — cross-block grid.sync
-                // in lean_expert_ffn deadlocks. TODO: fix lean worker.
+                // Dispatch expert FFN:
+                // - GPU 0: fat dense worker (OP_EXPERT_FFN)
+                // - GPUs 1+: lean MoE workers with per-block scratch (no grid.sync)
                 for (gpu, batch) in &gpu_batches {
-                    dispatch.dispatch_batch(0, batch);
+                    if *gpu == 0 {
+                        dispatch.dispatch_batch(0, batch);
+                    } else {
+                        let moe_idx = gpu - 1;
+                        let seq = dispatch.moe_dispatch_fire(moe_idx, batch);
+                        moe_pending.push((moe_idx, seq));
+                    }
                 }
-                let _ = &moe_pending; // unused
+                for &(idx, seq) in &moe_pending {
+                    dispatch.moe_wait_ack(idx, seq);
+                }
 
                 // CPU sums per-GPU output slots into ffn_down_stage (no race — sequential)
                 unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }
