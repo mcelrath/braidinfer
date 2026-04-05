@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{
-    apply_chat_template, load_tokenizer, ChatMessage, TokenConfig,
+    apply_chat_template_thinking, load_tokenizer, ChatMessage, TokenConfig,
 };
 use braidinfer_runtime::model::Model;
 
@@ -17,7 +17,7 @@ async fn main() {
     let max_tokens: usize = std::env::var("MAX_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(256);
+        .unwrap_or(4096);
 
     let system_prompt = std::env::var("SYSTEM").ok();
 
@@ -76,9 +76,8 @@ async fn main() {
         eprintln!("system: {sys}");
     }
 
+    let enable_thinking = std::env::var("THINK").is_ok();
     let mut history: Vec<(String, String)> = Vec::new();
-    let mut prev_ids: Vec<u32> = Vec::new(); // all tokens fed so far (for incremental prefill)
-    let mut position: u32 = 0;
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
@@ -105,7 +104,7 @@ async fn main() {
         }
         messages.push(ChatMessage { role: "user", content: &user_input });
 
-        let full_ids = match apply_chat_template(&tokenizer, &token_config, &messages) {
+        let prompt_ids = match apply_chat_template_thinking(&tokenizer, &token_config, &messages, enable_thinking) {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("template error: {e}");
@@ -113,49 +112,63 @@ async fn main() {
             }
         };
 
-        // Incremental prefill: only feed tokens not already in KV cache
-        let new_ids = &full_ids[prev_ids.len()..];
+        // Full re-prefill each turn (incremental requires exact token tracking
+        // which breaks when re-encoding the assistant response tokenizes differently)
+        model.reset_state().expect("reset");
 
         let start = Instant::now();
-
-        // Prefill new tokens only (KV cache retains previous turns)
-        let last_logits = if new_ids.len() == 1 {
-            match model.decode_step(new_ids[0], position) {
+        let n_prompt = prompt_ids.len();
+        let last_logits = if n_prompt <= 1 {
+            match model.decode_step(prompt_ids[0], 0) {
                 Ok(l) => l,
                 Err(e) => { eprintln!("prefill error: {e}"); continue; }
             }
         } else {
-            // decode_step each new token (prefill expects position=0 for full sequence)
-            let mut logits = Vec::new();
-            for (i, &tok) in new_ids.iter().enumerate() {
-                match model.decode_step(tok, position + i as u32) {
-                    Ok(l) => logits = l,
-                    Err(e) => { eprintln!("prefill error: {e}"); continue; }
-                }
+            match model.prefill(&prompt_ids) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("prefill error: {e}"); continue; }
             }
-            logits
         };
-        position += new_ids.len() as u32;
 
         let prefill_elapsed = start.elapsed().as_secs_f64();
-        eprintln!("[prefill {} new tokens ({} total) in {prefill_elapsed:.2}s]",
-                  new_ids.len(), full_ids.len());
+        eprintln!("[prefill {n_prompt} tokens in {prefill_elapsed:.2}s]");
 
         // Streaming decode — print each token as it's generated
         let mut next_token = last_logits.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i as u32).unwrap_or(0);
+        let mut position = n_prompt as u32;
         let mut response = String::new();
         let mut n_gen = 0u32;
+        let mut in_thinking = false;
         let decode_start = Instant::now();
+
+        // Detect <think> and </think> tokens for thinking block display
+        let think_start_id = tokenizer.token_to_id("<think>");
+        let think_end_id = tokenizer.token_to_id("</think>");
 
         for _ in 0..max_tokens {
             if token_config.is_stop_token(next_token) { break; }
 
-            let piece = tokenizer.decode(&[next_token], false).unwrap_or_default();
-            print!("{piece}");
-            io::stdout().flush().unwrap();
-            response.push_str(&piece);
+            // Handle thinking block display
+            if Some(next_token) == think_start_id {
+                in_thinking = true;
+                eprint!("\x1b[2m<think>"); // dim text for thinking
+                io::stderr().flush().unwrap();
+            } else if Some(next_token) == think_end_id {
+                in_thinking = false;
+                eprintln!("</think>\x1b[0m"); // reset formatting
+            } else {
+                let piece = tokenizer.decode(&[next_token], false).unwrap_or_default();
+                if in_thinking {
+                    eprint!("{piece}"); // thinking goes to stderr (dim)
+                    io::stderr().flush().unwrap();
+                } else {
+                    print!("{piece}");
+                    io::stdout().flush().unwrap();
+                    response.push_str(&piece);
+                }
+            }
             n_gen += 1;
 
             next_token = match model.decode_step_token(next_token, position) {
@@ -171,28 +184,5 @@ async fn main() {
                   n_gen as f64 / decode_elapsed);
 
         history.push((user_input, response));
-
-        // Re-template the full history to compute prev_ids for next turn's prefix match.
-        // If the template adds end-of-turn tokens after the assistant response, feed them
-        // to the model so the KV cache stays in sync.
-        let mut full_messages: Vec<ChatMessage<'_>> = Vec::new();
-        if let Some(sys) = &system_prompt {
-            full_messages.push(ChatMessage { role: "system", content: sys });
-        }
-        for (u, a) in &history {
-            full_messages.push(ChatMessage { role: "user", content: u });
-            full_messages.push(ChatMessage { role: "assistant", content: a });
-        }
-        let expected = apply_chat_template(&tokenizer, &token_config, &full_messages)
-            .unwrap_or_default();
-
-        // Feed any end-of-turn template tokens the model hasn't seen yet
-        if expected.len() > position as usize {
-            for &tok in &expected[position as usize..] {
-                let _ = model.decode_step(tok, position);
-                position += 1;
-            }
-        }
-        prev_ids = expected;
     }
 }

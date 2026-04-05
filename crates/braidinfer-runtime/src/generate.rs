@@ -94,6 +94,15 @@ pub fn apply_chat_template(
     token_config: &TokenConfig,
     messages: &[ChatMessage<'_>],
 ) -> Result<Vec<u32>, ModelError> {
+    apply_chat_template_thinking(tokenizer, token_config, messages, false)
+}
+
+pub fn apply_chat_template_thinking(
+    tokenizer: &Tokenizer,
+    token_config: &TokenConfig,
+    messages: &[ChatMessage<'_>],
+    enable_thinking: bool,
+) -> Result<Vec<u32>, ModelError> {
     let template_src = token_config.chat_template.as_deref()
         .ok_or_else(|| ModelError::MissingWeight("no chat_template found in model files".into()))?;
 
@@ -115,7 +124,7 @@ pub fn apply_chat_template(
     let rendered = tmpl.render(minijinja::context! {
         messages => msgs,
         add_generation_prompt => true,
-        enable_thinking => false,
+        enable_thinking => enable_thinking,
     }).map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("template render: {e}"))))?;
 
     let encoding = tokenizer.encode(rendered.as_str(), false)
