@@ -102,6 +102,12 @@ impl Model {
             return self.decode_step_moe(token_id, position);
         }
 
+        // Persistent worker path: CPU-scheduled dispatch via host-mapped work queue.
+        // Gated by PERSISTENT=1 env var. Replaces megakernel for single-GPU.
+        if std::env::var("PERSISTENT").is_ok() {
+            return self.decode_step_persistent(token_id, position);
+        }
+
         // Dense models: use megakernel (handles bf16 + quantized weights, both RMSNorm variants)
         if self.megakernel.is_none() {
             let mut mk = MegakernelProgram::compile(self)?;
@@ -125,6 +131,63 @@ impl Model {
                 mk.write_dump_btrc(&self.stream, &dump_path)?;
                 mk.disable_dump()?;
             }
+        }
+
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
+
+        self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// Persistent worker decode: compile megakernel program, replay via CPU-scheduled dispatch.
+    fn decode_step_persistent(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        use crate::persistent_dispatch::PersistentDispatch;
+
+        // Lazy-init: compile megakernel program FIRST (needs GPU queries),
+        // then launch persistent worker (occupies all SMs).
+        if self.persistent_workers.is_none() {
+            if self.megakernel.is_none() {
+                let mk = MegakernelProgram::compile(self)?;
+                self.megakernel = Some(mk);
+            }
+
+            let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
+            let shared_mem = if has_moe { 1024u32 * 4 } else { 256u32 * 4 * 2 };
+            let dispatch = PersistentDispatch::init(&[self.device], shared_mem)
+                .map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
+        }
+
+        eprintln!("PERSISTENT: before host update");
+        let mk = self.megakernel.as_mut().unwrap();
+        // Skip hipMemcpy entirely — position_ids already written during prefill
+        mk.instructions[mk.embedding_inst_idx].set_int(3, token_id as i32);
+        let hd = mk.head_dim_attn;
+        let max_sl = mk.max_seq_len as usize;
+        let head_stride = max_sl * hd;
+        for (layer_i, head_indices) in mk.kv_write_indices.iter().enumerate() {
+            let (k_base, v_base) = mk.kv_base_ptrs[layer_i];
+            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
+                let offset = (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
+                mk.instructions[k_idx].words[1] = k_base + offset as u64;
+                mk.instructions[v_idx].words[1] = v_base + offset as u64;
+            }
+        }
+        let seq_len = position + 1;
+        for &idx in &mk.gqa_attn_inst_indices {
+            mk.instructions[idx].set_int(8, seq_len as i32);
+        }
+        eprintln!("PERSISTENT: host update done, dispatching {} instructions", mk.instructions.len());
+
+        // Replay instructions via persistent worker
+        eprintln!("PERSISTENT: dispatching {} instructions", mk.instructions.len());
+        let dispatch = self.persistent_workers.as_mut().unwrap();
+        for (i, inst) in mk.instructions.iter().enumerate() {
+            let opcode = inst.words[0] & 0x7FFFFFFF;
+            if opcode == 16 { break; } // OP_HALT
+            eprintln!("PERSISTENT: inst[{i}] opcode={opcode}");
+            dispatch.dispatch_gpu0(inst);
         }
 
         let mut logits = vec![0.0f32; self.config.vocab_size];

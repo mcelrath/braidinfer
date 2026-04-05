@@ -72,6 +72,45 @@ impl MegakernelProgram {
         Ok(())
     }
 
+    /// Update host-side instruction fields only (no GPU upload).
+    /// For persistent worker path: worker reads instructions from host-mapped memory,
+    /// not from device_program. Also writes position_ids via hipMemcpy (DMA, not SM).
+    pub fn update_step_host_only(&mut self, token_id: u32, position: u32) -> HipResult<()> {
+        assert!(position < self.max_seq_len);
+
+        self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
+
+        // position_ids still need GPU write (DMA engine, doesn't need SMs)
+        let pos_data = [position as i32, position as i32, position as i32];
+        braidinfer_hip::error::check(unsafe {
+            braidinfer_hip::ffi::hipMemcpy(
+                self.position_ids_dev_ptr as *mut std::ffi::c_void,
+                pos_data.as_ptr().cast(),
+                3 * std::mem::size_of::<i32>(),
+                braidinfer_hip::ffi::hipMemcpyHostToDevice,
+            )
+        })?;
+
+        let hd = self.head_dim_attn;
+        let max_sl = self.max_seq_len as usize;
+        let head_stride = max_sl * hd;
+        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
+            let (k_base, v_base) = self.kv_base_ptrs[layer_i];
+            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
+                let offset = (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
+                self.instructions[k_idx].words[1] = k_base + offset as u64;
+                self.instructions[v_idx].words[1] = v_base + offset as u64;
+            }
+        }
+
+        let seq_len = position + 1;
+        for &idx in &self.gqa_attn_inst_indices {
+            self.instructions[idx].set_int(8, seq_len as i32);
+        }
+
+        Ok(())
+    }
+
     /// Update per-step fields for the paged KV path.
     /// Must be called before `execute()` each decode step.
     pub fn update_step_paged(
