@@ -103,12 +103,15 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
             printf("WORKER: seq=%u opcode=%u grid_x=%u\n", seq, opcode, grid_x);
         }
 
-        // OP_EXPERT_FFN: compound gate+up+silu+down for one expert (internal grid.sync)
+        // OP_EXPERT_FFN: compound gate+up+silu+down, weighted accumulate into output (host-mapped).
+        // inst[1]=sg, [2]=su, [3]=sa, [4]=output (accumulate target, host-mapped),
+        // [5]=gate_up_weight, [6]=down_weight, [7]=activation,
+        // [8]=(eis<<32)|hs, [9]=gu_row_stride, [10]=has_gate, [11]=expert_weight (f32 bits)
         if (opcode == OP_EXPERT_FFN) {
             float* sg = (float*)(uintptr_t)inst[1];
             float* su = (float*)(uintptr_t)inst[2];
             float* sa = (float*)(uintptr_t)inst[3];
-            float* eo = (float*)(uintptr_t)inst[4];
+            float* output = (float*)(uintptr_t)inst[4]; // host-mapped: ew * down_result accumulated here
             const unsigned char* gate_up = (const unsigned char*)(uintptr_t)inst[5];
             const unsigned char* down    = (const unsigned char*)(uintptr_t)inst[6];
             const float* activation = (const float*)(uintptr_t)inst[7];
@@ -116,42 +119,38 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
             int hs  = (int)(inst[8] & 0xFFFFFFFF);
             int gu_row_stride = (int)inst[9];
             int has_gate = (int)inst[10];
+            // Expert weight packed as f32 bits in u64
+            u32 ew_bits = (u32)inst[11];
+            float ew; __builtin_memcpy(&ew, &ew_bits, sizeof(float));
 
             if (has_gate) {
-                // Gate proj
-                for (int row = blockIdx.x; row < eis; row += gridDim.x) {
+                for (int row = blockIdx.x; row < eis; row += gridDim.x)
                     op_linear_proj_pcg32_row(sg, gate_up, activation, row, eis, hs);
-                }
                 grid.sync();
-                // Up proj
                 const unsigned char* up_data = gate_up + (long long)eis * gu_row_stride;
-                for (int row = blockIdx.x; row < eis; row += gridDim.x) {
+                for (int row = blockIdx.x; row < eis; row += gridDim.x)
                     op_linear_proj_pcg32_row(su, up_data, activation, row, eis, hs);
-                }
                 grid.sync();
-                // SiLU mul
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis;
-                     i += gridDim.x * blockDim.x) {
-                    float g = sg[i];
-                    sa[i] = (g / (1.0f + expf(-g))) * su[i];
+                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
+                    float g = sg[i]; sa[i] = (g / (1.0f + expf(-g))) * su[i];
                 }
                 grid.sync();
             } else {
-                // Up only → relu²
-                for (int row = blockIdx.x; row < eis; row += gridDim.x) {
+                for (int row = blockIdx.x; row < eis; row += gridDim.x)
                     op_linear_proj_pcg32_row(su, gate_up, activation, row, eis, hs);
-                }
                 grid.sync();
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis;
-                     i += gridDim.x * blockDim.x) {
+                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
                     float x = su[i]; float r = x > 0.0f ? x : 0.0f; sa[i] = r * r;
                 }
                 grid.sync();
             }
-            // Down proj
-            for (int row = blockIdx.x; row < hs; row += gridDim.x) {
-                op_linear_proj_pcg32_row(eo, down, sa, row, hs, eis);
-            }
+            // Down proj → sg (temp), then weighted accumulate → output
+            for (int row = blockIdx.x; row < hs; row += gridDim.x)
+                op_linear_proj_pcg32_row(sg, down, sa, row, hs, eis);
+            grid.sync();
+            // Weighted accumulate: output[i] += ew * sg[i]
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hs; i += gridDim.x * blockDim.x)
+                output[i] += ew * sg[i];
             grid.sync();
             goto ack;
         }
