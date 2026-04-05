@@ -381,12 +381,18 @@ impl PersistentDispatch {
         let _ = gpu0_func.max_active_blocks_per_sm(256, shared_mem as usize)?; // warm up
 
         let mut moe_modules: Vec<Module> = Vec::new();
+        let mut moe_num_blocks: Vec<u32> = Vec::new();
         for &device in &all_devices[1..] {
             Device::set_current(device)?;
             let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
-            // Don't query max_active_blocks_per_sm — stalls with cooperative kernel on GPU 0.
-            eprintln!("  GPU {}: lean MoE worker (96 blocks)", device.0);
+            // Query BEFORE fat worker launch — safe here.
+            let func = module.get_function("moe_gemv_worker")?;
+            let bps = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
+            // Cap at 96 to stay within VGPR budget (same as fat worker)
+            let num_blocks = (bps as u32 * 48).min(96); // 48 WGPs (HIP counts WGPs not CUs)
+            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks, {bps}/WGP)", device.0);
             moe_modules.push(module);
+            moe_num_blocks.push(num_blocks);
         }
 
         // PHASE 3: Launch all cooperative kernels (all host-mapped memory already allocated)
@@ -404,7 +410,6 @@ impl PersistentDispatch {
             Device::set_current(device)?;
             let stream = Stream::new(device)?;
             let func = moe_modules[i].get_function("moe_gemv_worker")?;
-            let num_blocks = 1u32; // single-block, regular launch
             let (scratch_gate, scratch_up, scratch_act) = scratch_bufs.remove(0);
 
             let mut q  = moe_queues[i].device_ptr() as *mut std::ffi::c_void;
@@ -417,10 +422,11 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(su).cast::<std::ffi::c_void>(),
                 std::ptr::addr_of_mut!(sa).cast::<std::ffi::c_void>(),
             ];
-            // Regular launch — not cooperative. Lean worker is single-block.
-            eprintln!("  GPU {}: lean MoE worker (1 block, regular launch)", device.0);
-            func.launch((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
-                .map_err(|e| { eprintln!("  GPU {}: lean MoE launch FAILED: {:?}", device.0, e); e })?;
+            // Cooperative launch with block count queried in Phase 2 (before fat worker launch).
+            let num_blocks = moe_num_blocks[i];
+            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
+                .map_err(|e| { eprintln!("  GPU {}: lean MoE FAILED ({num_blocks} blocks): {:?}", device.0, e); e })?;
+            eprintln!("  GPU {}: lean MoE cooperative launched ({num_blocks} blocks)", device.0);
             moe_workers.push(MoeGpuWorker {
                 device,
                 queue: moe_queues.remove(0),
@@ -565,7 +571,10 @@ impl PersistentDispatch {
             // CLFLUSH invalidates the CPU cache line so we see GPU 1's write.
             // Without this, the CPU may read a stale cached value of ack=0.
             #[cfg(target_arch = "x86_64")]
-            unsafe { std::arch::x86_64::_mm_clflush(ack_ptr as *const u8); }
+            unsafe {
+                std::arch::x86_64::_mm_clflush(ack_ptr as *const u8);
+                std::arch::x86_64::_mm_mfence(); // ensure clflush completes before read
+            }
             let ack = unsafe { std::ptr::read_volatile(ack_ptr) };
             if ack == seq { break; }
             if start.elapsed().as_secs() > 2 {
