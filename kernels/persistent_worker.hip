@@ -9,48 +9,6 @@
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
 
-// Per-row Q4 PcG32 GEMV for OP_EXPERT_FFN compound instruction.
-// output[row] = dot(weight_row, input). One block per row in virtual block loop.
-__device__ void op_linear_proj_pcg32_row(
-    float* output, const unsigned char* weight, const float* input,
-    int row, int out_dim, int in_dim
-) {
-    if (row >= out_dim) return;
-    const int tid = threadIdx.x;
-    const int stride = blockDim.x;
-    const int group_size = 32;
-    const int group_bytes = 20;
-    const int num_groups = (in_dim + group_size - 1) / group_size;
-    const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
-    extern __shared__ float shared[];
-
-    float acc = 0.0f;
-    for (int g = tid; g < num_groups; g += stride) {
-        const unsigned char* gp = row_data + g * group_bytes;
-        float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
-        float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
-        int base = g * group_size;
-        int count = min(group_size, in_dim - base);
-        for (int i = 0; i < count; i += 2) {
-            unsigned char byte = gp[i / 2];
-            float v0 = (float)(byte & 0xF) * sc + mn;
-            float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
-            acc += v0 * input[base + i] + v1 * input[base + i + 1];
-        }
-    }
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_down(acc, offset);
-    if ((tid & 31) == 0) shared[tid >> 5] = acc;
-    __syncthreads();
-    if (tid < 8) {
-        acc = shared[tid];
-        for (int offset = 4; offset > 0; offset >>= 1)
-            acc += __shfl_down(acc, offset);
-        if (tid == 0) output[row] = acc;
-    }
-    __syncthreads();
-}
-
 // Work queue for CPU → GPU communication (host-mapped memory).
 // CPU writes an instruction + increments seq_num. Worker polls seq_num.
 #define MAX_BATCH_INSTRUCTIONS 64
@@ -112,55 +70,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
 
-        // OP_EXPERT_FFN: compound gate+up+silu+down, weighted accumulate into output (host-mapped).
-        // inst[1]=sg, [2]=su, [3]=sa, [4]=output (accumulate target, host-mapped),
-        // [5]=gate_up_weight, [6]=down_weight, [7]=activation,
-        // [8]=(eis<<32)|hs, [9]=gu_row_stride, [10]=has_gate, [11]=expert_weight (f32 bits)
-        if (opcode == OP_EXPERT_FFN) {
-            float* sg = (float*)(uintptr_t)inst[1];
-            float* su = (float*)(uintptr_t)inst[2];
-            float* sa = (float*)(uintptr_t)inst[3];
-            float* output = (float*)(uintptr_t)inst[4]; // host-mapped: ew * down_result accumulated here
-            const unsigned char* gate_up = (const unsigned char*)(uintptr_t)inst[5];
-            const unsigned char* down    = (const unsigned char*)(uintptr_t)inst[6];
-            const float* activation = (const float*)(uintptr_t)inst[7];
-            int eis = (int)(inst[8] >> 32);
-            int hs  = (int)(inst[8] & 0xFFFFFFFF);
-            int gu_row_stride = (int)inst[9];
-            int has_gate = (int)inst[10];
-            // Expert weight packed as f32 bits in u64
-            u32 ew_bits = (u32)inst[11];
-            float ew; __builtin_memcpy(&ew, &ew_bits, sizeof(float));
-
-            if (has_gate) {
-                for (int row = blockIdx.x; row < eis; row += gridDim.x)
-                    op_linear_proj_pcg32_row(sg, gate_up, activation, row, eis, hs);
-                grid.sync();
-                const unsigned char* up_data = gate_up + (long long)eis * gu_row_stride;
-                for (int row = blockIdx.x; row < eis; row += gridDim.x)
-                    op_linear_proj_pcg32_row(su, up_data, activation, row, eis, hs);
-                grid.sync();
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
-                    float g = sg[i]; sa[i] = (g / (1.0f + expf(-g))) * su[i];
-                }
-                grid.sync();
-            } else {
-                for (int row = blockIdx.x; row < eis; row += gridDim.x)
-                    op_linear_proj_pcg32_row(su, gate_up, activation, row, eis, hs);
-                grid.sync();
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
-                    float x = su[i]; float r = x > 0.0f ? x : 0.0f; sa[i] = r * r;
-                }
-                grid.sync();
-            }
-            // Down proj → sg (temp), then weighted accumulate → output
-            for (int row = blockIdx.x; row < hs; row += gridDim.x)
-                op_linear_proj_pcg32_row(sg, down, sa, row, hs, eis);
-            grid.sync();
-            // Weighted accumulate: output[i] += ew * sg[i]
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hs; i += gridDim.x * blockDim.x)
-                output[i] += ew * sg[i];
-            grid.sync();
+        // Note: empty branch before else-if is intentional — compiler optimization
+        // artifact that reduces VGPR allocation from 252 to 182 (2 blocks/CU vs 1).
+        if (opcode == OP_MOE_FFN) {
         } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
         } else {
@@ -196,6 +108,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     case OP_FFN_GATE_UP_RNF4:  op_ffn_gate_up_rnf4(inst, vb); break;
                     case OP_FFN_DOWN_RES_RNF4: op_ffn_down_res_rnf4(inst, vb); break;
                     case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
+                    case OP_SCALE_ADD:   op_scale_add(inst, vb); break;
+                    case OP_RELU_SQ:     op_relu_sq(inst, vb); break;
                     default: break;
                 }
             }

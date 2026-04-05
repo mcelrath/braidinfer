@@ -199,6 +199,8 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_FFN_GATE_UP_RNF4:  op_ffn_gate_up_rnf4(inst, vb); break;
                 case OP_FFN_DOWN_RES_RNF4: op_ffn_down_res_rnf4(inst, vb); break;
                 case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
+                case OP_SCALE_ADD:   op_scale_add(inst, vb); break;
+                case OP_RELU_SQ:     op_relu_sq(inst, vb); break;
                 default:
                     if (threadIdx.x == 0 && blockIdx.x == 0)
                         printf("MEGAKERNEL: unknown opcode %u at pc %d\n", opcode, pc);

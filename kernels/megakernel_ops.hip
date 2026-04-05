@@ -577,6 +577,28 @@ __device__ void op_sigmoid_weighted_add(const u64* inst, u32 vblock) {
     }
 }
 
+// OP_SCALE_ADD: output[i] += scale * src[i]
+// args: [1]=output (float*), [2]=src (float*), [3]=scale (f32 bits packed as u32), [4]=size
+__device__ void op_scale_add(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* src = inst_fptr(inst, 2);
+    u32 scale_bits = (u32)inst[3];
+    float scale; __builtin_memcpy(&scale, &scale_bits, sizeof(float));
+    int size = inst_int(inst, 4);
+    int idx = vblock * blockDim.x + threadIdx.x;
+    if (idx < size) output[idx] += scale * src[idx];
+}
+
+// OP_RELU_SQ: output[i] = relu(input[i])^2
+// args: [1]=output (float*), [2]=input (float*), [3]=size
+__device__ void op_relu_sq(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* input = inst_fptr(inst, 2);
+    int size = inst_int(inst, 3);
+    int idx = vblock * blockDim.x + threadIdx.x;
+    if (idx < size) { float x = input[idx]; float r = x > 0.0f ? x : 0.0f; output[idx] = r * r; }
+}
+
 // OP_FFN_GATE_UP: fused RMSNorm + gate_proj + up_proj + SiLU*up
 // args: [1]=scratch, [2]=input, [3]=rms_weight, [4]=w_gate, [5]=w_up,
 //       [6]=hidden_size, [7]=intermediate_size, [8]=eps, [9]=batch_size (0/1=single)

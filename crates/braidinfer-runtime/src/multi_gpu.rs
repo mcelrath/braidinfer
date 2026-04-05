@@ -51,6 +51,7 @@ pub struct GpuWorker {
     pub scratch_gate: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
     pub scratch_up: DeviceBuffer<f32>,      // [max_expert_intermediate_size]
     pub scratch_act: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
+    pub scratch_down: DeviceBuffer<f32>,    // [hidden_size] — down proj output before scale_add
     pub transfer_done: HipEvent,   // signaled after D2H gather completes
     // Compute-path P2P copy kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe)
     pub peer_copy_module: Module,
@@ -113,6 +114,7 @@ impl MultiGpuContext {
                 scratch_gate: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
                 scratch_up: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
                 scratch_act: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
+                scratch_down: DeviceBuffer::<f32>::alloc(device, hidden_size)?,
                 transfer_done: HipEvent::new()?,
                 peer_copy_module: Module::load(device, &crate::kernel::kernel_dir().join("peer_copy.hsaco"))?,
                 gather_host: PinnedBuffer::<f32>::alloc(hidden_size)?,

@@ -38,3 +38,5 @@
 #define OP_BARRIER      33  // Park megakernel; CPU dispatches multi-GPU MoE; resume via mapped host flag
 #define OP_MOE_DISPATCH 34  // GPU-initiated MoE: write work queue, poll ack flags, sum output slots
 #define OP_EXPERT_FFN   35  // Compound: gate+up+silu+down (Q4 PcG32) with internal grid.sync()
+#define OP_SCALE_ADD    36  // output[i] += scale * src[i]; args: [1]=output, [2]=src, [3]=scale(f32 bits), [4]=size
+#define OP_RELU_SQ      37  // output[i] = relu(input[i])^2; args: [1]=output, [2]=input, [3]=size

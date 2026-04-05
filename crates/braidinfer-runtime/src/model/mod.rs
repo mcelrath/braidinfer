@@ -313,11 +313,94 @@ impl Model {
                     self.persistent_workers.as_mut().unwrap().dispatch_batch(0, &[copy_inst]);
                 }
 
-                // Dispatch routed experts on GPUs 1+ via kbk (hipLaunchKernel).
-                // dispatch_moe_layer natively iterates gpu in 1..num_devices — no GPU 0 access.
-                // hipMemcpyAsync/hipEventSynchronize on GPU 1-3 streams are safe: no cooperative
-                // kernel on those GPUs. hipEventSynchronize waits on a stream signal, not
-                // SyncAllStreams, so it doesn't interact with GPU 0's cooperative kernel.
+                // Build OP_EXPERT_FFN batch for GPU 0 (persistent worker handles its experts).
+                // GPUs 1+ run via kbk in parallel with GPU 0.
+                let expert_ids_snap: Vec<i32> = unsafe {
+                    std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k).to_vec()
+                };
+                let expert_wts_snap: Vec<f32> = unsafe {
+                    std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k).to_vec()
+                };
+                let mut gpu0_batch: Vec<Instruction> = Vec::new();
+                {
+                    let mgpu = self.multi_gpu.as_ref().unwrap();
+                    let buf = &dist_moe.expert_buffers[0];
+                    let sg_ptr = mgpu.workers[0].scratch_gate.as_ptr() as u64;
+                    let su_ptr = mgpu.workers[0].scratch_up.as_ptr() as u64;
+                    let sa_ptr = mgpu.workers[0].scratch_act.as_ptr() as u64;
+                    let sd_ptr = mgpu.workers[0].scratch_down.as_ptr() as u64;
+                    let act_ptr = self.activations.normed_stage.device_ptr() as u64;
+                    let out_ptr = self.persistent_workers.as_ref().unwrap().moe_output_slot.device_ptr() as u64;
+                    let gu_row_stride = dist_moe.gate_up_row_stride as u64;
+                    for j in 0..k {
+                        let eid = expert_ids_snap[j] as usize;
+                        if dist_moe.expert_device[eid] != 0 { continue; }
+                        let local_slot = buf.slot_map[eid].expect("GPU 0 expert missing slot");
+                        let gu_ptr = unsafe { dist_moe.gpu0_gate_up_base.add(local_slot * dist_moe.gate_up_expert_stride) } as u64;
+                        let dn_ptr = unsafe { dist_moe.gpu0_down_base.add(local_slot * dist_moe.down_expert_stride) } as u64;
+                        let ew_bits = expert_wts_snap[j].to_bits() as u64;
+
+                        if dist_moe.has_gate_proj {
+                            // Gate proj → scratch_gate
+                            let mut g = Instruction::new(crate::megakernel::OP_LINEAR_PROJ_PCG32, eis as u32);
+                            g.words[1] = sg_ptr; g.words[2] = gu_ptr; g.words[3] = act_ptr;
+                            g.words[4] = eis as u64; g.words[5] = hs as u64; g.words[6] = 1;
+                            gpu0_batch.push(g);
+                            // Up proj → scratch_up (rows offset by eis * row_stride)
+                            let gu_up = gu_ptr + (eis as u64) * gu_row_stride;
+                            let mut u = Instruction::new(crate::megakernel::OP_LINEAR_PROJ_PCG32, eis as u32);
+                            u.words[1] = su_ptr; u.words[2] = gu_up; u.words[3] = act_ptr;
+                            u.words[4] = eis as u64; u.words[5] = hs as u64; u.words[6] = 1;
+                            gpu0_batch.push(u);
+                            // SiLU: silu(scratch_gate) * scratch_up → scratch_act
+                            let mut silu = Instruction::new(crate::megakernel::OP_SILU_MUL, (eis as u32 + 255) / 256);
+                            silu.words[1] = sa_ptr; silu.words[2] = sg_ptr; silu.words[3] = su_ptr;
+                            silu.words[4] = eis as u64;
+                            gpu0_batch.push(silu);
+                        } else {
+                            // Up-only proj → scratch_up
+                            let mut u = Instruction::new(crate::megakernel::OP_LINEAR_PROJ_PCG32, eis as u32);
+                            u.words[1] = su_ptr; u.words[2] = gu_ptr; u.words[3] = act_ptr;
+                            u.words[4] = eis as u64; u.words[5] = hs as u64; u.words[6] = 1;
+                            gpu0_batch.push(u);
+                            // ReLU²: relu(scratch_up)² → scratch_act
+                            let mut rsq = Instruction::new(crate::megakernel::OP_RELU_SQ, (eis as u32 + 255) / 256);
+                            rsq.words[1] = sa_ptr; rsq.words[2] = su_ptr; rsq.words[3] = eis as u64;
+                            gpu0_batch.push(rsq);
+                        }
+                        // Down proj: scratch_act → scratch_down
+                        let mut d = Instruction::new(crate::megakernel::OP_LINEAR_PROJ_PCG32, hs as u32);
+                        d.words[1] = sd_ptr; d.words[2] = dn_ptr; d.words[3] = sa_ptr;
+                        d.words[4] = hs as u64; d.words[5] = eis as u64; d.words[6] = 1;
+                        gpu0_batch.push(d);
+                        // Scale add: moe_output_slot += ew * scratch_down
+                        let mut sa_inst = Instruction::new(crate::megakernel::OP_SCALE_ADD, (hs as u32 + 255) / 256);
+                        sa_inst.words[1] = out_ptr; sa_inst.words[2] = sd_ptr;
+                        sa_inst.words[3] = ew_bits; sa_inst.words[4] = hs as u64;
+                        gpu0_batch.push(sa_inst);
+                    }
+                }
+
+                // Zero moe_output_slot so experts accumulate into a clean buffer.
+                if !gpu0_batch.is_empty() {
+                    unsafe {
+                        std::ptr::write_bytes(
+                            self.persistent_workers.as_ref().unwrap().moe_output_slot.host_ptr(),
+                            0,
+                            hs,
+                        );
+                    }
+                }
+
+                // Fire GPU 0 expert batch non-blocking (fat worker computes while CPU dispatches GPUs 1+).
+                let seq0 = if !gpu0_batch.is_empty() {
+                    Some(self.persistent_workers.as_mut().unwrap().dispatch_batch_fire(0, &gpu0_batch))
+                } else {
+                    None
+                };
+
+                // Dispatch GPUs 1+ via kbk — runs in parallel with GPU 0's fat worker.
+                // dispatch_moe_layer natively iterates 1..num_devices — no GPU 0 access.
                 {
                     let mgpu = self.multi_gpu.as_mut().unwrap() as *mut crate::multi_gpu::MultiGpuContext;
                     let wk = self.worker_kernels.as_slice() as *const [crate::moe_dispatch::WorkerKernels];
@@ -332,6 +415,21 @@ impl Model {
                             k, hs, eis,
                         ).map_err(ModelError::Hip)?;
                     }
+                }
+
+                // Wait for GPU 0 to finish, then accumulate its results into ffn_down_stage.
+                if let Some(seq) = seq0 {
+                    self.persistent_workers.as_ref().unwrap().wait_ack(0, seq);
+                    let out_slice = unsafe {
+                        std::slice::from_raw_parts(
+                            self.persistent_workers.as_ref().unwrap().moe_output_slot.host_ptr(),
+                            hs,
+                        )
+                    };
+                    let fds_slice = unsafe {
+                        std::slice::from_raw_parts_mut(self.activations.ffn_down_stage.host_ptr(), hs)
+                    };
+                    for i in 0..hs { fds_slice[i] += out_slice[i]; }
                 }
 
                 // Copy ffn_down_stage → ffn_down for post-barrier instructions
