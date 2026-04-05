@@ -359,6 +359,18 @@ impl PersistentDispatch {
             moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
         }
 
+        // Scratch device buffers for lean workers (must be before fat worker launch)
+        let scratch_sz = max_eis.max(1);
+        let mut scratch_bufs: Vec<(braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>)> = Vec::new();
+        for &device in &all_devices[1..] {
+            Device::set_current(device)?;
+            scratch_bufs.push((
+                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?,
+                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?,
+                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?,
+            ));
+        }
+
         // PHASE 2: Load modules and query occupancy (no kernel launches yet)
         Device::set_current(gpu0)?;
         let gpu0_module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
@@ -369,9 +381,8 @@ impl PersistentDispatch {
         for &device in &all_devices[1..] {
             Device::set_current(device)?;
             let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
-            let func = module.get_function("moe_gemv_worker")?;
-            let bps = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
-            eprintln!("  GPU {}: lean MoE worker (384 blocks, {bps}/CU)", device.0);
+            // Don't query max_active_blocks_per_sm — stalls with cooperative kernel on GPU 0.
+            eprintln!("  GPU {}: lean MoE worker (96 blocks)", device.0);
             moe_modules.push(module);
         }
 
@@ -390,12 +401,8 @@ impl PersistentDispatch {
             Device::set_current(device)?;
             let stream = Stream::new(device)?;
             let func = moe_modules[i].get_function("moe_gemv_worker")?;
-            // Per-block scratch: 96 blocks × max_eis floats each
-            let num_blocks = 384u32; // test: 4 args at 384 blocks (same as 1-arg that worked)
-            let scratch_sz = num_blocks as usize * max_eis.max(1);
-            let scratch_gate = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?;
-            let scratch_up   = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?;
-            let scratch_act  = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_sz)?;
+            let num_blocks = 1u32; // single-block, regular launch
+            let (scratch_gate, scratch_up, scratch_act) = scratch_bufs.remove(0);
 
             let mut q  = moe_queues[i].device_ptr() as *mut std::ffi::c_void;
             let mut sg = scratch_gate.as_write_ptr() as *mut std::ffi::c_void;
@@ -407,7 +414,9 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(su).cast::<std::ffi::c_void>(),
                 std::ptr::addr_of_mut!(sa).cast::<std::ffi::c_void>(),
             ];
-            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
+            // Regular launch — not cooperative. Lean worker is single-block.
+            eprintln!("  GPU {}: lean MoE worker (1 block, regular launch)", device.0);
+            func.launch((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
                 .map_err(|e| { eprintln!("  GPU {}: lean MoE launch FAILED: {:?}", device.0, e); e })?;
             moe_workers.push(MoeGpuWorker {
                 device,
