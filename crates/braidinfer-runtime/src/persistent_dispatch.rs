@@ -11,8 +11,10 @@ use braidinfer_hip::HipResult;
 
 use crate::megakernel::{Instruction, INST_SIZE};
 
-/// Max instructions per batch dispatch.
+/// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 64;
+/// Max instructions per MoE batch (lean MoE worker).
+pub const MAX_MOE_BATCH: usize = 16;
 
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
@@ -23,6 +25,18 @@ pub struct WorkerQueueLayout {
     pub num_instructions: u32,  // how many instructions in this batch (1..MAX_BATCH)
     pub _pad: u32,
     pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE],  // instruction batch buffer
+    pub ack: u32,
+    pub _pad2: [u32; 3],
+}
+
+/// Rust mirror of MoeWorkerQueue from moe_gemv_worker.hip.
+#[repr(C)]
+pub struct MoeWorkerQueueLayout {
+    pub seq_num: u32,
+    pub shutdown: u32,
+    pub num_instructions: u32,
+    pub _pad: u32,
+    pub inst: [u64; MAX_MOE_BATCH * INST_SIZE],
     pub ack: u32,
     pub _pad2: [u32; 3],
 }
@@ -81,9 +95,20 @@ impl GpuWorker {
     }
 }
 
+/// Per-GPU lean MoE worker (separate from the fat dense worker).
+pub struct MoeGpuWorker {
+    pub device: DeviceId,
+    pub queue: MappedHostBuffer<u8>,
+    pub stream: Stream,
+    pub module: Module,
+    pub seq_counter: u32,
+}
+
 /// Persistent dispatch context: manages worker kernels on all GPUs.
 pub struct PersistentDispatch {
     pub workers: Vec<GpuWorker>,
+    /// Lean MoE GEMV workers — one per GPU, high occupancy (~6 blocks/CU).
+    pub moe_workers: Vec<MoeGpuWorker>,
     /// Per-GPU host-mapped output slots for MoE result gathering [hidden_size each].
     pub moe_output_slots: Vec<MappedHostBuffer<f32>>,
 }
@@ -147,7 +172,40 @@ impl PersistentDispatch {
             moe_output_slots.push(slot);
         }
 
-        Ok(PersistentDispatch { workers, moe_output_slots })
+        // Launch lean MoE GEMV workers on GPUs 1+ (GPU 0 uses fat worker for its experts).
+        // Can't coexist two cooperative kernels on the same GPU.
+        let moe_queue_size = std::mem::size_of::<MoeWorkerQueueLayout>();
+        let mut moe_workers = Vec::with_capacity(devices.len());
+        // GPU 0 placeholder (no MoE worker)
+        if hidden_size > 0 && devices.len() > 1 {
+            let moe_shared_mem = 256u32 * 4;
+            for &device in &devices[1..] { // skip GPU 0
+                Device::set_current(device)?;
+                let queue = MappedHostBuffer::<u8>::alloc(moe_queue_size)?;
+                let stream = Stream::new(device)?;
+                let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
+                let func = module.get_function("moe_gemv_worker")?;
+
+                let blocks_per_sm = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
+                let num_blocks = (blocks_per_sm as u32 * 96).min(576); // 96 CUs, target 6/CU
+                eprintln!("  GPU {}: MoE GEMV worker launched ({num_blocks} blocks, {blocks_per_sm}/CU)",
+                          device.0);
+
+                let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
+                let mut args: [*mut std::ffi::c_void; 1] = [
+                    std::ptr::addr_of_mut!(queue_ptr).cast(),
+                ];
+                func.launch_cooperative(
+                    (num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args,
+                )?;
+
+                moe_workers.push(MoeGpuWorker {
+                    device, queue, stream, module, seq_counter: 0,
+                });
+            }
+        }
+
+        Ok(PersistentDispatch { workers, moe_workers, moe_output_slots })
     }
 
     /// Dispatch an instruction to a specific GPU and wait for completion.
@@ -266,6 +324,54 @@ impl PersistentDispatch {
         }
     }
 
+    /// Multi-GPU init: fat dense worker on gpu0 only, lean MoE workers on all GPUs except gpu0.
+    pub fn init_multi_gpu(gpu0: DeviceId, all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize) -> HipResult<Self> {
+        // Fat dense worker on GPU 0 only
+        let mut base = Self::init(&[gpu0], shared_mem, 0)?;
+
+        // Lean MoE workers on GPUs 1+ (skip GPU 0)
+        let kernel_dir = crate::kernel::kernel_dir();
+        let moe_shared_mem = 256u32 * 4;
+        let moe_queue_size = std::mem::size_of::<MoeWorkerQueueLayout>();
+
+        for &device in &all_devices[1..] {
+            Device::set_current(device)?;
+            let queue = MappedHostBuffer::<u8>::alloc(moe_queue_size)?;
+            let stream = Stream::new(device)?;
+            let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
+            let func = module.get_function("moe_gemv_worker")?;
+
+            let blocks_per_sm = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
+            // Try progressive block counts until cooperative launch succeeds
+            // VGPRs/block = ceil(66/24)*24 * 8waves = 576. Total available = 294,912.
+            // Max = 294912/576 = 512. Cap at 384 for safety.
+            let num_blocks = 384u32;
+            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks target, {blocks_per_sm}/CU)",
+                      device.0);
+
+            let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
+            let mut args: [*mut std::ffi::c_void; 1] = [
+                std::ptr::addr_of_mut!(queue_ptr).cast(),
+            ];
+            func.launch_cooperative(
+                (num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args,
+            )?;
+
+            base.moe_workers.push(MoeGpuWorker {
+                device, queue, stream, module, seq_counter: 0,
+            });
+        }
+
+        // Per-GPU output slots for ALL devices (index matches GPU index)
+        base.moe_output_slots.clear();
+        for _ in 0..all_devices.len() {
+            base.moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
+        }
+
+        Device::set_current(gpu0)?;
+        Ok(base)
+    }
+
     /// Shut down workers (write shutdown flag, sync streams).
     pub fn shutdown(&mut self) {
         for worker in &self.workers {
@@ -345,6 +451,47 @@ impl PersistentDispatch {
         }
     }
 
+    /// Dispatch a batch of OP_EXPERT_FFN instructions to a GPU's lean MoE worker.
+    /// Fire without waiting — call moe_wait_ack after dispatching to all GPUs.
+    pub fn moe_dispatch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
+        assert!(instructions.len() <= MAX_MOE_BATCH);
+        let w = &mut self.moe_workers[gpu_idx];
+        let q_ptr = w.queue.host_ptr() as *mut MoeWorkerQueueLayout;
+
+        for (i, inst) in instructions.iter().enumerate() {
+            let offset = i * INST_SIZE;
+            for j in 0..INST_SIZE {
+                unsafe {
+                    std::ptr::write_volatile(
+                        std::ptr::addr_of_mut!((*q_ptr).inst[offset + j]),
+                        inst.words[j],
+                    );
+                }
+            }
+        }
+        unsafe {
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).num_instructions), instructions.len() as u32);
+        }
+        w.seq_counter += 1;
+        let seq = w.seq_counter;
+        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
+        seq
+    }
+
+    /// Wait for a MoE worker to ack.
+    pub fn moe_wait_ack(&self, gpu_idx: usize, seq: u32) {
+        let q_ptr = self.moe_workers[gpu_idx].queue.host_ptr() as *const MoeWorkerQueueLayout;
+        let start = std::time::Instant::now();
+        loop {
+            let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
+            if ack == seq { break; }
+            if start.elapsed().as_secs() > 10 {
+                panic!("moe_wait_ack timeout gpu={gpu_idx} seq={seq}");
+            }
+            std::hint::spin_loop();
+        }
+    }
+
     /// Number of GPUs with workers.
     pub fn num_gpus(&self) -> usize {
         self.workers.len()
@@ -353,11 +500,21 @@ impl PersistentDispatch {
 
 impl Drop for PersistentDispatch {
     fn drop(&mut self) {
+        // Shut down fat dense workers
         for worker in &self.workers {
             let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
             unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1); }
         }
+        // Shut down lean MoE workers
+        for worker in &self.moe_workers {
+            let q_ptr = worker.queue.host_ptr() as *mut MoeWorkerQueueLayout;
+            unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1); }
+        }
         for worker in &self.workers {
+            let _ = Device::set_current(worker.device);
+            let _ = worker.stream.synchronize();
+        }
+        for worker in &self.moe_workers {
             let _ = Device::set_current(worker.device);
             let _ = worker.stream.synchronize();
         }

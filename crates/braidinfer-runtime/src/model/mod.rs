@@ -108,9 +108,11 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU MoE: kbk is fastest (17.9 tok/s) — full occupancy per expert kernel.
-        // Persistent worker can't yield SMs for kbk expert launches on the same GPU.
+        // Multi-GPU: use persistent (dense on GPU 0 + lean MoE workers on all GPUs)
         if is_multi_gpu {
+            if std::env::var("PERSISTENT").is_ok() {
+                return self.decode_step_persistent_multi_gpu(token_id, position);
+            }
             return self.decode_step_moe(token_id, position);
         }
 
@@ -243,8 +245,9 @@ impl Model {
             let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
             let shared_mem = 1024u32 * 4 + 256;
             let hs = self.config.hidden_size;
-            let devices: Vec<_> = (0..num_gpus).map(|i| braidinfer_core::types::DeviceId(i as u32)).collect();
-            let dispatch = PersistentDispatch::init(&devices, shared_mem, hs)
+            // GPU 0: fat dense worker. GPUs 1+: lean MoE workers only.
+            let all_devices: Vec<_> = (0..num_gpus).map(|i| braidinfer_core::types::DeviceId(i as u32)).collect();
+            let dispatch = PersistentDispatch::init_multi_gpu(self.device, &all_devices, shared_mem, hs)
                 .map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
         }
@@ -262,7 +265,7 @@ impl Model {
         mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
         let hs = self.config.hidden_size;
-        let num_gpus = self.persistent_workers.as_ref().unwrap().num_gpus();
+        let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
         #[allow(non_snake_case)]
         let OP_EXPERT_FFN: u32 = 35;
 
@@ -373,33 +376,27 @@ impl Model {
                     gpu_batches.push((gpu, batch));
                 }
 
-                // Dispatch all GPU batches in parallel (fire all, wait all)
+                // Dispatch expert FFN:
+                // - GPU 0: use fat dense worker (OP_EXPERT_FFN via dispatch_batch)
+                // - GPUs 1+: use lean MoE workers (high occupancy, moe_dispatch_fire)
                 let dispatch = self.persistent_workers.as_mut().unwrap();
-                let mut pending: Vec<(usize, u32)> = Vec::new();
+                let mut moe_pending: Vec<(usize, u32)> = Vec::new();
+
                 for (gpu, batch) in &gpu_batches {
-                    let w = &mut dispatch.workers[*gpu];
-                    let q_ptr = w.queue.host_ptr() as *mut crate::persistent_dispatch::WorkerQueueLayout;
-                    for (i, inst) in batch.iter().enumerate() {
-                        let offset = i * crate::megakernel::INST_SIZE;
-                        for j in 0..crate::megakernel::INST_SIZE {
-                            unsafe {
-                                std::ptr::write_volatile(
-                                    std::ptr::addr_of_mut!((*q_ptr).inst[offset + j]),
-                                    inst.words[j],
-                                );
-                            }
-                        }
+                    if *gpu == 0 {
+                        // GPU 0: fat worker handles experts (96 blocks)
+                        dispatch.dispatch_batch(0, batch);
+                    } else {
+                        // GPUs 1+: lean MoE workers (576 blocks)
+                        // moe_workers[0] = GPU 1, moe_workers[1] = GPU 2, etc.
+                        let moe_idx = gpu - 1;
+                        let seq = dispatch.moe_dispatch_fire(moe_idx, batch);
+                        moe_pending.push((moe_idx, seq));
                     }
-                    unsafe {
-                        std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).num_instructions), batch.len() as u32);
-                    }
-                    w.seq_counter += 1;
-                    let seq = w.seq_counter;
-                    unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
-                    pending.push((*gpu, seq));
                 }
-                for &(gpu, seq) in &pending {
-                    dispatch.wait_ack(gpu, seq);
+                // Wait for lean MoE workers
+                for &(idx, seq) in &moe_pending {
+                    dispatch.moe_wait_ack(idx, seq);
                 }
 
                 // CPU sums per-GPU output slots into ffn_down_stage (no race — sequential)
