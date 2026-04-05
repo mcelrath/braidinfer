@@ -65,7 +65,7 @@ struct WorkerQueue {
     uint32_t _pad2[3];
 };
 
-extern "C" __global__ __launch_bounds__(256) void persistent_worker(
+extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     volatile WorkerQueue* queue
 ) {
     namespace cg = cooperative_groups;

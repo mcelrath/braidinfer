@@ -113,8 +113,9 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(queue_ptr).cast(),
             ];
 
-            // Query max cooperative blocks for this kernel/shared_mem combination.
-            let num_blocks = 96u32;
+            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+            let num_cus = 48u32;
+            let num_blocks = (blocks_per_sm as u32 * num_cus).min(384);
 
             func.launch_cooperative(
                 (num_blocks, 1, 1),
@@ -295,7 +296,8 @@ impl PersistentDispatch {
             let mut args: [*mut std::ffi::c_void; 1] = [
                 std::ptr::addr_of_mut!(queue_ptr).cast(),
             ];
-            let num_blocks = 96u32;
+            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+            let num_blocks = (blocks_per_sm as u32 * 48).min(384);
             func.launch_cooperative(
                 (num_blocks, 1, 1), (256, 1, 1), shared_mem, &worker.stream, &mut args,
             )?;
