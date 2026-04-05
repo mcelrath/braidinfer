@@ -9,6 +9,48 @@
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
 
+// Per-row Q4 PcG32 GEMV for OP_EXPERT_FFN compound instruction.
+// output[row] = dot(weight_row, input). One block per row in virtual block loop.
+__device__ void op_linear_proj_pcg32_row(
+    float* output, const unsigned char* weight, const float* input,
+    int row, int out_dim, int in_dim
+) {
+    if (row >= out_dim) return;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 32;
+    const int group_bytes = 20;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+    extern __shared__ float shared[];
+
+    float acc = 0.0f;
+    for (int g = tid; g < num_groups; g += stride) {
+        const unsigned char* gp = row_data + g * group_bytes;
+        float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+        float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+        int base = g * group_size;
+        int count = min(group_size, in_dim - base);
+        for (int i = 0; i < count; i += 2) {
+            unsigned char byte = gp[i / 2];
+            float v0 = (float)(byte & 0xF) * sc + mn;
+            float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+            acc += v0 * input[base + i] + v1 * input[base + i + 1];
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+    if ((tid & 31) == 0) shared[tid >> 5] = acc;
+    __syncthreads();
+    if (tid < 8) {
+        acc = shared[tid];
+        for (int offset = 4; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if (tid == 0) output[row] = acc;
+    }
+    __syncthreads();
+}
+
 // Work queue for CPU → GPU communication (host-mapped memory).
 // CPU writes an instruction + increments seq_num. Worker polls seq_num.
 struct WorkerQueue {
@@ -61,6 +103,59 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
             printf("WORKER: seq=%u opcode=%u grid_x=%u\n", seq, opcode, grid_x);
         }
 
+        // OP_EXPERT_FFN: compound gate+up+silu+down for one expert (internal grid.sync)
+        if (opcode == OP_EXPERT_FFN) {
+            float* sg = (float*)(uintptr_t)inst[1];
+            float* su = (float*)(uintptr_t)inst[2];
+            float* sa = (float*)(uintptr_t)inst[3];
+            float* eo = (float*)(uintptr_t)inst[4];
+            const unsigned char* gate_up = (const unsigned char*)(uintptr_t)inst[5];
+            const unsigned char* down    = (const unsigned char*)(uintptr_t)inst[6];
+            const float* activation = (const float*)(uintptr_t)inst[7];
+            int eis = (int)(inst[8] >> 32);
+            int hs  = (int)(inst[8] & 0xFFFFFFFF);
+            int gu_row_stride = (int)inst[9];
+            int has_gate = (int)inst[10];
+
+            if (has_gate) {
+                // Gate proj
+                for (int row = blockIdx.x; row < eis; row += gridDim.x) {
+                    op_linear_proj_pcg32_row(sg, gate_up, activation, row, eis, hs);
+                }
+                grid.sync();
+                // Up proj
+                const unsigned char* up_data = gate_up + (long long)eis * gu_row_stride;
+                for (int row = blockIdx.x; row < eis; row += gridDim.x) {
+                    op_linear_proj_pcg32_row(su, up_data, activation, row, eis, hs);
+                }
+                grid.sync();
+                // SiLU mul
+                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis;
+                     i += gridDim.x * blockDim.x) {
+                    float g = sg[i];
+                    sa[i] = (g / (1.0f + expf(-g))) * su[i];
+                }
+                grid.sync();
+            } else {
+                // Up only → relu²
+                for (int row = blockIdx.x; row < eis; row += gridDim.x) {
+                    op_linear_proj_pcg32_row(su, gate_up, activation, row, eis, hs);
+                }
+                grid.sync();
+                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis;
+                     i += gridDim.x * blockDim.x) {
+                    float x = su[i]; float r = x > 0.0f ? x : 0.0f; sa[i] = r * r;
+                }
+                grid.sync();
+            }
+            // Down proj
+            for (int row = blockIdx.x; row < hs; row += gridDim.x) {
+                op_linear_proj_pcg32_row(eo, down, sa, row, hs, eis);
+            }
+            grid.sync();
+            goto ack;
+        }
+
         // Dispatch: same switch as megakernel, minus OP_HALT/OP_BARRIER/OP_MOE_DISPATCH
         if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
@@ -110,6 +205,7 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
         }
 
         // Ack: write seq_num to host-mapped flag
+        ack:
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             queue->ack = seq;
         }

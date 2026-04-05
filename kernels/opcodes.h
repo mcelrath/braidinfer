@@ -37,3 +37,4 @@
 #define OP_SIGMOID_WEIGHTED_ADD 32  // output[i] += sigmoid(scalar[0]) * input[i]
 #define OP_BARRIER      33  // Park megakernel; CPU dispatches multi-GPU MoE; resume via mapped host flag
 #define OP_MOE_DISPATCH 34  // GPU-initiated MoE: write work queue, poll ack flags, sum output slots
+#define OP_EXPERT_FFN   35  // Compound: gate+up+silu+down (Q4 PcG32) with internal grid.sync()
