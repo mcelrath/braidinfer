@@ -323,14 +323,24 @@ impl Model {
                 }
                 let act_ptr = self.activations.normed_stage.as_ptr() as u64;
 
-                // Zero ffn_down_stage
-                unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }
-
                 // Group experts by GPU
                 let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_gpus];
                 for j in 0..k {
                     let eid = expert_ids[j] as usize;
                     per_gpu[dist_moe.expert_device[eid]].push((eid, expert_weights[j]));
+                }
+
+                // Each GPU accumulates into its OWN output slot (no race condition).
+                // Per-GPU output slots are in moe_output_slots (host-mapped).
+                let output_slot_ptrs: Vec<u64> = (0..num_gpus).map(|gpu| {
+                    self.persistent_workers.as_ref().unwrap().moe_output_slots[gpu].as_write_ptr() as u64
+                }).collect();
+
+                // Zero per-GPU output slots
+                for gpu in 0..num_gpus {
+                    if per_gpu[gpu].is_empty() { continue; }
+                    let slot = &self.persistent_workers.as_ref().unwrap().moe_output_slots[gpu];
+                    unsafe { std::ptr::write_bytes(slot.host_ptr(), 0, hs); }
                 }
 
                 // Build per-GPU OP_EXPERT_FFN instruction batches
@@ -352,7 +362,7 @@ impl Model {
                         inst.words[1] = sg;
                         inst.words[2] = su;
                         inst.words[3] = sa;
-                        inst.words[4] = ffn_down_stage_ptr; // accumulate directly
+                        inst.words[4] = output_slot_ptrs[gpu]; // per-GPU slot (no race)
                         inst.words[5] = gate_up_ptr;
                         inst.words[6] = down_ptr;
                         inst.words[7] = act_ptr;
@@ -369,7 +379,6 @@ impl Model {
                 let dispatch = self.persistent_workers.as_mut().unwrap();
                 let mut pending: Vec<(usize, u32)> = Vec::new();
                 for (gpu, batch) in &gpu_batches {
-                    // Write batch to GPU's work queue without waiting
                     let w = &mut dispatch.workers[*gpu];
                     let q_ptr = w.queue.host_ptr() as *mut crate::persistent_dispatch::WorkerQueueLayout;
                     for (i, inst) in batch.iter().enumerate() {
@@ -391,19 +400,29 @@ impl Model {
                     unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
                     pending.push((*gpu, seq));
                 }
-                // Wait for ALL GPUs to complete their expert batches
                 for &(gpu, seq) in &pending {
                     dispatch.wait_ack(gpu, seq);
                 }
 
-                // Post-barrier: ffn_down_stage has accumulated results (host-mapped).
-                // Copy to ffn_down (GPU 0 VRAM) for shared expert + residual instructions.
+                // CPU sums per-GPU output slots into ffn_down_stage (no race — sequential)
+                unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }
+                let out: &mut [f32] = unsafe {
+                    std::slice::from_raw_parts_mut(self.activations.ffn_down_stage.host_ptr(), hs)
+                };
+                for gpu in 0..num_gpus {
+                    if per_gpu[gpu].is_empty() { continue; }
+                    let slot_data: &[f32] = unsafe {
+                        std::slice::from_raw_parts(dispatch.moe_output_slots[gpu].host_ptr(), hs)
+                    };
+                    for i in 0..hs { out[i] += slot_data[i]; }
+                }
+
+                // Copy ffn_down_stage → ffn_down for post-barrier instructions
                 {
                     let mut copy_inst = Instruction::new(17, (hs as u32 + 255) / 256);
                     copy_inst.words[1] = self.activations.ffn_down.as_write_ptr() as u64;
                     copy_inst.words[2] = ffn_down_stage_ptr;
                     copy_inst.words[3] = hs as u64;
-                    // Don't batch this — it's a single instruction
                     self.persistent_workers.as_mut().unwrap().dispatch_batch(0, &[copy_inst]);
                 }
 

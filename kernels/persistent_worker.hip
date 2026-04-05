@@ -195,13 +195,7 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
                     default: break;
                 }
             }
-            if (threadIdx.x == 0 && blockIdx.x == 0 && grid_x > 10000) {
-                printf("WORKER: block0 finished loop, entering grid.sync (grid_x=%u)\n", grid_x);
-            }
             grid.sync();
-            if (threadIdx.x == 0 && blockIdx.x == 0 && grid_x > 10000) {
-                printf("WORKER: grid.sync done\n");
-            }
         }
 
         } // end for (pc = 0; pc < num_inst; pc++)
