@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{
-    apply_chat_template, generate_from_ids, load_tokenizer, ChatMessage, TokenConfig,
+    apply_chat_template, load_tokenizer, ChatMessage, TokenConfig,
 };
 use braidinfer_runtime::model::Model;
 
@@ -21,15 +21,55 @@ async fn main() {
 
     let system_prompt = std::env::var("SYSTEM").ok();
 
-    let model_path = std::env::var("MODEL").ok()
-        .or_else(|| std::env::args().nth(1))
-        .unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string());
+    fn resolve_hf_dir(bqnt_path: &str) -> Option<String> {
+        let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(Path::new(bqnt_path)).ok()?;
+        let model_name = bqnt.model_name()?;
+        let hf_name = model_name.replace('/', "--");
+        let cache_dir = dirs::home_dir()?
+            .join(".cache/huggingface/hub")
+            .join(format!("models--{hf_name}"))
+            .join("snapshots");
+        std::fs::read_dir(&cache_dir).ok()?
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path().to_string_lossy().to_string())
+    }
+
+    let model_arg = std::env::var("MODEL").ok()
+        .or_else(|| std::env::args().nth(1));
+
+    let (model_path, bqnt_override) = match model_arg {
+        Some(ref p) if p.ends_with(".bqnt") => {
+            let hf_dir = resolve_hf_dir(p).unwrap_or_else(|| {
+                eprintln!("Could not resolve HF cache dir for {p}");
+                std::process::exit(1);
+            });
+            (hf_dir, Some(p.clone()))
+        }
+        Some(p) => (p, None),
+        None => {
+            let from_bqnt = std::env::var("BQNT_PATH").ok().and_then(|p| resolve_hf_dir(&p));
+            (from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()), None)
+        }
+    };
+    if let Some(ref bqnt_path) = bqnt_override {
+        unsafe { std::env::set_var("BQNT_PATH", bqnt_path); }
+    }
+
     let model_dir = Path::new(&model_path);
+    if !model_dir.exists() {
+        eprintln!("Model not found at {}", model_path);
+        std::process::exit(1);
+    }
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
     let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN").ok().and_then(|v| v.parse().ok());
     let mut model = Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
+
+    if std::env::var("MULTI_GPU").is_ok() {
+        model.enable_multi_gpu().expect("enable multi-GPU");
+    }
 
     eprintln!("braidinfer chat (max_tokens={max_tokens}, ^D to quit)");
     if let Some(sys) = &system_prompt {
@@ -74,19 +114,53 @@ async fn main() {
         model.reset_state().expect("reset");
 
         let start = Instant::now();
-        let result = match generate_from_ids(&mut model, &tokenizer, &token_config, &prompt_ids, max_tokens) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("generate error: {e}");
-                continue;
+
+        // Prefill
+        let n_prompt = prompt_ids.len();
+        let last_logits = if n_prompt <= 1 {
+            match model.decode_step(prompt_ids[0], 0) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("prefill error: {e}"); continue; }
+            }
+        } else {
+            match model.prefill(&prompt_ids) {
+                Ok(l) => l,
+                Err(e) => { eprintln!("prefill error: {e}"); continue; }
             }
         };
-        let elapsed = start.elapsed().as_secs_f64();
-        let n = result.tokens.len();
 
-        let response: String = result.text_pieces.join("");
-        println!("{response}");
-        eprintln!("[{n} tokens in {elapsed:.2}s = {:.1} tok/s]", n as f64 / elapsed);
+        let prefill_elapsed = start.elapsed().as_secs_f64();
+        eprintln!("[prefill {n_prompt} tokens in {prefill_elapsed:.2}s]");
+
+        // Streaming decode — print each token as it's generated
+        let mut next_token = last_logits.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i as u32).unwrap_or(0);
+        let mut position = n_prompt as u32;
+        let mut response = String::new();
+        let mut n_gen = 0u32;
+        let decode_start = Instant::now();
+
+        for _ in 0..max_tokens {
+            if token_config.is_stop_token(next_token) { break; }
+
+            let piece = tokenizer.decode(&[next_token], false).unwrap_or_default();
+            print!("{piece}");
+            io::stdout().flush().unwrap();
+            response.push_str(&piece);
+            n_gen += 1;
+
+            next_token = match model.decode_step_token(next_token, position) {
+                Ok(t) => t,
+                Err(e) => { eprintln!("\ngenerate error: {e}"); break; }
+            };
+            position += 1;
+        }
+        println!();
+
+        let decode_elapsed = decode_start.elapsed().as_secs_f64();
+        eprintln!("[{n_gen} tokens in {decode_elapsed:.2}s = {:.1} tok/s]",
+                  n_gen as f64 / decode_elapsed);
 
         history.push((user_input, response));
     }
