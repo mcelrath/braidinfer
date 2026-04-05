@@ -188,19 +188,20 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
     extern __shared__ float shared[];
 
     if (batch == 1) {
-        // Single-token fast path
+        // Single-token path: flat loop over pairs with bit-shift group indexing.
+        // group_size=128 (power of 2): use shifts for group/local_pair computation.
         float acc = 0.0f;
         for (int pair = tid; pair < num_pairs; pair += block_size) {
-            int elem = pair * 2;
-            int g = elem / group_size;
-            int local_pair = (elem % group_size) / 2;
+            int elem = pair << 1;     // pair * 2
+            int g = elem >> 7;        // elem / 128
+            int local_pair = (elem & 127) >> 1; // (elem % 128) / 2
             const unsigned char* gp = row_data + g * group_bytes;
-            float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
-            float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+            float am1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+            float am2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
             unsigned char b1 = gp[local_pair];
             unsigned char b2 = gp[66 + local_pair];
-            float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
-            float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+            float v0 = NF4_TABLE[b1 & 0xF] * am1 + NF4_TABLE[b2 & 0xF] * am2;
+            float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * am1 + NF4_TABLE[(b2 >> 4) & 0xF] * am2;
             acc += v0 * input_base[elem] + v1 * input_base[elem + 1];
         }
         for (int offset = 16; offset > 0; offset >>= 1)
