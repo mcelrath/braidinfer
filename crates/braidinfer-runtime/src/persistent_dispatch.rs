@@ -136,11 +136,17 @@ pub struct MoeGpuWorker {
 }
 
 /// Persistent dispatch context: manages worker kernels on all GPUs.
+///
+/// `workers` and `moe_workers` are wrapped in `ManuallyDrop` so their HIP resources
+/// (DeviceBuffer → hipFree, MappedHostBuffer → hipHostFree, Stream → hipStreamDestroy,
+/// Module → hipModuleUnload) are only freed after all cooperative kernels have confirmed
+/// exit via the `done` flag. Auto-drop would free while kernels are still running.
 pub struct PersistentDispatch {
-    pub workers: Vec<GpuWorker>,
+    pub workers: Vec<std::mem::ManuallyDrop<GpuWorker>>,
     /// Lean MoE GEMV workers — one per GPU, high occupancy (~6 blocks/CU).
-    pub moe_workers: Vec<MoeGpuWorker>,
+    pub moe_workers: Vec<std::mem::ManuallyDrop<MoeGpuWorker>>,
     /// Per-GPU host-mapped output slots for MoE result gathering [hidden_size each].
+    /// Not wrapped in ManuallyDrop — no HIP kernels write to these after shutdown.
     pub moe_output_slots: Vec<MappedHostBuffer<f32>>,
 }
 
@@ -184,13 +190,13 @@ impl PersistentDispatch {
             eprintln!("  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared)",
                       device.0);
 
-            workers.push(GpuWorker {
+            workers.push(std::mem::ManuallyDrop::new(GpuWorker {
                 device,
                 queue,
                 stream,
                 module,
                 seq_counter: 0,
-            });
+            }));
         }
 
         // Allocate per-GPU host-mapped output slots for MoE result gathering
@@ -230,13 +236,13 @@ impl PersistentDispatch {
                     (num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args,
                 )?;
 
-                moe_workers.push(MoeGpuWorker {
+                moe_workers.push(std::mem::ManuallyDrop::new(MoeGpuWorker {
                     device, queue, stream, module, seq_counter: 0,
                     scratch_gate: braidinfer_hip::DeviceBuffer::<f32>::alloc(device, 1)?,
                     scratch_up:   braidinfer_hip::DeviceBuffer::<f32>::alloc(device, 1)?,
                     scratch_act:  braidinfer_hip::DeviceBuffer::<f32>::alloc(device, 1)?,
                     num_blocks: num_blocks,
-                });
+                }));
             }
         }
 
@@ -386,7 +392,7 @@ impl PersistentDispatch {
         eprintln!("  GPU {}: persistent worker launched (96 blocks, {shared_mem}B)", gpu0.0);
 
         // Lean MoE workers on GPUs 1+.
-        let mut moe_workers: Vec<MoeGpuWorker> = Vec::new();
+        let mut moe_workers: Vec<std::mem::ManuallyDrop<MoeGpuWorker>> = Vec::new();
         let mut moe_output_slots: Vec<MappedHostBuffer<f32>> = Vec::new();
         moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?); // GPU 0 slot
 
@@ -414,16 +420,16 @@ impl PersistentDispatch {
             func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)?;
             eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks, {bps}/WGP, cooperative)", device.0);
             moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
-            moe_workers.push(MoeGpuWorker { device, queue, stream, module, seq_counter: 0,
-                scratch_gate, scratch_up, scratch_act, num_blocks });
+            moe_workers.push(std::mem::ManuallyDrop::new(MoeGpuWorker { device, queue, stream, module, seq_counter: 0,
+                scratch_gate, scratch_up, scratch_act, num_blocks }));
         }
 
         Device::set_current(gpu0)?;
         Ok(PersistentDispatch {
-            workers: vec![GpuWorker {
+            workers: vec![std::mem::ManuallyDrop::new(GpuWorker {
                 device: gpu0, queue: gpu0_queue, stream: gpu0_stream,
                 module: gpu0_module, seq_counter: 0,
-            }],
+            })],
             moe_workers,
             moe_output_slots,
         })
@@ -616,6 +622,15 @@ impl Drop for PersistentDispatch {
                 }
                 std::hint::spin_loop();
             }
+        }
+        // All cooperative kernels have exited (or timed out). Safe to call HIP API now.
+        // Explicitly drop workers via ManuallyDrop — freeing DeviceBuffer (hipFree),
+        // MappedHostBuffer (hipHostFree), Stream (hipStreamDestroy), Module (hipModuleUnload).
+        for worker in &mut self.workers {
+            unsafe { std::mem::ManuallyDrop::drop(worker); }
+        }
+        for worker in &mut self.moe_workers {
+            unsafe { std::mem::ManuallyDrop::drop(worker); }
         }
     }
 }
