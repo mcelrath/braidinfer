@@ -11,14 +11,18 @@ use braidinfer_hip::HipResult;
 
 use crate::megakernel::{Instruction, INST_SIZE};
 
+/// Max instructions per batch dispatch.
+pub const MAX_BATCH_INSTRUCTIONS: usize = 64;
+
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
 #[repr(C)]
 pub struct WorkerQueueLayout {
     pub seq_num: u32,
     pub shutdown: u32,
-    pub _pad: [u32; 2],
-    pub inst: [u64; INST_SIZE],  // 17 u64s = 136 bytes
+    pub num_instructions: u32,  // how many instructions in this batch (1..MAX_BATCH)
+    pub _pad: u32,
+    pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE],  // instruction batch buffer
     pub ack: u32,
     pub _pad2: [u32; 3],
 }
@@ -176,6 +180,46 @@ impl PersistentDispatch {
     /// Dispatch an instruction to GPU 0 (primary).
     pub fn dispatch_gpu0(&mut self, inst: &Instruction) {
         self.workers[0].dispatch_and_wait(inst);
+    }
+
+    /// Dispatch a batch of instructions to a GPU. Worker executes all with grid.sync()
+    /// between them, acks once at the end. One signal round-trip per batch.
+    pub fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
+        let w = &mut self.workers[gpu_idx];
+        let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
+
+        // Copy all instructions to the batch buffer
+        for (i, inst) in instructions.iter().enumerate() {
+            let offset = i * INST_SIZE;
+            for j in 0..INST_SIZE {
+                unsafe {
+                    std::ptr::write_volatile(
+                        std::ptr::addr_of_mut!((*q_ptr).inst[offset + j]),
+                        inst.words[j],
+                    );
+                }
+            }
+        }
+
+        // Write num_instructions BEFORE seq_num (worker reads num_instructions after seeing seq_num)
+        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).num_instructions), instructions.len() as u32); }
+
+        // Trigger worker
+        w.seq_counter += 1;
+        let seq = w.seq_counter;
+        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
+
+        // Wait for ack
+        let start = std::time::Instant::now();
+        loop {
+            let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
+            if ack == seq { break; }
+            if start.elapsed().as_secs() > 10 {
+                panic!("dispatch_batch timeout gpu={gpu_idx} seq={seq} n={}", instructions.len());
+            }
+            std::hint::spin_loop();
+        }
     }
 
     /// Execute a full program (sequence of instructions) on GPU 0.

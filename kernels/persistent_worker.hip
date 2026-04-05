@@ -53,11 +53,14 @@ __device__ void op_linear_proj_pcg32_row(
 
 // Work queue for CPU → GPU communication (host-mapped memory).
 // CPU writes an instruction + increments seq_num. Worker polls seq_num.
+#define MAX_BATCH_INSTRUCTIONS 64
+
 struct WorkerQueue {
-    volatile uint32_t seq_num;      // monotonic counter, 0 = no work
+    volatile uint32_t seq_num;      // monotonic counter, triggers worker
     volatile uint32_t shutdown;     // 1 = exit
-    uint32_t _pad[2];
-    uint64_t inst[INST_SIZE_WORDS]; // single instruction to execute
+    uint32_t num_instructions;      // instructions in this batch (1..64)
+    uint32_t _pad;
+    uint64_t inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]; // instruction batch
     volatile uint32_t ack;          // worker writes seq_num when done
     uint32_t _pad2[3];
 };
@@ -89,19 +92,21 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
         uint32_t seq = queue->seq_num;
         if (seq == 0xFFFFFFFFu) return; // shutdown
 
+        uint32_t num_inst = queue->num_instructions;
+        if (num_inst == 0) num_inst = 1; // backward compat: 0 means 1
+
+        // Process batch of instructions with grid.sync() between each
+        for (uint32_t pc = 0; pc < num_inst; pc++) {
         // Copy instruction to shared memory (avoids PCIe reads in virtual block loop)
         __shared__ u64 sinst[INST_SIZE_WORDS];
+        const u64* src = (const u64*)(queue->inst + pc * INST_SIZE_WORDS);
         if (threadIdx.x < INST_SIZE_WORDS) {
-            sinst[threadIdx.x] = queue->inst[threadIdx.x];
+            sinst[threadIdx.x] = src[threadIdx.x];
         }
         __syncthreads();
         const u64* inst = sinst;
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
-
-        if (threadIdx.x == 0 && blockIdx.x == 0 && grid_x > 10000) {
-            printf("WORKER: seq=%u opcode=%u grid_x=%u\n", seq, opcode, grid_x);
-        }
 
         // OP_EXPERT_FFN: compound gate+up+silu+down, weighted accumulate into output (host-mapped).
         // inst[1]=sg, [2]=su, [3]=sa, [4]=output (accumulate target, host-mapped),
@@ -152,11 +157,7 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hs; i += gridDim.x * blockDim.x)
                 output[i] += ew * sg[i];
             grid.sync();
-            goto ack;
-        }
-
-        // Dispatch: same switch as megakernel, minus OP_HALT/OP_BARRIER/OP_MOE_DISPATCH
-        if (opcode == OP_MOE_FFN) {
+        } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
         } else {
             // Virtual block loop
@@ -203,7 +204,9 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
             }
         }
 
-        // Ack: write seq_num to host-mapped flag
+        } // end for (pc = 0; pc < num_inst; pc++)
+
+        // Ack: write seq_num to host-mapped flag (once per batch)
         ack:
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             queue->ack = seq;

@@ -209,12 +209,15 @@ impl Model {
         let lm_head_idx = n_inst - 2; // second-to-last (before HALT)
         mk.instructions[lm_head_idx].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
-        // Dispatch all instructions
+        // Batch dispatch: send all instructions as batches of up to 64.
+        // Worker processes all with grid.sync() between them, acks once per batch.
+        let batch: Vec<_> = mk.instructions.iter()
+            .take_while(|inst| (inst.words[0] & 0x7FFFFFFF) != 16)
+            .cloned()
+            .collect();
         let dispatch = self.persistent_workers.as_mut().unwrap();
-        for inst in mk.instructions.iter() {
-            let opcode = inst.words[0] & 0x7FFFFFFF;
-            if opcode == 16 { break; }
-            dispatch.dispatch_gpu0(inst);
+        for chunk in batch.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+            dispatch.dispatch_batch(0, chunk);
         }
 
         // Read logits directly from host-mapped memory (no hipMemcpy needed)
