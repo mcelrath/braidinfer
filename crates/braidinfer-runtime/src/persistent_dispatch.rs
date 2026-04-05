@@ -1,6 +1,29 @@
 //! CPU-scheduled persistent worker dispatch (braidinfer-czl).
 //! Each GPU runs a persistent cooperative kernel polling a host-mapped work queue.
 //! CPU sequences operations via memory writes — no HIP API calls in the hot path.
+//!
+//! # HIP API PROHIBITION (root cause of every shutdown/cleanup hang)
+//!
+//! Calling ANY HIP runtime API on a device with a running cooperative kernel deadlocks.
+//! HIP internally calls SyncAllStreams → releaseGpuMemoryFence → signal_wait_scacquire,
+//! which waits for the cooperative kernel to complete. Persistent kernels never complete.
+//!
+//! PROHIBITED while persistent kernels run (includes implicit calls from Drop impls):
+//!   hipFree (DeviceBuffer::drop), hipHostFree (MappedHostBuffer::drop),
+//!   hipMalloc, hipHostMalloc, hipMemcpy, hipStreamSynchronize (stream.synchronize()),
+//!   hipStreamQuery (stream.is_idle()), hipDeviceSynchronize, hipModuleLaunchKernel
+//!
+//! ALLOWED: read_volatile/write_volatile on MappedHostBuffer::host_ptr() (CPU ↔ system RAM)
+//!
+//! SHUTDOWN SEQUENCE:
+//!   1. write_volatile(shutdown_flag, 1) on each worker's host-mapped queue
+//!   2. Kernel writes completion_flag=1 to host-mapped memory before returning
+//!   3. CPU polls completion_flag via read_volatile (NOT hipStreamQuery)
+//!   4. After ALL completion_flags set → safe to call hipFree/hipHostFree
+//!   5. Timeout 10s: leak resources rather than deadlock on hipFree
+//!
+//! IMPLEMENTATION: Wrap GPU resources in ManuallyDrop. Only free after
+//! confirming kernel exit via host-mapped completion_flag.
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::Device;
@@ -26,7 +49,8 @@ pub struct WorkerQueueLayout {
     pub _pad: u32,
     pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE],  // instruction batch buffer
     pub ack: u32,
-    pub _pad2: [u32; 3],
+    pub done: u32,  // kernel writes 1 when exiting after shutdown (for Drop polling)
+    pub _pad2: [u32; 2],
 }
 
 /// Rust mirror of MoeWorkerQueue from moe_gemv_worker.hip.
@@ -38,7 +62,9 @@ pub struct MoeWorkerQueueLayout {
     pub _pad: u32,
     pub inst: [u64; MAX_MOE_BATCH * INST_SIZE],
     pub ack: u32,
-    pub _pad2: [u32; 3],
+    pub debug_stage: u32,  // GPU writes stage number for CPU-side diagnostics
+    pub done: u32,         // kernel writes 1 when exiting after shutdown (for Drop polling)
+    pub _pad2: [u32; 1],
 }
 
 /// Per-GPU worker state.
@@ -102,7 +128,7 @@ pub struct MoeGpuWorker {
     pub stream: Stream,
     pub module: Module,
     pub seq_counter: u32,
-    // Per-block scratch buffers: [num_blocks * max_eis] for gate/up/act
+    // Shared scratch buffers (single allocation, not per-block)
     pub scratch_gate: braidinfer_hip::DeviceBuffer<f32>,
     pub scratch_up:   braidinfer_hip::DeviceBuffer<f32>,
     pub scratch_act:  braidinfer_hip::DeviceBuffer<f32>,
@@ -341,63 +367,16 @@ impl PersistentDispatch {
     pub fn init_multi_gpu(gpu0: DeviceId, all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize, max_eis: usize) -> HipResult<Self> {
         let kernel_dir = crate::kernel::kernel_dir();
         let moe_shared_mem = 256u32 * 4;
-        let moe_queue_size = std::mem::size_of::<MoeWorkerQueueLayout>();
-        let dense_queue_size = std::mem::size_of::<WorkerQueueLayout>();
 
-        // PHASE 1: Allocate ALL host-mapped buffers (before any kernel launch)
+        // scratch_gate reused for gate proj output (eis) and down proj output (hs).
+        let scratch_gate_sz = hidden_size.max(max_eis).max(1);
+        let scratch_eis_sz = max_eis.max(1);
+
+        // Fat dense worker on GPU 0.
         Device::set_current(gpu0)?;
-        let gpu0_queue = MappedHostBuffer::<u8>::alloc(dense_queue_size)?;
-
-        let mut moe_queues: Vec<MappedHostBuffer<u8>> = Vec::new();
-        for &device in &all_devices[1..] {
-            Device::set_current(device)?;
-            moe_queues.push(MappedHostBuffer::<u8>::alloc(moe_queue_size)?);
-        }
-
-        let mut moe_output_slots: Vec<MappedHostBuffer<f32>> = Vec::new();
-        for _ in 0..all_devices.len() {
-            moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
-        }
-
-        // Scratch device buffers for lean workers (must be before fat worker launch)
-        // scratch_gate needs max(max_eis, hidden_size) — used for both gate proj output (eis)
-        // and down proj output (hs). scratch_up/act only need max_eis.
-        // Per-block scratch: [num_blocks * max_eis]. Use 96 as upper bound for block count.
-        let scratch_gate_sz = 96 * max_eis.max(1);
-        let scratch_eis_sz = 96 * max_eis.max(1);
-        let mut scratch_bufs: Vec<(braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>)> = Vec::new();
-        for &device in &all_devices[1..] {
-            Device::set_current(device)?;
-            scratch_bufs.push((
-                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_gate_sz)?,
-                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_eis_sz)?,
-                braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_eis_sz)?,
-            ));
-        }
-
-        // PHASE 2: Load modules and query occupancy (no kernel launches yet)
-        Device::set_current(gpu0)?;
+        let gpu0_queue = MappedHostBuffer::<u8>::alloc(std::mem::size_of::<WorkerQueueLayout>())?;
         let gpu0_module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
         let gpu0_func = gpu0_module.get_function("persistent_worker")?;
-        let _ = gpu0_func.max_active_blocks_per_sm(256, shared_mem as usize)?; // warm up
-
-        let mut moe_modules: Vec<Module> = Vec::new();
-        let mut moe_num_blocks: Vec<u32> = Vec::new();
-        for &device in &all_devices[1..] {
-            Device::set_current(device)?;
-            let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
-            // Query BEFORE fat worker launch — safe here.
-            let func = module.get_function("moe_gemv_worker")?;
-            let bps = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
-            // Cap at 96 to stay within VGPR budget (same as fat worker)
-            let num_blocks = (bps as u32 * 48).min(96); // 48 WGPs (HIP counts WGPs not CUs)
-            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks, {bps}/WGP)", device.0);
-            moe_modules.push(module);
-            moe_num_blocks.push(num_blocks);
-        }
-
-        // PHASE 3: Launch all cooperative kernels (all host-mapped memory already allocated)
-        Device::set_current(gpu0)?;
         let gpu0_stream = Stream::new(gpu0)?;
         {
             let mut q = gpu0_queue.device_ptr() as *mut std::ffi::c_void;
@@ -406,14 +385,23 @@ impl PersistentDispatch {
         }
         eprintln!("  GPU {}: persistent worker launched (96 blocks, {shared_mem}B)", gpu0.0);
 
+        // Lean MoE workers on GPUs 1+.
         let mut moe_workers: Vec<MoeGpuWorker> = Vec::new();
-        for (i, &device) in all_devices[1..].iter().enumerate() {
-            Device::set_current(device)?;
-            let stream = Stream::new(device)?;
-            let func = moe_modules[i].get_function("moe_gemv_worker")?;
-            let (scratch_gate, scratch_up, scratch_act) = scratch_bufs.remove(0);
+        let mut moe_output_slots: Vec<MappedHostBuffer<f32>> = Vec::new();
+        moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?); // GPU 0 slot
 
-            let mut q  = moe_queues[i].device_ptr() as *mut std::ffi::c_void;
+        for &device in &all_devices[1..] {
+            Device::set_current(device)?;
+            let queue = MappedHostBuffer::<u8>::alloc(std::mem::size_of::<MoeWorkerQueueLayout>())?;
+            let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
+            let func = module.get_function("moe_gemv_worker")?;
+            let bps = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
+            let num_blocks = (bps as u32 * 48).min(96); // 48 WGPs on 7900XTX
+            let scratch_gate = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_gate_sz)?;
+            let scratch_up   = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_eis_sz)?;
+            let scratch_act  = braidinfer_hip::DeviceBuffer::<f32>::alloc(device, scratch_eis_sz)?;
+            let stream = Stream::new(device)?;
+            let mut q  = queue.device_ptr() as *mut std::ffi::c_void;
             let mut sg = scratch_gate.as_write_ptr() as *mut std::ffi::c_void;
             let mut su = scratch_up.as_write_ptr()   as *mut std::ffi::c_void;
             let mut sa = scratch_act.as_write_ptr()  as *mut std::ffi::c_void;
@@ -423,22 +411,11 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(su).cast::<std::ffi::c_void>(),
                 std::ptr::addr_of_mut!(sa).cast::<std::ffi::c_void>(),
             ];
-            // Cooperative launch with block count from Phase 2 query.
-            let num_blocks = moe_num_blocks[i];
-            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
-                .map_err(|e| { eprintln!("  GPU {}: lean MoE FAILED: {:?}", device.0, e); e })?;
-            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks, cooperative)", device.0);
-            moe_workers.push(MoeGpuWorker {
-                device,
-                queue: moe_queues.remove(0),
-                stream,
-                module: moe_modules.remove(0),
-                seq_counter: 0,
-                scratch_gate,
-                scratch_up,
-                scratch_act,
-                num_blocks,
-            });
+            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)?;
+            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks, {bps}/WGP, cooperative)", device.0);
+            moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
+            moe_workers.push(MoeGpuWorker { device, queue, stream, module, seq_counter: 0,
+                scratch_gate, scratch_up, scratch_act, num_blocks });
         }
 
         Device::set_current(gpu0)?;
@@ -536,8 +513,6 @@ impl PersistentDispatch {
     pub fn moe_dispatch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
         assert!(instructions.len() <= MAX_MOE_BATCH);
         let w = &mut self.moe_workers[gpu_idx];
-        eprintln!("moe_dispatch_fire: gpu={gpu_idx} host_ptr={:p} dev_ptr={:p}",
-            w.queue.host_ptr() as *const u8, w.queue.device_ptr() as *const u8);
         let q_ptr = w.queue.host_ptr() as *mut MoeWorkerQueueLayout;
 
         for (i, inst) in instructions.iter().enumerate() {
@@ -564,32 +539,27 @@ impl PersistentDispatch {
     }
 
     /// Wait for a MoE worker to ack.
+    /// hipHostMallocMapped memory is system RAM — read_volatile on host_ptr() is correct.
+    /// Never use hipMemcpy D2H here: it hangs with a running cooperative kernel (all SMs occupied).
     pub fn moe_wait_ack(&self, gpu_idx: usize, seq: u32) {
         let w = &self.moe_workers[gpu_idx];
         let q_host = w.queue.host_ptr() as *const MoeWorkerQueueLayout;
-        let q_dev  = w.queue.device_ptr() as *const MoeWorkerQueueLayout;
         let start = std::time::Instant::now();
         loop {
-            // GPU 1's writes to host-mapped memory may not be visible via CPU load
-            // (NUMA topology / PCIe root complex boundary). Use hipMemcpy D2H to force
-            // a cache-coherent read through the GPU's DMA engine.
-            let mut ack = 0u32;
-            let ack_dev_ptr = unsafe { std::ptr::addr_of!((*q_dev).ack) };
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    &mut ack as *mut u32 as *mut std::ffi::c_void,
-                    ack_dev_ptr as *const std::ffi::c_void,
-                    4,
-                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
-                );
-            }
+            let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).ack)) };
             if ack == seq { break; }
-            if start.elapsed().as_secs() > 2 {
-                let cur_seq = unsafe { std::ptr::read_volatile(
-                    std::ptr::addr_of!((*q_host).seq_num)) };
-                eprintln!("moe_wait_ack: gpu={gpu_idx} ack={ack} want={seq} queue_seq={cur_seq}");
+            if start.elapsed().as_secs() > 60 {
+                let cur_seq = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).seq_num)) };
+                let stage = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).debug_stage)) };
+                let inst0 = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).inst[0])) };
+                let act_ptr = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).inst[7])) };
+                let gu_ptr  = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).inst[5])) };
+                let out_ptr = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_host).inst[4])) };
+                eprintln!("moe_wait_ack: gpu={gpu_idx} ack={ack} want={seq} queue_seq={cur_seq} stage={stage}");
+                eprintln!("  inst[0]={inst0:#x} act={act_ptr:#x} gate_up={gu_ptr:#x} out={out_ptr:#x}");
                 panic!("moe_wait_ack timeout gpu={gpu_idx} seq={seq} ack={ack}");
             }
+            std::hint::spin_loop();
         }
     }
 
@@ -600,24 +570,52 @@ impl PersistentDispatch {
 }
 
 impl Drop for PersistentDispatch {
+    /// Shutdown all workers and wait for them to exit via kernel-written `done` flag.
+    ///
+    /// INVARIANT: No HIP API calls (hipFree, hipMalloc, hipMemcpy, hipStreamSynchronize,
+    /// hipStreamQuery) after cooperative kernels are launched. These all trigger
+    /// SyncAllStreams → releaseGpuMemoryFence which deadlocks with a running cooperative kernel.
+    ///
+    /// The ONLY way to communicate after launch is via host-mapped memory (read_volatile /
+    /// write_volatile on host_ptr). The kernel writes `done=1` before returning so we can
+    /// poll without any HIP API.
     fn drop(&mut self) {
-        // Shut down fat dense workers
+        // Write shutdown flags to all workers (host-mapped write, no HIP API)
         for worker in &self.workers {
             let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
             unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1); }
         }
-        // Shut down lean MoE workers
         for worker in &self.moe_workers {
             let q_ptr = worker.queue.host_ptr() as *mut MoeWorkerQueueLayout;
             unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1); }
         }
+        // Poll kernel-written `done` flag (no HIP API — host-mapped memory read).
+        // The kernel writes done=1 before returning on shutdown. Timeout: 30s for 122B model.
+        let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         for worker in &self.workers {
-            let _ = Device::set_current(worker.device);
-            let _ = worker.stream.synchronize();
+            let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
+            loop {
+                let done = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done)) };
+                if done != 0 { break; }
+                if std::time::Instant::now() > shutdown_deadline {
+                    eprintln!("braidinfer: persistent worker shutdown timeout on GPU {}", worker.device.0);
+                    break;
+                }
+                std::hint::spin_loop();
+            }
         }
         for worker in &self.moe_workers {
-            let _ = Device::set_current(worker.device);
-            let _ = worker.stream.synchronize();
+            let q_ptr = worker.queue.host_ptr() as *const MoeWorkerQueueLayout;
+            let worker_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let done = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done)) };
+                if done != 0 { break; }
+                if std::time::Instant::now() > worker_deadline {
+                    eprintln!("braidinfer: lean MoE worker shutdown timeout on GPU {}", worker.device.0);
+                    break;
+                }
+                std::hint::spin_loop();
+            }
         }
     }
 }

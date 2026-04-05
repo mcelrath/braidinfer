@@ -215,11 +215,28 @@ unsafe impl<T: Send> Send for MappedHostBuffer<T> {}
 unsafe impl<T: Sync> Sync for MappedHostBuffer<T> {}
 
 impl<T> MappedHostBuffer<T> {
+    /// Allocate host-mapped memory for GPU→CPU signaling (ack, seq, flags).
+    /// Does NOT use hipHostMallocPortable — this preserves MTYPE_UC (uncached)
+    /// on the allocating GPU so that volatile writes are immediately CPU-visible.
+    /// The device_ptr is valid only on the GPU that was current at allocation time.
     pub fn alloc(len: usize) -> HipResult<Self> {
+        Self::alloc_impl(len, ffi::hipHostMallocMapped)
+    }
+
+    /// Allocate portable host-mapped memory: device_ptr valid from ALL GPUs.
+    /// Use ONLY for buffers read by GPU kernels on DIFFERENT GPUs than the
+    /// allocating GPU (e.g., normed_stage broadcast input).
+    /// WARNING: may use MTYPE_NC (L2-cached) on some GPUs → GPU writes may be
+    /// delayed reaching CPU. Do NOT use for GPU→CPU signaling (ack/seq fields).
+    pub fn alloc_portable(len: usize) -> HipResult<Self> {
+        Self::alloc_impl(len, ffi::hipHostMallocMapped | ffi::hipHostMallocPortable)
+    }
+
+    fn alloc_impl(len: usize, flags: u32) -> HipResult<Self> {
         let size = len * std::mem::size_of::<T>();
         let mut host_ptr: *mut std::ffi::c_void = ptr::null_mut();
         error::check(unsafe {
-            ffi::hipHostMalloc(&mut host_ptr, size, ffi::hipHostMallocMapped)
+            ffi::hipHostMalloc(&mut host_ptr, size, flags)
         })?;
         let mut device_ptr: *mut std::ffi::c_void = ptr::null_mut();
         error::check(unsafe {

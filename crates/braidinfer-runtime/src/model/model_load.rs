@@ -475,7 +475,7 @@ impl Model {
             moe_scores: DeviceBuffer::<f32>::alloc(device, config.layers.iter().filter_map(|l| match &l.ffn_type {
                 FfnType::MoE { num_experts, .. } => Some(*num_experts), _ => None
             }).max().unwrap_or(1))?,
-            normed_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(hs)?,
+            normed_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable(hs)?,
             ffn_down_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(hs)?,
             moe_expert_ids: braidinfer_hip::memory::MappedHostBuffer::<i32>::alloc(
                 config.layers.iter().filter_map(|l| match &l.ffn_type {

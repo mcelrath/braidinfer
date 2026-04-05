@@ -62,7 +62,8 @@ struct WorkerQueue {
     uint32_t _pad;
     uint64_t inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]; // instruction batch
     volatile uint32_t ack;          // worker writes seq_num when done
-    uint32_t _pad2[3];
+    volatile uint32_t done;         // kernel writes 1 when exiting (for Drop polling)
+    uint32_t _pad2[2];
 };
 
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
@@ -90,7 +91,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         grid.sync();
 
         uint32_t seq = queue->seq_num;
-        if (seq == 0xFFFFFFFFu) return; // shutdown
+        if (seq == 0xFFFFFFFFu) {
+            if (threadIdx.x == 0 && blockIdx.x == 0) queue->done = 1;
+            return;
+        }
 
         uint32_t num_inst = queue->num_instructions;
         if (num_inst == 0) num_inst = 1; // backward compat: 0 means 1

@@ -16,6 +16,9 @@ mod forward;     // Layer forward passes (GDN, attention, Mamba2, FFN, MoE)
 // ---- Main model struct ----
 
 pub struct Model {
+    // MUST be declared first: dropped first, shuts down cooperative kernels before any hipFree.
+    // DeviceBuffer::drop → hipFree → SyncAllStreams blocks if cooperative kernel is still running.
+    pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
     pub(crate) config: ModelConfig,
     pub(crate) device: DeviceId,
     pub(crate) stream: Stream,
@@ -48,8 +51,6 @@ pub struct Model {
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
     // Multi-GPU megakernel: dense layers run in megakernel; MoE layers use CPU-dispatch via OP_BARRIER
     pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
-    // CPU-scheduled persistent workers (czl): replaces megakernel for multi-GPU
-    pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
 }
 
 // ---- Model impl ----
@@ -108,10 +109,14 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU MoE: kbk is fastest and most reliable.
-        // Persistent worker for multi-GPU is disabled — cooperative grid.sync() deadlocks
-        // when two cooperative kernels run on different GPUs simultaneously on RDNA3.
+        // Multi-GPU MoE: use persistent dispatch when PERSISTENT=1.
+        // braidinfer-sg4: grid.sync() cross-GPU works fine on RDNA3 — the prior deadlock
+        // was a software bug (all 96 blocks computed ALL rows redundantly, timing out CPU).
+        // Fixed by virtual block loops + single shared scratch + grid.sync() between phases.
         if is_multi_gpu {
+            if std::env::var("PERSISTENT").as_deref() == Ok("1") {
+                return self.decode_step_persistent_multi_gpu(token_id, position);
+            }
             return self.decode_step_moe(token_id, position);
         }
 
