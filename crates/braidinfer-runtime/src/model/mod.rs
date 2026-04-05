@@ -108,11 +108,10 @@ impl Model {
         if has_mamba2 || self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
-        // Multi-GPU: use persistent (dense on GPU 0 + lean MoE workers on all GPUs)
+        // Multi-GPU MoE: kbk is fastest and most reliable.
+        // Persistent worker for multi-GPU is disabled — cooperative grid.sync() deadlocks
+        // when two cooperative kernels run on different GPUs simultaneously on RDNA3.
         if is_multi_gpu {
-            if std::env::var("PERSISTENT").is_ok() {
-                return self.decode_step_persistent_multi_gpu(token_id, position);
-            }
             return self.decode_step_moe(token_id, position);
         }
 

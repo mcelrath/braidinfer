@@ -362,8 +362,9 @@ impl PersistentDispatch {
         // Scratch device buffers for lean workers (must be before fat worker launch)
         // scratch_gate needs max(max_eis, hidden_size) — used for both gate proj output (eis)
         // and down proj output (hs). scratch_up/act only need max_eis.
-        let scratch_gate_sz = max_eis.max(hidden_size).max(1);
-        let scratch_eis_sz = max_eis.max(1);
+        // Per-block scratch: [num_blocks * max_eis]. Use 96 as upper bound for block count.
+        let scratch_gate_sz = 96 * max_eis.max(1);
+        let scratch_eis_sz = 96 * max_eis.max(1);
         let mut scratch_bufs: Vec<(braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>, braidinfer_hip::DeviceBuffer<f32>)> = Vec::new();
         for &device in &all_devices[1..] {
             Device::set_current(device)?;
@@ -422,13 +423,11 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(su).cast::<std::ffi::c_void>(),
                 std::ptr::addr_of_mut!(sa).cast::<std::ffi::c_void>(),
             ];
-            // Regular launch: grid.sync() deadlocks when another cooperative kernel runs
-            // on a different GPU (RDNA3 hardware constraint). Use 1 block for now.
-            // TODO: implement multi-block GEMV without grid.sync() (atomic block counter).
-            let num_blocks = 1u32;
-            func.launch((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
+            // Cooperative launch with block count from Phase 2 query.
+            let num_blocks = moe_num_blocks[i];
+            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
                 .map_err(|e| { eprintln!("  GPU {}: lean MoE FAILED: {:?}", device.0, e); e })?;
-            eprintln!("  GPU {}: lean MoE worker (1 block, regular launch)", device.0);
+            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks, cooperative)", device.0);
             moe_workers.push(MoeGpuWorker {
                 device,
                 queue: moe_queues.remove(0),
@@ -566,25 +565,31 @@ impl PersistentDispatch {
 
     /// Wait for a MoE worker to ack.
     pub fn moe_wait_ack(&self, gpu_idx: usize, seq: u32) {
-        let q_ptr = self.moe_workers[gpu_idx].queue.host_ptr() as *const MoeWorkerQueueLayout;
-        let ack_ptr = unsafe { std::ptr::addr_of!((*q_ptr).ack) };
+        let w = &self.moe_workers[gpu_idx];
+        let q_host = w.queue.host_ptr() as *const MoeWorkerQueueLayout;
+        let q_dev  = w.queue.device_ptr() as *const MoeWorkerQueueLayout;
         let start = std::time::Instant::now();
         loop {
-            // CLFLUSH invalidates the CPU cache line so we see GPU 1's write.
-            // Without this, the CPU may read a stale cached value of ack=0.
-            #[cfg(target_arch = "x86_64")]
+            // GPU 1's writes to host-mapped memory may not be visible via CPU load
+            // (NUMA topology / PCIe root complex boundary). Use hipMemcpy D2H to force
+            // a cache-coherent read through the GPU's DMA engine.
+            let mut ack = 0u32;
+            let ack_dev_ptr = unsafe { std::ptr::addr_of!((*q_dev).ack) };
             unsafe {
-                std::arch::x86_64::_mm_clflush(ack_ptr as *const u8);
-                std::arch::x86_64::_mm_mfence(); // ensure clflush completes before read
+                braidinfer_hip::ffi::hipMemcpy(
+                    &mut ack as *mut u32 as *mut std::ffi::c_void,
+                    ack_dev_ptr as *const std::ffi::c_void,
+                    4,
+                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                );
             }
-            let ack = unsafe { std::ptr::read_volatile(ack_ptr) };
             if ack == seq { break; }
             if start.elapsed().as_secs() > 2 {
-                let cur_seq = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).seq_num)) };
+                let cur_seq = unsafe { std::ptr::read_volatile(
+                    std::ptr::addr_of!((*q_host).seq_num)) };
                 eprintln!("moe_wait_ack: gpu={gpu_idx} ack={ack} want={seq} queue_seq={cur_seq}");
                 panic!("moe_wait_ack timeout gpu={gpu_idx} seq={seq} ack={ack}");
             }
-            std::hint::spin_loop();
         }
     }
 
