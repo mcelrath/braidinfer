@@ -113,9 +113,9 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(queue_ptr).cast(),
             ];
 
-            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-            let num_cus = 48u32;
-            let num_blocks = (blocks_per_sm as u32 * num_cus).min(384);
+            // 96 blocks: limited by 251 VGPRs per wavefront (2016 VGPRs/block).
+            // Total device VGPRs: 294K. 192 blocks would need 387K → doesn't fit.
+            let num_blocks = 96u32;
 
             func.launch_cooperative(
                 (num_blocks, 1, 1),
@@ -297,7 +297,9 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(queue_ptr).cast(),
             ];
             let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-            let num_blocks = (blocks_per_sm as u32 * 48).min(384);
+            // 251 VGPRs × 8 waves/block = 2016 VGPRs/block. 96 CUs × 1536 VGPRs/SIMD × 2 SIMDs
+            // = 294K total. Max blocks = 294912/2016 = 146. Cooperative launch needs clean fit → 96.
+            let num_blocks = 96u32;
             func.launch_cooperative(
                 (num_blocks, 1, 1), (256, 1, 1), shared_mem, &worker.stream, &mut args,
             )?;
