@@ -200,12 +200,12 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
 
         } // end for (pc = 0; pc < num_inst; pc++)
 
-        // Ack: write seq_num to host-mapped flag (once per batch)
+        // Ack: sync all blocks FIRST, then write ack.
+        // Write ack, then update last_seq for next iteration.
         ack:
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             queue->ack = seq;
         }
-
         last_seq = seq;
     }
 }

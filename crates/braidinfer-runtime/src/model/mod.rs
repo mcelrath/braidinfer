@@ -250,6 +250,7 @@ impl Model {
             let dispatch = PersistentDispatch::init_multi_gpu(self.device, &all_devices, shared_mem, hs)
                 .map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
+
         }
 
         // Update host-side instructions
@@ -382,22 +383,13 @@ impl Model {
                 let dispatch = self.persistent_workers.as_mut().unwrap();
                 let mut moe_pending: Vec<(usize, u32)> = Vec::new();
 
+                // All experts dispatched to GPU 0's fat worker.
+                // GPU 1+ lean workers are dummy (ack only) — cross-block grid.sync
+                // in lean_expert_ffn deadlocks. TODO: fix lean worker.
                 for (gpu, batch) in &gpu_batches {
-                    if *gpu == 0 {
-                        // GPU 0: fat worker handles experts (96 blocks)
-                        dispatch.dispatch_batch(0, batch);
-                    } else {
-                        // GPUs 1+: lean MoE workers (576 blocks)
-                        // moe_workers[0] = GPU 1, moe_workers[1] = GPU 2, etc.
-                        let moe_idx = gpu - 1;
-                        let seq = dispatch.moe_dispatch_fire(moe_idx, batch);
-                        moe_pending.push((moe_idx, seq));
-                    }
+                    dispatch.dispatch_batch(0, batch);
                 }
-                // Wait for lean MoE workers
-                for &(idx, seq) in &moe_pending {
-                    dispatch.moe_wait_ack(idx, seq);
-                }
+                let _ = &moe_pending; // unused
 
                 // CPU sums per-GPU output slots into ffn_down_stage (no race — sequential)
                 unsafe { std::ptr::write_bytes(self.activations.ffn_down_stage.host_ptr(), 0, hs); }

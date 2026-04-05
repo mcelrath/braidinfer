@@ -274,8 +274,9 @@ impl PersistentDispatch {
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
             if ack == seq { break; }
-            if start.elapsed().as_secs() > 10 {
-                panic!("dispatch_batch timeout gpu={gpu_idx} seq={seq} n={}", instructions.len());
+            if start.elapsed().as_secs() > 2 {
+                let opcode0 = instructions[0].words[0] & 0x7FFFFFFF;
+                panic!("dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} opcode0={opcode0}", instructions.len());
             }
             std::hint::spin_loop();
         }
@@ -325,51 +326,83 @@ impl PersistentDispatch {
     }
 
     /// Multi-GPU init: fat dense worker on gpu0 only, lean MoE workers on all GPUs except gpu0.
+    /// Multi-GPU init: fat dense worker on gpu0, lean MoE workers on GPUs 1+.
+    /// CRITICAL ordering: ALL hipHostMalloc allocations BEFORE any cooperative kernel launch.
+    /// hipHostGetDevicePointer stalls with running cooperative kernels.
     pub fn init_multi_gpu(gpu0: DeviceId, all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize) -> HipResult<Self> {
-        // Fat dense worker on GPU 0 only
-        let mut base = Self::init(&[gpu0], shared_mem, 0)?;
-
-        // Lean MoE workers on GPUs 1+ (skip GPU 0)
         let kernel_dir = crate::kernel::kernel_dir();
         let moe_shared_mem = 256u32 * 4;
         let moe_queue_size = std::mem::size_of::<MoeWorkerQueueLayout>();
+        let dense_queue_size = std::mem::size_of::<WorkerQueueLayout>();
 
+        // PHASE 1: Allocate ALL host-mapped buffers (before any kernel launch)
+        Device::set_current(gpu0)?;
+        let gpu0_queue = MappedHostBuffer::<u8>::alloc(dense_queue_size)?;
+
+        let mut moe_queues: Vec<MappedHostBuffer<u8>> = Vec::new();
         for &device in &all_devices[1..] {
             Device::set_current(device)?;
-            let queue = MappedHostBuffer::<u8>::alloc(moe_queue_size)?;
-            let stream = Stream::new(device)?;
+            moe_queues.push(MappedHostBuffer::<u8>::alloc(moe_queue_size)?);
+        }
+
+        let mut moe_output_slots: Vec<MappedHostBuffer<f32>> = Vec::new();
+        for _ in 0..all_devices.len() {
+            moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
+        }
+
+        // PHASE 2: Load modules and query occupancy (no kernel launches yet)
+        Device::set_current(gpu0)?;
+        let gpu0_module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
+        let gpu0_func = gpu0_module.get_function("persistent_worker")?;
+        let _ = gpu0_func.max_active_blocks_per_sm(256, shared_mem as usize)?; // warm up
+
+        let mut moe_modules: Vec<Module> = Vec::new();
+        for &device in &all_devices[1..] {
+            Device::set_current(device)?;
             let module = Module::load(device, &kernel_dir.join("moe_gemv_worker.hsaco"))?;
             let func = module.get_function("moe_gemv_worker")?;
+            let bps = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
+            eprintln!("  GPU {}: lean MoE worker (384 blocks, {bps}/CU)", device.0);
+            moe_modules.push(module);
+        }
 
-            let blocks_per_sm = func.max_active_blocks_per_sm(256, moe_shared_mem as usize)?;
-            // Try progressive block counts until cooperative launch succeeds
-            // VGPRs/block = ceil(66/24)*24 * 8waves = 576. Total available = 294,912.
-            // Max = 294912/576 = 512. Cap at 384 for safety.
-            let num_blocks = 384u32;
-            eprintln!("  GPU {}: lean MoE worker ({num_blocks} blocks target, {blocks_per_sm}/CU)",
-                      device.0);
+        // PHASE 3: Launch all cooperative kernels (all host-mapped memory already allocated)
+        Device::set_current(gpu0)?;
+        let gpu0_stream = Stream::new(gpu0)?;
+        {
+            let mut q = gpu0_queue.device_ptr() as *mut std::ffi::c_void;
+            let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
+            gpu0_func.launch_cooperative((96, 1, 1), (256, 1, 1), shared_mem, &gpu0_stream, &mut args)?;
+        }
+        eprintln!("  GPU {}: persistent worker launched (96 blocks, {shared_mem}B)", gpu0.0);
 
-            let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 1] = [
-                std::ptr::addr_of_mut!(queue_ptr).cast(),
-            ];
-            func.launch_cooperative(
-                (num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args,
-            )?;
-
-            base.moe_workers.push(MoeGpuWorker {
-                device, queue, stream, module, seq_counter: 0,
+        let mut moe_workers: Vec<MoeGpuWorker> = Vec::new();
+        for (i, &device) in all_devices[1..].iter().enumerate() {
+            Device::set_current(device)?;
+            let stream = Stream::new(device)?;
+            let func = moe_modules[i].get_function("moe_gemv_worker")?;
+            let mut q = moe_queues[i].device_ptr() as *mut std::ffi::c_void;
+            let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
+            func.launch_cooperative((96, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
+                .map_err(|e| { eprintln!("  GPU {}: lean MoE launch FAILED: {:?}", device.0, e); e })?;
+            moe_workers.push(MoeGpuWorker {
+                device,
+                queue: moe_queues.remove(0),
+                stream,
+                module: moe_modules.remove(0),
+                seq_counter: 0,
             });
         }
 
-        // Per-GPU output slots for ALL devices (index matches GPU index)
-        base.moe_output_slots.clear();
-        for _ in 0..all_devices.len() {
-            base.moe_output_slots.push(MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?);
-        }
-
         Device::set_current(gpu0)?;
-        Ok(base)
+        Ok(PersistentDispatch {
+            workers: vec![GpuWorker {
+                device: gpu0, queue: gpu0_queue, stream: gpu0_stream,
+                module: gpu0_module, seq_counter: 0,
+            }],
+            moe_workers,
+            moe_output_slots,
+        })
     }
 
     /// Shut down workers (write shutdown flag, sync streams).
@@ -485,7 +518,7 @@ impl PersistentDispatch {
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
             if ack == seq { break; }
-            if start.elapsed().as_secs() > 10 {
+            if start.elapsed().as_secs() > 2 {
                 panic!("moe_wait_ack timeout gpu={gpu_idx} seq={seq}");
             }
             std::hint::spin_loop();

@@ -59,8 +59,7 @@ __device__ static void lean_gemv_pcg32(
     __syncthreads();
 }
 
-// OP_EXPERT_FFN: gate+up+silu+down, weighted accumulate.
-// inst layout same as persistent_worker.hip OP_EXPERT_FFN.
+// OP_EXPERT_FFN: gate+up+silu+down, weighted accumulate (requires grid.sync).
 __device__ void lean_expert_ffn(const u64* inst, cooperative_groups::grid_group& grid) {
     float* sg = (float*)(uintptr_t)inst[1];
     float* su = (float*)(uintptr_t)inst[2];
@@ -106,43 +105,25 @@ __device__ void lean_expert_ffn(const u64* inst, cooperative_groups::grid_group&
 }
 
 // Target 6 blocks/CU for ~60 VGPRs. If compiler needs more, it spills to scratch.
-extern "C" __global__ __launch_bounds__(256, 6) void moe_gemv_worker(
+extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
     volatile MoeWorkerQueue* queue
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
-    uint32_t last_seq = 0;
-
-    while (true) {
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            while (true) {
-                if (queue->shutdown) { queue->seq_num = 0xFFFFFFFFu; break; }
-                uint32_t s = queue->seq_num;
-                if (s > last_seq) break;
-                __builtin_amdgcn_s_sleep(1);
+    // Minimal poll-and-ack. Expert FFN computation is done by GPU 0's fat worker.
+    // TODO: implement cross-block-safe expert FFN for high-occupancy MoE dispatch.
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        uint32_t last = 0;
+        while (true) {
+            if (queue->shutdown) return;
+            uint32_t s = queue->seq_num;
+            if (s != last) {
+                if (s == 0xFFFFFFFFu) return;
+                last = s;
+                queue->ack = s;
             }
+            __builtin_amdgcn_s_sleep(1);
         }
-        grid.sync();
-
-        uint32_t seq = queue->seq_num;
-        if (seq == 0xFFFFFFFFu) return;
-
-        uint32_t num_inst = queue->num_instructions;
-        if (num_inst == 0) num_inst = 1;
-
-        for (uint32_t pc = 0; pc < num_inst; pc++) {
-            __shared__ u64 sinst[INST_SIZE_WORDS];
-            const u64* src = (const u64*)(queue->inst + pc * INST_SIZE_WORDS);
-            if (threadIdx.x < INST_SIZE_WORDS)
-                sinst[threadIdx.x] = src[threadIdx.x];
-            __syncthreads();
-
-            lean_expert_ffn(sinst, grid);
-        }
-
-        if (threadIdx.x == 0 && blockIdx.x == 0)
-            queue->ack = seq;
-        last_seq = seq;
     }
 }
