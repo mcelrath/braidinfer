@@ -1161,7 +1161,9 @@ pub fn distribute_moe_weights_from_bqnt(
         let entry = bqnt.entry(&probe_name)
             .ok_or_else(|| ModelError::MissingWeight(probe_name.clone()))?;
         crate::bqnt::code_to_format(entry.format)
-            .unwrap_or(WeightFormat::PcG32Q4)
+            .ok_or_else(|| ModelError::MissingWeight(
+                format!("{probe_name}: unknown bqnt format code {}", entry.format)
+            ))?
     };
 
     // Get byte sizes per expert from bqnt entries
