@@ -152,8 +152,9 @@ impl Model {
                 self.megakernel = Some(mk);
             }
 
+            // Use same shared_mem as megakernel (4096 for MoE, 2048 for dense) + 256 for local_inst
             let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
-            let shared_mem = if has_moe { 1024u32 * 4 } else { 256u32 * 4 * 2 };
+            let shared_mem = if has_moe { 1024u32 * 4 + 256 } else { 256u32 * 4 * 2 + 256 };
             let dispatch = PersistentDispatch::init(&[self.device], shared_mem)
                 .map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
@@ -180,15 +181,29 @@ impl Model {
         }
         eprintln!("PERSISTENT: host update done, dispatching {} instructions", mk.instructions.len());
 
-        // Replay instructions via persistent worker
-        eprintln!("PERSISTENT: dispatching {} instructions", mk.instructions.len());
+        // Replay instructions via persistent worker.
+        // Skip the last instruction (LM head, OP_LINEAR_PROJ grid_x=vocab_size) which
+        // deadlocks with 96 blocks — handle it via kbk kernel launch instead.
         let dispatch = self.persistent_workers.as_mut().unwrap();
+        let n_inst = mk.instructions.len();
         for (i, inst) in mk.instructions.iter().enumerate() {
             let opcode = inst.words[0] & 0x7FFFFFFF;
             if opcode == 16 { break; } // OP_HALT
-            eprintln!("PERSISTENT: inst[{i}] opcode={opcode}");
+            // Skip last non-HALT instruction (LM head)
+            if i + 2 >= n_inst { break; } // inst[n-2] = LM head, inst[n-1] = HALT
             dispatch.dispatch_gpu0(inst);
         }
+
+        // LM head via kbk kernel (not persistent worker)
+        let hs = self.config.hidden_size as u32;
+        let vs = self.config.vocab_size as u32;
+        self.kernels.linear_proj.forward(
+            &mut self.activations.logits,
+            if self.config.tie_word_embeddings { &self.embed_weight } else { &self.lm_head_weight },
+            &self.activations.hidden,
+            vs, hs, &self.stream,
+        )?;
+        self.stream.synchronize()?;
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;

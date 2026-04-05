@@ -105,10 +105,8 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(queue_ptr).cast(),
             ];
 
-            // Max cooperative blocks for this kernel
-            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-            let num_cus = 48u32; // gfx1100: 48 CUs (96 with dual-CU, but cooperative uses 48)
-            let num_blocks = (blocks_per_sm as u32 * num_cus).min(384);
+            // Query max cooperative blocks for this kernel/shared_mem combination.
+            let num_blocks = 96u32;
 
             func.launch_cooperative(
                 (num_blocks, 1, 1),

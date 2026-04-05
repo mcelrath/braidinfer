@@ -47,8 +47,13 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
         uint32_t seq = queue->seq_num;
         if (seq == 0xFFFFFFFFu) return; // shutdown
 
-        // Read instruction (volatile → non-volatile copy for op dispatch)
-        const u64* inst = (const u64*)queue->inst;
+        // Copy instruction to shared memory (avoids PCIe reads in virtual block loop)
+        __shared__ u64 sinst[INST_SIZE_WORDS];
+        if (threadIdx.x < INST_SIZE_WORDS) {
+            sinst[threadIdx.x] = queue->inst[threadIdx.x];
+        }
+        __syncthreads();
+        const u64* inst = sinst;
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
 
