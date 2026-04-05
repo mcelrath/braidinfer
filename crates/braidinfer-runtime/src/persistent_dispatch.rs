@@ -422,11 +422,13 @@ impl PersistentDispatch {
                 std::ptr::addr_of_mut!(su).cast::<std::ffi::c_void>(),
                 std::ptr::addr_of_mut!(sa).cast::<std::ffi::c_void>(),
             ];
-            // Cooperative launch with block count queried in Phase 2 (before fat worker launch).
-            let num_blocks = moe_num_blocks[i];
-            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
-                .map_err(|e| { eprintln!("  GPU {}: lean MoE FAILED ({num_blocks} blocks): {:?}", device.0, e); e })?;
-            eprintln!("  GPU {}: lean MoE cooperative launched ({num_blocks} blocks)", device.0);
+            // Regular launch: grid.sync() deadlocks when another cooperative kernel runs
+            // on a different GPU (RDNA3 hardware constraint). Use 1 block for now.
+            // TODO: implement multi-block GEMV without grid.sync() (atomic block counter).
+            let num_blocks = 1u32;
+            func.launch((num_blocks, 1, 1), (256, 1, 1), moe_shared_mem, &stream, &mut args)
+                .map_err(|e| { eprintln!("  GPU {}: lean MoE FAILED: {:?}", device.0, e); e })?;
+            eprintln!("  GPU {}: lean MoE worker (1 block, regular launch)", device.0);
             moe_workers.push(MoeGpuWorker {
                 device,
                 queue: moe_queues.remove(0),

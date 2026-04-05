@@ -1,10 +1,8 @@
-// Multi-block lean MoE GEMV worker: cooperative launch, grid.sync() between phases.
-// grid.sync() is safe because all blocks enter the instruction loop together via
-// the outer grid.sync() at top of the while loop.
-// Phase 1 allocation (before cooperative launch) prevents the stall that caused
-// previous grid.sync() "deadlocks".
+// Lean MoE GEMV worker: single-block, regular launch.
+// grid.sync() deadlocks with another cooperative kernel on a different GPU (RDNA3).
+// Single-block (1×256 threads) processes all expert rows sequentially.
+// TODO: multi-block without grid.sync() via atomic block counter.
 #include <hip/hip_runtime.h>
-#include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
 
 #define MOE_MAX_BATCH 16
@@ -19,15 +17,14 @@ struct MoeWorkerQueue {
     uint32_t _pad2[3];
 };
 
-// Virtual-block-loop GEMV: distributed across all blocks.
-__device__ static void lean_gemv_pcg32(
+__device__ static void block_gemv_pcg32(
     float* output, const unsigned char* weight, const float* input,
     int out_dim, int in_dim
 ) {
     const int tid = threadIdx.x, stride = blockDim.x;
     const int gs = 32, gb = 20, ng = (in_dim + gs - 1) / gs;
     extern __shared__ float shm[];
-    for (int row = blockIdx.x; row < out_dim; row += gridDim.x) {
+    for (int row = 0; row < out_dim; row++) {
         const unsigned char* rd = weight + (long long)row * ng * gb;
         float acc = 0.0f;
         for (int g = tid; g < ng; g += stride) {
@@ -55,18 +52,14 @@ __device__ static void lean_gemv_pcg32(
 
 extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
     volatile MoeWorkerQueue* queue,
-    float* scratch_gate,  // [eis] shared scratch — grid.sync() ensures ordering
-    float* scratch_up,    // [eis]
-    float* scratch_act    // [eis]
+    float* scratch_gate,
+    float* scratch_up,
+    float* scratch_act
 ) {
-    namespace cg = cooperative_groups;
-    cg::grid_group grid = cg::this_grid();
-
     uint32_t last_seq = 0;
 
     while (true) {
-        // Only block 0 thread 0 polls. All other blocks wait at grid.sync() below.
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (threadIdx.x == 0) {
             while (true) {
                 if (queue->shutdown) { queue->seq_num = 0xFFFFFFFFu; break; }
                 uint32_t s = queue->seq_num;
@@ -74,8 +67,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
                 __builtin_amdgcn_s_sleep(1);
             }
         }
-        // ALL blocks converge: block 0 after poll, others from previous grid.sync()
-        grid.sync();
+        __syncthreads();
 
         uint32_t seq = queue->seq_num;
         if (seq == 0xFFFFFFFFu) return;
@@ -89,7 +81,6 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
                 sinst[threadIdx.x] = ((const u64*)(queue->inst))[pc * INST_SIZE_WORDS + threadIdx.x];
             __syncthreads();
 
-            // OP_EXPERT_FFN: gate+up+silu+down with virtual block loop + grid.sync()
             float* output = (float*)(uintptr_t)sinst[4];
             const unsigned char* gate_up = (const unsigned char*)(uintptr_t)sinst[5];
             const unsigned char* down    = (const unsigned char*)(uintptr_t)sinst[6];
@@ -100,33 +91,27 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
             float ew; __builtin_memcpy(&ew, &ew_bits, sizeof(float));
 
             if (has_gate) {
-                lean_gemv_pcg32(scratch_gate, gate_up, activation, eis, hs);
-                grid.sync();
-                lean_gemv_pcg32(scratch_up, gate_up + (long long)eis * gu_rs, activation, eis, hs);
-                grid.sync();
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
+                block_gemv_pcg32(scratch_gate, gate_up, activation, eis, hs);
+                block_gemv_pcg32(scratch_up, gate_up + (long long)eis * gu_rs, activation, eis, hs);
+                for (int i = threadIdx.x; i < eis; i += blockDim.x) {
                     float g = scratch_gate[i];
                     scratch_act[i] = (g / (1.0f + expf(-g))) * scratch_up[i];
                 }
-                grid.sync();
+                __syncthreads();
             } else {
-                lean_gemv_pcg32(scratch_up, gate_up, activation, eis, hs);
-                grid.sync();
-                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
+                block_gemv_pcg32(scratch_up, gate_up, activation, eis, hs);
+                for (int i = threadIdx.x; i < eis; i += blockDim.x) {
                     float x = scratch_up[i]; float r = x > 0.0f ? x : 0.0f; scratch_act[i] = r * r;
                 }
-                grid.sync();
+                __syncthreads();
             }
-            // Down proj + weighted accumulate
-            lean_gemv_pcg32(scratch_gate, down, scratch_act, hs, eis);
-            grid.sync();
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hs; i += gridDim.x * blockDim.x)
+            block_gemv_pcg32(scratch_gate, down, scratch_act, hs, eis);
+            for (int i = threadIdx.x; i < hs; i += blockDim.x)
                 output[i] += ew * scratch_gate[i];
-            grid.sync();
+            __syncthreads();
         }
 
         last_seq = seq;
-        if (threadIdx.x == 0 && blockIdx.x == 0)
-            queue->ack = seq;
+        if (threadIdx.x == 0) queue->ack = seq;
     }
 }
