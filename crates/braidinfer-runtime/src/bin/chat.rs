@@ -77,6 +77,8 @@ async fn main() {
     }
 
     let mut history: Vec<(String, String)> = Vec::new();
+    let mut prev_ids: Vec<u32> = Vec::new(); // all tokens fed so far (for incremental prefill)
+    let mut position: u32 = 0;
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
@@ -103,7 +105,7 @@ async fn main() {
         }
         messages.push(ChatMessage { role: "user", content: &user_input });
 
-        let prompt_ids = match apply_chat_template(&tokenizer, &token_config, &messages) {
+        let full_ids = match apply_chat_template(&tokenizer, &token_config, &messages) {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("template error: {e}");
@@ -111,32 +113,38 @@ async fn main() {
             }
         };
 
-        model.reset_state().expect("reset");
+        // Incremental prefill: only feed tokens not already in KV cache
+        let new_ids = &full_ids[prev_ids.len()..];
 
         let start = Instant::now();
 
-        // Prefill
-        let n_prompt = prompt_ids.len();
-        let last_logits = if n_prompt <= 1 {
-            match model.decode_step(prompt_ids[0], 0) {
+        // Prefill new tokens only (KV cache retains previous turns)
+        let last_logits = if new_ids.len() == 1 {
+            match model.decode_step(new_ids[0], position) {
                 Ok(l) => l,
                 Err(e) => { eprintln!("prefill error: {e}"); continue; }
             }
         } else {
-            match model.prefill(&prompt_ids) {
-                Ok(l) => l,
-                Err(e) => { eprintln!("prefill error: {e}"); continue; }
+            // decode_step each new token (prefill expects position=0 for full sequence)
+            let mut logits = Vec::new();
+            for (i, &tok) in new_ids.iter().enumerate() {
+                match model.decode_step(tok, position + i as u32) {
+                    Ok(l) => logits = l,
+                    Err(e) => { eprintln!("prefill error: {e}"); continue; }
+                }
             }
+            logits
         };
+        position += new_ids.len() as u32;
 
         let prefill_elapsed = start.elapsed().as_secs_f64();
-        eprintln!("[prefill {n_prompt} tokens in {prefill_elapsed:.2}s]");
+        eprintln!("[prefill {} new tokens ({} total) in {prefill_elapsed:.2}s]",
+                  new_ids.len(), full_ids.len());
 
         // Streaming decode — print each token as it's generated
         let mut next_token = last_logits.iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i as u32).unwrap_or(0);
-        let mut position = n_prompt as u32;
         let mut response = String::new();
         let mut n_gen = 0u32;
         let decode_start = Instant::now();
@@ -163,5 +171,28 @@ async fn main() {
                   n_gen as f64 / decode_elapsed);
 
         history.push((user_input, response));
+
+        // Re-template the full history to compute prev_ids for next turn's prefix match.
+        // If the template adds end-of-turn tokens after the assistant response, feed them
+        // to the model so the KV cache stays in sync.
+        let mut full_messages: Vec<ChatMessage<'_>> = Vec::new();
+        if let Some(sys) = &system_prompt {
+            full_messages.push(ChatMessage { role: "system", content: sys });
+        }
+        for (u, a) in &history {
+            full_messages.push(ChatMessage { role: "user", content: u });
+            full_messages.push(ChatMessage { role: "assistant", content: a });
+        }
+        let expected = apply_chat_template(&tokenizer, &token_config, &full_messages)
+            .unwrap_or_default();
+
+        // Feed any end-of-turn template tokens the model hasn't seen yet
+        if expected.len() > position as usize {
+            for &tok in &expected[position as usize..] {
+                let _ = model.decode_step(tok, position);
+                position += 1;
+            }
+        }
+        prev_ids = expected;
     }
 }
