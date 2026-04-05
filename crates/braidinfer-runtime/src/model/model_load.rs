@@ -45,22 +45,54 @@ impl Model {
 
         let st = SafeTensorSet::open_directory(model_dir)?;
 
-        // Check for pre-quantized .bqnt file (set BQNT_PATH env var)
-        let bqnt = std::env::var("BQNT_PATH").ok()
-            .and_then(|p| {
-                let path = std::path::PathBuf::from(&p);
-                match crate::bqnt::MmapBqnt::open(&path) {
+        // Locate .bqnt file: BQNT_PATH env var takes priority; else auto-derive from model_dir.
+        // Auto path: sibling to model_dir named "{model_dir_name}.q4.bqnt"
+        let explicit_bqnt_path = std::env::var("BQNT_PATH").ok().map(std::path::PathBuf::from);
+        let auto_bqnt_path = model_dir.file_name()
+            .map(|n| model_dir.parent().unwrap_or(model_dir).join(format!("{}.q4.bqnt", n.to_string_lossy())));
+        let bqnt_path_to_try = explicit_bqnt_path.as_ref().or(auto_bqnt_path.as_ref());
+
+        let bqnt = bqnt_path_to_try.and_then(|path| {
+            if path.exists() {
+                match crate::bqnt::MmapBqnt::open(path) {
                     Ok(b) => {
                         eprintln!("Loaded pre-quantized weights from {} ({} tensors)",
-                            p, b.n_tensors());
+                            path.display(), b.n_tensors());
                         Some(b)
                     }
                     Err(e) => {
-                        eprintln!("WARNING: Failed to open BQNT_PATH={p}: {e}");
+                        eprintln!("WARNING: Failed to open {}: {e}", path.display());
                         None
                     }
                 }
-            });
+            } else {
+                None
+            }
+        });
+
+        // If no bqnt found and quantizing, create a writer to cache for next launch.
+        // Only create writer when BQNT_PATH is not explicitly set (avoid overwriting user files).
+        let save_bqnt_path = if bqnt.is_none() && explicit_bqnt_path.is_none()
+            && config.weight_quant != WeightQuantMode::Bf16
+        {
+            auto_bqnt_path.clone()
+        } else {
+            None
+        };
+        let bqnt_writer: std::cell::RefCell<Option<crate::bqnt::BqntWriter>> = std::cell::RefCell::new(
+            save_bqnt_path.as_ref().and_then(|p| {
+                match crate::bqnt::BqntWriter::create(p) {
+                    Ok(w) => {
+                        eprintln!("First-time quantization: caching to {}", p.display());
+                        Some(w)
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: Cannot create bqnt cache at {}: {e}", p.display());
+                        None
+                    }
+                }
+            })
+        );
 
         // Pin mmap'd shard regions so hipMemcpy can DMA directly (avoids bounce buffer).
         // Costs ~300ms upfront to fault in pages, but saves ~500ms on weight copies.
@@ -166,18 +198,30 @@ impl Model {
         // Per-layer weights
         let mut layers = Vec::with_capacity(config.num_layers);
         let mut moe_weights_vec: Vec<Option<MoeWeights>> = (0..config.num_layers).map(|_| None).collect();
+        let is_caching = save_bqnt_path.is_some() && bqnt_writer.borrow().is_some();
         for i in 0..config.num_layers {
+            if is_caching {
+                eprint!("\rQuantizing layer {}/{} ...", i + 1, config.num_layers);
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
             let p = format!("{prefix}layers.{i}.");
             let is_moe = matches!(config.layers[i].ffn_type, FfnType::MoE { .. });
             let wq = config.weight_quant;
             let use_quant = quant_layers.as_ref().map_or(true, |s| s.contains(&i));
-            // Helper: load linear weight, trying bqnt first if available and layer is quantized
+            // Helper: load linear weight, trying bqnt first if available and layer is quantized.
+            // Falls through to quantize-at-load from safetensors, caching to bqnt_writer if set.
             let load_lw = |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
                 if use_quant {
                     if let Some(ref b) = bqnt {
                         if let Ok(lw) = crate::weights::load_linear_weight_bqnt(b, name, device) {
                             return Ok(lw);
                         }
+                    }
+                    if bqnt_writer.borrow().is_some() {
+                        let mut guard = bqnt_writer.borrow_mut();
+                        return crate::weights::load_linear_weight_cached(
+                            &st, name, device, out_dim, in_dim, wq,
+                            guard.as_mut().unwrap());
                     }
                 }
                 load_linear_weight(&st, name, device, out_dim, in_dim, wq)
@@ -229,9 +273,19 @@ impl Model {
                     format!("{p}mlp.")
                 };
                 moe_weights_vec[i] = Some(if multi_gpu {
-                    load_moe_weights_lite(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    if bqnt_writer.borrow().is_some() {
+                        let mut g = bqnt_writer.borrow_mut();
+                        crate::weights::load_moe_weights_lite_cached(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref(), g.as_mut().unwrap())?
+                    } else {
+                        load_moe_weights_lite(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    }
                 } else {
-                    load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    if bqnt_writer.borrow().is_some() {
+                        let mut g = bqnt_writer.borrow_mut();
+                        crate::weights::load_moe_weights_cached(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref(), g.as_mut().unwrap())?
+                    } else {
+                        load_moe_weights(&st, &moe_prefix, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                    }
                 });
             } else if config.layers[i].layer_type == LayerType::Attention {
                 let hs = config.hidden_size;
@@ -292,9 +346,19 @@ impl Model {
                 // Load MoE weights if this layer uses MoE FFN
                 if is_moe {
                     moe_weights_vec[i] = Some(if multi_gpu {
-                        load_moe_weights_lite(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        if bqnt_writer.borrow().is_some() {
+                            let mut g = bqnt_writer.borrow_mut();
+                            crate::weights::load_moe_weights_lite_cached(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref(), g.as_mut().unwrap())?
+                        } else {
+                            load_moe_weights_lite(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        }
                     } else {
-                        load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        if bqnt_writer.borrow().is_some() {
+                            let mut g = bqnt_writer.borrow_mut();
+                            crate::weights::load_moe_weights_cached(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref(), g.as_mut().unwrap())?
+                        } else {
+                            load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        }
                     });
                 }
             } else {
@@ -354,12 +418,35 @@ impl Model {
                 // Load MoE weights for GDN layers with MoE FFN (e.g. Qwen3.5-122B)
                 if is_moe {
                     moe_weights_vec[i] = Some(if multi_gpu {
-                        load_moe_weights_lite(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        if bqnt_writer.borrow().is_some() {
+                            let mut g = bqnt_writer.borrow_mut();
+                            crate::weights::load_moe_weights_lite_cached(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref(), g.as_mut().unwrap())?
+                        } else {
+                            load_moe_weights_lite(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        }
                     } else {
-                        load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        if bqnt_writer.borrow().is_some() {
+                            let mut g = bqnt_writer.borrow_mut();
+                            crate::weights::load_moe_weights_cached(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref(), g.as_mut().unwrap())?
+                        } else {
+                            load_moe_weights(&st, &p, &config, &config.layers[i].ffn_type, device, wq, bqnt.as_ref())?
+                        }
                     });
                 }
             }
+        }
+
+        // Finish bqnt cache file if we created one
+        if let Some(writer) = bqnt_writer.into_inner() {
+            if let Some(ref p) = save_bqnt_path {
+                eprintln!("\nSaving quantized weights to {} ...", p.display());
+                match writer.finish("{}") {
+                    Ok(()) => eprintln!("Cached weights saved to {}", p.display()),
+                    Err(e) => eprintln!("WARNING: Failed to save bqnt cache: {e}"),
+                }
+            }
+        } else if is_caching {
+            eprintln!();
         }
 
         // Unpin mmap'd regions now that all weights are on GPU

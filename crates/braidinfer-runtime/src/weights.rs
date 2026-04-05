@@ -434,9 +434,74 @@ pub fn host_bf16_to_linear_weight(
     }
 }
 
+/// Quantize host bf16 buffer, optionally write to bqnt writer, upload to GPU.
+/// Used by MoE loading paths that fuse per-expert tensors into a single packed buffer.
+fn host_bf16_quantize_upload_cache(
+    host_buf: &[u16],
+    out_dim: usize,
+    in_dim: usize,
+    fmt: WeightFormat,
+    device: DeviceId,
+    cache_name: &str,
+    writer: Option<&mut crate::bqnt::BqntWriter>,
+) -> Result<LinearWeight, ModelError> {
+    let packed = match fmt {
+        WeightFormat::Rnf4G128 => quantize_rnf4_g128(host_buf, out_dim, in_dim),
+        WeightFormat::PcG32Q4  => quantize_pc_g32_q4(host_buf, out_dim, in_dim),
+        WeightFormat::Bf16 => host_buf.iter().flat_map(|x| x.to_le_bytes()).collect(),
+    };
+    if let Some(w) = writer {
+        if let Err(e) = w.write_tensor(cache_name, fmt, out_dim as u32, in_dim as u32, 2, &packed) {
+            eprintln!("bqnt: cache write failed for {cache_name}: {e}");
+        }
+    }
+    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+    buf.copy_from_host(&packed)?;
+    Ok(LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim, in_dim }))
+}
+
 // --- BQNT (pre-quantized) loading ---
 
 use crate::bqnt::{MmapBqnt, code_to_format};
+
+/// Like load_linear_weight but also writes packed bytes to a BqntWriter for caching.
+/// Only called when quantizing from safetensors for the first time (no bqnt found).
+pub fn load_linear_weight_cached(
+    st: &SafeTensorSet,
+    name: &str,
+    device: DeviceId,
+    out_dim: usize,
+    in_dim: usize,
+    mode: WeightQuantMode,
+    writer: &mut crate::bqnt::BqntWriter,
+) -> Result<LinearWeight, ModelError> {
+    let format = weight_format_for(name, mode);
+    match format {
+        WeightFormat::Bf16 => {
+            // Bf16 weights not quantized, don't cache in bqnt
+            let buf = load_weight_bf16(st, name, device, out_dim * in_dim)?;
+            Ok(LinearWeight::Bf16(buf))
+        }
+        _ => {
+            let expected_len = out_dim * in_dim;
+            let raw = st.tensor_data(name)
+                .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
+            let bf16_data: &[u16] = unsafe {
+                std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
+            };
+            let packed = match format {
+                WeightFormat::Rnf4G128 => quantize_rnf4_g128(bf16_data, out_dim, in_dim),
+                WeightFormat::PcG32Q4  => quantize_pc_g32_q4(bf16_data, out_dim, in_dim),
+                WeightFormat::Bf16 => unreachable!(),
+            };
+            writer.write_tensor(name, format, out_dim as u32, in_dim as u32, 2, &packed)
+                .map_err(|e| ModelError::MissingWeight(format!("bqnt write {name}: {e}")))?;
+            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
+            buf.copy_from_host(&packed)?;
+            Ok(LinearWeight::Packed(PackedWeights { data: buf, format, out_dim, in_dim }))
+        }
+    }
+}
 
 /// Load a linear weight directly from a pre-quantized .bqnt file.
 /// Zero quantization cost — packed bytes go straight from mmap to GPU.
@@ -507,7 +572,36 @@ pub fn load_moe_weights(
     wq: WeightQuantMode,
     bqnt: Option<&MmapBqnt>,
 ) -> Result<MoeWeights, ModelError> {
-    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, false)
+    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, false, None)
+}
+
+/// Like load_moe_weights_lite but writes packed bytes to writer for bqnt caching.
+/// skip_experts=true so expert weights are not loaded (multi-GPU loads them directly).
+pub fn load_moe_weights_lite_cached(
+    st: &SafeTensorSet,
+    prefix: &str,
+    config: &ModelConfig,
+    ffn_type: &FfnType,
+    device: DeviceId,
+    wq: WeightQuantMode,
+    bqnt: Option<&MmapBqnt>,
+    writer: &mut crate::bqnt::BqntWriter,
+) -> Result<MoeWeights, ModelError> {
+    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, true, Some(writer))
+}
+
+/// Like load_moe_weights but writes packed bytes to writer for bqnt caching.
+pub fn load_moe_weights_cached(
+    st: &SafeTensorSet,
+    prefix: &str,
+    config: &ModelConfig,
+    ffn_type: &FfnType,
+    device: DeviceId,
+    wq: WeightQuantMode,
+    bqnt: Option<&MmapBqnt>,
+    writer: &mut crate::bqnt::BqntWriter,
+) -> Result<MoeWeights, ModelError> {
+    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, false, Some(writer))
 }
 
 /// Load MoE weights, optionally skipping expert weights (for multi-GPU direct loading).
@@ -521,7 +615,7 @@ pub fn load_moe_weights_lite(
     wq: WeightQuantMode,
     bqnt: Option<&MmapBqnt>,
 ) -> Result<MoeWeights, ModelError> {
-    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, true)
+    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, true, None)
 }
 
 fn load_moe_weights_inner(
@@ -533,6 +627,7 @@ fn load_moe_weights_inner(
     wq: WeightQuantMode,
     bqnt: Option<&MmapBqnt>,
     skip_experts: bool,
+    mut writer: Option<&mut crate::bqnt::BqntWriter>,
 ) -> Result<MoeWeights, ModelError> {
     let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = ffn_type
         else { unreachable!("load_moe_weights called on non-MoE layer") };
@@ -540,14 +635,21 @@ fn load_moe_weights_inner(
     let eis = *expert_intermediate_size;
     let hs = config.hidden_size;
 
-    // Helper: try bqnt first, then safetensors
+    // Helper: try bqnt first, then safetensors (with optional bqnt cache write).
+    // RefCell allows the closure and outer code to share mutable writer access.
+    let writer_cell = std::cell::RefCell::new(writer);
     let load_lw = |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
         if let Some(b) = bqnt {
             if let Ok(lw) = load_linear_weight_bqnt(b, name, device) {
                 return Ok(lw);
             }
         }
-        load_linear_weight(st, name, device, out_dim, in_dim, wq)
+        if writer_cell.borrow().is_some() {
+            let mut guard = writer_cell.borrow_mut();
+            load_linear_weight_cached(st, name, device, out_dim, in_dim, wq, guard.as_mut().unwrap())
+        } else {
+            load_linear_weight(st, name, device, out_dim, in_dim, wq)
+        }
     };
 
     // Router gate: try mlp.gate, gate (Nemotron), block_sparse_moe.gate, mlp.router (always bf16)
@@ -597,7 +699,12 @@ fn load_moe_weights_inner(
     let expert_gate_up = if let Some(lw) = bqnt_fused {
         lw
     } else if st.tensor_data(&fused_name).is_ok() {
-        load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
+        if writer_cell.borrow().is_some() {
+            let mut guard = writer_cell.borrow_mut();
+            load_linear_weight_cached(st, &fused_name, device, ne * 2 * eis, hs, wq, guard.as_mut().unwrap())?
+        } else {
+            load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
+        }
     } else if has_gate_proj {
         // SwiGLU: fuse gate_proj + up_proj per expert
         let expert_elems = 2 * eis * hs;
@@ -616,7 +723,9 @@ fn load_moe_weights_inner(
             host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
             host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
         }
-        host_bf16_to_linear_weight(&host_buf, ne * 2 * eis, hs, expert_fmt, device)?
+        let mut wg = writer_cell.borrow_mut();
+        host_bf16_quantize_upload_cache(&host_buf, ne * 2 * eis, hs, expert_fmt, device,
+            &fused_name, (*wg).as_deref_mut())?
     } else {
         // No gate_proj (relu² activation): load only up_proj per expert
         // Try bqnt per-expert concatenation first
@@ -664,7 +773,9 @@ fn load_moe_weights_inner(
             host_buf[dst_off..dst_off + expert_elems].copy_from_slice(u_slice);
         }
         // Store as expert_gate_up with size eis (not 2*eis) — dispatch must handle this
-        host_bf16_to_linear_weight(&host_buf, ne * eis, hs, expert_fmt, device)?
+        let mut wg2 = writer_cell.borrow_mut();
+        host_bf16_quantize_upload_cache(&host_buf, ne * eis, hs, expert_fmt, device,
+            &fused_name, (*wg2).as_deref_mut())?
     }};
 
     // --- Expert down ---
@@ -673,7 +784,12 @@ fn load_moe_weights_inner(
     let expert_down = if let Some(lw) = bqnt_down {
         lw
     } else if st.tensor_data(&down_name).is_ok() {
-        load_linear_weight(st, &down_name, device, ne * hs, eis, wq)?
+        if writer_cell.borrow().is_some() {
+            let mut guard = writer_cell.borrow_mut();
+            load_linear_weight_cached(st, &down_name, device, ne * hs, eis, wq, guard.as_mut().unwrap())?
+        } else {
+            load_linear_weight(st, &down_name, device, ne * hs, eis, wq)?
+        }
     } else {
         // Try bqnt per-expert concatenation for down_proj
         let bqnt_per_expert_down = bqnt.and_then(|b| {
@@ -715,7 +831,9 @@ fn load_moe_weights_inner(
             let dst_off = e * expert_elems_d;
             host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
         }
-        host_bf16_to_linear_weight(&host_buf_d, ne * hs, eis, expert_fmt, device)?
+        let mut wg3 = writer_cell.borrow_mut();
+        host_bf16_quantize_upload_cache(&host_buf_d, ne * hs, eis, expert_fmt, device,
+            &down_name, (*wg3).as_deref_mut())?
     }};
 
     (expert_gate_up, expert_down)
