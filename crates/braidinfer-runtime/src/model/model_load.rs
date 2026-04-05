@@ -663,7 +663,7 @@ impl Model {
         }).max().unwrap_or(1);
 
         let ctx = crate::multi_gpu::MultiGpuContext::init(self.config.hidden_size, max_eis)?;
-        let ctx = match ctx {
+        let mut ctx = match ctx {
             Some(c) => c,
             None => { eprintln!("Multi-GPU: only 1 device, skipping"); return Ok(()); }
         };
@@ -718,6 +718,19 @@ impl Model {
         self.distributed_moe = distributed;
         self.worker_kernels = worker_kernels;
         eprintln!("Multi-GPU: experts distributed across all {num_devices} GPUs");
+
+        // Allocate head-parallel attention buffers for all GPUs
+        let num_attn_layers = self.config.layers.iter()
+            .filter(|l| l.layer_type == crate::config::LayerType::Attention)
+            .count();
+        if num_attn_layers > 0 && self.config.num_q_heads >= num_devices && self.config.num_kv_heads >= num_devices {
+            let local_nqh = self.config.num_q_heads / num_devices;
+            let local_nkh = self.config.num_kv_heads / num_devices;
+            ctx.init_attn_buffers(
+                num_attn_layers, local_nqh, local_nkh,
+                self.config.head_dim, self.config.max_seq_len,
+            )?;
+        }
 
         self.multi_gpu = Some(ctx);
         Ok(())

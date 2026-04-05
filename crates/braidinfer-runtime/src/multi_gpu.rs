@@ -57,6 +57,10 @@ pub struct GpuWorker {
     pub peer_copy_module: Module,
     // Pre-allocated pinned host buffer for async gather (hipHostMalloc for true async DMA)
     pub gather_host: PinnedBuffer<f32>,
+    // Head-parallel attention buffers (allocated by init_attn_buffers after construction)
+    pub attn_kv_caches: Vec<crate::weights::KvCache>, // [num_attn_layers], each [local_nkh, max_seq_len, hd]
+    pub attn_q: Option<DeviceBuffer<f32>>,             // [local_nqh * head_dim]
+    pub attn_out: Option<DeviceBuffer<f32>>,           // [local_nqh * head_dim]
 }
 
 /// Multi-GPU context for expert parallel dispatch.
@@ -118,6 +122,9 @@ impl MultiGpuContext {
                 transfer_done: HipEvent::new()?,
                 peer_copy_module: Module::load(device, &crate::kernel::kernel_dir().join("peer_copy.hsaco"))?,
                 gather_host: PinnedBuffer::<f32>::alloc(hidden_size)?,
+                attn_kv_caches: Vec::new(),
+                attn_q: None,
+                attn_out: None,
             });
         }
 
@@ -134,6 +141,33 @@ impl MultiGpuContext {
             gather_stream,
             gather_done,
         }))
+    }
+
+    /// Allocate head-parallel attention buffers for all workers.
+    /// Must be called after init(), before compile_multi_gpu.
+    pub fn init_attn_buffers(
+        &mut self,
+        num_attn_layers: usize,
+        local_nqh: usize,
+        local_nkh: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<()> {
+        for worker in self.workers.iter_mut() {
+            Device::set_current(worker.device)?;
+            worker.attn_q = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nqh * head_dim)?);
+            worker.attn_out = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nqh * head_dim)?);
+            for _ in 0..num_attn_layers {
+                worker.attn_kv_caches.push(crate::weights::KvCache {
+                    k: DeviceBuffer::<f32>::alloc(worker.device, local_nkh * max_seq_len * head_dim)?,
+                    v: DeviceBuffer::<f32>::alloc(worker.device, local_nkh * max_seq_len * head_dim)?,
+                });
+            }
+        }
+        Device::set_current(DeviceId(0))?;
+        eprintln!("Multi-GPU attn: {} layers × {} workers, local_nqh={local_nqh} local_nkh={local_nkh}",
+            num_attn_layers, self.num_devices);
+        Ok(())
     }
 
     /// Async P2P copy using compute kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe).

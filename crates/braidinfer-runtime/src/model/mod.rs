@@ -275,12 +275,33 @@ impl Model {
         let hs = self.config.hidden_size;
         let ffn_down_stage_ptr = self.activations.ffn_down_stage.as_write_ptr() as u64;
 
+        // Precompute head-parallel attention boundaries.
+        // For each attn layer: (mrope_idx, gqa_idx) — we flush at mrope, skip up to gqa.
+        let has_head_parallel = self.multi_gpu.as_ref()
+            .map(|m| !m.workers[0].attn_kv_caches.is_empty())
+            .unwrap_or(false);
+        let attn_boundaries: Vec<(usize, usize)> = if has_head_parallel {
+            let mk_ref = self.megakernel_multi_gpu.as_ref().unwrap();
+            mk_ref._mrope_inst_indices.iter()
+                .zip(mk_ref.gqa_attn_inst_indices.iter())
+                .map(|(&mrope_idx, &gqa_idx)| (mrope_idx, gqa_idx))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let n_inst = self.megakernel_multi_gpu.as_ref().unwrap().instructions.len();
+
         // Split instruction stream at OP_BARRIER markers into segments.
         // Dense segments batched to GPU 0. At OP_BARRIER: build per-GPU expert
         // FFN batches, dispatch to all GPUs in parallel via persistent workers.
+        // At attention mRoPE boundary: flush and dispatch head-parallel attention.
         let mut segment: Vec<Instruction> = Vec::new();
+        let mut attn_i = 0usize;
+        let mut i = 0usize;
 
-        for inst in mk.instructions.iter() {
+        while i < n_inst {
+            let inst = self.megakernel_multi_gpu.as_ref().unwrap().instructions[i].clone();
+            i += 1;
             let opcode = inst.words[0] & 0x7FFFFFFF;
             if opcode == 16 { break; }
 
@@ -444,7 +465,27 @@ impl Model {
                 continue;
             }
 
-            segment.push(inst.clone());
+            // Head-parallel attention: at mRoPE, flush segment, dispatch parallel GQA
+            if has_head_parallel && attn_i < attn_boundaries.len() {
+                let (mrope_idx, gqa_idx) = attn_boundaries[attn_i];
+                if i - 1 == mrope_idx {
+                    // Include mRoPE in segment, flush to GPU 0 (blocking = waits for mRoPE)
+                    segment.push(inst);
+                    {
+                        let dispatch = self.persistent_workers.as_mut().unwrap();
+                        for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                            dispatch.dispatch_batch(0, chunk);
+                        }
+                    }
+                    segment.clear();
+                    self.dispatch_head_parallel_attention(attn_i, position)?;
+                    attn_i += 1;
+                    i = gqa_idx + 1; // skip KV write + GQA instructions
+                    continue;
+                }
+            }
+
+            segment.push(inst);
         }
 
         // Flush final segment
@@ -461,6 +502,139 @@ impl Model {
 
         self.seq_len = position + 1;
         Ok(logits)
+    }
+
+    /// Head-parallel GQA attention: run KV write + GQA on all GPUs in parallel.
+    /// Called from decode_step_persistent_multi_gpu after GPU 0 has completed mRoPE.
+    /// After this returns, activations.attn_out[0..nqh*hd] contains the concatenated result.
+    fn dispatch_head_parallel_attention(&mut self, attn_i: usize, position: u32) -> Result<(), ModelError> {
+        use crate::megakernel::{Instruction, OP_D2D_COPY, OP_GQA_ATTN};
+        use crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS;
+        use crate::multi_gpu::MultiGpuContext;
+
+        let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
+        let nqh = self.config.num_q_heads;
+        let nkh = self.config.num_kv_heads;
+        let hd = self.config.head_dim;
+        let max_sl = self.config.max_seq_len;
+        let local_nqh = nqh / num_gpus;
+        let local_nkh = nkh / num_gpus;
+        let head_stride = max_sl * hd; // element stride between KV heads in cache [H, max_sl, hd]
+
+        // Source pointers on GPU 0 (P2P-accessible from all GPUs)
+        let k_attn_base = self.activations.k_attn.as_ptr() as u64;
+        let v_attn_base = self.activations.v_attn.as_ptr() as u64;
+        let q_attn_base = self.activations.q_attn.as_ptr() as u64;
+        let attn_out_base = self.activations.attn_out.as_write_ptr() as u64;
+
+        let mut seq_nums: Vec<(usize, u32)> = Vec::with_capacity(num_gpus);
+
+        for gpu_i in 0..num_gpus {
+            let mut batch: Vec<Instruction> = Vec::new();
+
+            // Get KV cache pointers and output pointer for this GPU
+            let (kv_k_base, kv_v_base, q_ptr, out_ptr) = {
+                let mgpu = self.multi_gpu.as_ref().unwrap();
+                let kc = &mgpu.workers[gpu_i].attn_kv_caches[attn_i];
+                let q = if gpu_i == 0 {
+                    q_attn_base
+                } else {
+                    mgpu.workers[gpu_i].attn_q.as_ref().unwrap().as_ptr() as u64
+                };
+                let out = if gpu_i == 0 {
+                    attn_out_base
+                } else {
+                    mgpu.workers[gpu_i].attn_out.as_ref().unwrap().as_write_ptr() as u64
+                };
+                (kc.k.as_write_ptr() as u64, kc.v.as_write_ptr() as u64, q, out)
+            };
+
+            // KV write: per KV head, from GPU 0's k/v_attn to this GPU's KV cache at position
+            for h_local in 0..local_nkh {
+                let h_global = gpu_i * local_nkh + h_local;
+                let src_k = k_attn_base + (h_global * hd * 4) as u64;
+                let src_v = v_attn_base + (h_global * hd * 4) as u64;
+                let dst_k = kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
+                let dst_v = kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
+
+                let mut inst = Instruction::new(OP_D2D_COPY, ((hd as u32) + 255) / 256);
+                inst.set_output_ptr(1, dst_k as *mut f32);
+                inst.set_ptr(2, src_k as *const f32);
+                inst.set_int(3, hd as i32);
+                inst.set_no_sync();
+                batch.push(inst);
+
+                let mut inst = Instruction::new(OP_D2D_COPY, ((hd as u32) + 255) / 256);
+                inst.set_output_ptr(1, dst_v as *mut f32);
+                inst.set_ptr(2, src_v as *const f32);
+                inst.set_int(3, hd as i32);
+                inst.set_no_sync();
+                batch.push(inst);
+            }
+
+            // For GPU i > 0: copy Q slice from GPU 0's q_attn (P2P read) to local attn_q
+            if gpu_i > 0 {
+                let src_q = q_attn_base + (gpu_i * local_nqh * hd * 4) as u64;
+                let mut inst = Instruction::new(OP_D2D_COPY, ((local_nqh * hd) as u32 + 255) / 256);
+                inst.set_output_ptr(1, q_ptr as *mut f32);
+                inst.set_ptr(2, src_q as *const f32);
+                inst.set_int(3, (local_nqh * hd) as i32);
+                batch.push(inst);
+            }
+
+            // GQA attention: q=q_ptr[0..local_nqh*hd], kv=this GPU's kv_cache
+            let seq_len = (position + 1) as i32;
+            let q_src = if gpu_i == 0 { q_attn_base } else { q_ptr };
+            {
+                let mut inst = Instruction::new(OP_GQA_ATTN, local_nqh as u32);
+                inst.set_output_ptr(1, out_ptr as *mut f32);
+                inst.set_ptr(2, q_src as *const f32);
+                inst.set_ptr(3, kv_k_base as *const f32);
+                inst.set_ptr(4, kv_v_base as *const f32);
+                inst.set_int(5, local_nqh as i32);
+                inst.set_int(6, local_nkh as i32);
+                inst.set_int(7, hd as i32);
+                inst.set_int(8, seq_len);
+                inst.set_int(9, max_sl as i32);
+                batch.push(inst);
+            }
+
+            assert!(batch.len() <= MAX_BATCH_INSTRUCTIONS, "attn batch overflow gpu={gpu_i}");
+            let seq = self.persistent_workers.as_mut().unwrap().dispatch_batch_fire(gpu_i, &batch);
+            seq_nums.push((gpu_i, seq));
+        }
+
+        // Wait for all GPUs to complete their KV write + GQA
+        for &(gpu_i, seq) in &seq_nums {
+            self.persistent_workers.as_ref().unwrap().wait_ack(gpu_i, seq);
+        }
+
+        // Collect GPU 1..num_gpus attn_out → activations.attn_out[gpu_i * local_nqh * hd ..]
+        for gpu_i in 1..num_gpus {
+            let (src_ptr, dst_ptr, size) = {
+                let mgpu = self.multi_gpu.as_ref().unwrap();
+                let src = mgpu.workers[gpu_i].attn_out.as_ref().unwrap().as_ptr() as *const u8;
+                let dst = unsafe {
+                    (self.activations.attn_out.as_write_ptr() as *mut u8)
+                        .add(gpu_i * local_nqh * hd * 4)
+                };
+                (src, dst, local_nqh * hd * 4)
+            };
+            {
+                let mgpu = self.multi_gpu.as_ref().unwrap();
+                MultiGpuContext::peer_copy_async(
+                    dst_ptr, src_ptr, size,
+                    &mgpu.workers[0].peer_copy_module,
+                    &mgpu.gather_stream,
+                ).map_err(ModelError::Hip)?;
+            }
+        }
+        if num_gpus > 1 {
+            self.multi_gpu.as_ref().unwrap().gather_stream
+                .synchronize().map_err(ModelError::Hip)?;
+        }
+
+        Ok(())
     }
 
     /// MoE decode step: kernel-by-kernel execution with MoE FFN dispatch.
