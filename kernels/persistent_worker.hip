@@ -57,6 +57,10 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
 
+        if (threadIdx.x == 0 && blockIdx.x == 0 && grid_x > 10000) {
+            printf("WORKER: seq=%u opcode=%u grid_x=%u\n", seq, opcode, grid_x);
+        }
+
         // Dispatch: same switch as megakernel, minus OP_HALT/OP_BARRIER/OP_MOE_DISPATCH
         if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
@@ -96,7 +100,13 @@ extern "C" __global__ __launch_bounds__(256) void persistent_worker(
                     default: break;
                 }
             }
+            if (threadIdx.x == 0 && blockIdx.x == 0 && grid_x > 10000) {
+                printf("WORKER: block0 finished loop, entering grid.sync (grid_x=%u)\n", grid_x);
+            }
             grid.sync();
+            if (threadIdx.x == 0 && blockIdx.x == 0 && grid_x > 10000) {
+                printf("WORKER: grid.sync done\n");
+            }
         }
 
         // Ack: write seq_num to host-mapped flag

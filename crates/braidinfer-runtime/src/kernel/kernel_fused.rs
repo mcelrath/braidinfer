@@ -630,7 +630,7 @@ impl AttnLayerFusedKernel {
         w_v: &DeviceBuffer<f32>,
         w_o: &DeviceBuffer<f32>,
         inv_freq: &DeviceBuffer<f32>,
-        position_ids: &DeviceBuffer<i32>,
+        position_ids: *const i32,
         k_cache: &mut DeviceBuffer<f32>,
         v_cache: &mut DeviceBuffer<f32>,
         hidden_size: u32,
@@ -656,7 +656,6 @@ impl AttnLayerFusedKernel {
         assert_eq!(w_v.device(), self.device);
         assert_eq!(w_o.device(), self.device);
         assert_eq!(inv_freq.device(), self.device);
-        assert_eq!(position_ids.device(), self.device);
         assert_eq!(k_cache.device(), self.device);
         assert_eq!(v_cache.device(), self.device);
         assert_eq!(stream.device(), self.device);
@@ -713,7 +712,7 @@ impl AttnLayerFusedKernel {
             let mut kc_ptr: *mut c_void         = k_cache.as_mut_ptr().cast();
             let mut vc_ptr: *mut c_void         = v_cache.as_mut_ptr().cast();
             let mut inv_ptr: *const c_void      = inv_freq.as_ptr().cast();
-            let mut pos_ptr: *const c_void      = position_ids.as_ptr().cast();
+            let mut pos_ptr: *const c_void      = position_ids.cast();
             let mut nqh = num_q_heads   as i32;
             let mut nkh = num_kv_heads  as i32;
             let mut hd  = head_dim      as i32;

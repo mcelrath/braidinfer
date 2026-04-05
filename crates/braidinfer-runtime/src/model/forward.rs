@@ -936,13 +936,13 @@ impl Model {
         // 5. Apply RoPE (skip for Nemotron-H which has no rotary embeddings)
         if cfg.use_rope {
         let pos_data = [position as i32, position as i32, position as i32];
-        self.activations.position_ids.copy_from_host(&pos_data)?;
+        unsafe { std::ptr::copy_nonoverlapping(pos_data.as_ptr(), self.activations.position_ids.host_ptr(), pos_data.len()) };
 
         self.kernels.mrope.forward(
             &mut self.activations.q_attn,
             &mut self.activations.k_attn,
             &self.activations.inv_freq,
-            &self.activations.position_ids,
+            self.activations.position_ids.as_ptr(),
             nqh,
             nkh,
             hd,

@@ -80,16 +80,8 @@ impl MegakernelProgram {
 
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
 
-        // position_ids still need GPU write (DMA engine, doesn't need SMs)
-        let pos_data = [position as i32, position as i32, position as i32];
-        braidinfer_hip::error::check(unsafe {
-            braidinfer_hip::ffi::hipMemcpy(
-                self.position_ids_dev_ptr as *mut std::ffi::c_void,
-                pos_data.as_ptr().cast(),
-                3 * std::mem::size_of::<i32>(),
-                braidinfer_hip::ffi::hipMemcpyHostToDevice,
-            )
-        })?;
+        // position_ids is now MappedHostBuffer — written via host_ptr by caller,
+        // GPU reads through device_ptr. No hipMemcpy needed.
 
         let hd = self.head_dim_attn;
         let max_sl = self.max_seq_len as usize;

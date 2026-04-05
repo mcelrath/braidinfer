@@ -62,7 +62,14 @@ impl Model {
 
     pub fn set_position(&mut self, position: u32) -> HipResult<()> {
         let pos_data = [position as i32, position as i32, position as i32];
-        self.activations.position_ids.copy_from_host(&pos_data)
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pos_data.as_ptr(),
+                self.activations.position_ids.host_ptr(),
+                3,
+            );
+        }
+        Ok(())
     }
 
     pub fn read_logits(&self) -> Result<Vec<f32>, ModelError> {
@@ -74,18 +81,23 @@ impl Model {
     /// GPU-resident argmax: run decode step and return token ID without transferring logits.
     /// Eliminates vocab_size×4 bytes PCIe transfer per token (e.g., 512KB for Nemotron).
     pub fn decode_step_token(&mut self, token_id: u32, position: u32) -> Result<u32, ModelError> {
-        // Run the full decode step (logits stay on GPU — decode_step copies them
-        // to CPU but that's the current architecture; the argmax avoids the NEXT copy)
-        // TODO(braidinfer-ekg): add decode_step_no_copy to avoid CPU transfer
-        let _ = self.decode_step(token_id, position)?;
-        // Argmax on GPU — transfers only 4 bytes back
-        let result = self.kernels.argmax.forward(
-            &self.activations.logits,
-            &mut self.activations.argmax_result,
-            self.config.vocab_size as u32,
-            &self.stream,
-        )?;
-        Ok(result)
+        let logits = self.decode_step(token_id, position)?;
+        if self.persistent_workers.is_some() {
+            // CPU argmax: persistent worker occupies all SMs, can't launch GPU argmax
+            let (idx, _) = logits.iter().enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .unwrap();
+            Ok(idx as u32)
+        } else {
+            // GPU argmax: transfers only 4 bytes back
+            let result = self.kernels.argmax.forward(
+                &self.activations.logits,
+                &mut self.activations.argmax_result,
+                self.config.vocab_size as u32,
+                &self.stream,
+            )?;
+            Ok(result)
+        }
     }
 
     /// Run a single decode step. Returns logits [vocab_size].
@@ -160,9 +172,17 @@ impl Model {
             self.persistent_workers = Some(dispatch);
         }
 
-        eprintln!("PERSISTENT: before host update");
+        // Write position_ids directly to host-mapped memory (no hipMemcpy)
+        let pos_data = [position as i32, position as i32, position as i32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pos_data.as_ptr(),
+                self.activations.position_ids.host_ptr(),
+                3,
+            );
+        }
+
         let mk = self.megakernel.as_mut().unwrap();
-        // Skip hipMemcpy entirely — position_ids already written during prefill
         mk.instructions[mk.embedding_inst_idx].set_int(3, token_id as i32);
         let hd = mk.head_dim_attn;
         let max_sl = mk.max_seq_len as usize;
@@ -179,34 +199,26 @@ impl Model {
         for &idx in &mk.gqa_attn_inst_indices {
             mk.instructions[idx].set_int(8, seq_len as i32);
         }
-        eprintln!("PERSISTENT: host update done, dispatching {} instructions", mk.instructions.len());
+        // dispatch instructions via persistent worker
 
-        // Replay instructions via persistent worker.
-        // Skip the last instruction (LM head, OP_LINEAR_PROJ grid_x=vocab_size) which
-        // deadlocks with 96 blocks — handle it via kbk kernel launch instead.
-        let dispatch = self.persistent_workers.as_mut().unwrap();
+        // Patch LM head instruction to write to logits_mapped (host-mapped)
+        // so CPU can read without hipMemcpy (which deadlocks cooperative kernel).
         let n_inst = mk.instructions.len();
-        for (i, inst) in mk.instructions.iter().enumerate() {
+        let lm_head_idx = n_inst - 2; // second-to-last (before HALT)
+        mk.instructions[lm_head_idx].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
+
+        // Dispatch all instructions
+        let dispatch = self.persistent_workers.as_mut().unwrap();
+        for inst in mk.instructions.iter() {
             let opcode = inst.words[0] & 0x7FFFFFFF;
-            if opcode == 16 { break; } // OP_HALT
-            // Skip last non-HALT instruction (LM head)
-            if i + 2 >= n_inst { break; } // inst[n-2] = LM head, inst[n-1] = HALT
+            if opcode == 16 { break; }
             dispatch.dispatch_gpu0(inst);
         }
 
-        // LM head via kbk kernel (not persistent worker)
-        let hs = self.config.hidden_size as u32;
-        let vs = self.config.vocab_size as u32;
-        self.kernels.linear_proj.forward(
-            &mut self.activations.logits,
-            if self.config.tie_word_embeddings { &self.embed_weight } else { &self.lm_head_weight },
-            &self.activations.hidden,
-            vs, hs, &self.stream,
-        )?;
-        self.stream.synchronize()?;
-
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.activations.logits.copy_to_host(&mut logits)?;
+        // Read logits directly from host-mapped memory (no hipMemcpy needed)
+        let logits = unsafe {
+            std::slice::from_raw_parts(self.activations.logits_mapped.host_ptr(), self.config.vocab_size)
+        }.to_vec();
 
         self.seq_len = position + 1;
         Ok(logits)
@@ -219,7 +231,7 @@ impl Model {
 
         // Set position_ids for mRoPE/RoPE
         let pos_data = [position as i32, position as i32, position as i32];
-        self.activations.position_ids.copy_from_host(&pos_data)?;
+        unsafe { std::ptr::copy_nonoverlapping(pos_data.as_ptr(), self.activations.position_ids.host_ptr(), pos_data.len()) };
 
         // Embedding
         self.kernels.embedding.forward(

@@ -426,8 +426,7 @@ impl Model {
         let mut inv_freq_buf = DeviceBuffer::<f32>::alloc(device, inv_freq_data.len())?;
         inv_freq_buf.copy_from_host(&inv_freq_data)?;
 
-        let mut pos_buf = DeviceBuffer::<i32>::alloc(device, 3)?;
-        pos_buf.copy_from_host(&[0i32, 0, 0])?;
+        let pos_buf = braidinfer_hip::MappedHostBuffer::<i32>::alloc(3)?;
 
         let hs = config.hidden_size;
         let is = config.intermediate_size;
@@ -463,6 +462,7 @@ impl Model {
             ffn_down: DeviceBuffer::<f32>::alloc(device, hs)?,
             residual: DeviceBuffer::<f32>::alloc(device, hs)?,
             logits: DeviceBuffer::<f32>::alloc(device, vs)?,
+            logits_mapped: braidinfer_hip::MappedHostBuffer::<f32>::alloc(vs)?,
             inv_freq: inv_freq_buf,
             position_ids: pos_buf,
             gdn_cs_q: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,

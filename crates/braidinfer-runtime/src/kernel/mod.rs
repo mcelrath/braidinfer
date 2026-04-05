@@ -355,7 +355,7 @@ impl MRoPEKernel {
         q: &mut DeviceBuffer<f32>,
         k: &mut DeviceBuffer<f32>,
         inv_freq: &DeviceBuffer<f32>,
-        position_ids: &DeviceBuffer<i32>,
+        position_ids_ptr: *const i32,
         num_q_heads: u32,
         num_kv_heads: u32,
         head_dim: u32,
@@ -368,7 +368,6 @@ impl MRoPEKernel {
         assert_eq!(q.device(), self.device);
         assert_eq!(k.device(), self.device);
         assert_eq!(inv_freq.device(), self.device);
-        assert_eq!(position_ids.device(), self.device);
         assert_eq!(stream.device(), self.device);
 
         let func = self.module.get_function("mrope_f32")?;
@@ -376,7 +375,7 @@ impl MRoPEKernel {
         let mut q_ptr: *mut c_void = q.as_mut_ptr().cast();
         let mut k_ptr: *mut c_void = k.as_mut_ptr().cast();
         let mut inv_ptr: *const c_void = inv_freq.as_ptr().cast();
-        let mut pos_ptr: *const c_void = position_ids.as_ptr().cast();
+        let mut pos_ptr: *const c_void = position_ids_ptr.cast();
         let mut nqh = num_q_heads as i32;
         let mut nkh = num_kv_heads as i32;
         let mut hd = head_dim as i32;

@@ -173,9 +173,10 @@ pub struct ActivationBuffers {
     pub residual: DeviceBuffer<f32>,  // [1024]
     // Final
     pub logits: DeviceBuffer<f32>,    // [vocab_size]
+    pub logits_mapped: braidinfer_hip::MappedHostBuffer<f32>, // [vocab_size] for persistent worker path
     // inv_freq and position_ids for mRoPE
     pub inv_freq: DeviceBuffer<f32>,  // [rope_dim/2]
-    pub position_ids: DeviceBuffer<i32>, // [3]
+    pub position_ids: braidinfer_hip::MappedHostBuffer<i32>, // [3] — host-mapped for persistent worker path
     // conv states per GDN layer (allocated separately)
     // Pre-allocated GDN conv state temp buffers (reused each gdn_forward call)
     pub gdn_cs_q: DeviceBuffer<f32>,      // [nh*kd*(ck-1)]

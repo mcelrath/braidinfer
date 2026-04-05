@@ -29,7 +29,7 @@ pub struct GpuWorker {
     pub queue: MappedHostBuffer<u8>,  // WorkerQueueLayout, host-mapped
     pub stream: Stream,
     pub module: Module,
-    seq_counter: u32,
+    pub seq_counter: u32,
 }
 
 impl GpuWorker {
@@ -67,7 +67,7 @@ impl GpuWorker {
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
             if ack == seq { break; }
-            if start.elapsed().as_secs() > 5 {
+            if start.elapsed().as_secs() > 10 {
                 let opcode = inst.words[0] & 0x7FFFFFFF;
                 let grid_x = (inst.words[0] >> 32) as u32;
                 panic!("PERSISTENT: dispatch timeout seq={seq} opcode={opcode} grid_x={grid_x} ack={ack}");
