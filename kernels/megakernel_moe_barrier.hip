@@ -146,6 +146,11 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
     }
     grid.sync();
 
+    // Acquire fence: ensure all worker P2P writes to output_slots are visible before sum.
+    // Workers use __threadfence_system() before writing ack_flags; this matching fence on
+    // GPU 0 side ensures the HIP memory model guarantees ordering (not just empirical RDNA3 behavior).
+    __threadfence_system();
+
     // 5. Sum all output_slots into final_output (all blocks cooperate).
     // GPU 0 slot (index 0) is in local VRAM — no stale L2 issue.
     // Worker slots (indices 1..num_workers) were P2P-written — GPU 0 reads fresh VRAM (L2 miss).
