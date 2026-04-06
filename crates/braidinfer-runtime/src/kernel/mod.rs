@@ -410,6 +410,36 @@ impl MRoPEKernel {
             &mut args,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ptr(
+        &self,
+        q: *mut f32, k: *mut f32, inv_freq: *const f32, position_ids: *const i32,
+        num_q_heads: u32, num_kv_heads: u32, head_dim: u32, rope_dim: u32,
+        section0_pairs: u32, section1_pairs: u32, section2_pairs: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("mrope_f32")?;
+        let mut qp = q as *mut std::ffi::c_void;
+        let mut kp = k as *mut std::ffi::c_void;
+        let mut ip = inv_freq as *const std::ffi::c_void;
+        let mut pp = position_ids as *const std::ffi::c_void;
+        let mut nqh = num_q_heads as i32; let mut nkh = num_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut rd = rope_dim as i32;
+        let mut s0 = section0_pairs as i32; let mut s1 = section1_pairs as i32; let mut s2 = section2_pairs as i32;
+        let mut args: [*mut std::ffi::c_void; 11] = [
+            std::ptr::addr_of_mut!(qp).cast(), std::ptr::addr_of_mut!(kp).cast(),
+            std::ptr::addr_of_mut!(ip).cast(), std::ptr::addr_of_mut!(pp).cast(),
+            std::ptr::addr_of_mut!(nqh).cast(), std::ptr::addr_of_mut!(nkh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(), std::ptr::addr_of_mut!(rd).cast(),
+            std::ptr::addr_of_mut!(s0).cast(), std::ptr::addr_of_mut!(s1).cast(),
+            std::ptr::addr_of_mut!(s2).cast(),
+        ];
+        let total_heads = num_q_heads + num_kv_heads;
+        let total_pairs = rope_dim / 2;
+        let block_size = 32u32.max(total_pairs).next_power_of_two().min(256);
+        func.launch((total_heads, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
 }
 
 
@@ -455,6 +485,31 @@ impl OutputGateKernel {
 
         let block_size = 256u32;
         let grid_size = (size + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
+}
+
+pub struct DeinterleaveKernel { module: Module, #[allow(dead_code)] device: DeviceId }
+impl DeinterleaveKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let module = Module::load(device, &kernel_dir().join("deinterleave.hsaco"))?;
+        Ok(Self { module, device })
+    }
+    pub fn forward_ptr(&self, dst_q: *mut f32, dst_gate: *mut f32, src: *const f32, num_heads: u32, head_dim: u32, stream: &Stream) -> HipResult<()> {
+        let func = self.module.get_function("deinterleave_f32")?;
+        let total = num_heads * head_dim;
+        let block_size = 256u32;
+        let grid_size = (total + block_size - 1) / block_size;
+        let mut dq = dst_q as *mut std::ffi::c_void;
+        let mut dg = dst_gate as *mut std::ffi::c_void;
+        let mut s = src as *const std::ffi::c_void;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut args: [*mut std::ffi::c_void; 5] = [
+            std::ptr::addr_of_mut!(dq).cast(), std::ptr::addr_of_mut!(dg).cast(),
+            std::ptr::addr_of_mut!(s).cast(), std::ptr::addr_of_mut!(nh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(),
+        ];
         func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
     }
 }

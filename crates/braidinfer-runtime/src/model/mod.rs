@@ -438,7 +438,6 @@ impl Model {
                 } else {
                     None
                 };
-
                 // Dispatch GPUs 1+ via kbk — runs in parallel with GPU 0's fat worker.
                 // dispatch_moe_layer natively iterates 1..num_devices — no GPU 0 access.
                 {
@@ -566,7 +565,7 @@ impl Model {
         let hs = self.config.hidden_size;
         let max_sl = self.config.max_seq_len;
         let local_nqh = nqh / num_gpus;
-        let local_nkh = nkh / num_gpus;
+        let local_nkh = nkh; // GQA: KV heads replicated on every GPU, not split
         let head_stride = max_sl * hd;
         let q_mult = if self.config.has_output_gate { 2 } else { 1 };
         let has_gate = self.config.has_output_gate;
@@ -606,6 +605,11 @@ impl Model {
                 // ── Distributed QKV mode ──────────────────────────────────────────────────
                 // GPU 0 has normed in act.normed (from megakernel RMSNorm).
                 // GPUs 1..n need normed via P2P broadcast.
+                // Get this attention layer's weights (GPU 0 VRAM, P2P-accessible from all GPUs).
+                let layer_idx_for_attn = self.config.layers.iter().enumerate()
+                    .filter(|(_, l)| l.layer_type == crate::config::LayerType::Attention)
+                    .nth(attn_i).map(|(i, _)| i).unwrap();
+
                 let (normed_local, q_gate_ptr, k_local_ptr, v_local_ptr, gate_ptr) = {
                     let mgpu = self.multi_gpu.as_ref().unwrap();
                     if gpu_i == 0 {
@@ -635,33 +639,38 @@ impl Model {
                     batch.push(inst);
                 }
 
-                // 1. Q_gate projection (local_nqh*hd*q_mult rows)
-                {
-                    let w = unsafe {
+                // 1-3. QKV projections.
+                // GPU 0: use original layer weights (no copy, row_start=0).
+                // GPUs 1+: use pre-copied slice in ctx.workers[gpu_i].attn_w_*.
+                if gpu_i == 0 {
+                    let aw = match &self.layers[layer_idx_for_attn] {
+                        LayerWeights::Attention(w) => w,
+                        _ => panic!("expected attention layer"),
+                    };
+                    emit_linear_proj_inst(&mut batch, &aw.w_q_gate, q_gate_ptr as *mut f32,
+                        normed_local as *const f32, local_nqh * hd * q_mult, hs);
+                    emit_linear_proj_inst(&mut batch, &aw.w_k, k_local_ptr as *mut f32,
+                        normed_local as *const f32, local_nkh * hd, hs);
+                    emit_linear_proj_inst(&mut batch, &aw.w_v, v_local_ptr as *mut f32,
+                        normed_local as *const f32, local_nkh * hd, hs);
+                } else {
+                    let w_q = unsafe {
                         &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_q_gate[attn_i]
                             as *const LinearWeight)
                     };
-                    emit_linear_proj_inst(&mut batch, w, q_gate_ptr as *mut f32,
-                        normed_local as *const f32, local_nqh * hd * q_mult, hs);
-                }
-
-                // 2. K projection (local_nkh*hd rows)
-                {
-                    let w = unsafe {
+                    let w_k = unsafe {
                         &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_k[attn_i]
                             as *const LinearWeight)
                     };
-                    emit_linear_proj_inst(&mut batch, w, k_local_ptr as *mut f32,
-                        normed_local as *const f32, local_nkh * hd, hs);
-                }
-
-                // 3. V projection (local_nkh*hd rows)
-                {
-                    let w = unsafe {
+                    let w_v = unsafe {
                         &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_v[attn_i]
                             as *const LinearWeight)
                     };
-                    emit_linear_proj_inst(&mut batch, w, v_local_ptr as *mut f32,
+                    emit_linear_proj_inst(&mut batch, w_q, q_gate_ptr as *mut f32,
+                        normed_local as *const f32, local_nqh * hd * q_mult, hs);
+                    emit_linear_proj_inst(&mut batch, w_k, k_local_ptr as *mut f32,
+                        normed_local as *const f32, local_nkh * hd, hs);
+                    emit_linear_proj_inst(&mut batch, w_v, v_local_ptr as *mut f32,
                         normed_local as *const f32, local_nkh * hd, hs);
                 }
 
@@ -688,10 +697,7 @@ impl Model {
                 // 5. QK-norm on local k (uses q_norm/k_norm weights from GPU 0 via P2P)
                 // Note: QK-norm weights are DeviceBuffer<u16> on GPU 0, P2P-accessible
                 let (q_norm_ptr, k_norm_ptr, qk_norm_eps) = {
-                    let layer_idx = self.config.layers.iter().enumerate()
-                        .filter(|(_, l)| l.layer_type == crate::config::LayerType::Attention)
-                        .nth(attn_i).map(|(i, _)| i).unwrap();
-                    match &self.layers[layer_idx] {
+                    match &self.layers[layer_idx_for_attn] {
                         LayerWeights::Attention(w) => (
                             w.q_norm.as_ptr(), w.k_norm.as_ptr(), self.config.rms_norm_eps,
                         ),
@@ -819,79 +825,177 @@ impl Model {
                 }
             }
 
-            assert!(batch.len() <= MAX_BATCH_INSTRUCTIONS,
-                "attn batch overflow gpu={gpu_i} len={}", batch.len());
-            let seq = self.persistent_workers.as_mut().unwrap().dispatch_batch_fire(gpu_i, &batch);
-            seq_nums.push((gpu_i, seq));
+            // GPU 0: dispatch via persistent worker. GPUs 1+: kbk on compute_stream.
+            if gpu_i == 0 {
+                assert!(batch.len() <= MAX_BATCH_INSTRUCTIONS,
+                    "attn batch overflow gpu=0 len={}", batch.len());
+                let seq = self.persistent_workers.as_mut().unwrap().dispatch_batch_fire(0, &batch);
+                seq_nums.push((0, seq));
+            } else {
+                self.dispatch_attn_kbk(gpu_i, attn_i, position, &batch).map_err(ModelError::Hip)?;
+            }
         }
 
-        // Wait for all GPUs to complete
+        // Wait for GPU 0 persistent worker to complete
         for &(gpu_i, seq) in &seq_nums {
             self.persistent_workers.as_ref().unwrap().wait_ack(gpu_i, seq);
         }
-
-        // Collect GPU 1..num_gpus attn_out → activations.attn_out[gpu_i * local_nqh * hd ..]
+        // Wait for GPUs 1+ compute_streams to complete
         for gpu_i in 1..num_gpus {
-            let (src_ptr, dst_ptr, size) = {
-                let mgpu = self.multi_gpu.as_ref().unwrap();
-                let src = mgpu.workers[gpu_i].attn_out.as_ref().unwrap().as_ptr() as *const u8;
-                let dst = unsafe {
-                    (self.activations.attn_out.as_write_ptr() as *mut u8)
-                        .add(gpu_i * local_nqh * hd * 4)
-                };
-                (src, dst, local_nqh * hd * 4)
-            };
-            {
-                let mgpu = self.multi_gpu.as_ref().unwrap();
-                MultiGpuContext::peer_copy_async(
-                    dst_ptr, src_ptr, size,
-                    &mgpu.workers[0].peer_copy_module,
-                    &mgpu.gather_stream,
-                ).map_err(ModelError::Hip)?;
-            }
-        }
-
-        // For distributed QKV: also collect gate slices → activations.gate_attn[gpu_i*local_nqh*hd..]
-        // Output-gate runs in megakernel and reads gate_attn.
-        if use_distributed_qkv && has_gate {
-            // GPU 0's gate: copy from workers[0].attn_gate → act.gate_attn[0..local_nqh*hd]
-            {
-                let mgpu = self.multi_gpu.as_ref().unwrap();
-                if let Some(gate_buf) = &mgpu.workers[0].attn_gate {
-                    let src = gate_buf.as_ptr() as *const u8;
-                    let dst = self.activations.gate_attn.as_write_ptr() as *mut u8;
-                    let size = local_nqh * hd * 4;
-                    MultiGpuContext::peer_copy_async(
-                        dst, src, size,
-                        &mgpu.workers[0].peer_copy_module,
-                        &mgpu.gather_stream,
-                    ).map_err(ModelError::Hip)?;
-                }
-            }
-            for gpu_i in 1..num_gpus {
-                let (src_ptr, dst_ptr, size) = {
-                    let mgpu = self.multi_gpu.as_ref().unwrap();
-                    let src = mgpu.workers[gpu_i].attn_gate.as_ref().unwrap().as_ptr() as *const u8;
-                    let dst = unsafe {
-                        (self.activations.gate_attn.as_write_ptr() as *mut u8)
-                            .add(gpu_i * local_nqh * hd * 4)
-                    };
-                    (src, dst, local_nqh * hd * 4)
-                };
-                let mgpu = self.multi_gpu.as_ref().unwrap();
-                MultiGpuContext::peer_copy_async(
-                    dst_ptr, src_ptr, size,
-                    &mgpu.workers[0].peer_copy_module,
-                    &mgpu.gather_stream,
-                ).map_err(ModelError::Hip)?;
-            }
-        }
-
-        if num_gpus > 1 {
-            self.multi_gpu.as_ref().unwrap().gather_stream
+            braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(gpu_i as u32)).map_err(ModelError::Hip)?;
+            self.multi_gpu.as_ref().unwrap().workers[gpu_i].compute_stream
                 .synchronize().map_err(ModelError::Hip)?;
         }
+        // Reset to GPU 0 for gather
+        braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(0)).map_err(ModelError::Hip)?;
 
+        // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.
+        // MUST NOT use peer_copy_async (kernel launch on GPU 0) while persistent cooperative
+        // worker holds all CUs. Route all GPU-0 copies through persistent worker protocol.
+        {
+            let mut gather_batch: Vec<Instruction> = Vec::new();
+            let n_elems = local_nqh * hd;
+            let grid_x = ((n_elems as u32) + 255) / 256;
+
+            // attn_out gather: GPU i → act.attn_out[i*n_elems..]
+            for gpu_i in 1..num_gpus {
+                let src = self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_out
+                    .as_ref().unwrap().as_ptr() as *const f32;
+                let dst = unsafe {
+                    (self.activations.attn_out.as_write_ptr())
+                        .add(gpu_i * n_elems)
+                };
+                let mut inst = Instruction::new(OP_D2D_COPY, grid_x);
+                inst.set_output_ptr(1, dst);
+                inst.set_ptr(2, src);
+                inst.set_int(3, n_elems as i32);
+                inst.set_no_sync();
+                gather_batch.push(inst);
+            }
+
+            // gate_attn gather: GPU i → act.gate_attn[i*n_elems..]
+            // GPU 0's gate was written directly to act.gate_attn[0..n_elems] by deinterleave.
+            if use_distributed_qkv && has_gate {
+                for gpu_i in 1..num_gpus {
+                    let src = self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_gate
+                        .as_ref().unwrap().as_ptr() as *const f32;
+                    let dst = unsafe {
+                        self.activations.gate_attn.as_write_ptr().add(gpu_i * n_elems)
+                    };
+                    let mut inst = Instruction::new(OP_D2D_COPY, grid_x);
+                    inst.set_output_ptr(1, dst);
+                    inst.set_ptr(2, src);
+                    inst.set_int(3, n_elems as i32);
+                    inst.set_no_sync();
+                    gather_batch.push(inst);
+                }
+            }
+
+            if !gather_batch.is_empty() {
+                assert!(gather_batch.len() <= MAX_BATCH_INSTRUCTIONS,
+                    "gather batch overflow len={}", gather_batch.len());
+                self.persistent_workers.as_mut().unwrap().dispatch_batch(0, &gather_batch);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch a batch of attention instructions via kbk on GPU i's compute_stream.
+    /// Used for GPUs 1+ where persistent cooperative workers cannot coexist with MoE kbk.
+    fn dispatch_attn_kbk(&mut self, gpu_i: usize, _attn_i: usize, _position: u32, batch: &[crate::megakernel::Instruction]) -> braidinfer_hip::HipResult<()> {
+        use crate::megakernel::{OP_D2D_COPY, OP_GQA_ATTN, OP_DEINTERLEAVE, OP_QK_NORM, OP_MROPE};
+        use crate::megakernel::{OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4};
+        use crate::moe_dispatch::dispatch_proj;
+        use crate::multi_gpu::MultiGpuContext;
+        use crate::quant::WeightFormat;
+        use braidinfer_hip::device::Device;
+        use braidinfer_core::types::DeviceId;
+
+        Device::set_current(DeviceId(gpu_i as u32))?;
+
+        let stream = unsafe {
+            &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].compute_stream as *const braidinfer_hip::stream::Stream)
+        };
+
+        for inst in batch {
+            let opcode = (inst.words[0] & 0x7FFFFFFF) as u32;
+            match opcode {
+                OP_D2D_COPY => {
+                    let dst = inst.words[1] as *mut u8;
+                    let src = inst.words[2] as *const u8;
+                    // Recover original element count from inst word 3 (set_int(3, n))
+                    let n_elems = inst.words[3] as usize;
+                    let size = n_elems * 4; // f32 bytes
+                    MultiGpuContext::peer_copy_async(dst, src, size,
+                        &self.multi_gpu.as_ref().unwrap().workers[gpu_i].peer_copy_module, stream)?;
+                }
+                OP_LINEAR_PROJ | OP_LINEAR_PROJ_PCG32 | OP_LINEAR_PROJ_RNF4 => {
+                    let out = inst.words[1] as *mut f32;
+                    let w_bytes = inst.words[2] as *const u8;
+                    let inp = inst.words[3] as *const f32;
+                    let out_dim = inst.words[4] as u32;
+                    let in_dim = inst.words[5] as u32;
+                    let fmt = match opcode {
+                        OP_LINEAR_PROJ_PCG32 => WeightFormat::PcG32Q4,
+                        OP_LINEAR_PROJ_RNF4  => WeightFormat::Rnf4G128,
+                        _                    => WeightFormat::Bf16,
+                    };
+                    let kernel = &self.worker_kernels[gpu_i].linear_proj;
+                    dispatch_proj(kernel, out, w_bytes, inp, out_dim, in_dim, fmt, stream)?;
+                }
+                OP_DEINTERLEAVE => {
+                    let dst_q    = inst.words[1] as *mut f32;
+                    let dst_gate = inst.words[2] as *mut f32;
+                    let src      = inst.words[3] as *const f32;
+                    let num_heads = inst.words[4] as u32;
+                    let head_dim  = inst.words[5] as u32;
+                    self.multi_gpu.as_ref().unwrap().workers[gpu_i].deinterleave_kernel
+                        .forward_ptr(dst_q, dst_gate, src, num_heads, head_dim, stream)?;
+                }
+                OP_QK_NORM => {
+                    let q       = inst.words[1] as *mut f32;
+                    let k       = inst.words[2] as *mut f32;
+                    let q_norm  = inst.words[3] as *const u16;
+                    let k_norm  = inst.words[4] as *const u16;
+                    let nqh     = inst.words[5] as u32;
+                    let nkh     = inst.words[6] as u32;
+                    let hd      = inst.words[7] as u32;
+                    let eps     = f32::from_bits(inst.words[8] as u32);
+                    self.multi_gpu.as_ref().unwrap().workers[gpu_i].qk_norm_kernel
+                        .forward_ptr(q, k, q_norm, k_norm, nqh, nkh, hd, eps, stream)?;
+                }
+                OP_MROPE => {
+                    let q    = inst.words[1] as *mut f32;
+                    let k    = inst.words[2] as *mut f32;
+                    let inv_freq = inst.words[3] as *const f32;
+                    let pos_ids  = inst.words[4] as *const i32;
+                    let nqh  = inst.words[5] as u32;
+                    let nkh  = inst.words[6] as u32;
+                    let hd   = inst.words[7] as u32;
+                    let rd   = inst.words[8] as u32;
+                    let s0   = inst.words[9] as u32;
+                    let s1   = inst.words[10] as u32;
+                    let s2   = inst.words[11] as u32;
+                    self.multi_gpu.as_ref().unwrap().workers[gpu_i].mrope_kernel
+                        .forward_ptr(q, k, inv_freq, pos_ids, nqh, nkh, hd, rd, s0, s1, s2, stream)?;
+                }
+                OP_GQA_ATTN => {
+                    let out    = inst.words[1] as *mut f32;
+                    let q      = inst.words[2] as *const f32;
+                    let k_cache = inst.words[3] as *const f32;
+                    let v_cache = inst.words[4] as *const f32;
+                    let nqh   = inst.words[5] as u32;
+                    let nkh   = inst.words[6] as u32;
+                    let hd    = inst.words[7] as u32;
+                    let sl    = inst.words[8] as u32;
+                    let msl   = inst.words[9] as u32;
+                    self.multi_gpu.as_ref().unwrap().workers[gpu_i].gqa_kernel
+                        .forward_ptr(out, q, k_cache, v_cache, nqh, nkh, hd, sl, msl, stream)?;
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 

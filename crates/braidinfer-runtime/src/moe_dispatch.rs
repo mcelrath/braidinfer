@@ -23,7 +23,7 @@ use crate::weights::DistributedMoeWeights;
 ///
 /// For quantized formats (PcG32Q4, Rnf4G128) uses `forward_packed_ptr`.
 /// For bf16 casts the raw byte pointer to u16 and uses `forward_ptr`.
-fn dispatch_proj(
+pub(crate) fn dispatch_proj(
     kernel: &crate::kernel::LinearProjKernel,
     output: *mut f32,
     weight_bytes: *const u8,

@@ -230,6 +230,42 @@ def wait_for_gpus(count, min_vram_mb, timeout_s):
         time.sleep(GPU_WAIT_POLL_S)
 
 
+def do_kill(session_id=None):
+    """Kill processes launched by this session (or a specified session)."""
+    if not LOCK_DIR.exists():
+        print("No lock directory.")
+        return
+    current_session = session_id or os.environ.get("CLAUDE_SESSION_ID", "unknown")
+    killed = 0
+    skipped = 0
+    for lp in LOCK_DIR.glob("gpu-*.lock"):
+        try:
+            info = json.loads(lp.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        lock_session = info.get("session", "")
+        pid = info.get("pid", -1)
+        if lock_session != current_session:
+            skipped += 1
+            continue
+        if is_pid_alive(pid):
+            print(f"Killing PID {pid} (GPU {info.get('gpu', '?')}, session {lock_session})")
+            try:
+                os.kill(pid, signal.SIGTERM)
+                # Wait briefly for graceful exit
+                for _ in range(KILL_GRACE_S * 10):
+                    time.sleep(0.1)
+                    if not is_pid_alive(pid):
+                        break
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+            killed += 1
+        lp.unlink(missing_ok=True)
+    print(f"Killed {killed} process(es)." + (f" Skipped {skipped} from other sessions." if skipped else ""))
+
+
 def do_cleanup(silent=False):
     if not LOCK_DIR.exists():
         if not silent:
@@ -275,9 +311,11 @@ def main():
     parser.add_argument("--gpus", "-g", type=int, default=1, help="Number of GPUs (default: 1)")
     parser.add_argument("--min-vram", type=int, default=DEFAULT_MIN_VRAM_MB, help="Min free VRAM in MiB")
     parser.add_argument("--gpu-timeout", type=int, default=DEFAULT_GPU_WAIT_TIMEOUT_S, help="GPU wait timeout (s)")
-    parser.add_argument("--timeout", type=int, default=300, help="Process timeout (s, default: 300)")
+    parser.add_argument("--timeout", type=int, default=600, help="Process timeout (s, default: 600)")
     parser.add_argument("--status", "-s", action="store_true")
     parser.add_argument("--cleanup", "-c", action="store_true")
+    parser.add_argument("--kill", "-k", action="store_true",
+                        help="Kill processes launched by this session (CLAUDE_SESSION_ID)")
 
     argv = sys.argv[1:]
     if "--" in argv:
@@ -295,6 +333,9 @@ def main():
         return
     if args.cleanup:
         do_cleanup()
+        return
+    if args.kill:
+        do_kill()
         return
 
     if not cmd_args:
@@ -349,7 +390,7 @@ def main():
         proc.wait(timeout=args.timeout)
         sys.exit(proc.returncode)
     except subprocess.TimeoutExpired:
-        print(f"Process timed out after {args.timeout}s, killing", file=sys.stderr)
+        print(f"\n*** TIMEOUT: process killed after {args.timeout}s (exit 124) ***", file=sys.stderr)
         proc.terminate()
         try:
             proc.wait(timeout=KILL_GRACE_S)

@@ -723,9 +723,10 @@ impl Model {
         let num_attn_layers = self.config.layers.iter()
             .filter(|l| l.layer_type == crate::config::LayerType::Attention)
             .count();
-        if num_attn_layers > 0 && self.config.num_q_heads >= num_devices && self.config.num_kv_heads >= num_devices {
+        // GQA: only require num_q_heads >= num_devices; KV heads are replicated (not split)
+        if num_attn_layers > 0 && self.config.num_q_heads >= num_devices {
             let local_nqh = self.config.num_q_heads / num_devices;
-            let local_nkh = self.config.num_kv_heads / num_devices;
+            let local_nkh = self.config.num_kv_heads; // replicated on every GPU
             let q_mult = if self.config.has_output_gate { 2 } else { 1 };
             ctx.init_attn_buffers(
                 num_attn_layers, local_nqh, local_nkh,
@@ -764,15 +765,17 @@ impl Model {
                 LayerWeights::Attention(w) => w,
                 _ => continue,
             };
-            for gpu_i in 0..num_gpus {
+            // GPU 0: skip copy — dispatch_head_parallel_attention reads from self.layers directly.
+            // GPUs 1+: copy the row slice to each GPU's VRAM.
+            for gpu_i in 1..num_gpus {
                 let dst_device = ctx.workers[gpu_i].device;
                 let q_row_start = gpu_i * local_nqh * hd * q_mult;
-                let k_row_start = gpu_i * local_nkh * hd;
+                // KV heads are replicated (GQA): always copy from row 0, copy all local_nkh rows
                 let w_q = MultiGpuContext::copy_weight_slice(&w.w_q_gate, dst_device, q_row_start, local_nqh * hd * q_mult, hs)
                     .map_err(ModelError::Hip)?;
-                let w_k = MultiGpuContext::copy_weight_slice(&w.w_k, dst_device, k_row_start, local_nkh * hd, hs)
+                let w_k = MultiGpuContext::copy_weight_slice(&w.w_k, dst_device, 0, local_nkh * hd, hs)
                     .map_err(ModelError::Hip)?;
-                let w_v = MultiGpuContext::copy_weight_slice(&w.w_v, dst_device, k_row_start, local_nkh * hd, hs)
+                let w_v = MultiGpuContext::copy_weight_slice(&w.w_v, dst_device, 0, local_nkh * hd, hs)
                     .map_err(ModelError::Hip)?;
                 ctx.workers[gpu_i].attn_w_q_gate.push(w_q);
                 ctx.workers[gpu_i].attn_w_k.push(w_k);

@@ -203,6 +203,35 @@ impl GqaAttentionKernel {
             &mut args,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ptr(
+        &self,
+        output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32,
+        num_q_heads: u32, num_kv_heads: u32, head_dim: u32, seq_len: u32, max_seq_len: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("gqa_attention_decode_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut q_ptr: *const c_void = q.cast();
+        let mut k_ptr: *const c_void = k_cache.cast();
+        let mut v_ptr: *const c_void = v_cache.cast();
+        let mut nqh = num_q_heads as i32;
+        let mut nkh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sl = seq_len as i32;
+        let mut msl = max_seq_len as i32;
+        let mut args: [*mut c_void; 9] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(), std::ptr::addr_of_mut!(q_ptr).cast(),
+            std::ptr::addr_of_mut!(k_ptr).cast(), std::ptr::addr_of_mut!(v_ptr).cast(),
+            std::ptr::addr_of_mut!(nqh).cast(), std::ptr::addr_of_mut!(nkh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(), std::ptr::addr_of_mut!(sl).cast(),
+            std::ptr::addr_of_mut!(msl).cast(),
+        ];
+        let block_size = head_dim.min(256);
+        let shared_bytes = block_size * 4;
+        func.launch((num_q_heads, 1, 1), (block_size, 1, 1), shared_bytes, stream, &mut args)
+    }
 }
 
 #[cfg(test)]

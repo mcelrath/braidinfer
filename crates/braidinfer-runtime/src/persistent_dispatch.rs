@@ -227,30 +227,29 @@ impl PersistentDispatch {
         seq
     }
 
-    /// Multi-GPU init: fat dense worker on GPU 0 only.
-    /// MoE dispatch uses kbk (hipLaunchKernel) on GPUs 1+ — no lean workers launched.
+    /// Multi-GPU init: launch persistent workers on ALL devices.
+    /// GPU 0 handles MoE + its head slice; GPUs 1+ handle their head slices.
+    /// Launch persistent cooperative worker on GPU 0 only.
+    /// GPUs 1+ use kbk (hipLaunchKernel) for MoE expert dispatch — cooperative kernels
+    /// hold all SMs and deadlock with kbk on the same device.
     pub fn init_multi_gpu(gpu0: DeviceId, _all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize, _max_eis: usize) -> HipResult<Self> {
         let kernel_dir = crate::kernel::kernel_dir();
         Device::set_current(gpu0)?;
-        let gpu0_queue = MappedHostBuffer::<u8>::alloc(std::mem::size_of::<WorkerQueueLayout>())?;
-        let gpu0_module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
-        let gpu0_func = gpu0_module.get_function("persistent_worker")?;
-        let gpu0_stream = Stream::new(gpu0)?;
-        let blocks_per_sm = gpu0_func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let queue = MappedHostBuffer::<u8>::alloc(std::mem::size_of::<WorkerQueueLayout>())?;
+        let stream = Stream::new(gpu0)?;
+        let module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
+        let func = module.get_function("persistent_worker")?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let num_cus = multiprocessor_count(gpu0)?;
         let num_blocks = (blocks_per_sm as u32 * num_cus).max(num_cus);
-        {
-            let mut q = gpu0_queue.device_ptr() as *mut std::ffi::c_void;
-            let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
-            gpu0_func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), shared_mem, &gpu0_stream, &mut args)?;
-        }
-        // Allocate GPU 0 MoE output slot (MTYPE_UC): expert FFN results accumulate here.
+        let mut q = queue.device_ptr() as *mut std::ffi::c_void;
+        let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
+        func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), shared_mem, &stream, &mut args)?;
+        eprintln!("  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B); GPUs 1+ use kbk", gpu0.0);
         let moe_output_slot = MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?;
-        eprintln!("  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B); MoE GPU 0 via batch ops, GPUs 1+ via kbk", gpu0.0);
         Ok(PersistentDispatch {
             workers: vec![std::mem::ManuallyDrop::new(GpuWorker {
-                device: gpu0, queue: gpu0_queue, stream: gpu0_stream,
-                module: gpu0_module, seq_counter: 0,
+                device: gpu0, queue, stream, module, seq_counter: 0,
             })],
             moe_output_slot,
         })

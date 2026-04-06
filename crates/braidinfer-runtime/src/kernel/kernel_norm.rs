@@ -134,6 +134,32 @@ impl QkNormKernel {
             &mut args,
         )
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ptr(
+        &self,
+        q: *mut f32, k: *mut f32, q_weight: *const u16, k_weight: *const u16,
+        num_q_heads: u32, num_kv_heads: u32, head_dim: u32, eps: f32, stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("qk_norm_f32")?;
+        let mut qp = q as *mut std::ffi::c_void;
+        let mut kp = k as *mut std::ffi::c_void;
+        let mut qwp = q_weight as *const std::ffi::c_void;
+        let mut kwp = k_weight as *const std::ffi::c_void;
+        let mut nqh = num_q_heads as i32;
+        let mut nkh = num_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut args: [*mut std::ffi::c_void; 8] = [
+            std::ptr::addr_of_mut!(qp).cast(), std::ptr::addr_of_mut!(kp).cast(),
+            std::ptr::addr_of_mut!(qwp).cast(), std::ptr::addr_of_mut!(kwp).cast(),
+            std::ptr::addr_of_mut!(nqh).cast(), std::ptr::addr_of_mut!(nkh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(), std::ptr::addr_of_mut!(ep).cast(),
+        ];
+        let total_heads = num_q_heads + num_kv_heads;
+        let block_size = 256u32.min(head_dim);
+        func.launch((total_heads, 1, 1), (block_size, 1, 1), block_size * 4, stream, &mut args)
+    }
 }
 
 
