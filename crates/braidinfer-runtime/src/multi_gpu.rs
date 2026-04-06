@@ -61,6 +61,16 @@ pub struct GpuWorker {
     pub attn_kv_caches: Vec<crate::weights::KvCache>, // [num_attn_layers], each [local_nkh, max_seq_len, hd]
     pub attn_q: Option<DeviceBuffer<f32>>,             // [local_nqh * head_dim]
     pub attn_out: Option<DeviceBuffer<f32>>,           // [local_nqh * head_dim]
+    // Distributed QKV projection buffers (allocated by init_split_attn_weights)
+    pub attn_normed: Option<DeviceBuffer<f32>>,        // [hidden_size] — P2P copy of GPU 0's normed
+    pub attn_q_gate: Option<DeviceBuffer<f32>>,        // [local_nqh*hd*q_mult] — Q+gate interleaved
+    pub attn_k: Option<DeviceBuffer<f32>>,             // [local_nkh*hd]
+    pub attn_v: Option<DeviceBuffer<f32>>,             // [local_nkh*hd]
+    pub attn_gate: Option<DeviceBuffer<f32>>,          // [local_nqh*hd] — gate (split from q_gate)
+    // Split attention projection weights (per attention layer), stored on this GPU
+    pub attn_w_q_gate: Vec<crate::quant::LinearWeight>, // [local_nqh*hd*q_mult, hs] per attn layer
+    pub attn_w_k:      Vec<crate::quant::LinearWeight>, // [local_nkh*hd, hs] per attn layer
+    pub attn_w_v:      Vec<crate::quant::LinearWeight>, // [local_nkh*hd, hs] per attn layer
 }
 
 /// Multi-GPU context for expert parallel dispatch.
@@ -125,6 +135,14 @@ impl MultiGpuContext {
                 attn_kv_caches: Vec::new(),
                 attn_q: None,
                 attn_out: None,
+                attn_normed: None,
+                attn_q_gate: None,
+                attn_k: None,
+                attn_v: None,
+                attn_gate: None,
+                attn_w_q_gate: Vec::new(),
+                attn_w_k: Vec::new(),
+                attn_w_v: Vec::new(),
             });
         }
 
@@ -152,11 +170,21 @@ impl MultiGpuContext {
         local_nkh: usize,
         head_dim: usize,
         max_seq_len: usize,
+        hidden_size: usize,
+        q_mult: usize,
     ) -> HipResult<()> {
         for worker in self.workers.iter_mut() {
             Device::set_current(worker.device)?;
             worker.attn_q = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nqh * head_dim)?);
             worker.attn_out = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nqh * head_dim)?);
+            // Distributed QKV projection activation buffers
+            worker.attn_normed = Some(DeviceBuffer::<f32>::alloc(worker.device, hidden_size)?);
+            worker.attn_q_gate = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nqh * head_dim * q_mult)?);
+            worker.attn_k = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nkh * head_dim)?);
+            worker.attn_v = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nkh * head_dim)?);
+            if q_mult > 1 {
+                worker.attn_gate = Some(DeviceBuffer::<f32>::alloc(worker.device, local_nqh * head_dim)?);
+            }
             for _ in 0..num_attn_layers {
                 worker.attn_kv_caches.push(crate::weights::KvCache {
                     k: DeviceBuffer::<f32>::alloc(worker.device, local_nkh * max_seq_len * head_dim)?,
@@ -165,9 +193,38 @@ impl MultiGpuContext {
             }
         }
         Device::set_current(DeviceId(0))?;
-        eprintln!("Multi-GPU attn: {} layers × {} workers, local_nqh={local_nqh} local_nkh={local_nkh}",
+        eprintln!("Multi-GPU attn: {} layers × {} workers, local_nqh={local_nqh} local_nkh={local_nkh} q_mult={q_mult}",
             num_attn_layers, self.num_devices);
         Ok(())
+    }
+
+    /// Copy a contiguous slice of rows from `src` (on GPU 0) to a new DeviceBuffer on `dst_device`.
+    /// `row_start`, `num_rows`, `in_dim` are logical (pre-quantization layout).
+    /// Returns a LinearWeight with the correct format, out_dim=num_rows, in_dim=in_dim.
+    pub fn copy_weight_slice(
+        src: &crate::quant::LinearWeight,
+        dst_device: DeviceId,
+        row_start: usize,
+        num_rows: usize,
+        in_dim: usize,
+    ) -> HipResult<crate::quant::LinearWeight> {
+        use braidinfer_hip::memory::DeviceBuffer;
+        let byte_offset = src.row_byte_offset_dim(row_start, in_dim);
+        let byte_len = src.row_byte_offset_dim(num_rows, in_dim);
+        let mut dst_buf = DeviceBuffer::<u8>::alloc(dst_device, byte_len)?;
+        let src_ptr = unsafe { src.raw_data_ptr().add(byte_offset) };
+        braidinfer_hip::memory::memcpy_d2d(
+            dst_buf.as_write_ptr(),
+            src_ptr,
+            byte_len,
+        )?;
+        // Always return Packed — WeightFormat::Bf16 in Packed is valid and used by forward_sub.
+        Ok(crate::quant::LinearWeight::Packed(crate::quant::PackedWeights {
+            data: dst_buf,
+            format: src.weight_format(),
+            out_dim: num_rows,
+            in_dim,
+        }))
     }
 
     /// Async P2P copy using compute kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe).

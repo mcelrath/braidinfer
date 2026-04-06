@@ -141,6 +141,7 @@ impl MegakernelProgram {
         let mut kv_write_indices = Vec::new();
         let mut kv_base_ptrs = Vec::new();
         let mut barrier_layer_map: Vec<(usize, usize)> = Vec::new();
+        let mut multi_gpu_attn_boundaries: Vec<(usize, usize)> = Vec::new();
 
         let hs = cfg.hidden_size;
         let nh_gdn = cfg.linear_num_heads;
@@ -187,6 +188,13 @@ impl MegakernelProgram {
                             &mut kv_write_indices, &mut kv_base_ptrs,
                             &mut attn_paged_inst_indices,
                             &mut attn_quant_inst_indices,
+                        );
+                    } else if multi_gpu {
+                        // Distribute QKV projection + GQA across GPUs.
+                        // Only RMSNorm + output-gate/O-proj/residual in megakernel.
+                        Self::compile_attention_layer_multi_gpu(
+                            cfg, &model.layers[layer_i], act,
+                            &mut instructions, &mut multi_gpu_attn_boundaries,
                         );
                     } else {
                         Self::compile_attention_layer(
@@ -321,6 +329,7 @@ impl MegakernelProgram {
             head_dim_attn: cfg.head_dim,
             moe_barrier: None,
             barrier_layer_map,
+            multi_gpu_attn_boundaries,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -652,6 +661,7 @@ impl MegakernelProgram {
             head_dim_attn: cfg.head_dim,
             moe_barrier: None,
             barrier_layer_map: Vec::new(),
+            multi_gpu_attn_boundaries: Vec::new(),
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1284,6 +1294,91 @@ impl MegakernelProgram {
             instructions, mrope_indices, gqa_indices, kv_write_indices, kv_base_ptrs,
             &mut Vec::new(), &mut Vec::new(),
         );
+    }
+
+    /// Multi-GPU attention: emit only RMSNorm + output-gate + O-proj + residual.
+    /// QKV projection, deinterleave, QK-norm, KV-write, mRoPE, and GQA are handled by
+    /// dispatch_head_parallel_attention() (runs on all GPUs in parallel via persistent workers).
+    ///
+    /// Records `(rmsnorm_idx, output_gate_idx)` into `multi_gpu_boundaries`:
+    ///   rmsnorm_idx     = index of RMSNorm instruction (flush and dispatch after this)
+    ///   output_gate_idx = index of first post-GQA instruction (resume megakernel here)
+    fn compile_attention_layer_multi_gpu(
+        cfg: &ModelConfig,
+        layer: &LayerWeights,
+        act: &ActivationBuffers,
+        instructions: &mut Vec<Instruction>,
+        multi_gpu_boundaries: &mut Vec<(usize, usize)>,
+    ) {
+        let w = match layer {
+            LayerWeights::Attention(w) => w,
+            _ => panic!("expected attention layer"),
+        };
+        let hs = cfg.hidden_size;
+        let nqh = cfg.num_q_heads;
+        let hd = cfg.head_dim;
+        let eps = cfg.rms_norm_eps;
+
+        // Activation buffer pointers (single-token decode only; prefill uses full path)
+        let hidden_ptr = act.hidden.as_write_ptr();
+        let normed_ptr = act.normed.as_write_ptr();
+        let attn_out_ptr = act.attn_out.as_write_ptr();
+        let gated_out_ptr = act.gated_out.as_write_ptr();
+        let gate_attn_ptr = act.gate_attn.as_write_ptr();
+        let out_proj_ptr = act.out_proj.as_write_ptr();
+
+        // 1. RMSNorm
+        let rmsnorm_idx = instructions.len();
+        {
+            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
+            inst.set_output_ptr(1, normed_ptr);
+            inst.set_ptr(2, hidden_ptr);
+            inst.set_ptr(3, w.input_norm.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_float(5, eps);
+            instructions.push(inst);
+        }
+        // Steps 2–9 (QKV proj, deinterleave, QK-norm, KV write, mRoPE, GQA) handled by dispatcher.
+        // output_gate_idx points to the first instruction AFTER the dispatched block.
+        let output_gate_idx = instructions.len(); // == rmsnorm_idx + 1
+
+        // 10. Output gate (Qwen3.5) or pass-through
+        let final_attn_ptr = if cfg.has_output_gate {
+            let gate_size = nqh * hd;
+            let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
+            inst.set_output_ptr(1, gated_out_ptr);
+            inst.set_ptr(2, attn_out_ptr);
+            inst.set_ptr(3, gate_attn_ptr);
+            inst.set_int(4, gate_size as i32);
+            instructions.push(inst);
+            gated_out_ptr
+        } else {
+            attn_out_ptr
+        };
+
+        // 11. Output projection + residual (single-token decode path)
+        emit_batched_linear_proj(
+            &w.w_o, out_proj_ptr, final_attn_ptr,
+            hs, nqh * hd, 1, false, instructions,
+        );
+        // Two-step residual (single-token decode): copy hidden → residual, then add
+        {
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.residual.as_write_ptr());
+            inst.set_ptr(2, hidden_ptr);
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+        }
+        {
+            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.hidden.as_write_ptr());
+            inst.set_ptr(2, out_proj_ptr);
+            inst.set_ptr(3, act.residual.as_ptr());
+            inst.set_int(4, hs as i32);
+            instructions.push(inst);
+        }
+
+        multi_gpu_boundaries.push((rmsnorm_idx, output_gate_idx));
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -726,13 +726,61 @@ impl Model {
         if num_attn_layers > 0 && self.config.num_q_heads >= num_devices && self.config.num_kv_heads >= num_devices {
             let local_nqh = self.config.num_q_heads / num_devices;
             let local_nkh = self.config.num_kv_heads / num_devices;
+            let q_mult = if self.config.has_output_gate { 2 } else { 1 };
             ctx.init_attn_buffers(
                 num_attn_layers, local_nqh, local_nkh,
                 self.config.head_dim, self.config.max_seq_len,
+                self.config.hidden_size, q_mult,
             )?;
+            // Split Q/K/V projection weights onto each GPU
+            self.init_split_attn_weights(&mut ctx, local_nqh, local_nkh, q_mult)?;
         }
 
         self.multi_gpu = Some(ctx);
+        Ok(())
+    }
+
+    /// Copy row-slices of Q/K/V attention weights onto each GPU for distributed projection.
+    /// Each GPU i gets rows [i*local_rows .. (i+1)*local_rows] of each weight matrix.
+    fn init_split_attn_weights(
+        &self,
+        ctx: &mut crate::multi_gpu::MultiGpuContext,
+        local_nqh: usize,
+        local_nkh: usize,
+        q_mult: usize,
+    ) -> Result<(), ModelError> {
+        use crate::multi_gpu::MultiGpuContext;
+        let num_gpus = ctx.num_devices;
+        let hs = self.config.hidden_size;
+        let hd = self.config.head_dim;
+
+        let attn_layer_indices: Vec<usize> = self.config.layers.iter().enumerate()
+            .filter(|(_, l)| l.layer_type == crate::config::LayerType::Attention)
+            .map(|(i, _)| i)
+            .collect();
+
+        for &layer_idx in attn_layer_indices.iter() {
+            let w = match &self.layers[layer_idx] {
+                LayerWeights::Attention(w) => w,
+                _ => continue,
+            };
+            for gpu_i in 0..num_gpus {
+                let dst_device = ctx.workers[gpu_i].device;
+                let q_row_start = gpu_i * local_nqh * hd * q_mult;
+                let k_row_start = gpu_i * local_nkh * hd;
+                let w_q = MultiGpuContext::copy_weight_slice(&w.w_q_gate, dst_device, q_row_start, local_nqh * hd * q_mult, hs)
+                    .map_err(ModelError::Hip)?;
+                let w_k = MultiGpuContext::copy_weight_slice(&w.w_k, dst_device, k_row_start, local_nkh * hd, hs)
+                    .map_err(ModelError::Hip)?;
+                let w_v = MultiGpuContext::copy_weight_slice(&w.w_v, dst_device, k_row_start, local_nkh * hd, hs)
+                    .map_err(ModelError::Hip)?;
+                ctx.workers[gpu_i].attn_w_q_gate.push(w_q);
+                ctx.workers[gpu_i].attn_w_k.push(w_k);
+                ctx.workers[gpu_i].attn_w_v.push(w_v);
+            }
+        }
+        eprintln!("Multi-GPU: split QKV weights for {} attn layers across {} GPUs",
+            attn_layer_indices.len(), num_gpus);
         Ok(())
     }
 }

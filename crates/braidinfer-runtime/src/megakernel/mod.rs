@@ -125,6 +125,11 @@ pub struct MegakernelProgram {
     /// CPU dispatch loop uses layer_idx to look up DistributedMoeWeights.
     pub(crate) barrier_layer_map: Vec<(usize, usize)>,
     pub(crate) _mrope_inst_indices: Vec<usize>,
+    // Multi-GPU distributed QKV projection boundaries (only used when multi_gpu=true).
+    // For each attention layer: (rmsnorm_idx, output_gate_idx) where:
+    //   rmsnorm_idx  = index of the RMSNorm instruction (flush + dispatch QKV/GQA after this)
+    //   output_gate_idx = index of OP_OUTPUT_GATE or O-proj (resume megakernel here after dispatch)
+    pub(crate) multi_gpu_attn_boundaries: Vec<(usize, usize)>,
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
 }
