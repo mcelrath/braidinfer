@@ -74,6 +74,37 @@ pub fn packed_size(format: WeightFormat, out_dim: usize, in_dim: usize) -> usize
     }
 }
 
+fn checked_packed_size(format: WeightFormat, out_dim: u32, in_dim: u32) -> io::Result<u64> {
+    let out_dim = out_dim as u64;
+    let in_dim = in_dim as u64;
+    match format {
+        WeightFormat::Bf16 => out_dim
+            .checked_mul(in_dim)
+            .and_then(|x| x.checked_mul(2))
+            .ok_or_else(|| invalid_data("bf16 packed size overflows")),
+        WeightFormat::PcG32Q4 => {
+            let groups = in_dim
+                .checked_add(31)
+                .map(|x| x / 32)
+                .ok_or_else(|| invalid_data("pcg32 packed group count overflows"))?;
+            out_dim
+                .checked_mul(groups)
+                .and_then(|x| x.checked_mul(20))
+                .ok_or_else(|| invalid_data("pcg32 packed size overflows"))
+        }
+        WeightFormat::Rnf4G128 => {
+            let groups = in_dim
+                .checked_add(127)
+                .map(|x| x / 128)
+                .ok_or_else(|| invalid_data("rnf4 packed group count overflows"))?;
+            out_dim
+                .checked_mul(groups)
+                .and_then(|x| x.checked_mul(132))
+                .ok_or_else(|| invalid_data("rnf4 packed size overflows"))
+        }
+    }
+}
+
 fn align_up(offset: u64, alignment: u64) -> u64 {
     (offset + alignment - 1) & !(alignment - 1)
 }
@@ -130,11 +161,12 @@ impl BqntWriter {
         // Store packed data temporarily — we'll write everything in finish()
         // For streaming large models, we write data immediately and record offset
         if self.current_offset == 0 {
-            // Reserve space for header + tensor table (will be rewritten in finish)
-            let table_end = HEADER_SIZE + self.entries.len() as u64 * ENTRY_SIZE;
-            // We don't know final n_tensors yet, so reserve generous space
-            // Actually, write data first, header last via seeking
-            let data_start = align_up(HEADER_SIZE + 4096 * ENTRY_SIZE, ALIGNMENT);
+            // Reserve space for header + tensor table (will be rewritten in finish).
+            // We don't know final n_tensors yet; reserve 8192 slots (enough for any current model).
+            // CRITICAL: data_start must be >= HEADER_SIZE + actual_n_tensors * ENTRY_SIZE or
+            // finish() will overwrite tensor data when writing the entry table. 8192 supports
+            // models with up to 8192 tensors before this assumption needs revisiting.
+            let data_start = align_up(HEADER_SIZE + 8192 * ENTRY_SIZE, ALIGNMENT);
             self.current_offset = data_start;
             self.writer.seek(SeekFrom::Start(data_start))?;
         }
@@ -172,10 +204,12 @@ impl BqntWriter {
         self.writer.seek(SeekFrom::Start(0))?;
         self.writer.write_all(&MAGIC.to_le_bytes())?;
         self.writer.write_all(&VERSION.to_le_bytes())?;
-        self.writer.write_all(&(self.entries.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&0u32.to_le_bytes())?; // reserved
+        self.writer
+            .write_all(&(self.entries.len() as u32).to_le_bytes())?;
+        self.writer.write_all(&8192u32.to_le_bytes())?; // reserved_entries: fixed table capacity
         self.writer.write_all(&metadata_offset.to_le_bytes())?;
-        self.writer.write_all(&(metadata_bytes.len() as u64).to_le_bytes())?;
+        self.writer
+            .write_all(&(metadata_bytes.len() as u64).to_le_bytes())?;
 
         // Write tensor table
         for entry in &self.entries {
@@ -197,6 +231,7 @@ impl BqntWriter {
 // --- Reader ---
 
 /// Parsed .bqnt file header and tensor table.
+#[derive(Debug)]
 pub struct BqntFile {
     pub entries: HashMap<u64, TensorEntry>,
     pub n_tensors: usize,
@@ -204,27 +239,82 @@ pub struct BqntFile {
     pub metadata_size: u64,
 }
 
+fn invalid_data(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+fn checked_end(offset: u64, size: u64, context: &str) -> io::Result<u64> {
+    offset
+        .checked_add(size)
+        .ok_or_else(|| invalid_data(format!("{context} range overflows file address space")))
+}
+
+fn ranges_overlap(start_a: u64, end_a: u64, start_b: u64, end_b: u64) -> bool {
+    start_a < end_b && start_b < end_a
+}
+
 impl BqntFile {
     /// Open and parse a .bqnt file header and tensor table.
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut file = File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < HEADER_SIZE {
+            return Err(invalid_data(format!(
+                "BQNT file too small: expected at least {HEADER_SIZE} bytes, got {file_len}"
+            )));
+        }
         let mut header = [0u8; 32];
         file.read_exact(&mut header)?;
 
         let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         if magic != MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Not a BQNT file"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Not a BQNT file",
+            ));
         }
 
         let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         if version != VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData,
-                format!("Unsupported BQNT version {version}")));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported BQNT version {version}"),
+            ));
         }
 
         let n_tensors = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        // bytes 12-15: reserved_entries (added in v1.1). Zero in old files → default to 4096.
+        // The writer always reserves this many entry slots before tensor data starts.
+        let reserved_entries = {
+            let v = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+            if v == 0 { 4096 } else { v }
+        };
         let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap());
         let metadata_size = u64::from_le_bytes(header[24..32].try_into().unwrap());
+        let table_bytes = (n_tensors as u64).checked_mul(ENTRY_SIZE).ok_or_else(|| {
+            invalid_data(format!(
+                "tensor table size overflows for {n_tensors} entries"
+            ))
+        })?;
+        let table_end_exact = checked_end(HEADER_SIZE, table_bytes, "tensor table")?;
+        // Use the aligned reserved size for overlap checks (writer always aligns to ALIGNMENT).
+        let table_end = align_up(HEADER_SIZE + reserved_entries as u64 * ENTRY_SIZE, ALIGNMENT);
+        if table_end_exact > file_len {
+            return Err(invalid_data(format!(
+                "tensor table ends at {table_end_exact}, beyond file size {file_len}"
+            )));
+        }
+        let metadata_end = checked_end(metadata_offset, metadata_size, "metadata")?;
+        if metadata_end > file_len {
+            return Err(invalid_data(format!(
+                "metadata ends at {metadata_end}, beyond file size {file_len}"
+            )));
+        }
+        if metadata_size != 0 && metadata_offset < table_end {
+            return Err(invalid_data(format!(
+                "metadata offset {metadata_offset} overlaps tensor table ending at {table_end}"
+            )));
+        }
 
         let mut entries = HashMap::with_capacity(n_tensors);
         for _ in 0..n_tensors {
@@ -238,14 +328,62 @@ impl BqntFile {
             let original_ndim = u32::from_le_bytes(buf[20..24].try_into().unwrap());
             let data_offset = u64::from_le_bytes(buf[24..32].try_into().unwrap());
             let data_bytes = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+            let format = code_to_format(format).ok_or_else(|| {
+                invalid_data(format!(
+                    "tensor {name_hash:#x} has unknown format code {}",
+                    buf[8]
+                ))
+            })?;
+            let expected_bytes = checked_packed_size(format, out_features, in_features)?;
+            if data_bytes != expected_bytes {
+                return Err(invalid_data(format!(
+                    "tensor {name_hash:#x} size mismatch: header says {data_bytes} bytes, expected {expected_bytes}"
+                )));
+            }
+            let data_end = checked_end(data_offset, data_bytes, "tensor data")?;
+            if data_end > file_len {
+                return Err(invalid_data(format!(
+                    "tensor {name_hash:#x} ends at {data_end}, beyond file size {file_len}"
+                )));
+            }
+            if data_offset < table_end {
+                return Err(invalid_data(format!(
+                    "tensor {name_hash:#x} data offset {data_offset} overlaps tensor table ending at {table_end}"
+                )));
+            }
+            if metadata_size != 0
+                && ranges_overlap(data_offset, data_end, metadata_offset, metadata_end)
+            {
+                return Err(invalid_data(format!(
+                    "tensor {name_hash:#x} data range [{data_offset}, {data_end}) overlaps metadata range [{metadata_offset}, {metadata_end})"
+                )));
+            }
+            if entries.contains_key(&name_hash) {
+                return Err(invalid_data(format!(
+                    "duplicate tensor hash {name_hash:#x}; hash-only lookup would be ambiguous"
+                )));
+            }
 
-            entries.insert(name_hash, TensorEntry {
-                name_hash, format, out_features, in_features,
-                original_ndim, data_offset, data_bytes,
-            });
+            entries.insert(
+                name_hash,
+                TensorEntry {
+                    name_hash,
+                    format: buf[8],
+                    out_features,
+                    in_features,
+                    original_ndim,
+                    data_offset,
+                    data_bytes,
+                },
+            );
         }
 
-        Ok(Self { entries, n_tensors, metadata_offset, metadata_size })
+        Ok(Self {
+            entries,
+            n_tensors,
+            metadata_offset,
+            metadata_size,
+        })
     }
 
     /// Look up a tensor by name.
@@ -260,6 +398,144 @@ impl BqntFile {
         let mut buf = vec![0u8; self.metadata_size as usize];
         file.read_exact(&mut buf)?;
         String::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("braidinfer-{name}-{unique}.bqnt"))
+    }
+
+    #[test]
+    fn rejects_duplicate_hash_entries() {
+        let path = temp_path("dup-hash");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let metadata_offset = HEADER_SIZE + 2 * ENTRY_SIZE;
+        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        let hash = 0x1234u64;
+        for _ in 0..2 {
+            bytes.extend_from_slice(&hash.to_le_bytes());
+            bytes.extend_from_slice(&[0, 0, 0, 0]);
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+            bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+            bytes.extend_from_slice(&2u64.to_le_bytes());
+            bytes.extend_from_slice(&0u64.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0u8, 0u8]);
+
+        std::fs::write(&path, bytes).unwrap();
+        let err = match BqntFile::open(&path) {
+            Ok(_) => panic!("expected duplicate-hash BQNT to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("duplicate tensor hash"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_metadata() {
+        let path = temp_path("bad-meta");
+        let mut writer = BqntWriter::create(&path).unwrap();
+        writer
+            .write_tensor("x", WeightFormat::Bf16, 1, 1, 2, &[0, 0])
+            .unwrap();
+        writer.finish("{}").unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let bad_offset = (bytes.len() as u64) + 16;
+        bytes[16..24].copy_from_slice(&bad_offset.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = match BqntFile::open(&path) {
+            Ok(_) => panic!("expected out-of-bounds metadata to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("metadata ends"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_tensor_range_overlapping_metadata() {
+        let path = temp_path("metadata-overlap");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let metadata_offset = HEADER_SIZE + ENTRY_SIZE + 8;
+        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+
+        bytes.extend_from_slice(&0x1234u64.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&(metadata_offset - 2).to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 12]);
+
+        std::fs::write(&path, bytes).unwrap();
+        let err = match BqntFile::open(&path) {
+            Ok(_) => panic!("expected metadata-overlapping tensor to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("overlaps metadata range"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_overflowing_packed_size() {
+        let path = temp_path("packed-size-overflow");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&VERSION.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        let metadata_offset = HEADER_SIZE + ENTRY_SIZE;
+        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        bytes.extend_from_slice(&0x5678u64.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+
+        std::fs::write(&path, bytes).unwrap();
+        let err = match BqntFile::open(&path) {
+            Ok(_) => panic!("expected overflowed packed size to be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("packed size overflows"));
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -295,7 +571,9 @@ impl MmapBqnt {
         if end <= self.mmap.len() {
             let json_str = std::str::from_utf8(&self.mmap[start..end]).ok()?;
             let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
-            v.get("model_name").and_then(|v| v.as_str()).map(|s| s.to_string())
+            v.get("model_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
         } else {
             None
         }
@@ -334,15 +612,18 @@ impl MmapBqnt {
 
     /// Iterate all tensors: yields (name_hash, entry, data_slice).
     pub fn iter_tensors(&self) -> impl Iterator<Item = (u64, &TensorEntry, &[u8])> {
-        self.header.entries.iter().filter_map(move |(&hash, entry)| {
-            let start = entry.data_offset as usize;
-            let end = start + entry.data_bytes as usize;
-            if end <= self.mmap.len() {
-                Some((hash, entry, &self.mmap[start..end]))
-            } else {
-                None
-            }
-        })
+        self.header
+            .entries
+            .iter()
+            .filter_map(move |(&hash, entry)| {
+                let start = entry.data_offset as usize;
+                let end = start + entry.data_bytes as usize;
+                if end <= self.mmap.len() {
+                    Some((hash, entry, &self.mmap[start..end]))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Read JSON metadata.
@@ -353,7 +634,10 @@ impl MmapBqnt {
             String::from_utf8(self.mmap[start..end].to_vec())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
         } else {
-            Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Metadata out of bounds"))
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Metadata out of bounds",
+            ))
         }
     }
 }
