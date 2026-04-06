@@ -779,6 +779,8 @@ impl Model {
                 ctx.workers[gpu_i].attn_w_v.push(w_v);
             }
         }
+        braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(0))
+            .map_err(ModelError::Hip)?;
         eprintln!("Multi-GPU: split QKV weights for {} attn layers across {} GPUs",
             attn_layer_indices.len(), num_gpus);
         Ok(())
