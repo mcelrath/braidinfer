@@ -122,15 +122,19 @@ impl MegakernelProgram {
         // will return an error if unsupported.
 
         let has_moe = cfg.layers.iter().any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
-        // OP_MOE_GATE needs 1024 floats (512 selection + 512 raw) = 4KB
-        // GDN recurrent + warp reduction needs 2KB
-        let shared_mem = if has_moe { 1024u32 * 4 } else { 256u32 * 4 * 2 };
+        // OP_MOE_GATE needs 1024 floats = 4KB. GDN recurrent needs 2KB.
+        // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS: (8+7680+256)*4 = 31776 bytes per block.
+        // 2 blocks/CU: 2*31776 = 63552 < 65536 ✓ — no occupancy reduction.
+        let base_shared = if has_moe { 1024u32 * 4 } else { 256u32 * 4 * 2 };
+        let shared_mem = base_shared.max(31776u32);
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-        // Cap at 192 blocks (2/CU): empirically optimal for virtual block loop.
-        // Higher counts increase cooperative launch overhead without improving throughput
-        // since the virtual block loop already distributes work across all blocks.
-        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
+        eprintln!("  megakernel: shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}");
+        // Cap blocks to what can fit cooperatively. With large LDS (31776B), blocks_per_sm=2
+        // but 192 blocks triggers hipErrorCooperativeLaunchTooLarge on RDNA3 — use 1/CU.
+        // blocks_per_sm=0 means LDS-limited; fall back to 1/CU.
+        let blocks_per_cu = blocks_per_sm.min(1).max(1) as u32;
+        let num_blocks = (blocks_per_cu * NUM_CUS).min(192);
 
         let mut instructions: Vec<Instruction> = Vec::new();
         let mut mrope_inst_indices: Vec<usize> = Vec::new();
@@ -339,13 +343,14 @@ impl MegakernelProgram {
         let act = &model.activations;
 
         let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
-        let shared_mem = (256u32 * 4 * 2).max((cfg.hidden_size as u32) * 4);
+        let shared_mem = (256u32 * 4 * 2).max((cfg.hidden_size as u32) * 4).max(31776u32);
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-        // Cap at 192 blocks (2/CU): empirically optimal for virtual block loop.
-        // Higher counts increase cooperative launch overhead without improving throughput
-        // since the virtual block loop already distributes work across all blocks.
-        let num_blocks = (blocks_per_sm as u32 * NUM_CUS).min(192);
+        eprintln!("  megakernel(paged): shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}");
+        // Cap blocks to what can fit cooperatively. With large LDS (31776B), blocks_per_sm=2
+        // but 192 blocks triggers hipErrorCooperativeLaunchTooLarge on RDNA3 — use 1/CU.
+        let blocks_per_cu = blocks_per_sm.min(1).max(1) as u32;
+        let num_blocks = (blocks_per_cu * NUM_CUS).min(192);
         let mut instructions: Vec<Instruction> = Vec::new();
 
         let hs = cfg.hidden_size;

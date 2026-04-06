@@ -151,6 +151,21 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             continue;
         }
 
+        // OP_LINEAR_PROJ_PCG32/RNF4: tiled-LDS optimized GEMV. Manages its own row loop
+        // (loads input tile once per block, processes all assigned rows per tile).
+        if (opcode == OP_LINEAR_PROJ_PCG32) {
+            op_linear_proj_pcg32_full(inst, grid_x);
+            grid.sync();
+            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); grid.sync(); }
+            continue;
+        }
+        if (opcode == OP_LINEAR_PROJ_RNF4) {
+            op_linear_proj_rnf4_full(inst, grid_x);
+            grid.sync();
+            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); grid.sync(); }
+            continue;
+        }
+
         // OP_BARRIER: block 0 thread 0 signals CPU and spins; all other blocks wait at grid.sync().
         // Must be outside the virtual block loop so blocks 1..N-1 can reach grid.sync() immediately
         // while block 0 spins. After CPU resumes block 0, block 0 also calls grid.sync() to reunite.

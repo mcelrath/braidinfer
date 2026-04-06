@@ -75,6 +75,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         if (opcode == OP_MOE_FFN) {
         } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
+        } else if (opcode == OP_LINEAR_PROJ_PCG32) {
+            op_linear_proj_pcg32_full(inst, grid_x);
+        } else if (opcode == OP_LINEAR_PROJ_RNF4) {
+            op_linear_proj_rnf4_full(inst, grid_x);
         } else {
             // Virtual block loop
             for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {

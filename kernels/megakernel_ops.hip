@@ -163,6 +163,138 @@ __device__ void op_silu_mul(const u64* inst, u32 vblock) {
 //   group = [idx1_packed(64B), absmax1(2B), idx2_packed(64B), absmax2(2B)] = 132 bytes
 //   idx1/idx2 are packed nibbles: 2 elements per byte, 64 bytes = 128 elements.
 //
+// Tiled LDS optimization constants for linear_proj quantized ops.
+// Each tile is 7680 floats (30KB). Shared memory layout per block:
+//   [0..7]          warp reduction sums (8 floats = 32 bytes)
+//   [8..8+7679]     input tile (7680 floats = 30720 bytes)
+//   [8+7680..8+7680+255]  partial outputs per row (256 floats = 1024 bytes)
+// Total: (8+7680+256)*4 = 31776 bytes. 2 blocks/CU: 63552 < 65536 ✓
+#define LPROJ_TILE_FLOATS  7680   // 240*32 PCG32 groups or 60*128 RNF4 groups
+#define LPROJ_MAX_ROWS     256    // max rows per block; limits out_dim ≤ 256*gridDim.x
+
+// OP_LINEAR_PROJ_RNF4 (full, tiled-LDS): loads input tile once per block,
+// processes all assigned rows per tile. One call replaces the virtual block loop.
+// batch=1 (decode) only; batch>1 falls back to per-row approach.
+__device__ void op_linear_proj_rnf4_full(const u64* inst, u32 grid_x) {
+    float* output_base = inst_fptr(inst, 1);
+    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
+    const float* input_base = inst_fptr(inst, 3);
+    int out_dim = inst_int(inst, 4);
+    int in_dim = inst_int(inst, 5);
+    int batch = inst_int(inst, 6);
+    if (batch <= 1) batch = 1;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 128;
+    const int group_bytes = 132;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    extern __shared__ float shared[];
+
+    if (batch == 1) {
+        float* lds_tile    = shared + 8;
+        float* row_partial = shared + 8 + LPROJ_TILE_FLOATS;
+
+        // Count and initialize row partials
+        int num_rows = 0;
+        for (u32 r = blockIdx.x; r < (u32)out_dim; r += gridDim.x) num_rows++;
+        for (int ri = tid; ri < num_rows; ri += stride) row_partial[ri] = 0.0f;
+        __syncthreads();
+
+        const int groups_per_tile = LPROJ_TILE_FLOATS / group_size;  // 60
+        const int n_tiles = (num_groups + groups_per_tile - 1) / groups_per_tile;
+        const int num_pairs = in_dim / 2;
+
+        for (int t = 0; t < n_tiles; t++) {
+            int g0 = t * groups_per_tile;
+            int g1 = min(g0 + groups_per_tile, num_groups);
+            int tile_start = g0 * group_size;
+            int tile_len = min((g1 - g0) * group_size, in_dim - tile_start);
+
+            // Load input tile cooperatively
+            for (int i = tid; i < tile_len; i += stride) lds_tile[i] = input_base[tile_start + i];
+            __syncthreads();
+
+            int ri = 0;
+            for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x, ri++) {
+                const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+                float acc = 0.0f;
+                // process pairs covering this tile's groups
+                int p0 = (tile_start) / 2;
+                int p1 = min((g1 * group_size) / 2, num_pairs);
+                for (int pair = p0 + tid; pair < p1; pair += stride) {
+                    int elem = pair * 2;
+                    int g = elem >> 7;        // elem / 128
+                    int local_pair = (elem & 127) >> 1;
+                    const unsigned char* gp = row_data + g * group_bytes;
+                    float am1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+                    float am2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+                    unsigned char b1 = gp[local_pair];
+                    unsigned char b2 = gp[66 + local_pair];
+                    float v0 = NF4_TABLE[b1 & 0xF] * am1 + NF4_TABLE[b2 & 0xF] * am2;
+                    float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * am1 + NF4_TABLE[(b2 >> 4) & 0xF] * am2;
+                    int local_elem = elem - tile_start;
+                    acc += v0 * lds_tile[local_elem] + v1 * lds_tile[local_elem + 1];
+                }
+                for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+                if ((tid & 31) == 0) shared[tid >> 5] = acc;
+                __syncthreads();
+                if (tid < 8) {
+                    acc = shared[tid];
+                    for (int offset = 4; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+                    if (tid == 0) row_partial[ri] += acc;
+                }
+                __syncthreads();
+            }
+            __syncthreads();  // Before overwriting lds_tile with next tile
+        }
+
+        for (u32 row = blockIdx.x, ri = 0; row < (u32)out_dim; row += gridDim.x, ri++) {
+            if (tid == 0) output_base[row] = row_partial[ri];
+        }
+        return;
+    }
+
+    // batch > 1 (prefill): existing per-row approach
+    const int num_pairs = in_dim / 2;
+    for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x) {
+        const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+        for (int b0 = 0; b0 < batch; b0 += B_TILE) {
+            int tile_end = (b0 + B_TILE < batch) ? b0 + B_TILE : batch;
+            int tile_size = tile_end - b0;
+            float acc[B_TILE];
+            #pragma unroll
+            for (int t = 0; t < B_TILE; t++) acc[t] = 0.0f;
+            for (int pair = tid; pair < num_pairs; pair += stride) {
+                int elem = pair * 2;
+                int g = elem / group_size;
+                int local_pair = (elem % group_size) / 2;
+                const unsigned char* gp = row_data + g * group_bytes;
+                float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+                float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+                unsigned char b1 = gp[local_pair];
+                unsigned char b2 = gp[66 + local_pair];
+                float v0 = NF4_TABLE[b1 & 0xF] * absmax1 + NF4_TABLE[b2 & 0xF] * absmax2;
+                float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * absmax1 + NF4_TABLE[(b2 >> 4) & 0xF] * absmax2;
+                for (int t = 0; t < tile_size; t++) {
+                    const float* inp = input_base + (long long)(b0 + t) * in_dim;
+                    acc[t] += v0 * inp[elem] + v1 * inp[elem + 1];
+                }
+            }
+            for (int t = 0; t < tile_size; t++) {
+                shared[tid] = acc[t];
+                __syncthreads();
+                for (int s = stride / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared[tid] += shared[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
+                __syncthreads();
+            }
+        }
+    }
+}
+
 // Optimized: all 256 threads cooperate on one row, processing element pairs in stride.
 // Each thread handles in_dim/512 pairs (2 elements each). No shared memory for input
 // (read from global — L2 cached after first row in this block).
@@ -253,6 +385,114 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
                 __syncthreads();
             }
             if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
+            __syncthreads();
+        }
+    }
+}
+
+// OP_LINEAR_PROJ_PCG32 (full, tiled-LDS): same semantics as OP_LINEAR_PROJ_PCG32 but
+// loads input in tiles into LDS once per block, then processes all assigned rows per tile.
+// One call handles all virtual blocks; must NOT be called from the virtual block loop.
+__device__ void op_linear_proj_pcg32_full(const u64* inst, u32 grid_x) {
+    float* output_base = inst_fptr(inst, 1);
+    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
+    const float* input_base = inst_fptr(inst, 3);
+    int out_dim = inst_int(inst, 4);
+    int in_dim = inst_int(inst, 5);
+    int batch = inst_int(inst, 6);
+    if (batch <= 1) batch = 1;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int group_size = 32;
+    const int group_bytes = 20;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    extern __shared__ float shared[];
+
+    if (batch == 1) {
+        float* lds_tile    = shared + 8;
+        float* row_partial = shared + 8 + LPROJ_TILE_FLOATS;
+
+        int num_rows = 0;
+        for (u32 r = blockIdx.x; r < (u32)out_dim; r += gridDim.x) num_rows++;
+        for (int ri = tid; ri < num_rows; ri += stride) row_partial[ri] = 0.0f;
+        __syncthreads();
+
+        const int groups_per_tile = LPROJ_TILE_FLOATS / group_size;  // 240
+        const int n_tiles = (num_groups + groups_per_tile - 1) / groups_per_tile;
+
+        for (int t = 0; t < n_tiles; t++) {
+            int g0 = t * groups_per_tile;
+            int g1 = min(g0 + groups_per_tile, num_groups);
+            int tile_start = g0 * group_size;
+            int tile_len = min((g1 - g0) * group_size, in_dim - tile_start);
+
+            // Load input tile cooperatively
+            for (int i = tid; i < tile_len; i += stride) lds_tile[i] = input_base[tile_start + i];
+            __syncthreads();
+
+            int ri = 0;
+            for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x, ri++) {
+                const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+                float acc = 0.0f;
+                for (int g = g0 + tid; g < g1; g += stride) {
+                    const unsigned char* gp = row_data + g * group_bytes;
+                    float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+                    float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                    int local_base = (g - g0) * group_size;
+                    int count = min(group_size, in_dim - g * group_size);
+                    for (int i = 0; i < count; i += 2) {
+                        unsigned char byte = gp[i / 2];
+                        float v0 = (float)(byte & 0xF) * sc + mn;
+                        float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                        acc += v0 * lds_tile[local_base + i] + v1 * lds_tile[local_base + i + 1];
+                    }
+                }
+                for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+                if ((tid & 31) == 0) shared[tid >> 5] = acc;
+                __syncthreads();
+                if (tid < 8) {
+                    acc = shared[tid];
+                    for (int offset = 4; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
+                    if (tid == 0) row_partial[ri] += acc;
+                }
+                __syncthreads();
+            }
+            __syncthreads();  // Before overwriting lds_tile with next tile
+        }
+
+        for (u32 row = blockIdx.x, ri = 0; row < (u32)out_dim; row += gridDim.x, ri++) {
+            if (tid == 0) output_base[row] = row_partial[ri];
+        }
+        return;
+    }
+
+    // batch > 1 (prefill): existing per-row, per-batch approach
+    for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x) {
+        const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+        for (int b = 0; b < batch; b++) {
+            const float* input = input_base + (long long)b * in_dim;
+            float acc = 0.0f;
+            for (int g = tid; g < num_groups; g += stride) {
+                const unsigned char* gp = row_data + g * group_bytes;
+                float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+                float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                int base = g * group_size;
+                int count = min(group_size, in_dim - base);
+                for (int i = 0; i < count; i += 2) {
+                    unsigned char byte = gp[i / 2];
+                    float v0 = (float)(byte & 0xF) * sc + mn;
+                    float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                    acc += v0 * input[base + i] + v1 * input[base + i + 1];
+                }
+            }
+            shared[tid] = acc;
+            __syncthreads();
+            for (int s = stride / 2; s > 0; s >>= 1) {
+                if (tid < s) shared[tid] += shared[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) output_base[(long long)b * out_dim + row] = shared[0];
             __syncthreads();
         }
     }
