@@ -804,6 +804,19 @@ impl Model {
         let s2 = cfg.mrope_section[2] as u32;
         let eps = cfg.rms_norm_eps;
         let max_sl = cfg.max_seq_len as u32;
+        let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
+
+        macro_rules! sync_check {
+            ($label:expr) => {
+                if sync_debug {
+                    if let Err(e) = self.stream.synchronize() {
+                        eprintln!("SYNC_DEBUG: crash at L{}.{}", layer_idx, $label);
+                        return Err(e);
+                    }
+                    eprintln!("SYNC_DEBUG: L{}.{} OK", layer_idx, $label);
+                }
+            };
+        }
 
         // 1. RMSNorm
         // SAFETY: Raw pointer breaks borrow on self.layers for mutable self.activations access.
@@ -824,7 +837,7 @@ impl Model {
                 &self.stream,
             )?;
         }
-
+        sync_check!("rmsnorm");
 
         // 2. Project Q+gate, K, V
         // Use raw pointers to LinearWeight to work around borrow checker
@@ -847,12 +860,15 @@ impl Model {
             (*w_q_gate_p).forward(&self.kernels.linear_proj,
                 &mut self.activations.q_gate_attn, &self.activations.normed,
                 nqh * hd * q_mult, hs, &self.stream)?;
+            sync_check!("q_proj");
             (*w_k_p).forward(&self.kernels.linear_proj,
                 &mut self.activations.k_attn, &self.activations.normed,
                 nkh * hd, hs, &self.stream)?;
+            sync_check!("k_proj");
             (*w_v_p).forward(&self.kernels.linear_proj,
                 &mut self.activations.v_attn, &self.activations.normed,
                 nkh * hd, hs, &self.stream)?;
+            sync_check!("v_proj");
         }
 
 
@@ -875,7 +891,7 @@ impl Model {
                 d2d_copy_f32(&mut self.activations.q_attn, 0, &self.activations.q_gate_attn, 0, total, &self.stream)?;
             }
         }
-
+        sync_check!("q_copy");
 
         // 4a. Write K,V to cache BEFORE QK-norm (pre-norm K has full dynamic range
         //     for quantization; post-norm K is bounded ±0.06 which destroys Q4 quantization).
@@ -952,6 +968,7 @@ impl Model {
             s2,
             &self.stream,
         )?;
+        sync_check!("mrope");
         } // end if cfg.use_rope
 
         // 6. KV write already done at step 4a (before QK-norm) for quantization quality.
@@ -971,6 +988,7 @@ impl Model {
             max_sl as u32,
             &self.stream,
         )?;
+        sync_check!("gqa_attention");
 
 
         // 8. Output gate (Qwen3.5 only) or pass-through

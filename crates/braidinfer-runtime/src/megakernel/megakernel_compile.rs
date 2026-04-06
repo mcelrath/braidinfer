@@ -130,11 +130,10 @@ impl MegakernelProgram {
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         eprintln!("  megakernel: shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}");
-        // Cap blocks to what can fit cooperatively. With large LDS (31776B), blocks_per_sm=2
-        // but 192 blocks triggers hipErrorCooperativeLaunchTooLarge on RDNA3 — use 1/CU.
-        // blocks_per_sm=0 means LDS-limited; fall back to 1/CU.
-        let blocks_per_cu = blocks_per_sm.min(1).max(1) as u32;
-        let num_blocks = (blocks_per_cu * NUM_CUS).min(192);
+        // NUM_CUS=48 = WGP count (MultiprocessorCount on RDNA3). Max cooperative blocks = blocks_per_sm * WGPs.
+        // blocks_per_sm=0 means LDS-limited; fall back to 1/WGP.
+        let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
 
         let mut instructions: Vec<Instruction> = Vec::new();
         let mut mrope_inst_indices: Vec<usize> = Vec::new();
@@ -347,10 +346,9 @@ impl MegakernelProgram {
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         eprintln!("  megakernel(paged): shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}");
-        // Cap blocks to what can fit cooperatively. With large LDS (31776B), blocks_per_sm=2
-        // but 192 blocks triggers hipErrorCooperativeLaunchTooLarge on RDNA3 — use 1/CU.
-        let blocks_per_cu = blocks_per_sm.min(1).max(1) as u32;
-        let num_blocks = (blocks_per_cu * NUM_CUS).min(192);
+        // NUM_CUS=48 = WGP count (MultiprocessorCount on RDNA3). Max cooperative blocks = blocks_per_sm * WGPs.
+        let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
         let mut instructions: Vec<Instruction> = Vec::new();
 
         let hs = cfg.hidden_size;
@@ -751,8 +749,9 @@ impl MegakernelProgram {
                 inst.set_int(3, (nqh * hd) as i32);
                 instructions.push(inst);
             }
-        } else if n > 1 {
-            // Batched: single OP_DEINTERLEAVE
+        } else {
+            // Use OP_DEINTERLEAVE for both batched and single-token (batch=1 handled by kernel).
+            // Replaces per-head D2D_COPY loop (48 instrs for nqh=24) with a single instruction.
             let total_elems = n * nqh * hd;
             let mut inst = Instruction::new(OP_DEINTERLEAVE, div_ceil(total_elems as u32, 256));
             inst.set_output_ptr(1, q_attn_ptr);
@@ -762,26 +761,6 @@ impl MegakernelProgram {
             inst.set_int(5, hd as i32);
             inst.set_int(6, n as i32);
             instructions.push(inst);
-        } else {
-            // Single-token: per-head D2D_COPY loop
-            for h in 0..nqh {
-                let src_q_offset = h * hd * 2;
-                let src_g_offset = h * hd * 2 + hd;
-                let dst_offset = h * hd;
-                let is_last = h == nqh - 1;
-                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                inst.set_output_ptr(1, unsafe { q_attn_ptr.add(dst_offset) });
-                inst.set_ptr(2, unsafe { q_gate_attn_ptr.add(src_q_offset) });
-                inst.set_int(3, hd as i32);
-                inst.set_no_sync();
-                instructions.push(inst);
-                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                inst.set_output_ptr(1, unsafe { gate_attn_ptr.add(dst_offset) });
-                inst.set_ptr(2, unsafe { q_gate_attn_ptr.add(src_g_offset) });
-                inst.set_int(3, hd as i32);
-                if !is_last { inst.set_no_sync(); }
-                instructions.push(inst);
-            }
         }
 
         // 4a. KV write for PagedKv — BEFORE QK-norm so cache stores pre-norm K/V.

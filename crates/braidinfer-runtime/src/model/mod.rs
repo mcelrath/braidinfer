@@ -122,7 +122,7 @@ impl Model {
 
         // Persistent worker path: CPU-scheduled dispatch via host-mapped work queue.
         // Gated by PERSISTENT=1 env var. Replaces megakernel for single-GPU.
-        if std::env::var("PERSISTENT").is_ok() {
+        if std::env::var("PERSISTENT").as_deref() == Ok("1") {
             return self.decode_step_persistent(token_id, position);
         }
 
@@ -139,8 +139,12 @@ impl Model {
         }
         let mk = self.megakernel.as_mut().unwrap();
         mk.update_step(token_id, position, &self.stream)?;
+        let t0 = std::time::Instant::now();
         let exec_result = mk.execute(&self.stream);
         let sync_result = self.stream.synchronize();
+        if std::env::var("TIME_MEGAKERNEL").is_ok() {
+            eprintln!("  megakernel execute+sync: {:.3}ms  n_inst={}", t0.elapsed().as_secs_f64()*1000.0, mk.instruction_count());
+        }
 
         // Write dump even on error (crash dump for debugging HipError(720))
         if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {

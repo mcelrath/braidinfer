@@ -62,7 +62,7 @@ pub struct GpuWorker {
 
 impl GpuWorker {
     /// Dispatch a single instruction and wait for completion.
-    pub fn dispatch_and_wait(&mut self, inst: &Instruction) {
+    pub(crate) fn dispatch_and_wait(&mut self, inst: &Instruction) {
         let q_ptr = self.queue.host_ptr() as *mut WorkerQueueLayout;
 
         // Copy instruction words to work queue
@@ -150,7 +150,7 @@ impl PersistentDispatch {
     }
 
     /// Wait for a GPU to ack a specific seq number.
-    pub fn wait_ack(&self, gpu_idx: usize, seq: u32) {
+    pub(crate) fn wait_ack(&self, gpu_idx: usize, seq: u32) {
         let q_ptr = self.workers[gpu_idx].queue.host_ptr() as *const WorkerQueueLayout;
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
@@ -162,7 +162,7 @@ impl PersistentDispatch {
 
     /// Dispatch a batch of instructions to a GPU. Worker executes all with grid.sync()
     /// between them, acks once at the end. One signal round-trip per batch.
-    pub fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+    pub(crate) fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
         assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
         let w = &mut self.workers[gpu_idx];
         let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
@@ -204,7 +204,7 @@ impl PersistentDispatch {
     /// Fire a batch of instructions to a GPU WITHOUT waiting for ack. Returns seq for wait_ack.
     /// Caller must call wait_ack(gpu_idx, seq) before reading GPU 0 output.
     /// Used to overlap GPU 0 OP_EXPERT_FFN with kbk dispatch on GPUs 1+.
-    pub fn dispatch_batch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
+    pub(crate) fn dispatch_batch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
         assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
         let w = &mut self.workers[gpu_idx];
         let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
