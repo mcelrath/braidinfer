@@ -199,6 +199,11 @@ impl PersistentDispatch {
             }
             std::hint::spin_loop();
         }
+        if std::env::var("DISPATCH_RTT").is_ok() {
+            let us = start.elapsed().as_micros();
+            let op0 = instructions[0].words[0] & 0x7FFFFFFF;
+            eprintln!("dispatch_batch gpu={gpu_idx} n={} op0={op0:#x} rtt={us}us", instructions.len());
+        }
     }
 
     /// Fire a batch of instructions to a GPU WITHOUT waiting for ack. Returns seq for wait_ack.

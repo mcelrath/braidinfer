@@ -263,6 +263,102 @@ pub fn dispatch_moe_layer(
     Ok(())
 }
 
+/// Compute-only dispatch for GPUs 1..N-1: launches expert FFNs and records compute_done.
+/// Does NOT D2H gather or CPU-accumulate. Caller is responsible for syncing and on-GPU reduction.
+/// Returns bitmask of GPUs with active experts (bit i set ↔ GPU i has experts).
+pub fn dispatch_moe_layer_kbk(
+    ctx: &mut MultiGpuContext,
+    worker_kernels: &[WorkerKernels],
+    moe: &DistributedMoeWeights,
+    _normed_stage: &MappedHostBuffer<f32>,
+    moe_expert_ids: &MappedHostBuffer<i32>,
+    moe_expert_weights: &MappedHostBuffer<f32>,
+    k: usize,
+    hs: usize,
+    eis: usize,
+) -> HipResult<u32> {
+    let expert_ids: &[i32] = unsafe {
+        std::slice::from_raw_parts(moe_expert_ids.host_ptr() as *const i32, k)
+    };
+    let expert_weights: &[f32] = unsafe {
+        std::slice::from_raw_parts(moe_expert_weights.host_ptr() as *const f32, k)
+    };
+    let num_devices = ctx.num_devices;
+    let mut per_gpu: Vec<Vec<(usize, f32)>> = vec![Vec::new(); num_devices];
+    for j in 0..k {
+        let eid = expert_ids[j] as usize;
+        let gpu = moe.expert_device[eid];
+        per_gpu[gpu].push((eid, expert_weights[j]));
+    }
+
+    // Zero per-worker output buffers and H2D broadcast activation (parallel via SDMA engines)
+    let act_host: *const std::ffi::c_void = _normed_stage.host_ptr() as *const std::ffi::c_void;
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        let worker = &ctx.workers[gpu];
+        Device::set_current(worker.device)?;
+        unsafe {
+            ffi::hipMemsetAsync(
+                worker.expert_out.as_ptr() as *mut std::ffi::c_void,
+                0, hs * 4, worker.compute_stream.raw(),
+            );
+            let rc = ffi::hipMemcpyAsync(
+                worker.activation_in.as_ptr() as *mut std::ffi::c_void,
+                act_host,
+                hs * 4,
+                ffi::hipMemcpyHostToDevice,
+                worker.transfer_stream.raw(),
+            );
+            if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+        }
+        worker.broadcast_done.record(&worker.transfer_stream)?;
+    }
+
+    // Launch expert FFN on each GPU 1..N-1
+    for gpu in 1..num_devices {
+        if per_gpu[gpu].is_empty() { continue; }
+        let worker = &mut ctx.workers[gpu];
+        let kernels = &worker_kernels[gpu];
+        let buf = &moe.expert_buffers[gpu];
+        MultiGpuContext::stream_wait_event(&worker.compute_stream, &worker.broadcast_done)?;
+        Device::set_current(worker.device)?;
+        let input_ptr: *const f32 = worker.activation_in.as_ptr();
+        let gate_up_base: *const u8 = buf.gate_up.as_ptr();
+        let down_base: *const u8 = buf.down.as_ptr();
+        let fmt = moe.weight_format;
+        for &(expert_id, weight) in &per_gpu[gpu] {
+            let local_slot = buf.slot_map[expert_id].expect("expert not on expected GPU");
+            let gate_up_offset = local_slot * moe.gate_up_expert_stride;
+            let down_offset = local_slot * moe.down_expert_stride;
+            if moe.has_gate_proj {
+                let gate_byte_offset = gate_up_offset;
+                let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
+                dispatch_proj(&kernels.linear_proj, worker.scratch_gate.as_ptr() as *mut f32,
+                    unsafe { gate_up_base.add(gate_byte_offset) }, input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream)?;
+                dispatch_proj(&kernels.linear_proj, worker.scratch_up.as_ptr() as *mut f32,
+                    unsafe { gate_up_base.add(up_byte_offset) }, input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream)?;
+                kernels.silu_mul.forward(&mut worker.scratch_act, &worker.scratch_gate, &worker.scratch_up, eis as u32, &worker.compute_stream)?;
+            } else {
+                dispatch_proj(&kernels.linear_proj, worker.scratch_up.as_ptr() as *mut f32,
+                    unsafe { gate_up_base.add(gate_up_offset) }, input_ptr, eis as u32, hs as u32, fmt, &worker.compute_stream)?;
+                kernels.silu_mul.relu_squared(&mut worker.scratch_act, &worker.scratch_up, eis as u32, &worker.compute_stream)?;
+            }
+            dispatch_proj(&kernels.linear_proj, worker.scratch_gate.as_ptr() as *mut f32,
+                unsafe { down_base.add(down_offset) }, worker.scratch_act.as_ptr(), hs as u32, eis as u32, fmt, &worker.compute_stream)?;
+            kernels.residual_add.weighted_accumulate(&mut worker.expert_out, &worker.scratch_gate,
+                weight, hs as u32, &worker.compute_stream)?;
+        }
+        worker.compute_done.record(&worker.compute_stream)?;
+    }
+
+    let mut active_mask = 0u32;
+    for gpu in 1..num_devices {
+        if !per_gpu[gpu].is_empty() { active_mask |= 1 << gpu; }
+    }
+    Device::set_current(DeviceId(0))?;
+    Ok(active_mask)
+}
+
 /// Kernel-by-kernel multi-GPU dispatch (called from decode_step_moe / moe_ffn_forward).
 /// No cooperative kernel running — GPU 0 is free to run experts alongside GPUs 1..N-1.
 /// Populates ffn_down_stage; caller copies to ffn_down if needed.
