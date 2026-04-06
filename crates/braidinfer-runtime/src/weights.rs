@@ -1,26 +1,29 @@
 //! Weight types, loading, and activation buffer allocation.
 //! Extracted from model.rs for maintainability.
 
+use braidinfer_core::safetensors::SafeTensorSet;
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
-use braidinfer_hip::{ffi, HipResult};
-use braidinfer_core::safetensors::SafeTensorSet;
+use braidinfer_hip::{HipResult, ffi};
 use safetensors::Dtype;
 
 use crate::config::*;
 use crate::kernel::{
     ArgmaxKernel, CausalConv1dUpdateKernel, EmbeddingKernel, FfnFusedKernel, GdnGateKernel,
-    GdnRecurrentStepV2Kernel, GqaAttentionKernel, LinearProjKernel, LmHeadKernel,
-    MRoPEKernel, MoeGateKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel,
-    RmsNormGatedKernel, RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
+    GdnRecurrentStepV2Kernel, GqaAttentionKernel, LinearProjKernel, LmHeadKernel, MRoPEKernel,
+    MoeGateKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel,
+    RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
 };
-pub use crate::quant::{WeightFormat, PackedWeights, WeightQuantMode, LinearWeight, quantize_rnf4_g128, quantize_pc_g32_q4};
+pub use crate::quant::{
+    LinearWeight, PackedWeights, WeightFormat, WeightQuantMode, quantize_pc_g32_q4,
+    quantize_rnf4_g128,
+};
 
 // ---- Layer weight structs ----
 
 pub struct GdnLayerWeights {
-    pub input_norm: DeviceBuffer<u16>,  // bf16: (1+w) pattern, zeros init
+    pub input_norm: DeviceBuffer<u16>, // bf16: (1+w) pattern, zeros init
     pub w_qkv: LinearWeight,           // [6144, 1024]
     pub w_a: LinearWeight,             // [16, 1024]
     pub w_b: LinearWeight,             // [16, 1024]
@@ -40,7 +43,7 @@ pub struct GdnLayerWeights {
 }
 
 pub struct AttentionLayerWeights {
-    pub input_norm: DeviceBuffer<u16>,  // bf16: stays bf16
+    pub input_norm: DeviceBuffer<u16>, // bf16: stays bf16
     pub w_q_gate: LinearWeight,        // [nqh*hd*q_mult, hs]
     pub w_k: LinearWeight,             // [nkh*hd, hs]
     pub w_v: LinearWeight,             // [nkh*hd, hs]
@@ -54,20 +57,20 @@ pub struct AttentionLayerWeights {
 }
 
 pub struct Mamba2LayerWeights {
-    pub input_norm: DeviceBuffer<u16>,      // bf16 rmsnorm weight [hidden_size]
-    pub in_proj: LinearWeight,              // [hidden_size, in_proj_size]
-    pub conv1d_weight: DeviceBuffer<u16>,   // bf16 [conv_dim, 1, conv_kernel] (depthwise)
-    pub conv1d_bias: DeviceBuffer<f32>,     // f32 [conv_dim]
-    pub dt_bias: DeviceBuffer<f32>,         // f32 [num_heads]
-    pub a_log: DeviceBuffer<f32>,           // f32 [num_heads]
-    pub d: DeviceBuffer<f32>,               // f32 [num_heads]
-    pub norm_weight: DeviceBuffer<f32>,     // f32 rmsnorm_gated weight [intermediate]
-    pub out_proj: LinearWeight,             // [intermediate, hidden_size]
+    pub input_norm: DeviceBuffer<u16>, // bf16 rmsnorm weight [hidden_size]
+    pub in_proj: LinearWeight,         // [hidden_size, in_proj_size]
+    pub conv1d_weight: DeviceBuffer<u16>, // bf16 [conv_dim, 1, conv_kernel] (depthwise)
+    pub conv1d_bias: DeviceBuffer<f32>, // f32 [conv_dim]
+    pub dt_bias: DeviceBuffer<f32>,    // f32 [num_heads]
+    pub a_log: DeviceBuffer<f32>,      // f32 [num_heads]
+    pub d: DeviceBuffer<f32>,          // f32 [num_heads]
+    pub norm_weight: DeviceBuffer<f32>, // f32 rmsnorm_gated weight [intermediate]
+    pub out_proj: LinearWeight,        // [intermediate, hidden_size]
 }
 
 /// Standalone MoE FFN layer (Nemotron-H 'E' layers) — just norm + MoE dispatch
 pub struct MoeFfnLayerWeights {
-    pub input_norm: DeviceBuffer<u16>,      // bf16 rmsnorm weight [hidden_size]
+    pub input_norm: DeviceBuffer<u16>, // bf16 rmsnorm weight [hidden_size]
 }
 
 pub enum LayerWeights {
@@ -86,25 +89,24 @@ pub struct DenseFfnWeights {
 
 /// MoE FFN weights for one layer
 pub struct MoeWeights {
-    pub gate: DeviceBuffer<u16>,                    // [num_experts, hidden_size] — router, MUST stay bf16
-    pub expert_gate_up: LinearWeight,               // SwiGLU: [ne, 2*eis, hs] fused; relu²: [ne, eis, hs] (up only)
-    pub expert_down: LinearWeight,                  // [num_experts, hidden_size, expert_is]
-    pub shared_expert: Option<DenseFfnWeights>,      // always-on shared expert
+    pub gate: DeviceBuffer<u16>, // [num_experts, hidden_size] — router, MUST stay bf16
+    pub expert_gate_up: LinearWeight, // SwiGLU: [ne, 2*eis, hs] fused; relu²: [ne, eis, hs] (up only)
+    pub expert_down: LinearWeight,    // [num_experts, hidden_size, expert_is]
+    pub shared_expert: Option<DenseFfnWeights>, // always-on shared expert
     pub shared_expert_gate: Option<DeviceBuffer<u16>>, // [1, hidden_size] gate for shared expert
-    pub has_gate_proj: bool,                          // false for relu² (Nemotron), true for SwiGLU
-    pub score_correction_bias: Option<Vec<f32>>,      // [num_experts] f32, added to scores before top-k
+    pub has_gate_proj: bool,          // false for relu² (Nemotron), true for SwiGLU
+    pub score_correction_bias: Option<Vec<f32>>, // [num_experts] f32, added to scores before top-k
     pub score_correction_bias_gpu: Option<DeviceBuffer<f32>>, // GPU copy of correction_bias
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
 }
 
-
 /// Per-GPU expert weight buffer for distributed MoE.
 pub struct GpuExpertBuffer {
     pub device: DeviceId,
-    pub gate_up: DeviceBuffer<u8>,       // packed expert weights on this GPU
-    pub down: DeviceBuffer<u8>,          // packed down_proj weights on this GPU
-    pub local_expert_count: usize,       // how many experts on this GPU
+    pub gate_up: DeviceBuffer<u8>, // packed expert weights on this GPU
+    pub down: DeviceBuffer<u8>,    // packed down_proj weights on this GPU
+    pub local_expert_count: usize, // how many experts on this GPU
     /// Maps global expert_id → local slot index (None if not on this GPU).
     /// Indexed by global expert_id, len = num_experts.
     pub slot_map: Vec<Option<usize>>,
@@ -114,8 +116,8 @@ pub struct GpuExpertBuffer {
 /// Gate, shared expert, and metadata stay in MoeWeights on GPU 0.
 /// This struct holds only the per-GPU expert copies.
 pub struct DistributedMoeWeights {
-    pub expert_buffers: Vec<GpuExpertBuffer>,       // [num_devices]
-    pub expert_device: Vec<usize>,                  // [num_experts] → device index
+    pub expert_buffers: Vec<GpuExpertBuffer>, // [num_devices]
+    pub expert_device: Vec<usize>,            // [num_experts] → device index
     pub has_gate_proj: bool,
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
@@ -143,20 +145,20 @@ pub struct KvCache {
 }
 
 pub struct ActivationBuffers {
-    pub hidden: DeviceBuffer<f32>,   // [hidden_size]
-    pub normed: DeviceBuffer<f32>,   // [hidden_size]
+    pub hidden: DeviceBuffer<f32>, // [hidden_size]
+    pub normed: DeviceBuffer<f32>, // [hidden_size]
     // GDN temporaries
-    pub qkv: DeviceBuffer<f32>,      // [6144]
-    pub q_gdn: DeviceBuffer<f32>,    // [16*128] = [2048]
-    pub k_gdn: DeviceBuffer<f32>,    // [16*128] = [2048]
-    pub v_gdn: DeviceBuffer<f32>,    // [16*128] = [2048]
-    pub a_proj: DeviceBuffer<f32>,   // [16]
-    pub b_proj: DeviceBuffer<f32>,   // [16]
-    pub z_proj: DeviceBuffer<f32>,   // [2048]
-    pub gate_gdn: DeviceBuffer<f32>, // [16]
+    pub qkv: DeviceBuffer<f32>,           // [6144]
+    pub q_gdn: DeviceBuffer<f32>,         // [16*128] = [2048]
+    pub k_gdn: DeviceBuffer<f32>,         // [16*128] = [2048]
+    pub v_gdn: DeviceBuffer<f32>,         // [16*128] = [2048]
+    pub a_proj: DeviceBuffer<f32>,        // [16]
+    pub b_proj: DeviceBuffer<f32>,        // [16]
+    pub z_proj: DeviceBuffer<f32>,        // [2048]
+    pub gate_gdn: DeviceBuffer<f32>,      // [16]
     pub recurrent_out: DeviceBuffer<f32>, // [2048]
     pub normed_gated: DeviceBuffer<f32>,  // [2048]
-    pub out_proj: DeviceBuffer<f32>, // [1024]
+    pub out_proj: DeviceBuffer<f32>,      // [1024]
     // Attention temporaries
     pub q_gate_attn: DeviceBuffer<f32>, // [4096] Q+gate
     pub q_attn: DeviceBuffer<f32>,      // [2048]
@@ -166,44 +168,44 @@ pub struct ActivationBuffers {
     pub attn_out: DeviceBuffer<f32>,    // [2048]
     pub gated_out: DeviceBuffer<f32>,   // [2048]
     // FFN temporaries
-    pub ffn_gate: DeviceBuffer<f32>,  // [3584]
-    pub ffn_up: DeviceBuffer<f32>,    // [3584]
-    pub ffn_act: DeviceBuffer<f32>,   // [3584]
-    pub ffn_down: DeviceBuffer<f32>,  // [1024]
+    pub ffn_gate: DeviceBuffer<f32>, // [3584]
+    pub ffn_up: DeviceBuffer<f32>,   // [3584]
+    pub ffn_act: DeviceBuffer<f32>,  // [3584]
+    pub ffn_down: DeviceBuffer<f32>, // [1024]
     // Shared
-    pub residual: DeviceBuffer<f32>,  // [1024]
+    pub residual: DeviceBuffer<f32>, // [1024]
     // Final
-    pub logits: DeviceBuffer<f32>,    // [vocab_size]
+    pub logits: DeviceBuffer<f32>, // [vocab_size]
     pub logits_mapped: braidinfer_hip::MappedHostBuffer<f32>, // [vocab_size] for persistent worker path
     // inv_freq and position_ids for mRoPE
-    pub inv_freq: DeviceBuffer<f32>,  // [rope_dim/2]
+    pub inv_freq: DeviceBuffer<f32>, // [rope_dim/2]
     pub position_ids: braidinfer_hip::MappedHostBuffer<i32>, // [3] — host-mapped for persistent worker path
     // conv states per GDN layer (allocated separately)
     // Pre-allocated GDN conv state temp buffers (reused each gdn_forward call)
-    pub gdn_cs_q: DeviceBuffer<f32>,      // [nh*kd*(ck-1)]
-    pub gdn_cs_k: DeviceBuffer<f32>,      // [nh*kd*(ck-1)]
-    pub gdn_cs_v: DeviceBuffer<f32>,      // [nh*vd*(ck-1)]
+    pub gdn_cs_q: DeviceBuffer<f32>,       // [nh*kd*(ck-1)]
+    pub gdn_cs_k: DeviceBuffer<f32>,       // [nh*kd*(ck-1)]
+    pub gdn_cs_v: DeviceBuffer<f32>,       // [nh*vd*(ck-1)]
     pub gdn_conv_out_q: DeviceBuffer<f32>, // [nh*kd]
     pub gdn_conv_out_k: DeviceBuffer<f32>, // [nh*kd]
     pub gdn_conv_out_v: DeviceBuffer<f32>, // [nh*vd]
     // Multi-GPU barrier staging: written by megakernel before OP_BARRIER, read by CPU dispatch.
     // MappedHostBuffer = GPU-writable (GART/uncached) + CPU-readable without hipMemcpy.
-    pub normed_stage: MappedHostBuffer<f32>,     // [hidden_size] — copy of normed for CPU broadcast
-    pub ffn_down_stage: MappedHostBuffer<f32>,   // [hidden_size] — CPU writes gathered expert output
+    pub normed_stage: MappedHostBuffer<f32>, // [hidden_size] — copy of normed for CPU broadcast
+    pub ffn_down_stage: MappedHostBuffer<f32>, // [hidden_size] — CPU writes gathered expert output
     // MoE scratch buffers (pre-allocated to avoid hipMalloc in hot path)
-    pub moe_scores: DeviceBuffer<f32>,        // [max_num_experts]
-    pub moe_expert_ids: MappedHostBuffer<i32>,    // [max_k] — GPU writes, CPU reads via host_ptr
+    pub moe_scores: DeviceBuffer<f32>,         // [max_num_experts]
+    pub moe_expert_ids: MappedHostBuffer<i32>, // [max_k] — GPU writes, CPU reads via host_ptr
     pub moe_expert_weights: MappedHostBuffer<f32>, // [max_k] — GPU writes, CPU reads via host_ptr
-    pub moe_expert_gate: DeviceBuffer<f32>,   // [max_expert_intermediate_size]
-    pub moe_expert_up: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
-    pub moe_expert_act: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
-    pub moe_expert_out: DeviceBuffer<f32>,    // [hidden_size]
+    pub moe_expert_gate: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
+    pub moe_expert_up: DeviceBuffer<f32>,      // [max_expert_intermediate_size]
+    pub moe_expert_act: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
+    pub moe_expert_out: DeviceBuffer<f32>,     // [hidden_size]
     // Mamba2 scratch buffers
-    pub mamba2_in_proj: DeviceBuffer<f32>,    // [in_proj_size] (gate + xBC + dt)
-    pub mamba2_conv_out: DeviceBuffer<f32>,   // [conv_dim] (after conv1d + activation)
-    pub mamba2_ssm_out: DeviceBuffer<f32>,    // [intermediate] (SSM output y)
+    pub mamba2_in_proj: DeviceBuffer<f32>, // [in_proj_size] (gate + xBC + dt)
+    pub mamba2_conv_out: DeviceBuffer<f32>, // [conv_dim] (after conv1d + activation)
+    pub mamba2_ssm_out: DeviceBuffer<f32>, // [intermediate] (SSM output y)
     // GPU-resident argmax
-    pub argmax_result: DeviceBuffer<i32>,    // [1] — single token ID
+    pub argmax_result: DeviceBuffer<i32>, // [1] — single token ID
 }
 
 // ---- All kernels ----
@@ -228,7 +230,6 @@ pub struct AllKernels {
     pub argmax: ArgmaxKernel,
     pub moe_gate: MoeGateKernel,
 }
-
 
 impl AllKernels {
     pub fn load(device: DeviceId) -> HipResult<Self> {
@@ -262,19 +263,37 @@ pub enum ModelError {
     Hip(braidinfer_hip::HipError),
     SafeTensors(braidinfer_core::safetensors::SafeTensorsError),
     MissingWeight(String),
+    InvalidConfig(String),
     Io(std::io::Error),
 }
 
 impl From<braidinfer_hip::HipError> for ModelError {
-    fn from(e: braidinfer_hip::HipError) -> Self { ModelError::Hip(e) }
+    fn from(e: braidinfer_hip::HipError) -> Self {
+        ModelError::Hip(e)
+    }
 }
 
 impl From<braidinfer_core::safetensors::SafeTensorsError> for ModelError {
-    fn from(e: braidinfer_core::safetensors::SafeTensorsError) -> Self { ModelError::SafeTensors(e) }
+    fn from(e: braidinfer_core::safetensors::SafeTensorsError) -> Self {
+        ModelError::SafeTensors(e)
+    }
+}
+
+fn checked_hip_memcpy_h2d(
+    dst: *mut std::ffi::c_void,
+    src: *const std::ffi::c_void,
+    size: usize,
+) -> Result<(), ModelError> {
+    braidinfer_hip::error::check(unsafe {
+        ffi::hipMemcpy(dst, src, size, ffi::hipMemcpyHostToDevice)
+    })?;
+    Ok(())
 }
 
 impl From<std::io::Error> for ModelError {
-    fn from(e: std::io::Error) -> Self { ModelError::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        ModelError::Io(e)
+    }
 }
 
 impl std::fmt::Display for ModelError {
@@ -283,6 +302,7 @@ impl std::fmt::Display for ModelError {
             ModelError::Hip(e) => write!(f, "HIP error: {e:?}"),
             ModelError::SafeTensors(e) => write!(f, "SafeTensors error: {e}"),
             ModelError::MissingWeight(s) => write!(f, "Missing weight: {s}"),
+            ModelError::InvalidConfig(s) => write!(f, "Invalid model configuration: {s}"),
             ModelError::Io(e) => write!(f, "IO error: {e}"),
         }
     }
@@ -299,7 +319,10 @@ pub fn find_weight_name(st: &SafeTensorSet, candidates: &[String]) -> Result<Str
             return Ok(name.clone());
         }
     }
-    Err(ModelError::MissingWeight(format!("none of {:?} found", candidates)))
+    Err(ModelError::MissingWeight(format!(
+        "none of {:?} found",
+        candidates
+    )))
 }
 
 /// Load a bf16 tensor, returning a typed DeviceBuffer<u16>.
@@ -310,13 +333,19 @@ pub fn load_weight_bf16(
     device: DeviceId,
     expected_len: usize,
 ) -> Result<DeviceBuffer<u16>, ModelError> {
-    let raw = st.tensor_data(name)
+    let raw = st
+        .tensor_data(name)
         .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
-    assert_eq!(raw.len(), expected_len * 2, "weight {name}: expected {} bytes, got {}", expected_len * 2, raw.len());
+    assert_eq!(
+        raw.len(),
+        expected_len * 2,
+        "weight {name}: expected {} bytes, got {}",
+        expected_len * 2,
+        raw.len()
+    );
     let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
-    let data: &[u16] = unsafe {
-        std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
-    };
+    let data: &[u16] =
+        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len) };
     buf.copy_from_host(data)?;
     Ok(buf)
 }
@@ -337,30 +366,51 @@ pub fn load_weight_quantized(
     format: WeightFormat,
 ) -> Result<PackedWeights, ModelError> {
     let expected_len = out_dim * in_dim;
-    let raw = st.tensor_data(name)
+    let raw = st
+        .tensor_data(name)
         .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
-    assert_eq!(raw.len(), expected_len * 2, "weight {name}: expected {} bytes, got {}", expected_len * 2, raw.len());
-    let bf16_data: &[u16] = unsafe {
-        std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
-    };
+    assert_eq!(
+        raw.len(),
+        expected_len * 2,
+        "weight {name}: expected {} bytes, got {}",
+        expected_len * 2,
+        raw.len()
+    );
+    let bf16_data: &[u16] =
+        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len) };
 
     match format {
         WeightFormat::Bf16 => {
             let mut buf = DeviceBuffer::<u8>::alloc(device, expected_len * 2)?;
             buf.copy_from_host(raw)?;
-            Ok(PackedWeights { data: buf, format, out_dim, in_dim })
+            Ok(PackedWeights {
+                data: buf,
+                format,
+                out_dim,
+                in_dim,
+            })
         }
         WeightFormat::Rnf4G128 => {
             let packed = quantize_rnf4_g128(bf16_data, out_dim, in_dim);
             let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
             buf.copy_from_host(&packed)?;
-            Ok(PackedWeights { data: buf, format, out_dim, in_dim })
+            Ok(PackedWeights {
+                data: buf,
+                format,
+                out_dim,
+                in_dim,
+            })
         }
         WeightFormat::PcG32Q4 => {
             let packed = quantize_pc_g32_q4(bf16_data, out_dim, in_dim);
             let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
             buf.copy_from_host(&packed)?;
-            Ok(PackedWeights { data: buf, format, out_dim, in_dim })
+            Ok(PackedWeights {
+                data: buf,
+                format,
+                out_dim,
+                in_dim,
+            })
         }
     }
 }
@@ -372,10 +422,17 @@ pub fn weight_format_for(name: &str, mode: WeightQuantMode) -> WeightFormat {
         WeightQuantMode::Rnf4 => WeightFormat::Rnf4G128,
         WeightQuantMode::Mixed => {
             // MLP weights at PcG32Q4, everything else at Rnf4G128
-            if name.contains("mlp.") || name.contains("gate_proj") || name.contains("up_proj") || name.contains("down_proj") {
+            if name.contains("mlp.")
+                || name.contains("gate_proj")
+                || name.contains("up_proj")
+                || name.contains("down_proj")
+            {
                 // But NOT the MoE router gate
-                if name.contains("mlp.gate.weight") || name.contains("block_sparse_moe.gate") || name.contains("mlp.router") {
-                    WeightFormat::Bf16  // router stays bf16
+                if name.contains("mlp.gate.weight")
+                    || name.contains("block_sparse_moe.gate")
+                    || name.contains("mlp.router")
+                {
+                    WeightFormat::Bf16 // router stays bf16
                 } else {
                     WeightFormat::PcG32Q4
                 }
@@ -430,7 +487,12 @@ pub fn host_bf16_to_linear_weight(
             };
             let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
             buf.copy_from_host(&packed)?;
-            Ok(LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim, in_dim }))
+            Ok(LinearWeight::Packed(PackedWeights {
+                data: buf,
+                format: fmt,
+                out_dim,
+                in_dim,
+            }))
         }
     }
 }
@@ -448,7 +510,7 @@ fn host_bf16_quantize_upload_cache(
 ) -> Result<LinearWeight, ModelError> {
     let packed = match fmt {
         WeightFormat::Rnf4G128 => quantize_rnf4_g128(host_buf, out_dim, in_dim),
-        WeightFormat::PcG32Q4  => quantize_pc_g32_q4(host_buf, out_dim, in_dim),
+        WeightFormat::PcG32Q4 => quantize_pc_g32_q4(host_buf, out_dim, in_dim),
         WeightFormat::Bf16 => host_buf.iter().flat_map(|x| x.to_le_bytes()).collect(),
     };
     if let Some(w) = writer {
@@ -458,7 +520,12 @@ fn host_bf16_quantize_upload_cache(
     }
     let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
     buf.copy_from_host(&packed)?;
-    Ok(LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim, in_dim }))
+    Ok(LinearWeight::Packed(PackedWeights {
+        data: buf,
+        format: fmt,
+        out_dim,
+        in_dim,
+    }))
 }
 
 // --- BQNT (pre-quantized) loading ---
@@ -485,21 +552,27 @@ pub fn load_linear_weight_cached(
         }
         _ => {
             let expected_len = out_dim * in_dim;
-            let raw = st.tensor_data(name)
+            let raw = st
+                .tensor_data(name)
                 .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
-            let bf16_data: &[u16] = unsafe {
-                std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len)
-            };
+            let bf16_data: &[u16] =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, expected_len) };
             let packed = match format {
                 WeightFormat::Rnf4G128 => quantize_rnf4_g128(bf16_data, out_dim, in_dim),
-                WeightFormat::PcG32Q4  => quantize_pc_g32_q4(bf16_data, out_dim, in_dim),
+                WeightFormat::PcG32Q4 => quantize_pc_g32_q4(bf16_data, out_dim, in_dim),
                 WeightFormat::Bf16 => unreachable!(),
             };
-            writer.write_tensor(name, format, out_dim as u32, in_dim as u32, 2, &packed)
+            writer
+                .write_tensor(name, format, out_dim as u32, in_dim as u32, 2, &packed)
                 .map_err(|e| ModelError::MissingWeight(format!("bqnt write {name}: {e}")))?;
             let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
             buf.copy_from_host(&packed)?;
-            Ok(LinearWeight::Packed(PackedWeights { data: buf, format, out_dim, in_dim }))
+            Ok(LinearWeight::Packed(PackedWeights {
+                data: buf,
+                format,
+                out_dim,
+                in_dim,
+            }))
         }
     }
 }
@@ -511,19 +584,21 @@ pub fn load_linear_weight_bqnt(
     name: &str,
     device: DeviceId,
 ) -> Result<LinearWeight, ModelError> {
-    let entry = bqnt.entry(name)
+    let entry = bqnt
+        .entry(name)
         .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
-    let format = code_to_format(entry.format)
-        .ok_or_else(|| ModelError::MissingWeight(format!("{name}: unknown format code {}", entry.format)))?;
-    let data = bqnt.tensor_data(name)
+    let format = code_to_format(entry.format).ok_or_else(|| {
+        ModelError::MissingWeight(format!("{name}: unknown format code {}", entry.format))
+    })?;
+    let data = bqnt
+        .tensor_data(name)
         .ok_or_else(|| ModelError::MissingWeight(format!("{name}: data out of bounds")))?;
 
     match format {
         WeightFormat::Bf16 => {
             let n_elements = entry.out_features as usize * entry.in_features as usize;
-            let bf16_data: &[u16] = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u16, n_elements)
-            };
+            let bf16_data: &[u16] =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, n_elements) };
             let mut buf = DeviceBuffer::<u16>::alloc(device, n_elements)?;
             buf.copy_from_host(bf16_data)?;
             Ok(LinearWeight::Bf16(buf))
@@ -550,11 +625,15 @@ pub fn load_weight_bf16_bqnt(
     expected_len: usize,
 ) -> Result<DeviceBuffer<u16>, ModelError> {
     if let Some(data) = bqnt.tensor_data(name) {
-        assert_eq!(data.len(), expected_len * 2,
-            "bqnt weight {name}: expected {} bytes, got {}", expected_len * 2, data.len());
-        let bf16_data: &[u16] = unsafe {
-            std::slice::from_raw_parts(data.as_ptr() as *const u16, expected_len)
-        };
+        assert_eq!(
+            data.len(),
+            expected_len * 2,
+            "bqnt weight {name}: expected {} bytes, got {}",
+            expected_len * 2,
+            data.len()
+        );
+        let bf16_data: &[u16] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, expected_len) };
         let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
         buf.copy_from_host(bf16_data)?;
         Ok(buf)
@@ -588,7 +667,17 @@ pub fn load_moe_weights_lite_cached(
     bqnt: Option<&MmapBqnt>,
     writer: &mut crate::bqnt::BqntWriter,
 ) -> Result<MoeWeights, ModelError> {
-    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, true, Some(writer))
+    load_moe_weights_inner(
+        st,
+        prefix,
+        config,
+        ffn_type,
+        device,
+        wq,
+        bqnt,
+        true,
+        Some(writer),
+    )
 }
 
 /// Like load_moe_weights but writes packed bytes to writer for bqnt caching.
@@ -602,7 +691,17 @@ pub fn load_moe_weights_cached(
     bqnt: Option<&MmapBqnt>,
     writer: &mut crate::bqnt::BqntWriter,
 ) -> Result<MoeWeights, ModelError> {
-    load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, false, Some(writer))
+    load_moe_weights_inner(
+        st,
+        prefix,
+        config,
+        ffn_type,
+        device,
+        wq,
+        bqnt,
+        false,
+        Some(writer),
+    )
 }
 
 /// Load MoE weights, optionally skipping expert weights (for multi-GPU direct loading).
@@ -630,8 +729,16 @@ fn load_moe_weights_inner(
     skip_experts: bool,
     mut writer: Option<&mut crate::bqnt::BqntWriter>,
 ) -> Result<MoeWeights, ModelError> {
-    let FfnType::MoE { num_experts, expert_intermediate_size, num_shared, shared_intermediate_size, .. } = ffn_type
-        else { unreachable!("load_moe_weights called on non-MoE layer") };
+    let FfnType::MoE {
+        num_experts,
+        expert_intermediate_size,
+        num_shared,
+        shared_intermediate_size,
+        ..
+    } = ffn_type
+    else {
+        unreachable!("load_moe_weights called on non-MoE layer")
+    };
     let ne = *num_experts;
     let eis = *expert_intermediate_size;
     let hs = config.hidden_size;
@@ -647,7 +754,15 @@ fn load_moe_weights_inner(
         }
         if writer_cell.borrow().is_some() {
             let mut guard = writer_cell.borrow_mut();
-            load_linear_weight_cached(st, name, device, out_dim, in_dim, wq, guard.as_mut().unwrap())
+            load_linear_weight_cached(
+                st,
+                name,
+                device,
+                out_dim,
+                in_dim,
+                wq,
+                guard.as_mut().unwrap(),
+            )
         } else {
             load_linear_weight(st, name, device, out_dim, in_dim, wq)
         }
@@ -659,8 +774,10 @@ fn load_moe_weights_inner(
         format!("{prefix}gate.weight"),
         format!("{prefix}block_sparse_moe.gate.weight"),
         format!("{prefix}mlp.router.weight"),
-    ].into_iter().find(|n| st.tensor_data(n).is_ok())
-        .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.gate.weight (or variants)")))?;
+    ]
+    .into_iter()
+    .find(|n| st.tensor_data(n).is_ok())
+    .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.gate.weight (or variants)")))?;
     let gate = load_weight_bf16(st, &gate_name, device, ne * hs)?;
 
     // Detect whether experts have gate_proj (SwiGLU) or just up_proj (relu²)
@@ -668,11 +785,14 @@ fn load_moe_weights_inner(
     let fused_name_check = format!("{prefix}mlp.experts.gate_up_proj");
     let has_fused_gate_up = st.tensor_data(&fused_name_check).is_ok()
         || bqnt.map_or(false, |b| b.entry(&fused_name_check).is_some());
-    let has_gate_proj = has_fused_gate_up || [
-        format!("{prefix}mlp.experts.0.gate_proj.weight"),
-        format!("{prefix}experts.0.gate_proj.weight"),
-        format!("{prefix}block_sparse_moe.experts.0.w1.weight"),
-    ].iter().any(|n| st.tensor_data(n).is_ok());
+    let has_gate_proj = has_fused_gate_up
+        || [
+            format!("{prefix}mlp.experts.0.gate_proj.weight"),
+            format!("{prefix}experts.0.gate_proj.weight"),
+            format!("{prefix}block_sparse_moe.experts.0.w1.weight"),
+        ]
+        .iter()
+        .any(|n| st.tensor_data(n).is_ok());
 
     let expert_fmt = if has_gate_proj {
         weight_format_for(&format!("{prefix}mlp.experts.0.gate_proj.weight"), wq)
@@ -685,159 +805,245 @@ fn load_moe_weights_inner(
     let (expert_gate_up, expert_down) = if skip_experts {
         let empty_gu = LinearWeight::Packed(PackedWeights {
             data: DeviceBuffer::<u8>::alloc(device, 0)?,
-            format: WeightFormat::PcG32Q4, out_dim: 0, in_dim: 0,
+            format: WeightFormat::PcG32Q4,
+            out_dim: 0,
+            in_dim: 0,
         });
         let empty_d = LinearWeight::Packed(PackedWeights {
             data: DeviceBuffer::<u8>::alloc(device, 0)?,
-            format: WeightFormat::PcG32Q4, out_dim: 0, in_dim: 0,
+            format: WeightFormat::PcG32Q4,
+            out_dim: 0,
+            in_dim: 0,
         });
         (empty_gu, empty_d)
     } else {
-
-    // Expert gate+up: try bqnt fused, then safetensors fused, else per-expert fuse on host
-    let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
-    let bqnt_fused = bqnt.and_then(|b| load_linear_weight_bqnt(b, &fused_name, device).ok());
-    let expert_gate_up = if let Some(lw) = bqnt_fused {
-        lw
-    } else if st.tensor_data(&fused_name).is_ok() {
-        if writer_cell.borrow().is_some() {
-            let mut guard = writer_cell.borrow_mut();
-            load_linear_weight_cached(st, &fused_name, device, ne * 2 * eis, hs, wq, guard.as_mut().unwrap())?
+        // Expert gate+up: try bqnt fused, then safetensors fused, else per-expert fuse on host
+        let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
+        let bqnt_fused = bqnt.and_then(|b| load_linear_weight_bqnt(b, &fused_name, device).ok());
+        let expert_gate_up = if let Some(lw) = bqnt_fused {
+            lw
+        } else if st.tensor_data(&fused_name).is_ok() {
+            if writer_cell.borrow().is_some() {
+                let mut guard = writer_cell.borrow_mut();
+                load_linear_weight_cached(
+                    st,
+                    &fused_name,
+                    device,
+                    ne * 2 * eis,
+                    hs,
+                    wq,
+                    guard.as_mut().unwrap(),
+                )?
+            } else {
+                load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
+            }
+        } else if has_gate_proj {
+            // SwiGLU: fuse gate_proj + up_proj per expert
+            let expert_elems = 2 * eis * hs;
+            let mut host_buf = vec![0u16; ne * expert_elems];
+            for e in 0..ne {
+                let (gp, up) = [
+                    (
+                        format!("{prefix}mlp.experts.{e}.gate_proj.weight"),
+                        format!("{prefix}mlp.experts.{e}.up_proj.weight"),
+                    ),
+                    (
+                        format!("{prefix}block_sparse_moe.experts.{e}.w1.weight"),
+                        format!("{prefix}block_sparse_moe.experts.{e}.w3.weight"),
+                    ),
+                ]
+                .into_iter()
+                .find(|(g, _)| st.tensor_data(g).is_ok())
+                .ok_or_else(|| {
+                    ModelError::MissingWeight(format!(
+                        "{prefix}experts.{e}.gate_proj.weight (or variants)"
+                    ))
+                })?;
+                let g_raw = st
+                    .tensor_data(&gp)
+                    .map_err(|_| ModelError::MissingWeight(gp))?;
+                let u_raw = st
+                    .tensor_data(&up)
+                    .map_err(|_| ModelError::MissingWeight(up))?;
+                let dst_off = e * expert_elems;
+                let g_slice =
+                    unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
+                let u_slice =
+                    unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
+                host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
+                host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
+            }
+            let mut wg = writer_cell.borrow_mut();
+            host_bf16_quantize_upload_cache(
+                &host_buf,
+                ne * 2 * eis,
+                hs,
+                expert_fmt,
+                device,
+                &fused_name,
+                (*wg).as_deref_mut(),
+            )?
         } else {
-            load_linear_weight(st, &fused_name, device, ne * 2 * eis, hs, wq)?
-        }
-    } else if has_gate_proj {
-        // SwiGLU: fuse gate_proj + up_proj per expert
-        let expert_elems = 2 * eis * hs;
-        let mut host_buf = vec![0u16; ne * expert_elems];
-        for e in 0..ne {
-            let (gp, up) = [
-                (format!("{prefix}mlp.experts.{e}.gate_proj.weight"), format!("{prefix}mlp.experts.{e}.up_proj.weight")),
-                (format!("{prefix}block_sparse_moe.experts.{e}.w1.weight"), format!("{prefix}block_sparse_moe.experts.{e}.w3.weight")),
-            ].into_iter().find(|(g, _)| st.tensor_data(g).is_ok())
-                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.gate_proj.weight (or variants)")))?;
-            let g_raw = st.tensor_data(&gp).map_err(|_| ModelError::MissingWeight(gp))?;
-            let u_raw = st.tensor_data(&up).map_err(|_| ModelError::MissingWeight(up))?;
-            let dst_off = e * expert_elems;
-            let g_slice = unsafe { std::slice::from_raw_parts(g_raw.as_ptr() as *const u16, eis * hs) };
-            let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, eis * hs) };
-            host_buf[dst_off..dst_off + eis * hs].copy_from_slice(g_slice);
-            host_buf[dst_off + eis * hs..dst_off + expert_elems].copy_from_slice(u_slice);
-        }
-        let mut wg = writer_cell.borrow_mut();
-        host_bf16_quantize_upload_cache(&host_buf, ne * 2 * eis, hs, expert_fmt, device,
-            &fused_name, (*wg).as_deref_mut())?
-    } else {
-        // No gate_proj (relu² activation): load only up_proj per expert
-        // Try bqnt per-expert concatenation first
-        let first_up_name = [
-            format!("{prefix}experts.0.up_proj.weight"),
-            format!("{prefix}mlp.experts.0.up_proj.weight"),
-        ].into_iter().find(|n| bqnt.map_or(false, |b| b.entry(n).is_some()) || st.tensor_data(n).is_ok());
-        let bqnt_per_expert = first_up_name.as_ref().and_then(|_| bqnt).and_then(|b| {
-            // Try to concatenate per-expert packed bytes from bqnt
-            let first_name = [
+            // No gate_proj (relu² activation): load only up_proj per expert
+            // Try bqnt per-expert concatenation first
+            let first_up_name = [
                 format!("{prefix}experts.0.up_proj.weight"),
                 format!("{prefix}mlp.experts.0.up_proj.weight"),
-            ].into_iter().find(|n| b.entry(n).is_some())?;
-            let first_entry = b.entry(&first_name)?;
-            let per_expert_bytes = first_entry.data_bytes as usize;
-            let mut packed = vec![0u8; ne * per_expert_bytes];
-            for e in 0..ne {
-                let name = first_name.replace(".0.", &format!(".{e}."));
-                let data = b.tensor_data(&name)?;
-                packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+            ]
+            .into_iter()
+            .find(|n| bqnt.map_or(false, |b| b.entry(n).is_some()) || st.tensor_data(n).is_ok());
+            let bqnt_per_expert = first_up_name.as_ref().and_then(|_| bqnt).and_then(|b| {
+                // Try to concatenate per-expert packed bytes from bqnt
+                let first_name = [
+                    format!("{prefix}experts.0.up_proj.weight"),
+                    format!("{prefix}mlp.experts.0.up_proj.weight"),
+                ]
+                .into_iter()
+                .find(|n| b.entry(n).is_some())?;
+                let first_entry = b.entry(&first_name)?;
+                let per_expert_bytes = first_entry.data_bytes as usize;
+                let mut packed = vec![0u8; ne * per_expert_bytes];
+                for e in 0..ne {
+                    let name = first_name.replace(".0.", &format!(".{e}."));
+                    let data = b.tensor_data(&name)?;
+                    packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+                }
+                let fmt = code_to_format(first_entry.format)?;
+                let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
+                buf.copy_from_host(&packed).ok()?;
+                Some(LinearWeight::Packed(PackedWeights {
+                    data: buf,
+                    format: fmt,
+                    out_dim: ne * first_entry.out_features as usize,
+                    in_dim: first_entry.in_features as usize,
+                }))
+            });
+            if let Some(lw) = bqnt_per_expert {
+                lw
+            } else {
+                let expert_elems = eis * hs;
+                let mut host_buf = vec![0u16; ne * expert_elems];
+                for e in 0..ne {
+                    let up_name = [
+                        format!("{prefix}experts.{e}.up_proj.weight"),
+                        format!("{prefix}mlp.experts.{e}.up_proj.weight"),
+                    ]
+                    .into_iter()
+                    .find(|n| st.tensor_data(n).is_ok())
+                    .ok_or_else(|| {
+                        ModelError::MissingWeight(format!("{prefix}experts.{e}.up_proj.weight"))
+                    })?;
+                    let u_raw = st
+                        .tensor_data(&up_name)
+                        .map_err(|_| ModelError::MissingWeight(up_name))?;
+                    let u_slice = unsafe {
+                        std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, expert_elems)
+                    };
+                    let dst_off = e * expert_elems;
+                    host_buf[dst_off..dst_off + expert_elems].copy_from_slice(u_slice);
+                }
+                // Store as expert_gate_up with size eis (not 2*eis) — dispatch must handle this
+                let mut wg2 = writer_cell.borrow_mut();
+                host_bf16_quantize_upload_cache(
+                    &host_buf,
+                    ne * eis,
+                    hs,
+                    expert_fmt,
+                    device,
+                    &fused_name,
+                    (*wg2).as_deref_mut(),
+                )?
             }
-            let fmt = code_to_format(first_entry.format)?;
-            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
-            buf.copy_from_host(&packed).ok()?;
-            Some(LinearWeight::Packed(PackedWeights {
-                data: buf, format: fmt,
-                out_dim: ne * first_entry.out_features as usize,
-                in_dim: first_entry.in_features as usize,
-            }))
-        });
-        if let Some(lw) = bqnt_per_expert {
-            lw
-        } else {
-        let expert_elems = eis * hs;
-        let mut host_buf = vec![0u16; ne * expert_elems];
-        for e in 0..ne {
-            let up_name = [
-                format!("{prefix}experts.{e}.up_proj.weight"),
-                format!("{prefix}mlp.experts.{e}.up_proj.weight"),
-            ].into_iter().find(|n| st.tensor_data(n).is_ok())
-                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.up_proj.weight")))?;
-            let u_raw = st.tensor_data(&up_name).map_err(|_| ModelError::MissingWeight(up_name))?;
-            let u_slice = unsafe { std::slice::from_raw_parts(u_raw.as_ptr() as *const u16, expert_elems) };
-            let dst_off = e * expert_elems;
-            host_buf[dst_off..dst_off + expert_elems].copy_from_slice(u_slice);
-        }
-        // Store as expert_gate_up with size eis (not 2*eis) — dispatch must handle this
-        let mut wg2 = writer_cell.borrow_mut();
-        host_bf16_quantize_upload_cache(&host_buf, ne * eis, hs, expert_fmt, device,
-            &fused_name, (*wg2).as_deref_mut())?
-    }};
+        };
 
-    // --- Expert down ---
-    let down_name = format!("{prefix}mlp.experts.down_proj");
-    let bqnt_down = bqnt.and_then(|b| load_linear_weight_bqnt(b, &down_name, device).ok());
-    let expert_down = if let Some(lw) = bqnt_down {
-        lw
-    } else if st.tensor_data(&down_name).is_ok() {
-        if writer_cell.borrow().is_some() {
-            let mut guard = writer_cell.borrow_mut();
-            load_linear_weight_cached(st, &down_name, device, ne * hs, eis, wq, guard.as_mut().unwrap())?
-        } else {
-            load_linear_weight(st, &down_name, device, ne * hs, eis, wq)?
-        }
-    } else {
-        // Try bqnt per-expert concatenation for down_proj
-        let bqnt_per_expert_down = bqnt.and_then(|b| {
-            let first_name = [
-                format!("{prefix}mlp.experts.0.down_proj.weight"),
-                format!("{prefix}experts.0.down_proj.weight"),
-            ].into_iter().find(|n| b.entry(n).is_some())?;
-            let first_entry = b.entry(&first_name)?;
-            let per_expert_bytes = first_entry.data_bytes as usize;
-            let mut packed = vec![0u8; ne * per_expert_bytes];
-            for e in 0..ne {
-                let name = first_name.replace(".0.", &format!(".{e}."));
-                let data = b.tensor_data(&name)?;
-                packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+        // --- Expert down ---
+        let down_name = format!("{prefix}mlp.experts.down_proj");
+        let bqnt_down = bqnt.and_then(|b| load_linear_weight_bqnt(b, &down_name, device).ok());
+        let expert_down = if let Some(lw) = bqnt_down {
+            lw
+        } else if st.tensor_data(&down_name).is_ok() {
+            if writer_cell.borrow().is_some() {
+                let mut guard = writer_cell.borrow_mut();
+                load_linear_weight_cached(
+                    st,
+                    &down_name,
+                    device,
+                    ne * hs,
+                    eis,
+                    wq,
+                    guard.as_mut().unwrap(),
+                )?
+            } else {
+                load_linear_weight(st, &down_name, device, ne * hs, eis, wq)?
             }
-            let fmt = code_to_format(first_entry.format)?;
-            let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
-            buf.copy_from_host(&packed).ok()?;
-            Some(LinearWeight::Packed(PackedWeights {
-                data: buf, format: fmt,
-                out_dim: ne * first_entry.out_features as usize,
-                in_dim: first_entry.in_features as usize,
-            }))
-        });
-        if let Some(lw) = bqnt_per_expert_down {
-            lw
         } else {
-        let expert_elems_d = hs * eis;
-        let mut host_buf_d = vec![0u16; ne * expert_elems_d];
-        for e in 0..ne {
-            let dp = [
-                format!("{prefix}mlp.experts.{e}.down_proj.weight"),
-                format!("{prefix}experts.{e}.down_proj.weight"),
-                format!("{prefix}block_sparse_moe.experts.{e}.w2.weight"),
-            ].into_iter().find(|n| st.tensor_data(n).is_ok())
-                .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}experts.{e}.down_proj (or variants)")))?;
-            let d_raw = st.tensor_data(&dp).map_err(|_| ModelError::MissingWeight(dp))?;
-            let d_slice = unsafe { std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d) };
-            let dst_off = e * expert_elems_d;
-            host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
-        }
-        let mut wg3 = writer_cell.borrow_mut();
-        host_bf16_quantize_upload_cache(&host_buf_d, ne * hs, eis, expert_fmt, device,
-            &down_name, (*wg3).as_deref_mut())?
-    }};
+            // Try bqnt per-expert concatenation for down_proj
+            let bqnt_per_expert_down = bqnt.and_then(|b| {
+                let first_name = [
+                    format!("{prefix}mlp.experts.0.down_proj.weight"),
+                    format!("{prefix}experts.0.down_proj.weight"),
+                ]
+                .into_iter()
+                .find(|n| b.entry(n).is_some())?;
+                let first_entry = b.entry(&first_name)?;
+                let per_expert_bytes = first_entry.data_bytes as usize;
+                let mut packed = vec![0u8; ne * per_expert_bytes];
+                for e in 0..ne {
+                    let name = first_name.replace(".0.", &format!(".{e}."));
+                    let data = b.tensor_data(&name)?;
+                    packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+                }
+                let fmt = code_to_format(first_entry.format)?;
+                let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
+                buf.copy_from_host(&packed).ok()?;
+                Some(LinearWeight::Packed(PackedWeights {
+                    data: buf,
+                    format: fmt,
+                    out_dim: ne * first_entry.out_features as usize,
+                    in_dim: first_entry.in_features as usize,
+                }))
+            });
+            if let Some(lw) = bqnt_per_expert_down {
+                lw
+            } else {
+                let expert_elems_d = hs * eis;
+                let mut host_buf_d = vec![0u16; ne * expert_elems_d];
+                for e in 0..ne {
+                    let dp = [
+                        format!("{prefix}mlp.experts.{e}.down_proj.weight"),
+                        format!("{prefix}experts.{e}.down_proj.weight"),
+                        format!("{prefix}block_sparse_moe.experts.{e}.w2.weight"),
+                    ]
+                    .into_iter()
+                    .find(|n| st.tensor_data(n).is_ok())
+                    .ok_or_else(|| {
+                        ModelError::MissingWeight(format!(
+                            "{prefix}experts.{e}.down_proj (or variants)"
+                        ))
+                    })?;
+                    let d_raw = st
+                        .tensor_data(&dp)
+                        .map_err(|_| ModelError::MissingWeight(dp))?;
+                    let d_slice = unsafe {
+                        std::slice::from_raw_parts(d_raw.as_ptr() as *const u16, expert_elems_d)
+                    };
+                    let dst_off = e * expert_elems_d;
+                    host_buf_d[dst_off..dst_off + expert_elems_d].copy_from_slice(d_slice);
+                }
+                let mut wg3 = writer_cell.borrow_mut();
+                host_bf16_quantize_upload_cache(
+                    &host_buf_d,
+                    ne * hs,
+                    eis,
+                    expert_fmt,
+                    device,
+                    &down_name,
+                    (*wg3).as_deref_mut(),
+                )?
+            }
+        };
 
-    (expert_gate_up, expert_down)
+        (expert_gate_up, expert_down)
     }; // end else (skip_experts)
 
     // Shared expert (optional)
@@ -845,18 +1051,27 @@ fn load_moe_weights_inner(
         let sis = *shared_intermediate_size;
         let sis = if sis == 0 { eis } else { sis };
         // Try multiple naming patterns for shared expert weights
-        let se_up_name = find_weight_name(st, &[
-            format!("{prefix}mlp.shared_expert.up_proj.weight"),
-            format!("{prefix}shared_experts.up_proj.weight"),
-        ])?;
-        let se_down_name = find_weight_name(st, &[
-            format!("{prefix}mlp.shared_expert.down_proj.weight"),
-            format!("{prefix}shared_experts.down_proj.weight"),
-        ])?;
-        let se_gate_name = find_weight_name(st, &[
-            format!("{prefix}mlp.shared_expert.gate_proj.weight"),
-            format!("{prefix}shared_experts.gate_proj.weight"),
-        ]);
+        let se_up_name = find_weight_name(
+            st,
+            &[
+                format!("{prefix}mlp.shared_expert.up_proj.weight"),
+                format!("{prefix}shared_experts.up_proj.weight"),
+            ],
+        )?;
+        let se_down_name = find_weight_name(
+            st,
+            &[
+                format!("{prefix}mlp.shared_expert.down_proj.weight"),
+                format!("{prefix}shared_experts.down_proj.weight"),
+            ],
+        )?;
+        let se_gate_name = find_weight_name(
+            st,
+            &[
+                format!("{prefix}mlp.shared_expert.gate_proj.weight"),
+                format!("{prefix}shared_experts.gate_proj.weight"),
+            ],
+        );
         let gate_proj = if let Ok(name) = se_gate_name {
             load_lw(&name, sis, hs)?
         } else {
@@ -868,37 +1083,58 @@ fn load_moe_weights_inner(
             up_proj: load_lw(&se_up_name, sis, hs)?,
             down_proj: load_lw(&se_down_name, hs, sis)?,
         })
-    } else { None };
+    } else {
+        None
+    };
 
     // Shared expert gate (optional)
     let shared_gate_name = format!("{prefix}mlp.shared_expert_gate.weight");
     let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
         Some(load_weight_bf16(st, &shared_gate_name, device, hs)?)
-    } else { None };
+    } else {
+        None
+    };
 
     // Score correction bias (Nemotron): added to scores before top-k selection
-    let bias_name = find_weight_name(st, &[
-        format!("{prefix}gate.e_score_correction_bias"),
-        format!("{prefix}mlp.gate.e_score_correction_bias"),
-    ]);
+    let bias_name = find_weight_name(
+        st,
+        &[
+            format!("{prefix}gate.e_score_correction_bias"),
+            format!("{prefix}mlp.gate.e_score_correction_bias"),
+        ],
+    );
     let score_correction_bias = if let Ok(name) = bias_name {
-        let raw = st.tensor_data(&name).map_err(|_| ModelError::MissingWeight(name.clone()))?;
+        let raw = st
+            .tensor_data(&name)
+            .map_err(|_| ModelError::MissingWeight(name.clone()))?;
         // f32 tensor: 4 bytes per element
-        let data: Vec<f32> = unsafe {
-            std::slice::from_raw_parts(raw.as_ptr() as *const f32, ne)
-        }.to_vec();
+        let data: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, ne) }.to_vec();
         Some(data)
-    } else { None };
+    } else {
+        None
+    };
 
     let score_correction_bias_gpu = if let Some(ref bias) = score_correction_bias {
         let mut buf = DeviceBuffer::<f32>::alloc(device, ne)?;
         buf.copy_from_host(bias)?;
         Some(buf)
-    } else { None };
+    } else {
+        None
+    };
 
-    Ok(MoeWeights { gate, expert_gate_up, expert_down, shared_expert, shared_expert_gate,
-        num_experts: ne, expert_intermediate_size: eis, has_gate_proj, score_correction_bias,
-        score_correction_bias_gpu })
+    Ok(MoeWeights {
+        gate,
+        expert_gate_up,
+        expert_down,
+        shared_expert,
+        shared_expert_gate,
+        num_experts: ne,
+        expert_intermediate_size: eis,
+        has_gate_proj,
+        score_correction_bias,
+        score_correction_bias_gpu,
+    })
 }
 
 /// Load a tensor as f32. For f32 on disk: reinterpret. For bf16: convert on CPU.
@@ -909,9 +1145,11 @@ pub fn load_weight_f32(
     device: DeviceId,
     expected_len: usize,
 ) -> Result<DeviceBuffer<f32>, ModelError> {
-    let info = st.tensor_info(name)
+    let info = st
+        .tensor_info(name)
         .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
-    let raw = st.tensor_data(name)
+    let raw = st
+        .tensor_data(name)
         .map_err(|_| ModelError::MissingWeight(name.to_string()))?;
     let data: Vec<f32> = match info.dtype {
         Dtype::F32 => {
@@ -1004,12 +1242,20 @@ pub fn distribute_moe_weights_from_ref(
 ) -> Result<DistributedMoeWeights, ModelError> {
     use braidinfer_hip::device::Device;
 
+    if start_gpu >= num_devices {
+        return Err(ModelError::InvalidConfig(format!(
+            "start_gpu {start_gpu} must be less than num_devices {num_devices}"
+        )));
+    }
+
     let ne = moe.num_experts;
     let eis = moe.expert_intermediate_size;
 
     // Compute byte strides
     let gate_up_rows_per_expert = if moe.has_gate_proj { 2 * eis } else { eis };
-    let gate_up_expert_stride = moe.expert_gate_up.row_byte_offset_dim(gate_up_rows_per_expert, hs);
+    let gate_up_expert_stride = moe
+        .expert_gate_up
+        .row_byte_offset_dim(gate_up_rows_per_expert, hs);
     let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
     let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
 
@@ -1077,7 +1323,9 @@ pub fn distribute_moe_weights_from_ref(
 
     for e in 0..ne {
         let gpu = expert_device[e];
-        if gpu == 0 { continue; } // GPU 0 uses original packed buffer
+        if gpu == 0 {
+            continue;
+        } // GPU 0 uses original packed buffer
 
         let local_slot = expert_buffers[gpu].slot_map[e].unwrap();
 
@@ -1086,12 +1334,15 @@ pub fn distribute_moe_weights_from_ref(
         let dst_offset = local_slot * gate_up_expert_stride;
         Device::set_current(DeviceId(0))?;
         braidinfer_hip::memory::memcpy_d2h(
-            &mut host_buf, unsafe { src_gate_up.add(src_offset) }, gate_up_expert_stride,
+            &mut host_buf,
+            unsafe { src_gate_up.add(src_offset) },
+            gate_up_expert_stride,
         )?;
         Device::set_current(DeviceId(gpu as u32))?;
         braidinfer_hip::memory::memcpy_h2d(
             unsafe { expert_buffers[gpu].gate_up.as_write_ptr().add(dst_offset) },
-            &host_buf, gate_up_expert_stride,
+            &host_buf,
+            gate_up_expert_stride,
         )?;
 
         // down: GPU 0 → host → target GPU
@@ -1099,12 +1350,15 @@ pub fn distribute_moe_weights_from_ref(
         let dst_offset = local_slot * down_expert_stride;
         Device::set_current(DeviceId(0))?;
         braidinfer_hip::memory::memcpy_d2h(
-            &mut host_buf, unsafe { src_down.add(src_offset) }, down_expert_stride,
+            &mut host_buf,
+            unsafe { src_down.add(src_offset) },
+            down_expert_stride,
         )?;
         Device::set_current(DeviceId(gpu as u32))?;
         braidinfer_hip::memory::memcpy_h2d(
             unsafe { expert_buffers[gpu].down.as_write_ptr().add(dst_offset) },
-            &host_buf, down_expert_stride,
+            &host_buf,
+            down_expert_stride,
         )?;
     }
 
@@ -1126,7 +1380,6 @@ pub fn distribute_moe_weights_from_ref(
     })
 }
 
-
 /// Load expert weights directly from bqnt to per-GPU buffers.
 /// For models too large for single GPU (e.g. 122B).
 /// `start_gpu`: first GPU to receive experts (0 for kbk, 1 for gpu-dispatch).
@@ -1141,15 +1394,37 @@ pub fn distribute_moe_weights_from_bqnt(
 ) -> Result<DistributedMoeWeights, ModelError> {
     use braidinfer_hip::device::Device;
 
+    if start_gpu >= num_devices {
+        return Err(ModelError::InvalidConfig(format!(
+            "start_gpu {start_gpu} must be less than num_devices {num_devices}"
+        )));
+    }
+
     let ne = moe.num_experts;
     let eis = moe.expert_intermediate_size;
     let has_gate_proj = moe.has_gate_proj;
 
     // Detect ffn key: Qwen uses "mlp.", Nemotron uses "mixer."
-    let ffn_key = if bqnt.entry(&format!("{prefix}layers.{layer_idx}.mixer.experts.gate_up_proj")).is_some()
-        || bqnt.entry(&format!("{prefix}layers.{layer_idx}.mixer.experts.0.up_proj.weight")).is_some()
-        || bqnt.entry(&format!("{prefix}layers.{layer_idx}.mixer.experts.0.gate_proj.weight")).is_some()
-    { "mixer" } else { "mlp" };
+    let ffn_key = if bqnt
+        .entry(&format!(
+            "{prefix}layers.{layer_idx}.mixer.experts.gate_up_proj"
+        ))
+        .is_some()
+        || bqnt
+            .entry(&format!(
+                "{prefix}layers.{layer_idx}.mixer.experts.0.up_proj.weight"
+            ))
+            .is_some()
+        || bqnt
+            .entry(&format!(
+                "{prefix}layers.{layer_idx}.mixer.experts.0.gate_proj.weight"
+            ))
+            .is_some()
+    {
+        "mixer"
+    } else {
+        "mlp"
+    };
 
     // Check for fused gate_up_proj tensor
     let fused_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.gate_up_proj");
@@ -1161,15 +1436,23 @@ pub fn distribute_moe_weights_from_bqnt(
             fused_name.clone()
         } else {
             let first_up = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.0.up_proj.weight");
-            let first_gate = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.0.gate_proj.weight");
-            if bqnt.entry(&first_gate).is_some() { first_gate } else { first_up }
+            let first_gate =
+                format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.0.gate_proj.weight");
+            if bqnt.entry(&first_gate).is_some() {
+                first_gate
+            } else {
+                first_up
+            }
         };
-        let entry = bqnt.entry(&probe_name)
+        let entry = bqnt
+            .entry(&probe_name)
             .ok_or_else(|| ModelError::MissingWeight(probe_name.clone()))?;
-        crate::bqnt::code_to_format(entry.format)
-            .ok_or_else(|| ModelError::MissingWeight(
-                format!("{probe_name}: unknown bqnt format code {}", entry.format)
-            ))?
+        crate::bqnt::code_to_format(entry.format).ok_or_else(|| {
+            ModelError::MissingWeight(format!(
+                "{probe_name}: unknown bqnt format code {}",
+                entry.format
+            ))
+        })?
     };
 
     // Get byte sizes per expert from bqnt entries
@@ -1177,17 +1460,24 @@ pub fn distribute_moe_weights_from_bqnt(
         let entry = bqnt.entry(&fused_name).unwrap();
         let gu_total = entry.data_bytes as usize;
         let down_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.down_proj");
-        let down_entry = bqnt.entry(&down_name)
+        let down_entry = bqnt
+            .entry(&down_name)
             .ok_or_else(|| ModelError::MissingWeight(down_name))?;
         (gu_total / ne, down_entry.data_bytes as usize / ne)
     } else {
         let first_up = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.0.up_proj.weight");
-        let entry = bqnt.entry(&first_up)
+        let entry = bqnt
+            .entry(&first_up)
             .ok_or_else(|| ModelError::MissingWeight(first_up))?;
         let up_bytes = entry.data_bytes as usize;
-        let gu = if has_gate_proj { up_bytes * 2 } else { up_bytes };
+        let gu = if has_gate_proj {
+            up_bytes * 2
+        } else {
+            up_bytes
+        };
         let first_down = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.0.down_proj.weight");
-        let down_entry = bqnt.entry(&first_down)
+        let down_entry = bqnt
+            .entry(&first_down)
             .ok_or_else(|| ModelError::MissingWeight(first_down))?;
         (gu, down_entry.data_bytes as usize)
     };
@@ -1230,10 +1520,12 @@ pub fn distribute_moe_weights_from_bqnt(
 
     // Load from bqnt host memory directly to per-GPU buffers
     if has_fused {
-        let gu_data = bqnt.tensor_data(&fused_name)
+        let gu_data = bqnt
+            .tensor_data(&fused_name)
             .ok_or_else(|| ModelError::MissingWeight(fused_name.clone()))?;
         let down_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.down_proj");
-        let down_data = bqnt.tensor_data(&down_name)
+        let down_data = bqnt
+            .tensor_data(&down_name)
             .ok_or_else(|| ModelError::MissingWeight(down_name))?;
 
         for e in 0..ne {
@@ -1242,21 +1534,27 @@ pub fn distribute_moe_weights_from_bqnt(
             Device::set_current(DeviceId(gpu as u32))?;
 
             let gu_src = &gu_data[e * gu_bytes_per_expert..(e + 1) * gu_bytes_per_expert];
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) as *mut _,
-                    gu_src.as_ptr() as *const _, gu_bytes_per_expert,
-                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                );
-            }
+            checked_hip_memcpy_h2d(
+                unsafe {
+                    expert_buffers[gpu]
+                        .gate_up
+                        .as_ptr()
+                        .add(slot * gu_bytes_per_expert) as *mut _
+                },
+                gu_src.as_ptr() as *const _,
+                gu_bytes_per_expert,
+            )?;
             let d_src = &down_data[e * down_bytes_per_expert..(e + 1) * down_bytes_per_expert];
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    expert_buffers[gpu].down.as_ptr().add(slot * down_bytes_per_expert) as *mut _,
-                    d_src.as_ptr() as *const _, down_bytes_per_expert,
-                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                );
-            }
+            checked_hip_memcpy_h2d(
+                unsafe {
+                    expert_buffers[gpu]
+                        .down
+                        .as_ptr()
+                        .add(slot * down_bytes_per_expert) as *mut _
+                },
+                d_src.as_ptr() as *const _,
+                down_bytes_per_expert,
+            )?;
         }
     } else {
         for e in 0..ne {
@@ -1266,40 +1564,71 @@ pub fn distribute_moe_weights_from_bqnt(
 
             // gate_up
             if has_gate_proj {
-                let gate_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.gate_proj.weight");
-                let up_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.up_proj.weight");
-                let g = bqnt.tensor_data(&gate_name).ok_or_else(|| ModelError::MissingWeight(gate_name))?;
-                let u = bqnt.tensor_data(&up_name).ok_or_else(|| ModelError::MissingWeight(up_name))?;
-                let dst = unsafe { expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) };
-                unsafe {
-                    braidinfer_hip::ffi::hipMemcpy(dst as *mut _, g.as_ptr() as *const _, g.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice);
-                    braidinfer_hip::ffi::hipMemcpy(dst.add(g.len()) as *mut _, u.as_ptr() as *const _, u.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice);
-                }
+                let gate_name =
+                    format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.gate_proj.weight");
+                let up_name =
+                    format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.up_proj.weight");
+                let g = bqnt
+                    .tensor_data(&gate_name)
+                    .ok_or_else(|| ModelError::MissingWeight(gate_name))?;
+                let u = bqnt
+                    .tensor_data(&up_name)
+                    .ok_or_else(|| ModelError::MissingWeight(up_name))?;
+                let dst = unsafe {
+                    expert_buffers[gpu]
+                        .gate_up
+                        .as_ptr()
+                        .add(slot * gu_bytes_per_expert)
+                };
+                checked_hip_memcpy_h2d(dst as *mut _, g.as_ptr() as *const _, g.len())?;
+                checked_hip_memcpy_h2d(
+                    unsafe { dst.add(g.len()) as *mut _ },
+                    u.as_ptr() as *const _,
+                    u.len(),
+                )?;
             } else {
-                let up_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.up_proj.weight");
-                let u = bqnt.tensor_data(&up_name).ok_or_else(|| ModelError::MissingWeight(up_name))?;
-                unsafe {
-                    braidinfer_hip::ffi::hipMemcpy(
-                        expert_buffers[gpu].gate_up.as_ptr().add(slot * gu_bytes_per_expert) as *mut _,
-                        u.as_ptr() as *const _, u.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                    );
-                }
+                let up_name =
+                    format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.up_proj.weight");
+                let u = bqnt
+                    .tensor_data(&up_name)
+                    .ok_or_else(|| ModelError::MissingWeight(up_name))?;
+                checked_hip_memcpy_h2d(
+                    unsafe {
+                        expert_buffers[gpu]
+                            .gate_up
+                            .as_ptr()
+                            .add(slot * gu_bytes_per_expert) as *mut _
+                    },
+                    u.as_ptr() as *const _,
+                    u.len(),
+                )?;
             }
 
             // down
-            let down_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.down_proj.weight");
-            let d = bqnt.tensor_data(&down_name).ok_or_else(|| ModelError::MissingWeight(down_name))?;
-            unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    expert_buffers[gpu].down.as_ptr().add(slot * down_bytes_per_expert) as *mut _,
-                    d.as_ptr() as *const _, d.len(), braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                );
-            }
+            let down_name =
+                format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.{e}.down_proj.weight");
+            let d = bqnt
+                .tensor_data(&down_name)
+                .ok_or_else(|| ModelError::MissingWeight(down_name))?;
+            checked_hip_memcpy_h2d(
+                unsafe {
+                    expert_buffers[gpu]
+                        .down
+                        .as_ptr()
+                        .add(slot * down_bytes_per_expert) as *mut _
+                },
+                d.as_ptr() as *const _,
+                d.len(),
+            )?;
         }
     }
 
     Device::set_current(DeviceId(0))?;
-    eprintln!("  Layer {layer_idx}: {ne} experts distributed ({} per GPU, {} GPUs)", ne / num_devices, num_devices);
+    eprintln!(
+        "  Layer {layer_idx}: {ne} experts distributed ({} per GPU, {} GPUs)",
+        ne / num_devices,
+        num_devices
+    );
 
     let gpu0_gu = expert_buffers[0].gate_up.as_ptr();
     let gpu0_d = expert_buffers[0].down.as_ptr();

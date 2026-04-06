@@ -1,23 +1,23 @@
 //! Megakernel program compilation: translates model config + weights into instruction streams.
 //! Extracted from megakernel.rs for maintainability.
 
+use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
-use braidinfer_hip::HipResult;
 
-use crate::model::{
-    ActivationBuffers, AttentionLayerWeights, KvCache, GdnState,
-    LayerWeights, ModelConfig, Model,
-};
-use super::{Instruction, MegakernelProgram, PrefillBuffers, INST_SIZE, NUM_CUS, CHUNK_TOKENS};
+use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
-use super::{OP_RMSNORM, OP_LINEAR_PROJ, OP_CONV1D, OP_GDN_GATE, OP_GDN_RECUR,
-    OP_RMSNORM_GATE, OP_RESIDUAL_ADD, OP_QK_NORM, OP_MROPE, OP_GQA_ATTN, OP_OUTPUT_GATE,
-    OP_FFN_GATE_UP, OP_FFN_DOWN_RES, OP_EMBEDDING, OP_LM_HEAD, OP_HALT, OP_D2D_COPY,
-    OP_ATTN_PAGED, OP_ATTN_PREFILL, OP_DEINTERLEAVE, OP_KV_QUANTIZE, OP_ATTN_PAGED_Q,
-    OP_MOE_GATE, OP_MOE_FFN, OP_LINEAR_PROJ_RNF4, OP_LINEAR_PROJ_PCG32, OP_RMSNORM_WX,
-    OP_SILU_MUL, OP_FFN_GATE_UP_RNF4, OP_FFN_DOWN_RES_RNF4,
-    OP_SIGMOID_WEIGHTED_ADD, OP_BARRIER, OP_MOE_DISPATCH};
+use super::{
+    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
+    OP_DEINTERLEAVE, OP_EMBEDDING, OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP,
+    OP_FFN_GATE_UP_RNF4, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT, OP_KV_QUANTIZE,
+    OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_LM_HEAD, OP_MOE_DISPATCH,
+    OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM, OP_RESIDUAL_ADD, OP_RMSNORM,
+    OP_RMSNORM_GATE, OP_RMSNORM_WX, OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL,
+};
+use crate::model::{
+    ActivationBuffers, AttentionLayerWeights, GdnState, KvCache, LayerWeights, Model, ModelConfig,
+};
 
 fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight, ptr_slot: usize) {
     use crate::model::{LinearWeight, WeightFormat};
@@ -58,13 +58,19 @@ fn emit_batched_linear_proj(
     inst.set_int(4, out_dim as i32);
     inst.set_int(5, in_dim as i32);
     inst.set_int(6, n as i32);
-    if no_sync { inst.set_no_sync(); }
+    if no_sync {
+        inst.set_no_sync();
+    }
     instructions.push(inst);
 }
 
 /// Choose RMSNorm opcode based on model config.
 fn rmsnorm_opcode(one_plus_w: bool) -> u32 {
-    if one_plus_w { OP_RMSNORM } else { OP_RMSNORM_WX }
+    if one_plus_w {
+        OP_RMSNORM
+    } else {
+        OP_RMSNORM_WX
+    }
 }
 fn div_ceil(a: u32, b: u32) -> u32 {
     (a + b - 1) / b
@@ -75,9 +81,15 @@ enum AttentionVariant<'a> {
     /// Flat (non-paged) decode: GQA attention, KV written after mRoPE.
     FlatKv { kv_cache: &'a KvCache },
     /// Paged decode: OP_ATTN_PAGED, KV written BEFORE mRoPE.
-    PagedKv { kv_cache: &'a KvCache, attn_layer_index: usize },
+    PagedKv {
+        kv_cache: &'a KvCache,
+        attn_layer_index: usize,
+    },
     /// Prefill (N tokens): OP_ATTN_PREFILL, bulk KV write after mRoPE.
-    Prefill { kv_cache: &'a KvCache, start_pos: u32 },
+    Prefill {
+        kv_cache: &'a KvCache,
+        start_pos: u32,
+    },
 }
 
 impl MegakernelProgram {
@@ -92,7 +104,10 @@ impl MegakernelProgram {
     /// Compile for GPU-native P2P MoE dispatch (OP_MOE_DISPATCH).
     /// MoE layers emit OP_MOE_DISPATCH — handled entirely inside the megakernel by op_moe_dispatch.
     /// No CPU involvement in the hot path; workers on GPUs 1-3 run moe_worker_kernel.
-    pub fn compile_multi_gpu_p2p(model: &Model, p2p: &crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
+    pub fn compile_multi_gpu_p2p(
+        model: &Model,
+        p2p: &crate::moe_p2p::MoeP2pContext,
+    ) -> HipResult<Self> {
         Self::compile_inner_p2p(model, p2p)
     }
 
@@ -118,17 +133,26 @@ impl MegakernelProgram {
         let act = &model.activations;
 
         // Guard: only GDN recurrent layers are supported by the megakernel
-        if matches!(cfg.recurrent_kind, crate::model::RecurrentLayerKind::Mamba2 { .. }) {
+        if matches!(
+            cfg.recurrent_kind,
+            crate::model::RecurrentLayerKind::Mamba2 { .. }
+        ) {
             panic!("Mamba2 recurrent layers not yet supported by megakernel");
         }
 
-        let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
+        let module = Module::load(
+            device,
+            &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+        )?;
 
         // Note: hipDeviceAttributeCooperativeLaunch (95) returns 0 on ROCm/RDNA3 even though
         // cooperative launch works. Skipping capability check — hipModuleLaunchCooperativeKernel
         // will return an error if unsupported.
 
-        let has_moe = cfg.layers.iter().any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
+        let has_moe = cfg
+            .layers
+            .iter()
+            .any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
         // OP_MOE_GATE needs 1024 floats = 4KB. GDN recurrent needs 2KB.
         // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS: (8+7680+256)*4 = 31776 bytes per block.
         // 2 blocks/CU: 2*31776 = 63552 < 65536 ✓ — no occupancy reduction.
@@ -136,7 +160,9 @@ impl MegakernelProgram {
         let shared_mem = base_shared.max(31776u32);
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-        eprintln!("  megakernel: shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}");
+        eprintln!(
+            "  megakernel: shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}"
+        );
         // NUM_CUS=48 = WGP count (MultiprocessorCount on RDNA3). Max cooperative blocks = blocks_per_sm * WGPs.
         // blocks_per_sm=0 means LDS-limited; fall back to 1/WGP.
         let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
@@ -188,11 +214,15 @@ impl MegakernelProgram {
                 LayerType::Attention => {
                     if paged {
                         Self::compile_attention_layer_paged(
-                            cfg, &model.layers[layer_i], act,
+                            cfg,
+                            &model.layers[layer_i],
+                            act,
                             &model.kv_caches[kv_idx],
                             attn_layer_count,
-                            &mut instructions, &mut mrope_inst_indices,
-                            &mut kv_write_indices, &mut kv_base_ptrs,
+                            &mut instructions,
+                            &mut mrope_inst_indices,
+                            &mut kv_write_indices,
+                            &mut kv_base_ptrs,
                             &mut attn_paged_inst_indices,
                             &mut attn_quant_inst_indices,
                         );
@@ -200,15 +230,22 @@ impl MegakernelProgram {
                         // Distribute QKV projection + GQA across GPUs.
                         // Only RMSNorm + output-gate/O-proj/residual in megakernel.
                         Self::compile_attention_layer_multi_gpu(
-                            cfg, &model.layers[layer_i], act,
-                            &mut instructions, &mut multi_gpu_attn_boundaries,
+                            cfg,
+                            &model.layers[layer_i],
+                            act,
+                            &mut instructions,
+                            &mut multi_gpu_attn_boundaries,
                         );
                     } else {
                         Self::compile_attention_layer(
-                            cfg, &model.layers[layer_i], act,
+                            cfg,
+                            &model.layers[layer_i],
+                            act,
                             &model.kv_caches[kv_idx],
-                            &mut instructions, &mut mrope_inst_indices,
-                            &mut gqa_attn_inst_indices, &mut kv_write_indices,
+                            &mut instructions,
+                            &mut mrope_inst_indices,
+                            &mut gqa_attn_inst_indices,
+                            &mut kv_write_indices,
                             &mut kv_base_ptrs,
                         );
                     }
@@ -217,7 +254,9 @@ impl MegakernelProgram {
                 }
                 LayerType::Gdn => {
                     Self::compile_gdn_layer(
-                        cfg, &model.layers[layer_i], act,
+                        cfg,
+                        &model.layers[layer_i],
+                        act,
                         &model.gdn_conv_states[gdn_idx],
                         &model.gdn_states[gdn_idx],
                         &mut instructions,
@@ -246,14 +285,22 @@ impl MegakernelProgram {
                     if multi_gpu {
                         let moe = model.moe_weights[layer_i].as_ref().unwrap();
                         let barrier_inst_idx = Self::compile_moe_ffn_multi_gpu(
-                            cfg, layer_i, &model.layers[layer_i], moe, act, &mut instructions,
+                            cfg,
+                            layer_i,
+                            &model.layers[layer_i],
+                            moe,
+                            act,
+                            &mut instructions,
                         );
                         barrier_layer_map.push((barrier_inst_idx, layer_i));
                     } else {
                         Self::compile_moe_ffn(
-                            cfg, layer_i, &model.layers[layer_i],
+                            cfg,
+                            layer_i,
+                            &model.layers[layer_i],
                             model.moe_weights[layer_i].as_ref().unwrap(),
-                            act, &mut instructions,
+                            act,
+                            &mut instructions,
                         );
                     }
                 }
@@ -285,7 +332,14 @@ impl MegakernelProgram {
         {
             let mut inst = Instruction::new(OP_LINEAR_PROJ, vs as u32);
             inst.set_output_ptr(1, act.logits.as_write_ptr());
-            inst.set_ptr(2, if model.config.tie_word_embeddings { model.embed_weight.as_ptr() } else { model.lm_head_weight.as_ptr() });
+            inst.set_ptr(
+                2,
+                if model.config.tie_word_embeddings {
+                    model.embed_weight.as_ptr()
+                } else {
+                    model.lm_head_weight.as_ptr()
+                },
+            );
             inst.set_ptr(3, act.hidden.as_ptr());
             inst.set_int(4, vs as i32);
             inst.set_int(5, hs as i32);
@@ -357,11 +411,18 @@ impl MegakernelProgram {
         let device = model.device;
         let act = &model.activations;
 
-        let module = Module::load(device, &crate::kernel::kernel_dir().join("megakernel.hsaco"))?;
-        let shared_mem = (256u32 * 4 * 2).max((cfg.hidden_size as u32) * 4).max(31776u32);
+        let module = Module::load(
+            device,
+            &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+        )?;
+        let shared_mem = (256u32 * 4 * 2)
+            .max((cfg.hidden_size as u32) * 4)
+            .max(31776u32);
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-        eprintln!("  megakernel(paged): shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}");
+        eprintln!(
+            "  megakernel(paged): shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}"
+        );
         // NUM_CUS=48 = WGP count (MultiprocessorCount on RDNA3). Max cooperative blocks = blocks_per_sm * WGPs.
         let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
         let num_blocks = blocks_per_sm_clamped * NUM_CUS;
@@ -388,7 +449,9 @@ impl MegakernelProgram {
             inst.set_ptr(2, model.embed_weight.as_ptr());
             inst.set_int(3, tokens[t] as i32);
             inst.set_int(4, hs as i32);
-            if t + 1 < n { inst.set_no_sync(); }
+            if t + 1 < n {
+                inst.set_no_sync();
+            }
             instructions.push(inst);
         }
 
@@ -419,16 +482,31 @@ impl MegakernelProgram {
                 let kv_cache = &model.kv_caches[kv_idx];
 
                 Self::emit_attention_layer(
-                    cfg, w, act,
+                    cfg,
+                    w,
+                    act,
                     Some((prefill_bufs, n)),
-                    &AttentionVariant::Prefill { kv_cache, start_pos },
+                    &AttentionVariant::Prefill {
+                        kv_cache,
+                        start_pos,
+                    },
                     &mut instructions,
-                    &mut Vec::new(), &mut Vec::new(), &mut Vec::new(), &mut Vec::new(),
-                    &mut Vec::new(), &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                    &mut Vec::new(),
                 );
 
                 // Batched FFN
-                Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                Self::compile_ffn_batched(
+                    cfg,
+                    &model.layers[layer_i],
+                    prefill_bufs,
+                    n,
+                    &mut instructions,
+                );
                 _attn_layer_count += 1;
                 kv_idx += 1;
             } else {
@@ -443,7 +521,8 @@ impl MegakernelProgram {
                 // --- Batched projections ---
                 // RMSNorm (grid_x=N, one block per token)
                 {
-                    let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), n as u32);
+                    let mut inst =
+                        Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), n as u32);
                     inst.set_output_ptr(1, prefill_bufs.normed.as_write_ptr());
                     inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
                     inst.set_ptr(3, w.input_norm.as_ptr());
@@ -454,26 +533,50 @@ impl MegakernelProgram {
 
                 // QKV projection (batch=N)
                 emit_batched_linear_proj(
-                    &w.w_qkv, prefill_bufs.qkv.as_write_ptr(), prefill_bufs.normed.as_ptr(),
-                    conv_dim, hs, n, true, &mut instructions,
+                    &w.w_qkv,
+                    prefill_bufs.qkv.as_write_ptr(),
+                    prefill_bufs.normed.as_ptr(),
+                    conv_dim,
+                    hs,
+                    n,
+                    true,
+                    &mut instructions,
                 );
 
                 // a projection (batch=N)
                 emit_batched_linear_proj(
-                    &w.w_a, prefill_bufs.a_proj.as_write_ptr(), prefill_bufs.normed.as_ptr(),
-                    nvh_gdn, hs, n, true, &mut instructions,
+                    &w.w_a,
+                    prefill_bufs.a_proj.as_write_ptr(),
+                    prefill_bufs.normed.as_ptr(),
+                    nvh_gdn,
+                    hs,
+                    n,
+                    true,
+                    &mut instructions,
                 );
 
                 // b projection (batch=N)
                 emit_batched_linear_proj(
-                    &w.w_b, prefill_bufs.b_proj.as_write_ptr(), prefill_bufs.normed.as_ptr(),
-                    nvh_gdn, hs, n, true, &mut instructions,
+                    &w.w_b,
+                    prefill_bufs.b_proj.as_write_ptr(),
+                    prefill_bufs.normed.as_ptr(),
+                    nvh_gdn,
+                    hs,
+                    n,
+                    true,
+                    &mut instructions,
                 );
 
                 // z projection (batch=N) — SYNC before sequential part
                 emit_batched_linear_proj(
-                    &w.w_z, prefill_bufs.z_proj.as_write_ptr(), prefill_bufs.normed.as_ptr(),
-                    nvh_gdn * vd, hs, n, false, &mut instructions,
+                    &w.w_z,
+                    prefill_bufs.z_proj.as_write_ptr(),
+                    prefill_bufs.normed.as_ptr(),
+                    nvh_gdn * vd,
+                    hs,
+                    n,
+                    false,
+                    &mut instructions,
                 );
 
                 // --- Sequential per-token: conv1d, gate, recurrence, norm, output, residual ---
@@ -497,8 +600,12 @@ impl MegakernelProgram {
                     // Conv1d on K
                     {
                         let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
-                        inst.set_output_ptr(1, unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) });
-                        inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim) });
+                        inst.set_output_ptr(1, unsafe {
+                            conv_state.as_write_ptr().add(q_dim * (ck - 1))
+                        });
+                        inst.set_ptr(2, unsafe {
+                            prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim)
+                        });
                         inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
                         inst.set_output_ptr(4, act.k_gdn.as_write_ptr());
                         inst.set_int(5, k_dim as i32);
@@ -509,8 +616,12 @@ impl MegakernelProgram {
                     // Conv1d on V
                     {
                         let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
-                        inst.set_output_ptr(1, unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) });
-                        inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim) });
+                        inst.set_output_ptr(1, unsafe {
+                            conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1))
+                        });
+                        inst.set_ptr(2, unsafe {
+                            prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim)
+                        });
                         inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
                         inst.set_output_ptr(4, act.v_gdn.as_write_ptr());
                         inst.set_int(5, v_dim as i32);
@@ -551,7 +662,9 @@ impl MegakernelProgram {
                         let mut inst = Instruction::new(OP_RMSNORM_GATE, nvh_gdn as u32);
                         inst.set_output_ptr(1, act.normed_gated.as_write_ptr());
                         inst.set_ptr(2, act.recurrent_out.as_ptr());
-                        inst.set_ptr(3, unsafe { prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd) });
+                        inst.set_ptr(3, unsafe {
+                            prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd)
+                        });
                         inst.set_ptr(4, w.output_norm.as_ptr());
                         inst.set_int(5, nvh_gdn as i32);
                         inst.set_int(6, vd as i32);
@@ -583,7 +696,13 @@ impl MegakernelProgram {
                 }
 
                 // --- Batched FFN ---
-                Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                Self::compile_ffn_batched(
+                    cfg,
+                    &model.layers[layer_i],
+                    prefill_bufs,
+                    n,
+                    &mut instructions,
+                );
 
                 gdn_idx += 1;
             }
@@ -619,7 +738,14 @@ impl MegakernelProgram {
         {
             let mut inst = Instruction::new(OP_LINEAR_PROJ, cfg.vocab_size as u32);
             inst.set_output_ptr(1, act.logits.as_write_ptr());
-            inst.set_ptr(2, if cfg.tie_word_embeddings { model.embed_weight.as_ptr() } else { model.lm_head_weight.as_ptr() });
+            inst.set_ptr(
+                2,
+                if cfg.tie_word_embeddings {
+                    model.embed_weight.as_ptr()
+                } else {
+                    model.lm_head_weight.as_ptr()
+                },
+            );
             inst.set_ptr(3, act.hidden.as_ptr());
             inst.set_int(4, cfg.vocab_size as i32);
             inst.set_int(5, hs as i32);
@@ -705,21 +831,49 @@ impl MegakernelProgram {
         let n = prefill.as_ref().map_or(1, |&(_, n)| n);
 
         // Buffer pointers — either prefill or single-token activation buffers
-        let (normed_ptr, hidden_ptr, q_gate_attn_ptr, k_attn_ptr, v_attn_ptr,
-             q_attn_ptr, gate_attn_ptr, attn_out_ptr, gated_out_ptr,
-             out_proj_ptr, position_ids_ptr, ffn_hidden_ptr) =
-        if let Some((pb, _)) = &prefill {
-            (pb.normed.as_write_ptr(), pb.hidden.as_write_ptr(),
-             pb.q_gate_attn.as_write_ptr(), pb.k_attn.as_write_ptr(), pb.v_attn.as_write_ptr(),
-             pb.q_attn.as_write_ptr(), pb.gate_attn.as_write_ptr(),
-             pb.attn_out.as_write_ptr(), pb.gated_out.as_write_ptr(),
-             pb.out_proj.as_write_ptr(), pb.position_ids.as_ptr(), pb.hidden.as_write_ptr())
+        let (
+            normed_ptr,
+            hidden_ptr,
+            q_gate_attn_ptr,
+            k_attn_ptr,
+            v_attn_ptr,
+            q_attn_ptr,
+            gate_attn_ptr,
+            attn_out_ptr,
+            gated_out_ptr,
+            out_proj_ptr,
+            position_ids_ptr,
+            ffn_hidden_ptr,
+        ) = if let Some((pb, _)) = &prefill {
+            (
+                pb.normed.as_write_ptr(),
+                pb.hidden.as_write_ptr(),
+                pb.q_gate_attn.as_write_ptr(),
+                pb.k_attn.as_write_ptr(),
+                pb.v_attn.as_write_ptr(),
+                pb.q_attn.as_write_ptr(),
+                pb.gate_attn.as_write_ptr(),
+                pb.attn_out.as_write_ptr(),
+                pb.gated_out.as_write_ptr(),
+                pb.out_proj.as_write_ptr(),
+                pb.position_ids.as_ptr(),
+                pb.hidden.as_write_ptr(),
+            )
         } else {
-            (act.normed.as_write_ptr(), act.hidden.as_write_ptr(),
-             act.q_gate_attn.as_write_ptr(), act.k_attn.as_write_ptr(), act.v_attn.as_write_ptr(),
-             act.q_attn.as_write_ptr(), act.gate_attn.as_write_ptr(),
-             act.attn_out.as_write_ptr(), act.gated_out.as_write_ptr(),
-             act.out_proj.as_write_ptr(), act.position_ids.as_ptr(), act.hidden.as_write_ptr())
+            (
+                act.normed.as_write_ptr(),
+                act.hidden.as_write_ptr(),
+                act.q_gate_attn.as_write_ptr(),
+                act.k_attn.as_write_ptr(),
+                act.v_attn.as_write_ptr(),
+                act.q_attn.as_write_ptr(),
+                act.gate_attn.as_write_ptr(),
+                act.attn_out.as_write_ptr(),
+                act.gated_out.as_write_ptr(),
+                act.out_proj.as_write_ptr(),
+                act.position_ids.as_ptr(),
+                act.hidden.as_write_ptr(),
+            )
         };
 
         // 1. RMSNorm
@@ -736,16 +890,34 @@ impl MegakernelProgram {
         // 2. Q(+gate), K, V projections
         let q_mult = if cfg.has_output_gate { 2 } else { 1 };
         emit_batched_linear_proj(
-            &w.w_q_gate, q_gate_attn_ptr, normed_ptr,
-            nqh * hd * q_mult, hs, n, true, instructions,
+            &w.w_q_gate,
+            q_gate_attn_ptr,
+            normed_ptr,
+            nqh * hd * q_mult,
+            hs,
+            n,
+            true,
+            instructions,
         );
         emit_batched_linear_proj(
-            &w.w_k, k_attn_ptr, normed_ptr,
-            nkh * hd, hs, n, true, instructions,
+            &w.w_k,
+            k_attn_ptr,
+            normed_ptr,
+            nkh * hd,
+            hs,
+            n,
+            true,
+            instructions,
         );
         emit_batched_linear_proj(
-            &w.w_v, v_attn_ptr, normed_ptr,
-            nkh * hd, hs, n, false, instructions,
+            &w.w_v,
+            v_attn_ptr,
+            normed_ptr,
+            nkh * hd,
+            hs,
+            n,
+            false,
+            instructions,
         );
 
         // 3. Deinterleave Q+gate → Q, gate (only for gated Q models like Qwen3.5)
@@ -788,20 +960,27 @@ impl MegakernelProgram {
         let mut paged_layer_k_offset: u64 = 0;
         let mut paged_layer_v_offset: u64 = 0;
         if paged_kv_write_before_norm {
-            if let AttentionVariant::PagedKv { kv_cache, attn_layer_index } = &variant {
+            if let AttentionVariant::PagedKv {
+                kv_cache,
+                attn_layer_index,
+            } = &variant
+            {
                 let kv_stride = nkh * hd;
                 let chunk_tokens: usize = 64;
                 paged_layer_k_offset =
-                    (*attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
-                paged_layer_v_offset =
-                    paged_layer_k_offset + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+                    (*attn_layer_index * 2 * chunk_tokens * kv_stride * std::mem::size_of::<f32>())
+                        as u64;
+                paged_layer_v_offset = paged_layer_k_offset
+                    + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
                 let chunk_head_stride = chunk_tokens * hd;
                 let mut head_indices = Vec::new();
                 for h in 0..nkh {
                     let k_copy_idx = instructions.len();
                     {
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe { kv_cache.k.as_write_ptr().add(h * chunk_head_stride) });
+                        inst.set_output_ptr(1, unsafe {
+                            kv_cache.k.as_write_ptr().add(h * chunk_head_stride)
+                        });
                         inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
                         inst.set_int(3, hd as i32);
                         inst.set_no_sync();
@@ -810,10 +989,14 @@ impl MegakernelProgram {
                     let v_copy_idx = instructions.len();
                     {
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe { kv_cache.v.as_write_ptr().add(h * chunk_head_stride) });
+                        inst.set_output_ptr(1, unsafe {
+                            kv_cache.v.as_write_ptr().add(h * chunk_head_stride)
+                        });
                         inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
                         inst.set_int(3, hd as i32);
-                        if h < nkh - 1 { inst.set_no_sync(); }
+                        if h < nkh - 1 {
+                            inst.set_no_sync();
+                        }
                         instructions.push(inst);
                     }
                     head_indices.push((k_copy_idx, v_copy_idx));
@@ -834,7 +1017,9 @@ impl MegakernelProgram {
             inst.set_int(6, nkh as i32);
             inst.set_int(7, hd as i32);
             inst.set_float(8, eps);
-            if n > 1 { inst.set_int(9, n as i32); }
+            if n > 1 {
+                inst.set_int(9, n as i32);
+            }
             instructions.push(inst);
         }
 
@@ -872,17 +1057,23 @@ impl MegakernelProgram {
                     for h in 0..nkh {
                         let k_copy_idx = instructions.len();
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe { kv_cache.k.as_write_ptr().add(h * head_stride) });
+                        inst.set_output_ptr(1, unsafe {
+                            kv_cache.k.as_write_ptr().add(h * head_stride)
+                        });
                         inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
                         inst.set_int(3, hd as i32);
                         inst.set_no_sync();
                         instructions.push(inst);
                         let v_copy_idx = instructions.len();
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe { kv_cache.v.as_write_ptr().add(h * head_stride) });
+                        inst.set_output_ptr(1, unsafe {
+                            kv_cache.v.as_write_ptr().add(h * head_stride)
+                        });
                         inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
                         inst.set_int(3, hd as i32);
-                        if h < nkh - 1 { inst.set_no_sync(); }
+                        if h < nkh - 1 {
+                            inst.set_no_sync();
+                        }
                         instructions.push(inst);
                         head_indices.push((k_copy_idx, v_copy_idx));
                     }
@@ -906,7 +1097,10 @@ impl MegakernelProgram {
                 instructions.push(inst);
             }
 
-            AttentionVariant::PagedKv { kv_cache: _, attn_layer_index } => {
+            AttentionVariant::PagedKv {
+                kv_cache: _,
+                attn_layer_index,
+            } => {
                 // KV write already emitted above (step 4a, before QK-norm).
                 // Cache now stores pre-QK-norm K/V for quantization quality.
 
@@ -936,17 +1130,18 @@ impl MegakernelProgram {
                 {
                     use crate::paged_kv::quantized_kv_offsets;
                     let chunk_tokens: usize = CHUNK_TOKENS;
-                    let (q1d, q1s, rd_off, rs) = quantized_kv_offsets(cfg, chunk_tokens, *attn_layer_index, false);
+                    let (q1d, q1s, rd_off, rs) =
+                        quantized_kv_offsets(cfg, chunk_tokens, *attn_layer_index, false);
                     let mut inst = Instruction::new(OP_ATTN_PAGED_Q, 0); // grid_x=0: skip until chunks are quantized
-                    inst.set_int(1, 0);  // scratch ptr — patched when quantized KV is enabled
+                    inst.set_int(1, 0); // scratch ptr — patched when quantized KV is enabled
                     inst.set_ptr(2, q_attn_ptr);
-                    inst.set_int(3, 0);  // quant page_table — patched per step
-                    inst.set_int(4, 0);  // position_table — patched per step
+                    inst.set_int(3, 0); // quant page_table — patched per step
+                    inst.set_int(4, 0); // position_table — patched per step
                     inst.set_ptr(5, act.inv_freq.as_ptr());
                     inst.set_int(6, nqh as i32);
                     inst.set_int(7, nkh as i32);
                     inst.set_int(8, hd as i32);
-                    inst.set_int(9, 0);  // quant_seq_len — patched per step
+                    inst.set_int(9, 0); // quant_seq_len — patched per step
                     inst.set_int(10, chunk_tokens as i32);
                     inst.set_int(11, rd as i32);
                     inst.words[12] = q1d as u64;
@@ -954,7 +1149,14 @@ impl MegakernelProgram {
                     inst.words[14] = rd_off as u64;
                     inst.words[15] = rs as u64;
                     // Pass k_norm weight for QK-norm after dequant (null = no QK-norm)
-                    inst.set_ptr(16, if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() });
+                    inst.set_ptr(
+                        16,
+                        if cfg.has_qk_norm {
+                            w.k_norm.as_ptr()
+                        } else {
+                            std::ptr::null()
+                        },
+                    );
                     inst.set_no_sync(); // no sync between quant and f32 attention
                     instructions.push(inst);
                 }
@@ -979,12 +1181,22 @@ impl MegakernelProgram {
                     inst.words[13] = paged_layer_v_offset;
                     inst.words[14] = 0; // partial_state — patched when quantized KV enabled
                     // Pass k_norm weight for QK-norm after loading from cache (slot 16)
-                    inst.set_ptr(16, if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() });
+                    inst.set_ptr(
+                        16,
+                        if cfg.has_qk_norm {
+                            w.k_norm.as_ptr()
+                        } else {
+                            std::ptr::null()
+                        },
+                    );
                     instructions.push(inst);
                 }
             }
 
-            AttentionVariant::Prefill { kv_cache, start_pos } => {
+            AttentionVariant::Prefill {
+                kv_cache,
+                start_pos,
+            } => {
                 // mRoPE first (batched)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
@@ -1074,8 +1286,14 @@ impl MegakernelProgram {
 
         // 11. Output projection + residual
         emit_batched_linear_proj(
-            &w.w_o, out_proj_ptr, final_attn_ptr,
-            hs, nqh * hd, n, false, instructions,
+            &w.w_o,
+            out_proj_ptr,
+            final_attn_ptr,
+            hs,
+            nqh * hd,
+            n,
+            false,
+            instructions,
         );
         if n > 1 {
             // Batched residual: hidden = hidden + out_proj (N tokens)
@@ -1202,7 +1420,9 @@ impl MegakernelProgram {
 
         // Conv on K portion — NO_SYNC: conv_v reads different slice
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
-        inst.set_output_ptr(1, unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) });
+        inst.set_output_ptr(1, unsafe {
+            conv_state.as_write_ptr().add(q_dim * (ck - 1))
+        });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim) });
         inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
         inst.set_output_ptr(4, act.k_gdn.as_write_ptr());
@@ -1213,7 +1433,9 @@ impl MegakernelProgram {
 
         // Conv on V portion
         let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
-        inst.set_output_ptr(1, unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) });
+        inst.set_output_ptr(1, unsafe {
+            conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1))
+        });
         inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim + k_dim) });
         inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
         inst.set_output_ptr(4, act.v_gdn.as_write_ptr());
@@ -1296,10 +1518,18 @@ impl MegakernelProgram {
             _ => panic!("expected attention layer"),
         };
         Self::emit_attention_layer(
-            cfg, w, act, None,
+            cfg,
+            w,
+            act,
+            None,
             &AttentionVariant::FlatKv { kv_cache },
-            instructions, mrope_indices, gqa_indices, kv_write_indices, kv_base_ptrs,
-            &mut Vec::new(), &mut Vec::new(),
+            instructions,
+            mrope_indices,
+            gqa_indices,
+            kv_write_indices,
+            kv_base_ptrs,
+            &mut Vec::new(),
+            &mut Vec::new(),
         );
     }
 
@@ -1365,8 +1595,14 @@ impl MegakernelProgram {
 
         // 11. Output projection + residual (single-token decode path)
         emit_batched_linear_proj(
-            &w.w_o, out_proj_ptr, final_attn_ptr,
-            hs, nqh * hd, 1, false, instructions,
+            &w.w_o,
+            out_proj_ptr,
+            final_attn_ptr,
+            hs,
+            nqh * hd,
+            1,
+            false,
+            instructions,
         );
         // Two-step residual (single-token decode): copy hidden → residual, then add
         {
@@ -1407,10 +1643,21 @@ impl MegakernelProgram {
             _ => panic!("expected attention layer"),
         };
         Self::emit_attention_layer(
-            cfg, w, act, None,
-            &AttentionVariant::PagedKv { kv_cache, attn_layer_index },
-            instructions, mrope_indices, &mut Vec::new(), kv_write_indices, kv_base_ptrs,
-            attn_paged_indices, attn_quant_indices,
+            cfg,
+            w,
+            act,
+            None,
+            &AttentionVariant::PagedKv {
+                kv_cache,
+                attn_layer_index,
+            },
+            instructions,
+            mrope_indices,
+            &mut Vec::new(),
+            kv_write_indices,
+            kv_base_ptrs,
+            attn_paged_indices,
+            attn_quant_indices,
         );
     }
 
@@ -1592,9 +1839,18 @@ impl MegakernelProgram {
             instructions.push(inst);
         } else if all_rnf4 {
             // Fused path: OP_FFN_GATE_UP_RNF4 + OP_FFN_DOWN_RES_RNF4 (rnf4 decode n=1 only)
-            let w_gate_ptr = match w_gate { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
-            let w_up_ptr   = match w_up   { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
-            let w_down_ptr = match w_down { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let w_gate_ptr = match w_gate {
+                LinearWeight::Packed(pw) => pw.data.as_ptr(),
+                _ => unreachable!(),
+            };
+            let w_up_ptr = match w_up {
+                LinearWeight::Packed(pw) => pw.data.as_ptr(),
+                _ => unreachable!(),
+            };
+            let w_down_ptr = match w_down {
+                LinearWeight::Packed(pw) => pw.data.as_ptr(),
+                _ => unreachable!(),
+            };
 
             let mut inst = Instruction::new(OP_FFN_GATE_UP_RNF4, is as u32);
             inst.set_output_ptr(1, act.ffn_act.as_write_ptr());
@@ -1700,8 +1956,12 @@ impl MegakernelProgram {
         let eps = cfg.rms_norm_eps;
 
         let (k, gate_type, eis) = match &cfg.layers[layer_idx].ffn_type {
-            FfnType::MoE { num_active, gate_type, expert_intermediate_size, .. } =>
-                (*num_active, gate_type.clone(), *expert_intermediate_size),
+            FfnType::MoE {
+                num_active,
+                gate_type,
+                expert_intermediate_size,
+                ..
+            } => (*num_active, gate_type.clone(), *expert_intermediate_size),
             _ => unreachable!(),
         };
         let ne = moe.num_experts;
@@ -1743,11 +2003,18 @@ impl MegakernelProgram {
         // OP_MOE_GATE: top-k selection on GPU
         let (gate_mode, rsf) = match &gate_type {
             GateType::Softmax => (0u32, 1.0f32),
-            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
-            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
+            GateType::NormTopK {
+                routed_scaling_factor,
+            } => (1, *routed_scaling_factor),
+            GateType::Sigmoid {
+                routed_scaling_factor,
+            } => (2, *routed_scaling_factor),
         };
-        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
-            .map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
+        let bias_ptr = moe
+            .score_correction_bias_gpu
+            .as_ref()
+            .map(|b| b.as_ptr() as *const u8)
+            .unwrap_or(std::ptr::null());
 
         let mut inst = Instruction::new(OP_MOE_GATE, 1);
         inst.set_ptr(1, act.moe_scores.as_ptr());
@@ -1763,7 +2030,10 @@ impl MegakernelProgram {
         // OP_MOE_FFN: fused expert loop (internal grid.sync())
         // Currently only supports PcG32Q4 weights in the GPU kernel
         assert!(
-            matches!(moe.expert_gate_up.weight_format(), crate::quant::WeightFormat::PcG32Q4),
+            matches!(
+                moe.expert_gate_up.weight_format(),
+                crate::quant::WeightFormat::PcG32Q4
+            ),
             "OP_MOE_FFN only supports PcG32Q4 expert weights (got {:?})",
             moe.expert_gate_up.weight_format()
         );
@@ -1775,8 +2045,8 @@ impl MegakernelProgram {
         let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
         let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
 
-        let flags = (if moe.has_gate_proj { 1u32 } else { 0 })
-                  | (if !moe.has_gate_proj { 2 } else { 0 }); // bit1 = relu²
+        let flags =
+            (if moe.has_gate_proj { 1u32 } else { 0 }) | (if !moe.has_gate_proj { 2 } else { 0 }); // bit1 = relu²
 
         let grid_x = std::cmp::max(eis, hs) as u32;
 
@@ -1802,8 +2072,17 @@ impl MegakernelProgram {
         // Shared expert (if present)
         if let Some(ref se) = moe.shared_expert {
             let se_is = match &cfg.layers[layer_idx].ffn_type {
-                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } =>
-                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size },
+                FfnType::MoE {
+                    shared_intermediate_size,
+                    expert_intermediate_size,
+                    ..
+                } => {
+                    if *shared_intermediate_size > 0 {
+                        *shared_intermediate_size
+                    } else {
+                        *expert_intermediate_size
+                    }
+                }
                 _ => eis,
             };
 
@@ -1868,7 +2147,7 @@ impl MegakernelProgram {
                 inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
                 inst.set_ptr(2, gate_buf.as_ptr());
                 inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, 1i32);   // out_dim = 1
+                inst.set_int(4, 1i32); // out_dim = 1
                 inst.set_int(5, hs as i32);
                 instructions.push(inst);
 
@@ -1918,8 +2197,18 @@ impl MegakernelProgram {
         let eps = cfg.rms_norm_eps;
 
         let (k, gate_type, ne, eis) = match &cfg.layers[layer_idx].ffn_type {
-            FfnType::MoE { num_active, gate_type, num_experts, expert_intermediate_size, .. } =>
-                (*num_active, gate_type.clone(), *num_experts, *expert_intermediate_size),
+            FfnType::MoE {
+                num_active,
+                gate_type,
+                num_experts,
+                expert_intermediate_size,
+                ..
+            } => (
+                *num_active,
+                gate_type.clone(),
+                *num_experts,
+                *expert_intermediate_size,
+            ),
             _ => unreachable!(),
         };
 
@@ -1968,11 +2257,18 @@ impl MegakernelProgram {
         // OP_MOE_GATE: top-k selection; writes to moe_expert_ids/weights (GART memory, CPU-readable)
         let (gate_mode, rsf) = match &gate_type {
             GateType::Softmax => (0u32, 1.0f32),
-            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
-            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
+            GateType::NormTopK {
+                routed_scaling_factor,
+            } => (1, *routed_scaling_factor),
+            GateType::Sigmoid {
+                routed_scaling_factor,
+            } => (2, *routed_scaling_factor),
         };
-        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
-            .map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
+        let bias_ptr = moe
+            .score_correction_bias_gpu
+            .as_ref()
+            .map(|b| b.as_ptr() as *const u8)
+            .unwrap_or(std::ptr::null());
         let mut inst = Instruction::new(OP_MOE_GATE, 1);
         inst.set_ptr(1, act.moe_scores.as_ptr());
         inst.set_ptr(2, act.moe_expert_ids.as_ptr());
@@ -1987,9 +2283,9 @@ impl MegakernelProgram {
         // OP_BARRIER: park megakernel, CPU dispatches expert FFN into act.ffn_down_stage, then resumes.
         // barrier_flag_ptr and resume_flag_ptr are null here; patched in execute_multi_gpu().
         let barrier_inst_idx = instructions.len();
-        let mut inst = Instruction::new(OP_BARRIER, 1);  // grid_x=1: only block 0 runs op_barrier
-        inst.set_ptr(1, std::ptr::null::<u32>());  // barrier_flag — patched per-execute
-        inst.set_ptr(2, std::ptr::null::<u32>());  // resume_flag — patched per-execute
+        let mut inst = Instruction::new(OP_BARRIER, 1); // grid_x=1: only block 0 runs op_barrier
+        inst.set_ptr(1, std::ptr::null::<u32>()); // barrier_flag — patched per-execute
+        inst.set_ptr(2, std::ptr::null::<u32>()); // resume_flag — patched per-execute
         inst.set_int(3, layer_idx as i32);
         instructions.push(inst);
 
@@ -1997,8 +2293,17 @@ impl MegakernelProgram {
         // GPU 0 has all SMs available again after resume.
         if let Some(ref se) = moe.shared_expert {
             let se_is = match &cfg.layers[layer_idx].ffn_type {
-                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } =>
-                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size },
+                FfnType::MoE {
+                    shared_intermediate_size,
+                    expert_intermediate_size,
+                    ..
+                } => {
+                    if *shared_intermediate_size > 0 {
+                        *shared_intermediate_size
+                    } else {
+                        *expert_intermediate_size
+                    }
+                }
                 _ => eis,
             };
 
@@ -2114,8 +2419,11 @@ impl MegakernelProgram {
         for &(barrier_idx, layer_idx) in &prog.barrier_layer_map {
             let moe = model.moe_weights[layer_idx].as_ref().unwrap();
             let (k, eis) = match &cfg.layers[layer_idx].ffn_type {
-                crate::model::FfnType::MoE { num_active, expert_intermediate_size, .. } =>
-                    (*num_active, *expert_intermediate_size),
+                crate::model::FfnType::MoE {
+                    num_active,
+                    expert_intermediate_size,
+                    ..
+                } => (*num_active, *expert_intermediate_size),
                 _ => unreachable!(),
             };
             let has_gate = if moe.has_gate_proj { 1u64 } else { 0u64 };
@@ -2124,21 +2432,21 @@ impl MegakernelProgram {
 
             let mut inst = Instruction::new(OP_MOE_DISPATCH, 0);
             // inst[0] = opcode (grid_x=0 means all blocks, op_moe_dispatch manages its own blocks)
-            inst.words[1] = p2p.work_queue.device_ptr() as u64;           // MoeWorkItem* (GART)
-            inst.words[2] = p2p.output_slots.as_ptr() as u64;             // float* [num_gpus*hs] GPU 0 VRAM
-            inst.words[3] = act.ffn_down_stage.as_ptr() as u64;           // final_output (written by op_moe_dispatch)
-            inst.words[4] = act.moe_expert_ids.as_ptr() as u64;           // int32_t* expert_ids (GPU 0 VRAM)
-            inst.words[5] = act.moe_expert_weights.as_ptr() as u64;       // float* expert_weights
-            inst.words[6] = p2p.seq_counter.device_ptr() as u64;          // volatile uint32_t* seq_counter (GART)
-            inst.words[7] = ((num_workers as u64) << 32) | (hs as u64);   // num_workers | hidden_size
-            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64);      // layer_idx | num_active
-            inst.words[9] = ((eis as u64) << 32) | has_gate;              // expert_intermediate_size | has_gate
-            inst.words[10] = act.normed.as_ptr() as u64;                  // activation (GPU 0 VRAM)
-            inst.words[11] = p2p.gpu0_layer_config_ptrs.as_ptr() as u64;  // MoeWorkerConfig**[num_layers]
+            inst.words[1] = p2p.work_queue.device_ptr() as u64; // MoeWorkItem* (GART)
+            inst.words[2] = p2p.output_slots.as_ptr() as u64; // float* [num_gpus*hs] GPU 0 VRAM
+            inst.words[3] = act.ffn_down_stage.as_ptr() as u64; // final_output (written by op_moe_dispatch)
+            inst.words[4] = act.moe_expert_ids.as_ptr() as u64; // int32_t* expert_ids (GPU 0 VRAM)
+            inst.words[5] = act.moe_expert_weights.as_ptr() as u64; // float* expert_weights
+            inst.words[6] = p2p.seq_counter.device_ptr() as u64; // volatile uint32_t* seq_counter (GART)
+            inst.words[7] = ((num_workers as u64) << 32) | (hs as u64); // num_workers | hidden_size
+            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64); // layer_idx | num_active
+            inst.words[9] = ((eis as u64) << 32) | has_gate; // expert_intermediate_size | has_gate
+            inst.words[10] = act.normed.as_ptr() as u64; // activation (GPU 0 VRAM)
+            inst.words[11] = p2p.gpu0_layer_config_ptrs.as_ptr() as u64; // MoeWorkerConfig**[num_layers]
             inst.words[12] = p2p.gpu0_scratch_gate.as_ptr() as u64;
             inst.words[13] = p2p.gpu0_scratch_up.as_ptr() as u64;
             inst.words[14] = p2p.gpu0_scratch_act.as_ptr() as u64;
-            inst.words[15] = num_gpus as u64;                             // total_gpus (for output_slots indexing)
+            inst.words[15] = num_gpus as u64; // total_gpus (for output_slots indexing)
 
             prog.instructions[barrier_idx] = inst;
         }
