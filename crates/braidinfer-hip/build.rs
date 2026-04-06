@@ -14,7 +14,7 @@ fn main() {
         .join("kernels");
 
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
-    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2", "selective_state_update", "argmax", "moe_gate", "megakernel", "peer_copy", "persistent_worker", "deinterleave"];
+    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2", "selective_state_update", "argmax", "moe_gate", "megakernel", "peer_copy", "persistent_worker", "deinterleave", "moe_worker"];
 
     for kernel in &kernels {
         let src = kernel_dir.join(format!("{kernel}.hip"));
@@ -67,6 +67,9 @@ fn main() {
     println!("cargo:rerun-if-changed={}", kernel_dir.join("bf16_utils.h").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join("opcodes.h").display());
     println!("cargo:rerun-if-changed={}", kernel_dir.join("megakernel_moe_barrier.hip").display());
+    println!("cargo:rerun-if-changed={}", kernel_dir.join("moe_worker.hip").display());
+    println!("cargo:rerun-if-changed={}", kernel_dir.join("moe_work_queue.h").display());
+    println!("cargo:rerun-if-changed={}", kernel_dir.join("moe_expert_ops.h").display());
     println!("cargo:rerun-if-changed=build.rs");
 
     // Generate opcodes.rs from opcodes.h (single source of truth)

@@ -643,6 +643,8 @@ impl Model {
             distributed_moe: Vec::new(),
             worker_kernels: Vec::new(),
             megakernel_multi_gpu: None,
+            moe_p2p: None,
+            megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
         })
     }

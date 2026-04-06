@@ -9,7 +9,8 @@
 extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     volatile MoeWorkItem* work_queue,
     volatile MoeShutdownFlag* shutdown_flag,
-    MoeWorkerConfig* config,
+    MoeWorkerConfig** layer_configs,  // per-layer configs indexed by work_queue->layer_idx
+    volatile uint32_t* done_flag,     // CPU polls this after shutdown to know kernel exited
     float* local_activation,  // [hidden_size] local VRAM
     float* scratch_gate,      // [expert_intermediate_size] local VRAM
     float* scratch_up,        // [expert_intermediate_size] local VRAM
@@ -19,7 +20,8 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
-    const uint32_t my_gpu = config->my_gpu_id;
+    // my_gpu_id comes from the first config (same for all layers on this worker)
+    const uint32_t my_gpu = layer_configs[0]->my_gpu_id;
     uint32_t last_seq = 0;
 
     while (true) {
@@ -38,8 +40,17 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         grid.sync();
 
         uint32_t seq = work_queue->seq_num;
-        if (seq == 0xFFFFFFFFu) return;
+        if (seq == 0xFFFFFFFFu) {
+            // Signal CPU that kernel has exited
+            if (threadIdx.x == 0 && blockIdx.x == 0) {
+                *done_flag = 1u;
+            }
+            return;
+        }
         if (seq <= last_seq) continue;
+
+        uint32_t layer_idx = work_queue->layer_idx;
+        MoeWorkerConfig* config = layer_configs[layer_idx];
 
         uint32_t hs = work_queue->hidden_size;
         uint32_t eis = work_queue->expert_intermediate_size;
@@ -87,10 +98,15 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         }
 
         // 4. P2P write local_output to GPU 0's output_slots
-        __threadfence();
+        // __threadfence_system() ensures the write is visible to GPU 0 after
+        // it polls ack_flags (which polls MTYPE_UC host-mapped memory).
+        __threadfence_system();
         coop_copy(my_output_slot, local_output, hs, grid);
 
-        // 5. Ack via host-mapped flag (no __threadfence_system — MTYPE_UC bypasses L2)
+        // 5. Ack via host-mapped flag
+        // __threadfence_system() after coop_copy ensures P2P writes to output_slots
+        // are committed before the ack is visible to GPU 0.
+        __threadfence_system();
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             work_queue->ack_flags[my_gpu] = seq;
         }

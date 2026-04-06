@@ -17,7 +17,7 @@ use super::{OP_RMSNORM, OP_LINEAR_PROJ, OP_CONV1D, OP_GDN_GATE, OP_GDN_RECUR,
     OP_ATTN_PAGED, OP_ATTN_PREFILL, OP_DEINTERLEAVE, OP_KV_QUANTIZE, OP_ATTN_PAGED_Q,
     OP_MOE_GATE, OP_MOE_FFN, OP_LINEAR_PROJ_RNF4, OP_LINEAR_PROJ_PCG32, OP_RMSNORM_WX,
     OP_SILU_MUL, OP_FFN_GATE_UP_RNF4, OP_FFN_DOWN_RES_RNF4,
-    OP_SIGMOID_WEIGHTED_ADD, OP_BARRIER};
+    OP_SIGMOID_WEIGHTED_ADD, OP_BARRIER, OP_MOE_DISPATCH};
 
 fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight, ptr_slot: usize) {
     use crate::model::{LinearWeight, WeightFormat};
@@ -87,6 +87,13 @@ impl MegakernelProgram {
 
     pub fn compile_paged(model: &Model) -> HipResult<Self> {
         Self::compile_inner(model, true, false)
+    }
+
+    /// Compile for GPU-native P2P MoE dispatch (OP_MOE_DISPATCH).
+    /// MoE layers emit OP_MOE_DISPATCH — handled entirely inside the megakernel by op_moe_dispatch.
+    /// No CPU involvement in the hot path; workers on GPUs 1-3 run moe_worker_kernel.
+    pub fn compile_multi_gpu_p2p(model: &Model, p2p: &crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
+        Self::compile_inner_p2p(model, p2p)
     }
 
     /// Compile for multi-GPU MoE models. MoE layers emit OP_BARRIER instead of OP_MOE_FFN.
@@ -2079,5 +2086,89 @@ impl MegakernelProgram {
         instructions.push(inst);
 
         barrier_inst_idx
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // GPU-native P2P path: OP_MOE_DISPATCH
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Compile the full instruction stream for GPU-native P2P MoE dispatch.
+    /// MoE layers emit OP_MOE_DISPATCH; all other layers are identical to compile_inner.
+    fn compile_inner_p2p(model: &Model, p2p: &crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
+        // Start from the same compiled base (multi_gpu=true gives us the right shared_mem etc.)
+        // but we'll re-emit MoE FFN layers using compile_moe_ffn_p2p instead of compile_moe_ffn_multi_gpu.
+        // Simplest: call compile_inner with multi_gpu=false (gets single-GPU path for everything),
+        // then patch MoE layers. But easier: build from scratch mirroring compile_inner.
+        //
+        // We reuse compile_inner with multi_gpu=false and then patch only the MoE layers.
+        // Actually, the cleanest approach is a full parallel compile path.
+        // For now: call compile_inner(multi_gpu=true) which creates OP_BARRIER entries, then
+        // replace each OP_BARRIER instruction with the corresponding OP_MOE_DISPATCH.
+        let mut prog = Self::compile_inner(model, false, true)?;
+
+        let cfg = &model.config;
+        let act = &model.activations;
+        let hs = cfg.hidden_size;
+
+        // Replace every OP_BARRIER instruction with OP_MOE_DISPATCH
+        for &(barrier_idx, layer_idx) in &prog.barrier_layer_map {
+            let moe = model.moe_weights[layer_idx].as_ref().unwrap();
+            let (k, eis) = match &cfg.layers[layer_idx].ffn_type {
+                crate::model::FfnType::MoE { num_active, expert_intermediate_size, .. } =>
+                    (*num_active, *expert_intermediate_size),
+                _ => unreachable!(),
+            };
+            let has_gate = if moe.has_gate_proj { 1u64 } else { 0u64 };
+            let num_workers = p2p.workers.len();
+            let num_gpus = p2p.num_gpus;
+
+            let mut inst = Instruction::new(OP_MOE_DISPATCH, 0);
+            // inst[0] = opcode (grid_x=0 means all blocks, op_moe_dispatch manages its own blocks)
+            inst.words[1] = p2p.work_queue.device_ptr() as u64;           // MoeWorkItem* (GART)
+            inst.words[2] = p2p.output_slots.as_ptr() as u64;             // float* [num_gpus*hs] GPU 0 VRAM
+            inst.words[3] = act.ffn_down_stage.as_ptr() as u64;           // final_output (written by op_moe_dispatch)
+            inst.words[4] = act.moe_expert_ids.as_ptr() as u64;           // int32_t* expert_ids (GPU 0 VRAM)
+            inst.words[5] = act.moe_expert_weights.as_ptr() as u64;       // float* expert_weights
+            inst.words[6] = p2p.seq_counter.device_ptr() as u64;          // volatile uint32_t* seq_counter (GART)
+            inst.words[7] = ((num_workers as u64) << 32) | (hs as u64);   // num_workers | hidden_size
+            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64);      // layer_idx | num_active
+            inst.words[9] = ((eis as u64) << 32) | has_gate;              // expert_intermediate_size | has_gate
+            inst.words[10] = act.normed.as_ptr() as u64;                  // activation (GPU 0 VRAM)
+            inst.words[11] = p2p.gpu0_layer_config_ptrs.as_ptr() as u64;  // MoeWorkerConfig**[num_layers]
+            inst.words[12] = p2p.gpu0_scratch_gate.as_ptr() as u64;
+            inst.words[13] = p2p.gpu0_scratch_up.as_ptr() as u64;
+            inst.words[14] = p2p.gpu0_scratch_act.as_ptr() as u64;
+            inst.words[15] = num_gpus as u64;                             // total_gpus (for output_slots indexing)
+
+            prog.instructions[barrier_idx] = inst;
+        }
+
+        // Also patch the D2D_COPY normed→normed_stage instruction that precedes each OP_BARRIER.
+        // With GPU-native P2P, workers P2P-read activation directly from act.normed (GPU 0 VRAM).
+        // The normed_stage copy is no longer needed. Replace it with a NOP (OP_D2D_COPY of 0 bytes).
+        // We identify the normed_stage copy as the instruction immediately before each OP_BARRIER.
+        // (compile_moe_ffn_multi_gpu emits: ... MOE_GATE, D2D_COPY(normed→normed_stage), OP_BARRIER ...)
+        for &(barrier_idx, _layer_idx) in &prog.barrier_layer_map {
+            if barrier_idx > 0 {
+                let prev = &prog.instructions[barrier_idx - 1];
+                let prev_opcode = prev.words[0] & 0x7FFFFFFF;
+                // D2D_COPY is OP_D2D_COPY = 17; check destination is normed_stage
+                if prev_opcode == 17 {
+                    let dst = prev.words[1];
+                    let normed_stage_ptr = act.normed_stage.as_ptr() as u64;
+                    if dst == normed_stage_ptr {
+                        // Replace with a NOP-like D2D_COPY of 0 elements (grid_x=0 → no-op)
+                        prog.instructions[barrier_idx - 1] = Instruction::new(17, 0);
+                    }
+                }
+            }
+        }
+
+        // Clear barrier_layer_map so decode loop doesn't try to handle OP_BARRIER
+        prog.barrier_layer_map.clear();
+        // Clear moe_barrier (not needed for P2P path)
+        prog.moe_barrier = None;
+
+        Ok(prog)
     }
 }

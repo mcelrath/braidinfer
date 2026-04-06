@@ -19,6 +19,8 @@ pub struct Model {
     // MUST be declared first: dropped first, shuts down cooperative kernels before any hipFree.
     // DeviceBuffer::drop → hipFree → SyncAllStreams blocks if cooperative kernel is still running.
     pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
+    // GPU-native P2P MoE dispatch: cooperative kernels on GPUs 1-3. Drop before other GPU 1-3 resources.
+    pub(crate) moe_p2p: Option<crate::moe_p2p::MoeP2pContext>,
     pub(crate) config: ModelConfig,
     pub(crate) device: DeviceId,
     pub(crate) stream: Stream,
@@ -49,8 +51,9 @@ pub struct Model {
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
-    // Multi-GPU megakernel: dense layers run in megakernel; MoE layers use CPU-dispatch via OP_BARRIER
+    // Multi-GPU megakernel programs
     pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
+    pub(crate) megakernel_multi_gpu_p2p: Option<MegakernelProgram>,
 }
 
 // ---- Model impl ----
@@ -267,6 +270,35 @@ impl Model {
                 .map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
 
+            // Init GPU-native P2P MoE dispatch (moe_worker_kernel on GPUs 1-3)
+            let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+            if has_moe && num_gpus > 1 {
+                let worker_devices: Vec<_> = (1..num_gpus)
+                    .map(|i| braidinfer_core::types::DeviceId(i as u32))
+                    .collect();
+                let num_total_layers = self.config.layers.len();
+                let dist_refs: Vec<Option<&crate::weights::DistributedMoeWeights>> =
+                    self.distributed_moe.iter().map(|d| d.as_ref()).collect();
+                let p2p = crate::moe_p2p::MoeP2pContext::init(
+                    self.device,
+                    &worker_devices,
+                    hs,
+                    max_eis,
+                    num_total_layers,
+                    &dist_refs,
+                    shared_mem,
+                ).map_err(ModelError::Hip)?;
+                let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
+                    .map_err(ModelError::Hip)?;
+                self.moe_p2p = Some(p2p);
+                self.megakernel_multi_gpu_p2p = Some(mk_p2p);
+                eprintln!("  MoE P2P dispatch initialized: {} worker GPUs", num_gpus - 1);
+            }
+        }
+
+        // Use P2P megakernel if available (GPU-native MoE dispatch, no OP_BARRIER)
+        if self.megakernel_multi_gpu_p2p.is_some() {
+            return self.decode_step_p2p(token_id, position);
         }
 
         // Update host-side instructions
@@ -579,6 +611,88 @@ impl Model {
             std::slice::from_raw_parts(self.activations.logits_mapped.host_ptr(), self.config.vocab_size)
         }.to_vec();
 
+        self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
+    /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
+    fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        use crate::megakernel::Instruction;
+
+        let pos_data = [position as i32, position as i32, position as i32];
+        unsafe {
+            std::ptr::copy_nonoverlapping(pos_data.as_ptr(), self.activations.position_ids.host_ptr(), 3);
+        }
+
+        // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
+        let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
+        mk.update_step_host_only(token_id, position)?;
+        let n_inst = mk.instructions.len();
+        mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
+
+        let hs = self.config.hidden_size;
+        let has_head_parallel = self.multi_gpu.as_ref()
+            .map(|m| !m.workers[0].attn_kv_caches.is_empty())
+            .unwrap_or(false);
+        let use_distributed_qkv = has_head_parallel && {
+            !self.megakernel_multi_gpu_p2p.as_ref().unwrap().multi_gpu_attn_boundaries.is_empty()
+        };
+        let attn_boundaries: Vec<(usize, usize)> = if has_head_parallel {
+            let mk_ref = self.megakernel_multi_gpu_p2p.as_ref().unwrap();
+            if use_distributed_qkv {
+                mk_ref.multi_gpu_attn_boundaries.clone()
+            } else {
+                mk_ref._mrope_inst_indices.iter()
+                    .zip(mk_ref.gqa_attn_inst_indices.iter())
+                    .map(|(&m, &g)| (m, g))
+                    .collect()
+            }
+        } else {
+            Vec::new()
+        };
+        let n_inst = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions.len();
+
+        let mut segment: Vec<Instruction> = Vec::new();
+        let mut attn_i = 0usize;
+        let mut i = 0usize;
+
+        while i < n_inst {
+            let inst = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].clone();
+            i += 1;
+            let opcode = inst.words[0] & 0x7FFFFFFF;
+            if opcode == 16 { break; } // OP_HALT
+
+            // Head-parallel attention boundary: flush segment, dispatch parallel QKV+GQA
+            if has_head_parallel && attn_i < attn_boundaries.len() {
+                let (flush_idx, resume_idx) = attn_boundaries[attn_i];
+                if i - 1 == flush_idx {
+                    segment.push(inst);
+                    let dispatch = self.persistent_workers.as_mut().unwrap();
+                    for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                        dispatch.dispatch_batch(0, chunk);
+                    }
+                    segment.clear();
+                    self.dispatch_head_parallel_attention(attn_i, position)?;
+                    attn_i += 1;
+                    i = if use_distributed_qkv { resume_idx } else { resume_idx + 1 };
+                    continue;
+                }
+            }
+
+            segment.push(inst);
+        }
+
+        if !segment.is_empty() {
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                dispatch.dispatch_batch(0, chunk);
+            }
+        }
+
+        let logits = unsafe {
+            std::slice::from_raw_parts(self.activations.logits_mapped.host_ptr(), self.config.vocab_size)
+        }.to_vec();
         self.seq_len = position + 1;
         Ok(logits)
     }

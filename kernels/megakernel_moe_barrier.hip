@@ -63,7 +63,8 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
     int eis = (int)(inst[9] >> 32);
     int has_gate = (int)(inst[9] & 0xFFFFFFFF);
     const float* activation = (const float*)(uintptr_t)inst[10];
-    MoeWorkerConfig* gpu0_config = (MoeWorkerConfig*)(uintptr_t)inst[11];
+    // inst[11] is MoeWorkerConfig**: array of per-layer config ptrs indexed by layer_idx
+    MoeWorkerConfig* gpu0_config = ((MoeWorkerConfig**)(uintptr_t)inst[11])[layer_idx];
     float* scratch_gate = (float*)(uintptr_t)inst[12];
     float* scratch_up = (float*)(uintptr_t)inst[13];
     float* scratch_act = (float*)(uintptr_t)inst[14];
