@@ -88,7 +88,6 @@ pub struct MegakernelProgram {
     pub(crate) device: DeviceId,
     // Indices of instructions that need per-step updates
     pub(crate) embedding_inst_idx: usize,
-    pub(crate) _mrope_inst_indices: Vec<usize>,    // one per attention layer (reserved for future mRoPE patching)
     pub(crate) gqa_attn_inst_indices: Vec<usize>, // seq_len changes each step
     pub(crate) kv_write_indices: Vec<Vec<(usize, usize)>>, // per attn layer, per kv_head: (k_copy_idx, v_copy_idx)
     // Base KV cache pointers (position=0) for computing per-step write offsets
@@ -123,8 +122,7 @@ pub struct MegakernelProgram {
     /// (instruction_idx, layer_idx) for each OP_BARRIER in the program.
     /// CPU dispatch loop uses layer_idx to look up DistributedMoeWeights.
     pub(crate) barrier_layer_map: Vec<(usize, usize)>,
-    /// Number of OP_MOE_DISPATCH instructions (for seq_num reset between tokens).
-    pub(crate) moe_dispatch_seq_count: Option<u32>,
+    pub(crate) _mrope_inst_indices: Vec<usize>,
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
 }

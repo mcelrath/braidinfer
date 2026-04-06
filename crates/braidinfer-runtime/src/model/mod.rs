@@ -139,17 +139,22 @@ impl Model {
         }
         let mk = self.megakernel.as_mut().unwrap();
         mk.update_step(token_id, position, &self.stream)?;
-        mk.execute(&self.stream)?;
+        let exec_result = mk.execute(&self.stream);
+        let sync_result = self.stream.synchronize();
 
-        self.stream.synchronize()?;
-
-        // Write dump after first decode token if MEGAKERNEL_DUMP is set
+        // Write dump even on error (crash dump for debugging HipError(720))
         if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {
             if mk.dump_active() {
-                mk.write_dump_btrc(&self.stream, &dump_path)?;
+                // Use a fresh synchronous copy — stream may be in error state.
+                // write_dump_btrc uses hipMemcpy (synchronous) which works even after stream fault.
+                let _ = mk.write_dump_btrc(&self.stream, &dump_path);
+                eprintln!("Megakernel dump written to {dump_path}");
                 mk.disable_dump()?;
             }
         }
+
+        exec_result?;
+        sync_result?;
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
@@ -641,6 +646,19 @@ impl Model {
     fn decode_step_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let hs = self.config.hidden_size as u32;
         let eps = self.config.rms_norm_eps;
+        let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
+
+        macro_rules! sync_check_moe {
+            ($label:expr) => {
+                if sync_debug {
+                    if let Err(e) = self.stream.synchronize() {
+                        eprintln!("SYNC_DEBUG: crash at pos={}.{}", position, $label);
+                        return Err(e.into());
+                    }
+                    eprintln!("SYNC_DEBUG: pos={}.{} OK", position, $label);
+                }
+            };
+        }
 
         // Set position_ids for mRoPE/RoPE
         let pos_data = [position as i32, position as i32, position as i32];
@@ -652,6 +670,7 @@ impl Model {
             &self.embed_weight,
             token_id as i32, hs, &self.stream,
         )?;
+        sync_check_moe!("embed");
 
         if self.debug_nan {
             self.stream.synchronize()?;
@@ -676,14 +695,17 @@ impl Model {
             match self.config.layers[layer_i].layer_type {
                 LayerType::Attention => {
                     self.attention_forward(layer_i, kv_idx, position)?;
+                    sync_check_moe!(format!("L{layer_i}.attn"));
                     kv_idx += 1;
                 }
                 LayerType::Gdn => {
                     self.gdn_forward(layer_i, gdn_idx)?;
+                    sync_check_moe!(format!("L{layer_i}.gdn"));
                     gdn_idx += 1;
                 }
                 LayerType::Mamba2 => {
                     self.mamba2_forward(layer_i, mamba2_idx)?;
+                    sync_check_moe!(format!("L{layer_i}.mamba2"));
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -746,6 +768,7 @@ impl Model {
 
                 if all_bf16 {
                     unsafe { self.ffn_forward(&*post_norm_p, (*w_gate_p).as_bf16(), (*w_up_p).as_bf16(), (*w_down_p).as_bf16())?; }
+                    sync_check_moe!(format!("L{layer_i}.ffn_bf16"));
                 } else {
                     // Unfused path for quantized weights
                     unsafe {
@@ -756,22 +779,29 @@ impl Model {
                             &mut self.activations.normed, &self.activations.hidden, &*post_norm_p,
                             1, hs as u32, eps, self.config.rms_norm_one_plus_w, &self.stream)?;
                     }
+                    sync_check_moe!(format!("L{layer_i}.ffn_norm"));
                     unsafe {
                         (*w_gate_p).forward(&self.kernels.linear_proj,
                             &mut self.activations.ffn_gate, &self.activations.normed,
                             is as u32, hs as u32, &self.stream)?;
+                    }
+                    sync_check_moe!(format!("L{layer_i}.ffn_gate"));
+                    unsafe {
                         (*w_up_p).forward(&self.kernels.linear_proj,
                             &mut self.activations.ffn_up, &self.activations.normed,
                             is as u32, hs as u32, &self.stream)?;
                     }
+                    sync_check_moe!(format!("L{layer_i}.ffn_up"));
                     self.kernels.silu_mul.forward(
                         &mut self.activations.ffn_act, &self.activations.ffn_gate, &self.activations.ffn_up,
                         is as u32, &self.stream)?;
+                    sync_check_moe!(format!("L{layer_i}.ffn_silu"));
                     unsafe {
                         (*w_down_p).forward(&self.kernels.linear_proj,
                             &mut self.activations.ffn_down, &self.activations.ffn_act,
                             hs as u32, is as u32, &self.stream)?;
                     }
+                    sync_check_moe!(format!("L{layer_i}.ffn_down"));
                     self.kernels.residual_add.forward(
                         &mut self.activations.hidden, &self.activations.ffn_down, &self.activations.residual,
                         hs as u32, &self.stream)?;
@@ -942,7 +972,13 @@ impl Model {
         // (batched FFN fused kernel only handles bf16).
         // Fall back to sequential decode.
         let has_moe = self.config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-        let has_quant = self.config.weight_quant != WeightQuantMode::Bf16;
+        // Detect actual weight format from layers (config.weight_quant defaults to Bf16 when WEIGHT_QUANT
+        // env var is not set, even if the bqnt file has quantized weights).
+        let has_quant = self.layers.iter().any(|l| match l {
+            LayerWeights::Attention(w) => !matches!(w.w_gate, LinearWeight::Bf16(_)),
+            LayerWeights::Gdn(w) => !matches!(w.w_gate, LinearWeight::Bf16(_)),
+            _ => false,
+        });
         if has_moe || has_quant {
             let mut logits = vec![];
             for (i, &tok) in tokens.iter().enumerate() {
@@ -954,9 +990,23 @@ impl Model {
         let mut pos = 0u32;
         for chunk in tokens.chunks(CHUNK_TOKENS) {
             let mut bufs = PrefillBuffers::alloc(self.device, &self.config, chunk.len())?;
-            let program = MegakernelProgram::compile_prefill(self, chunk, pos, &mut bufs)?;
-            program.execute(&self.stream)?;
-            self.stream.synchronize()?;
+            let mut program = MegakernelProgram::compile_prefill(self, chunk, pos, &mut bufs)?;
+            if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {
+                let max_slots: i32 = std::env::var("MEGAKERNEL_DUMP_SLOTS")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+                program.enable_dump(max_slots)?;
+                eprintln!("Prefill dump enabled: {} slots, output={}", max_slots, dump_path);
+            }
+            let exec_result = program.execute(&self.stream);
+            let sync_result = self.stream.synchronize();
+            if let Ok(dump_path) = std::env::var("MEGAKERNEL_DUMP") {
+                if program.dump_active() {
+                    let _ = program.write_dump_btrc(&self.stream, &dump_path);
+                    eprintln!("Prefill dump written to {dump_path}");
+                }
+            }
+            exec_result?;
+            sync_result?;
             pos += chunk.len() as u32;
             if pos < tokens.len() as u32 {
                 let _slot = self.save_recurrent_checkpoint()?;

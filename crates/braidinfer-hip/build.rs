@@ -14,7 +14,7 @@ fn main() {
         .join("kernels");
 
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
-    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2", "selective_state_update", "argmax", "moe_gate", "megakernel", "peer_copy", "moe_worker", "persistent_worker", "moe_gemv_worker"];
+    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2", "selective_state_update", "argmax", "moe_gate", "megakernel", "peer_copy", "persistent_worker"];
 
     for kernel in &kernels {
         let src = kernel_dir.join(format!("{kernel}.hip"));

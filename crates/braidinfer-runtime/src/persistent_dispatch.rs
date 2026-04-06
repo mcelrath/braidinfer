@@ -61,16 +61,6 @@ pub struct GpuWorker {
 }
 
 impl GpuWorker {
-    /// Get mutable reference to queue layout.
-    fn queue_mut(&self) -> &mut WorkerQueueLayout {
-        unsafe { &mut *(self.queue.host_ptr() as *mut WorkerQueueLayout) }
-    }
-
-    /// Get reference to queue layout.
-    fn queue_ref(&self) -> &WorkerQueueLayout {
-        unsafe { &*(self.queue.host_ptr() as *const WorkerQueueLayout) }
-    }
-
     /// Dispatch a single instruction and wait for completion.
     pub fn dispatch_and_wait(&mut self, inst: &Instruction) {
         let q_ptr = self.queue.host_ptr() as *mut WorkerQueueLayout;
@@ -159,24 +149,6 @@ impl PersistentDispatch {
         Ok(PersistentDispatch { workers, moe_output_slot })
     }
 
-    /// Dispatch an instruction to a specific GPU and wait for completion.
-    pub fn dispatch(&mut self, gpu_idx: usize, inst: &Instruction) {
-        self.workers[gpu_idx].dispatch_and_wait(inst);
-    }
-
-    /// Dispatch an instruction to a GPU WITHOUT waiting for ack. Returns seq for wait_ack.
-    pub fn dispatch_fire(&mut self, gpu_idx: usize, inst: &Instruction) -> u32 {
-        let w = &mut self.workers[gpu_idx];
-        let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
-        for j in 0..INST_SIZE {
-            unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).inst[j]), inst.words[j]); }
-        }
-        w.seq_counter += 1;
-        let seq = w.seq_counter;
-        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
-        seq
-    }
-
     /// Wait for a GPU to ack a specific seq number.
     pub fn wait_ack(&self, gpu_idx: usize, seq: u32) {
         let q_ptr = self.workers[gpu_idx].queue.host_ptr() as *const WorkerQueueLayout;
@@ -187,10 +159,6 @@ impl PersistentDispatch {
         }
     }
 
-    /// Dispatch an instruction to GPU 0 (primary).
-    pub fn dispatch_gpu0(&mut self, inst: &Instruction) {
-        self.workers[0].dispatch_and_wait(inst);
-    }
 
     /// Dispatch a batch of instructions to a GPU. Worker executes all with grid.sync()
     /// between them, acks once at the end. One signal round-trip per batch.
@@ -259,49 +227,6 @@ impl PersistentDispatch {
         seq
     }
 
-    /// Execute a full program (sequence of instructions) on GPU 0.
-    pub fn execute_program(&mut self, instructions: &[Instruction]) {
-        for inst in instructions {
-            self.workers[0].dispatch_and_wait(inst);
-        }
-    }
-
-    /// Dispatch different instructions to each GPU in parallel, wait for all.
-    /// `per_gpu[i]` is the instruction for GPU i (None = skip that GPU).
-    pub fn dispatch_parallel(&mut self, per_gpu: &[Option<Instruction>]) {
-        // Fire all instructions (non-blocking writes)
-        let mut pending = Vec::new();
-        for (i, maybe_inst) in per_gpu.iter().enumerate() {
-            if let Some(inst) = maybe_inst {
-                if i < self.workers.len() {
-                    let w = &mut self.workers[i];
-                    let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
-                    for j in 0..INST_SIZE {
-                        unsafe {
-                            std::ptr::write_volatile(
-                                std::ptr::addr_of_mut!((*q_ptr).inst[j]),
-                                inst.words[j],
-                            );
-                        }
-                    }
-                    w.seq_counter += 1;
-                    let seq = w.seq_counter;
-                    unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
-                    pending.push((i, seq));
-                }
-            }
-        }
-        // Wait for all acks
-        for (i, seq) in pending {
-            let q_ptr = self.workers[i].queue.host_ptr() as *const WorkerQueueLayout;
-            loop {
-                let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-                if ack == seq { break; }
-                std::hint::spin_loop();
-            }
-        }
-    }
-
     /// Multi-GPU init: fat dense worker on GPU 0 only.
     /// MoE dispatch uses kbk (hipLaunchKernel) on GPUs 1+ — no lean workers launched.
     pub fn init_multi_gpu(gpu0: DeviceId, _all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize, _max_eis: usize) -> HipResult<Self> {
@@ -340,72 +265,6 @@ impl PersistentDispatch {
         for worker in &self.workers {
             let _ = Device::set_current(worker.device);
             let _ = worker.stream.synchronize();
-        }
-    }
-
-    /// Re-launch workers after shutdown (reuses existing modules and queues).
-    pub fn relaunch(&mut self, shared_mem: u32) -> HipResult<()> {
-        for worker in &mut self.workers {
-            Device::set_current(worker.device)?;
-            // Reset queue state
-            let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
-            unsafe {
-                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), 0);
-                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 0);
-                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).ack), 0);
-            }
-            worker.seq_counter = 0;
-
-            let func = worker.module.get_function("persistent_worker")?;
-            let mut queue_ptr = worker.queue.device_ptr() as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 1] = [
-                std::ptr::addr_of_mut!(queue_ptr).cast(),
-            ];
-            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-            let num_cus = multiprocessor_count(worker.device)?;
-            let num_blocks = (blocks_per_sm as u32 * num_cus).max(num_cus);
-            func.launch_cooperative(
-                (num_blocks, 1, 1), (256, 1, 1), shared_mem, &worker.stream, &mut args,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Dispatch a sequence of instructions to a GPU, waiting only after the last one.
-    pub fn dispatch_sequence(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
-        for (i, inst) in instructions.iter().enumerate() {
-            let w = &mut self.workers[gpu_idx];
-            let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
-            for j in 0..INST_SIZE {
-                unsafe {
-                    std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).inst[j]), inst.words[j]);
-                }
-            }
-            w.seq_counter += 1;
-            let seq = w.seq_counter;
-            unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
-
-            // Only wait for ack on the last instruction
-            if i == instructions.len() - 1 {
-                let start = std::time::Instant::now();
-                loop {
-                    let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-                    if ack == seq { break; }
-                    if start.elapsed().as_secs() > 10 {
-                        let opcode = inst.words[0] & 0x7FFFFFFF;
-                        panic!("dispatch_sequence timeout gpu={gpu_idx} seq={seq} opcode={opcode}");
-                    }
-                    std::hint::spin_loop();
-                }
-            } else {
-                // Wait briefly for worker to consume before writing next instruction
-                let q_ptr = q_ptr as *const WorkerQueueLayout;
-                loop {
-                    let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-                    if ack == seq { break; }
-                    std::hint::spin_loop();
-                }
-            }
         }
     }
 

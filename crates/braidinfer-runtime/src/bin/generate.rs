@@ -33,14 +33,27 @@ fn main() {
     fn resolve_hf_dir(bqnt_path: &str) -> Option<String> {
         let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(std::path::Path::new(bqnt_path)).ok()?;
         let model_name = bqnt.model_name()?;
+        // If model_name is an absolute path that exists as a directory, use it directly
+        if model_name.starts_with('/') {
+            let p = std::path::Path::new(&model_name);
+            if p.is_dir() {
+                return Some(model_name);
+            }
+        }
         let hf_name = model_name.replace('/', "--");
         let cache_dir = dirs::home_dir()?
             .join(".cache/huggingface/hub")
             .join(format!("models--{hf_name}"))
             .join("snapshots");
-        std::fs::read_dir(&cache_dir).ok()?
+        // Prefer snapshot that has tokenizer.json; fall back to first dir found
+        let mut snapshots: Vec<_> = std::fs::read_dir(&cache_dir).ok()?
             .filter_map(|e| e.ok())
-            .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .collect();
+        snapshots.sort_by_key(|e| e.file_name());
+        snapshots.iter()
+            .find(|e| e.path().join("tokenizer.json").exists())
+            .or_else(|| snapshots.first())
             .map(|e| e.path().to_string_lossy().to_string())
     }
 
