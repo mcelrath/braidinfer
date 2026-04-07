@@ -43,17 +43,22 @@ fn bf16_to_f32(bits: u16) -> f32 {
 
 /// Patterns for tensors that must stay bf16 (router weights).
 const BF16_PATTERNS: &[&str] = &[
-    "gate.weight",               // MoE router gate
-    "e_score_correction_bias",   // Nemotron router bias
+    "gate.weight",             // MoE router gate
+    "e_score_correction_bias", // Nemotron router bias
 ];
 
 /// Patterns for tensors to skip (not weight matrices).
 const SKIP_PATTERNS: &[&str] = &[
-    "layernorm.weight", "norm.weight",
-    "A_log", "dt_bias",
-    "in_proj_a.weight", "in_proj_b.weight",
-    "conv1d.weight", "conv1d.bias",
-    "qscale_weight", "qscale_act",  // FP8 per-tensor scales (scalar metadata)
+    "layernorm.weight",
+    "norm.weight",
+    "A_log",
+    "dt_bias",
+    "in_proj_a.weight",
+    "in_proj_b.weight",
+    "conv1d.weight",
+    "conv1d.bias",
+    "qscale_weight",
+    "qscale_act", // FP8 per-tensor scales (scalar metadata)
 ];
 
 fn should_skip(name: &str) -> bool {
@@ -100,14 +105,28 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--model" | "-m" => { i += 1; model_name = args[i].clone(); }
-            "--format" | "-f" => { i += 1; format_str = args[i].clone(); }
-            "--output" | "-o" => { i += 1; output_path = args[i].clone(); }
+            "--model" | "-m" => {
+                i += 1;
+                model_name = args[i].clone();
+            }
+            "--format" | "-f" => {
+                i += 1;
+                format_str = args[i].clone();
+            }
+            "--output" | "-o" => {
+                i += 1;
+                output_path = args[i].clone();
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: bqnt_quantize --model <name> [--format q4|q8|mixed] [--output <path>]");
+                eprintln!(
+                    "Usage: bqnt_quantize --model <name> [--format q4|q8|mixed] [--output <path>]"
+                );
                 std::process::exit(0);
             }
-            _ => { eprintln!("Unknown arg: {}", args[i]); std::process::exit(1); }
+            _ => {
+                eprintln!("Unknown arg: {}", args[i]);
+                std::process::exit(1);
+            }
         }
         i += 1;
     }
@@ -145,8 +164,6 @@ fn main() {
     eprintln!("Output: {output_path}");
 
     let start = Instant::now();
-    let mut writer = BqntWriter::create(Path::new(&output_path))
-        .expect("Failed to create output file");
 
     // Find all safetensors shards
     let mut shards: Vec<PathBuf> = std::fs::read_dir(&model_dir)
@@ -161,6 +178,16 @@ fn main() {
     shards.sort();
 
     eprintln!("Found {} safetensors shard(s)", shards.len());
+
+    // First pass: count tensors to size the entry table reservation correctly.
+    let max_tensors: usize = shards.iter().map(|shard_path| {
+        let data = std::fs::read(shard_path).expect("Failed to read shard");
+        SafeTensors::deserialize(&data).map(|st| st.names().len()).unwrap_or(0)
+    }).sum();
+    eprintln!("Total tensors (first pass): {max_tensors}");
+
+    let mut writer =
+        BqntWriter::create(Path::new(&output_path), max_tensors).expect("Failed to create output file");
 
     let mut total_params: u64 = 0;
     let mut quantized_params: u64 = 0;
@@ -204,8 +231,10 @@ fn main() {
                 // Standard attention (self_attn.*_proj) → RNF4
                 // Expert FFN (experts.*.w1/w2/w3, mlp.*) → Q4
                 // Shared experts → Q4
-                if name.contains("experts.") || name.contains("shared_expert")
-                    || name.contains("mlp.") {
+                if name.contains("experts.")
+                    || name.contains("shared_expert")
+                    || name.contains("mlp.")
+                {
                     WeightFormat::PcG32Q4
                 } else {
                     WeightFormat::Rnf4G128
@@ -230,24 +259,30 @@ fn main() {
                     let f16_slice = unsafe {
                         std::slice::from_raw_parts(raw.as_ptr() as *const u16, n_elements)
                     };
-                    let converted: Vec<u16> = f16_slice.iter().map(|&bits| {
-                        // f16: 1 sign, 5 exp (bias=15), 10 mantissa
-                        let sign = ((bits >> 15) & 1) as u32;
-                        let exp = ((bits >> 10) & 0x1F) as u32;
-                        let mant = (bits & 0x3FF) as u32;
-                        let f32_bits = if exp == 0 {
-                            if mant == 0 { sign << 31 }
-                            else { // subnormal f16 -> normalize for f32
-                                let f = f32::from_bits((mant as u32) << 13) * f32::from_bits(0x33800000);
-                                (sign << 31) | (f.to_bits() & 0x7FFFFFFF)
-                            }
-                        } else if exp == 0x1F {
-                            (sign << 31) | 0x7F800000 | (mant << 13) // inf/nan
-                        } else {
-                            (sign << 31) | ((exp + 112) << 23) | (mant << 13)
-                        };
-                        f32_to_bf16(f32::from_bits(f32_bits))
-                    }).collect();
+                    let converted: Vec<u16> = f16_slice
+                        .iter()
+                        .map(|&bits| {
+                            // f16: 1 sign, 5 exp (bias=15), 10 mantissa
+                            let sign = ((bits >> 15) & 1) as u32;
+                            let exp = ((bits >> 10) & 0x1F) as u32;
+                            let mant = (bits & 0x3FF) as u32;
+                            let f32_bits = if exp == 0 {
+                                if mant == 0 {
+                                    sign << 31
+                                } else {
+                                    // subnormal f16 -> normalize for f32
+                                    let f = f32::from_bits((mant as u32) << 13)
+                                        * f32::from_bits(0x33800000);
+                                    (sign << 31) | (f.to_bits() & 0x7FFFFFFF)
+                                }
+                            } else if exp == 0x1F {
+                                (sign << 31) | 0x7F800000 | (mant << 13) // inf/nan
+                            } else {
+                                (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+                            };
+                            f32_to_bf16(f32::from_bits(f32_bits))
+                        })
+                        .collect();
                     let ptr = converted.as_ptr();
                     let slice = unsafe { std::slice::from_raw_parts(ptr, n_elements) };
                     (Some(converted), slice)
@@ -259,9 +294,13 @@ fn main() {
                     // Look up per-tensor scale (qscale_weight)
                     let scale_name = format!(
                         "{}.qscale_weight",
-                        name.rsplit_once('.').map(|(prefix, _)| prefix).unwrap_or(name)
+                        name.rsplit_once('.')
+                            .map(|(prefix, _)| prefix)
+                            .unwrap_or(name)
                     );
-                    let scale: f32 = safetensors.tensor(&scale_name).ok()
+                    let scale: f32 = safetensors
+                        .tensor(&scale_name)
+                        .ok()
                         .and_then(|st| {
                             let sd = st.data();
                             if st.dtype() == Dtype::BF16 && sd.len() >= 2 {
@@ -274,9 +313,10 @@ fn main() {
                         })
                         .unwrap_or(1.0);
 
-                    let converted: Vec<u16> = fp8_bytes.iter().map(|&b| {
-                        f32_to_bf16(fp8_e4m3_to_f32(b) * scale)
-                    }).collect();
+                    let converted: Vec<u16> = fp8_bytes
+                        .iter()
+                        .map(|&b| f32_to_bf16(fp8_e4m3_to_f32(b) * scale))
+                        .collect();
                     let ptr = converted.as_ptr();
                     let slice = unsafe { std::slice::from_raw_parts(ptr, n_elements) };
                     (Some(converted), slice)
@@ -294,11 +334,9 @@ fn main() {
                     bf16_params += n_elements as u64;
                     // Store as bf16 bytes
                     unsafe {
-                        std::slice::from_raw_parts(
-                            bf16_slice.as_ptr() as *const u8,
-                            n_elements * 2,
-                        )
-                    }.to_vec()
+                        std::slice::from_raw_parts(bf16_slice.as_ptr() as *const u8, n_elements * 2)
+                    }
+                    .to_vec()
                 }
                 WeightFormat::PcG32Q4 => {
                     quantized_params += n_elements as u64;
@@ -311,7 +349,8 @@ fn main() {
             };
             drop(bf16_data); // free conversion buffer
 
-            writer.write_tensor(name, fmt, out_dim as u32, in_dim as u32, ndim, &packed)
+            writer
+                .write_tensor(name, fmt, out_dim as u32, in_dim as u32, ndim, &packed)
                 .unwrap_or_else(|e| panic!("Failed to write tensor {name}: {e}"));
 
             tensor_count += 1;
@@ -321,7 +360,9 @@ fn main() {
         }
     }
 
-    let file_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+    let file_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     let effective_bpw = if total_params > 0 {
         file_size as f64 * 8.0 / total_params as f64
     } else {
@@ -355,13 +396,18 @@ fn main() {
         }
     });
 
-    writer.finish(&metadata.to_string())
+    writer
+        .finish(&metadata.to_string())
         .expect("Failed to finalize BQNT file");
 
     let elapsed = start.elapsed();
     eprintln!("\nDone in {:.1}s", elapsed.as_secs_f64());
     eprintln!("Tensors: {tensor_count}");
     eprintln!("Params:  {total_params} total, {quantized_params} quantized, {bf16_params} bf16");
-    eprintln!("Size:    {:.1} GB ({:.2} bits/param)", file_size as f64 / 1e9, effective_bpw);
+    eprintln!(
+        "Size:    {:.1} GB ({:.2} bits/param)",
+        file_size as f64 / 1e9,
+        effective_bpw
+    );
     eprintln!("Output:  {output_path}");
 }

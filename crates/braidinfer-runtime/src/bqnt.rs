@@ -117,11 +117,15 @@ pub struct BqntWriter {
     entries: Vec<TensorEntry>,
     names: HashMap<u64, String>,
     current_offset: u64,
+    max_tensors: usize,
 }
 
 impl BqntWriter {
     /// Create a new .bqnt file for writing.
-    pub fn create(path: &Path) -> io::Result<Self> {
+    /// `max_tensors`: upper bound on the number of tensors to be written.
+    /// The entry table is reserved at `align_up(HEADER_SIZE + max_tensors * ENTRY_SIZE, ALIGNMENT)`.
+    /// Pass a count from a first-pass scan or a safe overestimate to avoid table/data overlap.
+    pub fn create(path: &Path, max_tensors: usize) -> io::Result<Self> {
         let file = File::create(path)?;
         let writer = BufWriter::with_capacity(1 << 20, file); // 1MB buffer
         Ok(Self {
@@ -129,6 +133,7 @@ impl BqntWriter {
             entries: Vec::new(),
             names: HashMap::new(),
             current_offset: 0,
+            max_tensors,
         })
     }
 
@@ -162,11 +167,10 @@ impl BqntWriter {
         // For streaming large models, we write data immediately and record offset
         if self.current_offset == 0 {
             // Reserve space for header + tensor table (will be rewritten in finish).
-            // We don't know final n_tensors yet; reserve 8192 slots (enough for any current model).
+            // data_start is determined by max_tensors passed at construction time.
             // CRITICAL: data_start must be >= HEADER_SIZE + actual_n_tensors * ENTRY_SIZE or
-            // finish() will overwrite tensor data when writing the entry table. 8192 supports
-            // models with up to 8192 tensors before this assumption needs revisiting.
-            let data_start = align_up(HEADER_SIZE + 8192 * ENTRY_SIZE, ALIGNMENT);
+            // finish() will overwrite tensor data when writing the entry table.
+            let data_start = align_up(HEADER_SIZE + self.max_tensors as u64 * ENTRY_SIZE, ALIGNMENT);
             self.current_offset = data_start;
             self.writer.seek(SeekFrom::Start(data_start))?;
         }
@@ -206,7 +210,7 @@ impl BqntWriter {
         self.writer.write_all(&VERSION.to_le_bytes())?;
         self.writer
             .write_all(&(self.entries.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&8192u32.to_le_bytes())?; // reserved_entries: fixed table capacity
+        self.writer.write_all(&(self.max_tensors as u32).to_le_bytes())?; // reserved_entries
         self.writer.write_all(&metadata_offset.to_le_bytes())?;
         self.writer
             .write_all(&(metadata_bytes.len() as u64).to_le_bytes())?;
@@ -452,7 +456,7 @@ mod tests {
     #[test]
     fn rejects_out_of_bounds_metadata() {
         let path = temp_path("bad-meta");
-        let mut writer = BqntWriter::create(&path).unwrap();
+        let mut writer = BqntWriter::create(&path, 64).unwrap();
         writer
             .write_tensor("x", WeightFormat::Bf16, 1, 1, 2, &[0, 0])
             .unwrap();
