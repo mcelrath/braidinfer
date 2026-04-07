@@ -32,21 +32,13 @@ unsafe extern "C" {
     pub fn hipSetDevice(device: c_int) -> hipError_t;
     pub fn hipGetDevice(device: *mut c_int) -> hipError_t;
     pub fn hipDeviceSynchronize() -> hipError_t;
-    pub fn hipDeviceGetAttribute(
-        pi: *mut c_int,
-        attr: c_int,
-        device: c_int,
-    ) -> hipError_t;
+    pub fn hipDeviceGetAttribute(pi: *mut c_int, attr: c_int, device: c_int) -> hipError_t;
 
     // Memory management
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> hipError_t;
     pub fn hipFree(ptr: *mut c_void) -> hipError_t;
-    pub fn hipMemcpy(
-        dst: *mut c_void,
-        src: *const c_void,
-        size: usize,
-        kind: c_uint,
-    ) -> hipError_t;
+    pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: c_uint)
+    -> hipError_t;
     pub fn hipMemcpyAsync(
         dst: *mut c_void,
         src: *const c_void,
@@ -55,20 +47,17 @@ unsafe extern "C" {
         stream: hipStream_t,
     ) -> hipError_t;
     pub fn hipMemset(ptr: *mut c_void, value: c_int, size: usize) -> hipError_t;
-    pub fn hipHostMalloc(
-        ptr: *mut *mut c_void,
-        size: usize,
-        flags: c_uint,
-    ) -> hipError_t;
+    pub fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
     pub fn hipHostFree(ptr: *mut c_void) -> hipError_t;
-    pub fn hipHostRegister(
-        host_ptr: *mut c_void,
-        size_bytes: usize,
-        flags: c_uint,
-    ) -> hipError_t;
+    pub fn hipHostRegister(host_ptr: *mut c_void, size_bytes: usize, flags: c_uint) -> hipError_t;
     pub fn hipHostUnregister(host_ptr: *mut c_void) -> hipError_t;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
-    pub fn hipMemsetAsync(dst: *mut c_void, value: c_int, size_bytes: usize, stream: hipStream_t) -> hipError_t;
+    pub fn hipMemsetAsync(
+        dst: *mut c_void,
+        value: c_int,
+        size_bytes: usize,
+        stream: hipStream_t,
+    ) -> hipError_t;
 
     // Stream management
     pub fn hipStreamCreate(stream: *mut hipStream_t) -> hipError_t;
@@ -132,11 +121,7 @@ unsafe extern "C" {
     pub fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
     pub fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
     pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
-    pub fn hipEventElapsedTime(
-        ms: *mut f32,
-        start: hipEvent_t,
-        stop: hipEvent_t,
-    ) -> hipError_t;
+    pub fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, stop: hipEvent_t) -> hipError_t;
 
     // Peer access
     pub fn hipDeviceEnablePeerAccess(peer_device: c_int, flags: c_uint) -> hipError_t;
@@ -162,9 +147,5 @@ unsafe extern "C" {
     ) -> hipError_t;
 
     // Stream-event synchronization
-    pub fn hipStreamWaitEvent(
-        stream: hipStream_t,
-        event: hipEvent_t,
-        flags: c_uint,
-    ) -> hipError_t;
+    pub fn hipStreamWaitEvent(stream: hipStream_t, event: hipEvent_t, flags: c_uint) -> hipError_t;
 }

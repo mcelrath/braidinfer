@@ -170,7 +170,10 @@ impl BqntWriter {
             // data_start is determined by max_tensors passed at construction time.
             // CRITICAL: data_start must be >= HEADER_SIZE + actual_n_tensors * ENTRY_SIZE or
             // finish() will overwrite tensor data when writing the entry table.
-            let data_start = align_up(HEADER_SIZE + self.max_tensors as u64 * ENTRY_SIZE, ALIGNMENT);
+            let data_start = align_up(
+                HEADER_SIZE + self.max_tensors as u64 * ENTRY_SIZE,
+                ALIGNMENT,
+            );
             self.current_offset = data_start;
             self.writer.seek(SeekFrom::Start(data_start))?;
         }
@@ -210,7 +213,8 @@ impl BqntWriter {
         self.writer.write_all(&VERSION.to_le_bytes())?;
         self.writer
             .write_all(&(self.entries.len() as u32).to_le_bytes())?;
-        self.writer.write_all(&(self.max_tensors as u32).to_le_bytes())?; // reserved_entries
+        self.writer
+            .write_all(&(self.max_tensors as u32).to_le_bytes())?; // reserved_entries
         self.writer.write_all(&metadata_offset.to_le_bytes())?;
         self.writer
             .write_all(&(metadata_bytes.len() as u64).to_le_bytes())?;
@@ -302,7 +306,10 @@ impl BqntFile {
         })?;
         let table_end_exact = checked_end(HEADER_SIZE, table_bytes, "tensor table")?;
         // Use the aligned reserved size for overlap checks (writer always aligns to ALIGNMENT).
-        let table_end = align_up(HEADER_SIZE + reserved_entries as u64 * ENTRY_SIZE, ALIGNMENT);
+        let table_end = align_up(
+            HEADER_SIZE + reserved_entries as u64 * ENTRY_SIZE,
+            ALIGNMENT,
+        );
         if table_end_exact > file_len {
             return Err(invalid_data(format!(
                 "tensor table ends at {table_end_exact}, beyond file size {file_len}"
@@ -504,10 +511,7 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string().contains("overlaps metadata range"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("overlaps metadata range"), "{err}");
         let _ = std::fs::remove_file(path);
     }
 

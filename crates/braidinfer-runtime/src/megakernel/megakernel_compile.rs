@@ -81,10 +81,7 @@ enum AttentionVariant<'a> {
     /// Flat (non-paged) decode: GQA attention, KV written after mRoPE.
     FlatKv { kv_cache: &'a KvCache },
     /// Paged decode: OP_ATTN_PAGED, KV written BEFORE mRoPE.
-    PagedKv {
-        kv_cache: &'a KvCache,
-        attn_layer_index: usize,
-    },
+    PagedKv { attn_layer_index: usize },
     /// Prefill (N tokens): OP_ATTN_PREFILL, bulk KV write after mRoPE.
     Prefill {
         kv_cache: &'a KvCache,
@@ -217,7 +214,6 @@ impl MegakernelProgram {
                             cfg,
                             &model.layers[layer_i],
                             act,
-                            &model.kv_caches[kv_idx],
                             attn_layer_count,
                             &mut instructions,
                             &mut mrope_inst_indices,
@@ -241,7 +237,12 @@ impl MegakernelProgram {
                             cfg,
                             &model.layers[layer_i],
                             act,
-                            &model.kv_caches[kv_idx],
+                            model
+                                .legacy_kv_caches
+                                .as_ref()
+                                .expect("legacy KV cache not initialized for flat megakernel")
+                                .get(kv_idx)
+                                .expect("missing legacy KV cache"),
                             &mut instructions,
                             &mut mrope_inst_indices,
                             &mut gqa_attn_inst_indices,
@@ -479,7 +480,12 @@ impl MegakernelProgram {
                     LayerWeights::Attention(w) => w,
                     _ => panic!("expected attention layer"),
                 };
-                let kv_cache = &model.kv_caches[kv_idx];
+                let kv_cache = model
+                    .legacy_kv_caches
+                    .as_ref()
+                    .expect("legacy KV cache not initialized for flat prefill")
+                    .get(kv_idx)
+                    .expect("missing legacy KV cache");
 
                 Self::emit_attention_layer(
                     cfg,
@@ -960,11 +966,7 @@ impl MegakernelProgram {
         let mut paged_layer_k_offset: u64 = 0;
         let mut paged_layer_v_offset: u64 = 0;
         if paged_kv_write_before_norm {
-            if let AttentionVariant::PagedKv {
-                kv_cache,
-                attn_layer_index,
-            } = &variant
-            {
+            if let AttentionVariant::PagedKv { attn_layer_index } = &variant {
                 let kv_stride = nkh * hd;
                 let chunk_tokens: usize = 64;
                 paged_layer_k_offset =
@@ -978,9 +980,7 @@ impl MegakernelProgram {
                     let k_copy_idx = instructions.len();
                     {
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe {
-                            kv_cache.k.as_write_ptr().add(h * chunk_head_stride)
-                        });
+                        inst.set_output_ptr(1, std::ptr::null_mut::<f32>());
                         inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
                         inst.set_int(3, hd as i32);
                         inst.set_no_sync();
@@ -989,9 +989,7 @@ impl MegakernelProgram {
                     let v_copy_idx = instructions.len();
                     {
                         let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe {
-                            kv_cache.v.as_write_ptr().add(h * chunk_head_stride)
-                        });
+                        inst.set_output_ptr(1, std::ptr::null_mut::<f32>());
                         inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
                         inst.set_int(3, hd as i32);
                         if h < nkh - 1 {
@@ -1002,7 +1000,6 @@ impl MegakernelProgram {
                     head_indices.push((k_copy_idx, v_copy_idx));
                 }
                 kv_write_indices.push(head_indices);
-                kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
             }
         }
 
@@ -1097,10 +1094,7 @@ impl MegakernelProgram {
                 instructions.push(inst);
             }
 
-            AttentionVariant::PagedKv {
-                kv_cache: _,
-                attn_layer_index,
-            } => {
+            AttentionVariant::PagedKv { attn_layer_index } => {
                 // KV write already emitted above (step 4a, before QK-norm).
                 // Cache now stores pre-QK-norm K/V for quantization quality.
 
@@ -1629,7 +1623,6 @@ impl MegakernelProgram {
         cfg: &ModelConfig,
         layer: &LayerWeights,
         act: &ActivationBuffers,
-        kv_cache: &KvCache,
         attn_layer_index: usize,
         instructions: &mut Vec<Instruction>,
         mrope_indices: &mut Vec<usize>,
@@ -1647,10 +1640,7 @@ impl MegakernelProgram {
             w,
             act,
             None,
-            &AttentionVariant::PagedKv {
-                kv_cache,
-                attn_layer_index,
-            },
+            &AttentionVariant::PagedKv { attn_layer_index },
             instructions,
             mrope_indices,
             &mut Vec::new(),

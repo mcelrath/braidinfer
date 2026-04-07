@@ -14,7 +14,34 @@ fn main() {
         .join("kernels");
 
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
-    let kernels = ["rmsnorm", "linear_proj", "silu_mul", "residual_add", "embedding", "lm_head", "mrope", "gqa_attention", "ffn_fused", "gdn_layer_fused", "attn_layer_fused", "causal_conv1d_update", "qk_norm", "rmsnorm_gated", "output_gate", "gdn_gate", "gdn_recurrent_step_v2", "selective_state_update", "argmax", "moe_gate", "megakernel", "peer_copy", "persistent_worker", "deinterleave", "moe_worker"];
+    let kernels = [
+        "rmsnorm",
+        "linear_proj",
+        "silu_mul",
+        "residual_add",
+        "embedding",
+        "lm_head",
+        "mrope",
+        "gqa_attention",
+        "paged_attention",
+        "ffn_fused",
+        "gdn_layer_fused",
+        "attn_layer_fused",
+        "causal_conv1d_update",
+        "qk_norm",
+        "rmsnorm_gated",
+        "output_gate",
+        "gdn_gate",
+        "gdn_recurrent_step_v2",
+        "selective_state_update",
+        "argmax",
+        "moe_gate",
+        "megakernel",
+        "peer_copy",
+        "persistent_worker",
+        "deinterleave",
+        "moe_worker",
+    ];
 
     for kernel in &kernels {
         let src = kernel_dir.join(format!("{kernel}.hip"));
@@ -26,8 +53,8 @@ fn main() {
                 "--genco",
                 "-O3",
                 "-std=c++17",
-                "-ffp-contract=fast",  // Aggressive FMA fusion for performance
-                "-mwavefrontsize64", // Required for WMMA (V_WMMA_F32_16X16X16_F16)
+                "-ffp-contract=fast", // Aggressive FMA fusion for performance
+                "-mwavefrontsize64",  // Required for WMMA (V_WMMA_F32_16X16X16_F16)
                 "-DHIP_API_PER_THREAD_DEFAULT_STREAM", // Avoids deadlock with persistent kernels
                 &format!("-I{}", kernel_dir.display()), // For opcodes.h
                 "-o",
@@ -56,30 +83,47 @@ fn main() {
     );
 
     // DEP_BRAIDINFER_KERNELS_DIR will be available to dependent crates
-    println!(
-        "cargo:KERNEL_DIR={}",
-        out_dir.display()
-    );
+    println!("cargo:KERNEL_DIR={}", out_dir.display());
 
     // Link to HIP runtime
     println!("cargo:rustc-link-search=native={rocm_path}/lib");
     println!("cargo:rustc-link-lib=dylib=amdhip64");
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("bf16_utils.h").display());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("opcodes.h").display());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("megakernel_moe_barrier.hip").display());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("moe_worker.hip").display());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("moe_work_queue.h").display());
-    println!("cargo:rerun-if-changed={}", kernel_dir.join("moe_expert_ops.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("bf16_utils.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("opcodes.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("megakernel_moe_barrier.hip").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("moe_worker.hip").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("moe_work_queue.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("moe_expert_ops.h").display()
+    );
     println!("cargo:rerun-if-changed=build.rs");
 
     // Generate opcodes.rs from opcodes.h (single source of truth)
-    let opcodes_h = std::fs::read_to_string(kernel_dir.join("opcodes.h"))
-        .expect("failed to read opcodes.h");
-    let mut opcodes_rs = String::from("// Auto-generated from kernels/opcodes.h — do not edit manually.\n\n");
+    let opcodes_h =
+        std::fs::read_to_string(kernel_dir.join("opcodes.h")).expect("failed to read opcodes.h");
+    let mut opcodes_rs =
+        String::from("// Auto-generated from kernels/opcodes.h — do not edit manually.\n\n");
     for line in opcodes_h.lines() {
         if let Some(rest) = line.strip_prefix("#define ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() >= 2 {  // >= to handle trailing comments
+            if parts.len() >= 2 {
+                // >= to handle trailing comments
                 if let Ok(val) = parts[1].parse::<u32>() {
                     opcodes_rs.push_str(&format!(
                         "#[allow(dead_code)]\npub const {}: u32 = {val};\n",
@@ -89,6 +133,5 @@ fn main() {
             }
         }
     }
-    std::fs::write(out_dir.join("opcodes.rs"), &opcodes_rs)
-        .expect("failed to write opcodes.rs");
+    std::fs::write(out_dir.join("opcodes.rs"), &opcodes_rs).expect("failed to write opcodes.rs");
 }

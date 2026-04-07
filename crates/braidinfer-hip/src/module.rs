@@ -1,6 +1,6 @@
-use crate::{error, ffi, HipError, HipResult};
+use crate::{HipError, HipResult, error, ffi};
 use braidinfer_core::types::DeviceId;
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::marker::PhantomData;
 use std::path::Path;
 
@@ -13,9 +13,7 @@ pub struct Module {
 impl Module {
     pub fn load(device: DeviceId, path: &Path) -> HipResult<Self> {
         crate::device::Device::set_current(device)?;
-        let path_str = path
-            .to_str()
-            .ok_or(HipError(ffi::hipErrorInvalidValue))?;
+        let path_str = path.to_str().ok_or(HipError(ffi::hipErrorInvalidValue))?;
         let path_c = CString::new(path_str).map_err(|_| HipError(ffi::hipErrorInvalidValue))?;
         let mut raw = std::ptr::null_mut();
         error::check(unsafe { ffi::hipModuleLoad(&mut raw, path_c.as_ptr()) })?;
@@ -29,9 +27,7 @@ impl Module {
     pub fn get_function(&self, name: &str) -> HipResult<Function<'_>> {
         let name_c = CString::new(name).map_err(|_| HipError(ffi::hipErrorInvalidValue))?;
         let mut func = std::ptr::null_mut();
-        error::check(unsafe {
-            ffi::hipModuleGetFunction(&mut func, self.raw, name_c.as_ptr())
-        })?;
+        error::check(unsafe { ffi::hipModuleGetFunction(&mut func, self.raw, name_c.as_ptr()) })?;
         Ok(Function {
             raw: func,
             _module: PhantomData,

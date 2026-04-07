@@ -5,3 +5,9 @@ target/
 .dolt/
 *.db
 models/
+
+# Python
+__pycache__
+
+# Models
+*.bqnt

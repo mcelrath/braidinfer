@@ -1,8 +1,8 @@
 //! Model configuration types and parsing.
 //! Parsed from HuggingFace config.json — zero per-model classes.
 
-use std::path::Path;
 use crate::quant::WeightQuantMode;
+use std::path::Path;
 
 // ---- Model config ----
 
@@ -11,7 +11,7 @@ pub enum LayerType {
     Attention,
     Gdn,
     Mamba2,
-    MoeFfn,  // Standalone MoE FFN layer (Nemotron-H 'E' layers)
+    MoeFfn, // Standalone MoE FFN layer (Nemotron-H 'E' layers)
     LfmConv,
 }
 
@@ -19,12 +19,12 @@ pub enum LayerType {
 pub enum GateType {
     Softmax,
     NormTopK { routed_scaling_factor: f32 },
-    Sigmoid { routed_scaling_factor: f32 },  // Nemotron-H: sigmoid scores, not softmax
+    Sigmoid { routed_scaling_factor: f32 }, // Nemotron-H: sigmoid scores, not softmax
 }
 
 #[derive(Debug, Clone)]
 pub enum FfnType {
-    None,   // Standalone layer with no FFN sub-layer (Nemotron-H M and * layers)
+    None, // Standalone layer with no FFN sub-layer (Nemotron-H M and * layers)
     Dense,
     MoE {
         num_experts: usize,
@@ -45,8 +45,8 @@ pub struct LayerConfig {
 #[derive(Debug, Clone)]
 pub enum RecurrentLayerKind {
     Gdn {
-        num_heads: usize,        // key heads
-        num_value_heads: usize,  // value heads (may differ from key heads)
+        num_heads: usize,       // key heads
+        num_value_heads: usize, // value heads (may differ from key heads)
         key_dim: usize,
         value_dim: usize,
         conv_dim: usize,
@@ -58,7 +58,7 @@ pub enum RecurrentLayerKind {
         head_dim: usize,
         conv_kernel: usize,
         n_groups: usize,
-        conv_dim: usize,  // intermediate + 2 * n_groups * state_dim
+        conv_dim: usize, // intermediate + 2 * n_groups * state_dim
         dt_min: f32,
         dt_max: f32,
         dt_floor: f32,
@@ -84,10 +84,10 @@ pub struct ModelConfig {
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
     // mrope sections (pairs)
-    pub mrope_section: [usize; 3],  // TODO(kvn.1): redundant with rope_type.sections, unify during split
+    pub mrope_section: [usize; 3], // TODO(kvn.1): redundant with rope_type.sections, unify during split
     // GDN config
     pub linear_num_heads: usize,       // num_key_heads for GDN
-    pub linear_num_value_heads: usize,  // may differ from linear_num_heads (e.g. 4B: 32 vs 16)
+    pub linear_num_value_heads: usize, // may differ from linear_num_heads (e.g. 4B: 32 vs 16)
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
@@ -104,8 +104,8 @@ pub struct ModelConfig {
     pub recurrent_kind: RecurrentLayerKind,
     pub rope_type: RopeType,
     pub has_qk_norm: bool,
-    pub has_output_gate: bool,  // Qwen3.5 interleaves Q+gate; others don't
-    pub use_rope: bool,         // false for Nemotron-H (attention has no RoPE)
+    pub has_output_gate: bool, // Qwen3.5 interleaves Q+gate; others don't
+    pub use_rope: bool,        // false for Nemotron-H (attention has no RoPE)
     pub rms_norm_one_plus_w: bool, // true: (1+w)*x (Qwen3.5), false: w*x (Llama, OLMoE)
     pub attention_layer_indices: Vec<usize>,
     pub model_type: String,
@@ -117,10 +117,16 @@ impl ModelConfig {
     pub fn qwen35_0_8b() -> Self {
         let attention_layer_indices: Vec<usize> = vec![3, 7, 11, 15, 19, 23];
         let ffn = FfnType::Dense;
-        let layers: Vec<LayerConfig> = (0..24).map(|i| LayerConfig {
-            layer_type: if attention_layer_indices.contains(&i) { LayerType::Attention } else { LayerType::Gdn },
-            ffn_type: ffn.clone(),
-        }).collect();
+        let layers: Vec<LayerConfig> = (0..24)
+            .map(|i| LayerConfig {
+                layer_type: if attention_layer_indices.contains(&i) {
+                    LayerType::Attention
+                } else {
+                    LayerType::Gdn
+                },
+                ffn_type: ffn.clone(),
+            })
+            .collect();
         ModelConfig {
             hidden_size: 1024,
             num_layers: 24,
@@ -153,7 +159,9 @@ impl ModelConfig {
                 conv_dim: 6144,
                 kernel_size: 4,
             },
-            rope_type: RopeType::MRope { sections: [11, 11, 10] },
+            rope_type: RopeType::MRope {
+                sections: [11, 11, 10],
+            },
             has_qk_norm: false,
             has_output_gate: false,
             use_rope: true,
@@ -174,15 +182,10 @@ impl ModelConfig {
         let get = |key: &str| -> Option<&serde_json::Value> {
             tc.and_then(|t| t.get(key)).or_else(|| v.get(key))
         };
-        let get_usize = |key: &str| -> Option<usize> {
-            get(key).and_then(|v| v.as_u64()).map(|v| v as usize)
-        };
-        let get_f64 = |key: &str| -> Option<f64> {
-            get(key).and_then(|v| v.as_f64())
-        };
-        let get_bool = |key: &str| -> Option<bool> {
-            get(key).and_then(|v| v.as_bool())
-        };
+        let get_usize =
+            |key: &str| -> Option<usize> { get(key).and_then(|v| v.as_u64()).map(|v| v as usize) };
+        let get_f64 = |key: &str| -> Option<f64> { get(key).and_then(|v| v.as_f64()) };
+        let get_bool = |key: &str| -> Option<bool> { get(key).and_then(|v| v.as_bool()) };
         let get_str = |key: &str| -> Option<String> {
             get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
         };
@@ -190,13 +193,18 @@ impl ModelConfig {
         let model_type = get_str("model_type").unwrap_or_default();
         let hidden_size = get_usize("hidden_size")
             .or(get_usize("n_embd"))
-            .or(get_usize("n_embed"))  // bloom
+            .or(get_usize("n_embed")) // bloom
             .or(get_usize("d_model"))
-            .or(get_usize("model_dim"))  // openelm
+            .or(get_usize("model_dim")) // openelm
             .ok_or("missing hidden_size")?;
         let num_layers = get_usize("num_hidden_layers")
             .or(get_usize("n_layer"))
-            .or_else(|| get("layers_block_type").and_then(|v| v.as_array()).map(|a| a.len()))
+            .or(get_usize("num_transformer_layers"))
+            .or_else(|| {
+                get("layers_block_type")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+            })
             .or_else(|| get_str("hybrid_override_pattern").map(|p| p.len()))
             .ok_or("missing num_hidden_layers")?;
         let vocab_size = get_usize("vocab_size")
@@ -204,44 +212,91 @@ impl ModelConfig {
             .ok_or("missing vocab_size")?;
         let num_q_heads = get_usize("num_attention_heads")
             .or(get_usize("n_head"))
-            .unwrap_or(1);  // pure recurrent models (falcon_mamba) have no attention heads
-        let num_kv_heads = get_usize("num_key_value_heads").unwrap_or(num_q_heads);
+            .or_else(|| {
+                get("num_query_heads")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+            })
+            .unwrap_or(1); // pure recurrent models (falcon_mamba) have no attention heads
+        let num_kv_heads = get_usize("num_key_value_heads")
+            .or(get_usize("num_kv_heads"))
+            .or_else(|| {
+                get("num_kv_heads")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+            })
+            .unwrap_or(num_q_heads);
         let head_dim = get_usize("head_dim").unwrap_or(hidden_size / num_q_heads);
         let intermediate_size = get_usize("intermediate_size").unwrap_or(0);
-        let rms_norm_eps = get_f64("rms_norm_eps").or(get_f64("norm_eps")).or(get_f64("layer_norm_epsilon")).unwrap_or(1e-5) as f32;
+        let rms_norm_eps = get_f64("rms_norm_eps")
+            .or(get_f64("norm_eps"))
+            .or(get_f64("layer_norm_epsilon"))
+            .unwrap_or(1e-5) as f32;
         let rope_theta = get_f64("rope_theta")
-            .or_else(|| get("rope_parameters").and_then(|rp| rp.get("rope_theta")).and_then(|v| v.as_f64()))
+            .or(get_f64("rope_freq_constant"))
+            .or_else(|| {
+                get("rope_parameters")
+                    .and_then(|rp| rp.get("rope_theta"))
+                    .and_then(|v| v.as_f64())
+            })
             .unwrap_or(10000.0) as f32;
         let partial_rotary_factor = get_f64("partial_rotary_factor")
-            .or_else(|| get("rope_parameters").and_then(|rp| rp.get("partial_rotary_factor")).and_then(|v| v.as_f64()))
+            .or_else(|| {
+                get("rope_parameters")
+                    .and_then(|rp| rp.get("partial_rotary_factor"))
+                    .and_then(|v| v.as_f64())
+            })
             .unwrap_or(1.0);
         let rope_dim = ((head_dim as f64) * partial_rotary_factor) as usize;
-        let max_seq_len = get_usize("max_position_embeddings").unwrap_or(2048);
+        let max_seq_len = get_usize("max_position_embeddings")
+            .or(get_usize("max_context_length"))
+            .or(get_usize("rope_max_length"))
+            .unwrap_or(2048);
         // Default true matches HF convention (most models tie). Models with separate lm_head
         // that omit this field will use embedding weights — load path should verify at runtime.
-        let tie_word_embeddings = get_bool("tie_word_embeddings").unwrap_or(true);
+        let tie_word_embeddings = get_bool("tie_word_embeddings")
+            .or(get_bool("share_input_output_layers"))
+            .unwrap_or(true);
 
         // mRoPE
         let mrope_section = get("rope_parameters")
             .and_then(|rp| rp.get("mrope_section"))
             .and_then(|v| v.as_array())
-            .and_then(|a| if a.len() == 3 {
-                Some([a[0].as_u64()? as usize, a[1].as_u64()? as usize, a[2].as_u64()? as usize])
-            } else { None })
+            .and_then(|a| {
+                if a.len() == 3 {
+                    Some([
+                        a[0].as_u64()? as usize,
+                        a[1].as_u64()? as usize,
+                        a[2].as_u64()? as usize,
+                    ])
+                } else {
+                    None
+                }
+            })
             .unwrap_or([0, 0, 0]);
         let rope_type = if mrope_section != [0, 0, 0] {
-            RopeType::MRope { sections: mrope_section }
+            RopeType::MRope {
+                sections: mrope_section,
+            }
         } else {
-            RopeType::Standard { rotary_dim: rope_dim }
+            RopeType::Standard {
+                rotary_dim: rope_dim,
+            }
         };
 
         // GDN / recurrent config
         let linear_num_heads = get_usize("linear_num_key_heads").unwrap_or(0);
-        let linear_num_value_heads = get_usize("linear_num_value_heads").unwrap_or(linear_num_heads);
+        let linear_num_value_heads =
+            get_usize("linear_num_value_heads").unwrap_or(linear_num_heads);
         let linear_key_head_dim = get_usize("linear_key_head_dim").unwrap_or(128);
         let linear_value_head_dim = get_usize("linear_value_head_dim").unwrap_or(128);
         let linear_conv_kernel_dim = get_usize("linear_conv_kernel_dim")
-            .or(get_usize("conv_kernel")).unwrap_or(4);
+            .or(get_usize("conv_kernel"))
+            .unwrap_or(4);
 
         // Mamba2 config
         let ssm_state_size = get_usize("ssm_state_size");
@@ -249,13 +304,19 @@ impl ModelConfig {
         let mamba_head_dim = get_usize("mamba_head_dim");
 
         let recurrent_kind = if linear_num_heads > 0 {
-            let conv_dim = 2 * linear_num_heads * linear_key_head_dim + linear_num_value_heads * linear_value_head_dim;
+            let conv_dim = 2 * linear_num_heads * linear_key_head_dim
+                + linear_num_value_heads * linear_value_head_dim;
             RecurrentLayerKind::Gdn {
-                num_heads: linear_num_heads, num_value_heads: linear_num_value_heads,
-                key_dim: linear_key_head_dim, value_dim: linear_value_head_dim,
-                conv_dim, kernel_size: linear_conv_kernel_dim,
+                num_heads: linear_num_heads,
+                num_value_heads: linear_num_value_heads,
+                key_dim: linear_key_head_dim,
+                value_dim: linear_value_head_dim,
+                conv_dim,
+                kernel_size: linear_conv_kernel_dim,
             }
-        } else if let (Some(sd), Some(nh), Some(hd)) = (ssm_state_size, mamba_num_heads, mamba_head_dim) {
+        } else if let (Some(sd), Some(nh), Some(hd)) =
+            (ssm_state_size, mamba_num_heads, mamba_head_dim)
+        {
             let ng = get_usize("n_groups").unwrap_or(1);
             let mamba_intermediate = nh * hd;
             let mamba_conv_dim = mamba_intermediate + 2 * ng * sd;
@@ -263,10 +324,15 @@ impl ModelConfig {
             let dt_max = get_f64("time_step_max").unwrap_or(0.1) as f32;
             let dt_floor = get_f64("time_step_floor").unwrap_or(0.0001) as f32;
             RecurrentLayerKind::Mamba2 {
-                state_dim: sd, num_heads: nh, head_dim: hd,
+                state_dim: sd,
+                num_heads: nh,
+                head_dim: hd,
                 conv_kernel: linear_conv_kernel_dim,
-                n_groups: ng, conv_dim: mamba_conv_dim,
-                dt_min, dt_max, dt_floor,
+                n_groups: ng,
+                conv_dim: mamba_conv_dim,
+                dt_min,
+                dt_max,
+                dt_floor,
             }
         } else {
             RecurrentLayerKind::None
@@ -276,12 +342,17 @@ impl ModelConfig {
         let rsf = get_f64("routed_scaling_factor").unwrap_or(1.0) as f32;
         let gate_type = if model_type == "nemotron_h" {
             // Nemotron-H uses sigmoid scoring (not softmax) with correction bias
-            GateType::Sigmoid { routed_scaling_factor: rsf }
-        } else if get_bool("norm_topk_prob").unwrap_or(false)
-            || model_type.starts_with("qwen3_5") {
+            GateType::Sigmoid {
+                routed_scaling_factor: rsf,
+            }
+        } else if get_bool("norm_topk_prob").unwrap_or(false) || model_type.starts_with("qwen3_5") {
             // Qwen3.5 MoE always renormalizes top-k weights (no config flag)
-            GateType::NormTopK { routed_scaling_factor: rsf }
-        } else { GateType::Softmax };
+            GateType::NormTopK {
+                routed_scaling_factor: rsf,
+            }
+        } else {
+            GateType::Softmax
+        };
         let num_experts = get_usize("num_experts")
             .or(get_usize("n_routed_experts"))
             .or(get_usize("num_local_experts"))
@@ -290,90 +361,189 @@ impl ModelConfig {
             .or(get_usize("num_selected_experts"))
             .unwrap_or(0);
         let num_shared_experts = get_usize("n_shared_experts")
-            .or_else(|| if get_usize("shared_expert_intermediate_size").unwrap_or(0) > 0 { Some(1) } else { None })
+            .or_else(|| {
+                if get_usize("shared_expert_intermediate_size").unwrap_or(0) > 0 {
+                    Some(1)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
-        let expert_intermediate_size = get_usize("moe_intermediate_size").unwrap_or(intermediate_size);
+        let expert_intermediate_size =
+            get_usize("moe_intermediate_size").unwrap_or(intermediate_size);
         let shared_expert_intermediate_size = get_usize("moe_shared_expert_intermediate_size")
             .or(get_usize("shared_expert_intermediate_size"))
             .unwrap_or(0);
 
         let moe_ffn = if num_experts > 0 {
             FfnType::MoE {
-                num_experts, num_active: num_active_experts, num_shared: num_shared_experts,
-                expert_intermediate_size, shared_intermediate_size: shared_expert_intermediate_size,
+                num_experts,
+                num_active: num_active_experts,
+                num_shared: num_shared_experts,
+                expert_intermediate_size,
+                shared_intermediate_size: shared_expert_intermediate_size,
                 gate_type: gate_type.clone(),
             }
-        } else { FfnType::Dense };
+        } else {
+            FfnType::Dense
+        };
         let dense_ffn = FfnType::Dense;
 
         // Layer pattern detection
-        let layers: Vec<LayerConfig> = if let Some(lt) = get("layer_types").and_then(|v| v.as_array()) {
-            lt.iter().map(|t| {
-                let ts = t.as_str().unwrap_or("");
-                let layer_type = match ts {
-                    "full_attention" | "attention" => LayerType::Attention,
-                    "linear_attention" => LayerType::Gdn,
-                    "conv" => LayerType::LfmConv,
-                    "sliding_attention" => LayerType::Attention,
-                    _ => LayerType::Attention,
+        let layers: Vec<LayerConfig> =
+            if let Some(lt) = get("layer_types").and_then(|v| v.as_array()) {
+                lt.iter()
+                    .map(|t| {
+                        let ts = t.as_str().unwrap_or("");
+                        let layer_type = match ts {
+                            "full_attention" | "attention" => LayerType::Attention,
+                            "linear_attention" => LayerType::Gdn,
+                            "conv" => LayerType::LfmConv,
+                            "sliding_attention" => LayerType::Attention,
+                            _ => LayerType::Attention,
+                        };
+                        let ffn = if num_experts > 0 {
+                            moe_ffn.clone()
+                        } else {
+                            dense_ffn.clone()
+                        };
+                        LayerConfig {
+                            layer_type,
+                            ffn_type: ffn,
+                        }
+                    })
+                    .collect()
+            } else if let Some(pattern) = get_str("hybrid_override_pattern") {
+                // Nemotron-H: M=pure Mamba2 SSM, E=pure MoE FFN, *=pure Attention
+                // Each letter is a standalone layer type, not a mixer+FFN pair
+                pattern
+                    .chars()
+                    .map(|c| match c {
+                        'M' => LayerConfig {
+                            layer_type: LayerType::Mamba2,
+                            ffn_type: FfnType::None,
+                        },
+                        'E' => LayerConfig {
+                            layer_type: LayerType::MoeFfn,
+                            ffn_type: moe_ffn.clone(),
+                        },
+                        '*' => LayerConfig {
+                            layer_type: LayerType::Attention,
+                            ffn_type: FfnType::None,
+                        },
+                        _ => LayerConfig {
+                            layer_type: LayerType::Attention,
+                            ffn_type: FfnType::None,
+                        },
+                    })
+                    .collect()
+            } else if let Some(lbt) = get("layers_block_type").and_then(|v| v.as_array()) {
+                lbt.iter()
+                    .map(|t| {
+                        let ts = t.as_str().unwrap_or("");
+                        match ts {
+                            "mamba" => LayerConfig {
+                                layer_type: LayerType::Mamba2,
+                                ffn_type: FfnType::None,
+                            },
+                            "moe" => LayerConfig {
+                                layer_type: LayerType::MoeFfn,
+                                ffn_type: moe_ffn.clone(),
+                            },
+                            "attention" => LayerConfig {
+                                layer_type: LayerType::Attention,
+                                ffn_type: FfnType::None,
+                            },
+                            _ => LayerConfig {
+                                layer_type: LayerType::Attention,
+                                ffn_type: dense_ffn.clone(),
+                            },
+                        }
+                    })
+                    .collect()
+            } else if let Some(interval) = get_usize("full_attention_interval") {
+                (0..num_layers)
+                    .map(|i| {
+                        let lt = if (i + 1) % interval == 0 {
+                            LayerType::Attention
+                        } else {
+                            LayerType::Gdn
+                        };
+                        let ffn = if num_experts > 0 {
+                            moe_ffn.clone()
+                        } else {
+                            dense_ffn.clone()
+                        };
+                        LayerConfig {
+                            layer_type: lt,
+                            ffn_type: ffn,
+                        }
+                    })
+                    .collect()
+            } else {
+                // Default: all attention, MoE if experts detected
+                let ffn = if num_experts > 0 {
+                    moe_ffn.clone()
+                } else {
+                    dense_ffn.clone()
                 };
-                let ffn = if num_experts > 0 { moe_ffn.clone() } else { dense_ffn.clone() };
-                LayerConfig { layer_type, ffn_type: ffn }
-            }).collect()
-        } else if let Some(pattern) = get_str("hybrid_override_pattern") {
-            // Nemotron-H: M=pure Mamba2 SSM, E=pure MoE FFN, *=pure Attention
-            // Each letter is a standalone layer type, not a mixer+FFN pair
-            pattern.chars().map(|c| match c {
-                'M' => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: FfnType::None },
-                'E' => LayerConfig { layer_type: LayerType::MoeFfn, ffn_type: moe_ffn.clone() },
-                '*' => LayerConfig { layer_type: LayerType::Attention, ffn_type: FfnType::None },
-                _ => LayerConfig { layer_type: LayerType::Attention, ffn_type: FfnType::None },
-            }).collect()
-        } else if let Some(lbt) = get("layers_block_type").and_then(|v| v.as_array()) {
-            lbt.iter().map(|t| {
-                let ts = t.as_str().unwrap_or("");
-                match ts {
-                    "mamba" => LayerConfig { layer_type: LayerType::Mamba2, ffn_type: FfnType::None },
-                    "moe" => LayerConfig { layer_type: LayerType::MoeFfn, ffn_type: moe_ffn.clone() },
-                    "attention" => LayerConfig { layer_type: LayerType::Attention, ffn_type: FfnType::None },
-                    _ => LayerConfig { layer_type: LayerType::Attention, ffn_type: dense_ffn.clone() },
-                }
-            }).collect()
-        } else if let Some(interval) = get_usize("full_attention_interval") {
-            (0..num_layers).map(|i| {
-                let lt = if (i + 1) % interval == 0 { LayerType::Attention } else { LayerType::Gdn };
-                let ffn = if num_experts > 0 { moe_ffn.clone() } else { dense_ffn.clone() };
-                LayerConfig { layer_type: lt, ffn_type: ffn }
-            }).collect()
+                (0..num_layers)
+                    .map(|_| LayerConfig {
+                        layer_type: LayerType::Attention,
+                        ffn_type: ffn.clone(),
+                    })
+                    .collect()
+            };
+
+        let attention_layer_indices: Vec<usize> = layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.layer_type == LayerType::Attention)
+            .map(|(i, _)| i)
+            .collect();
+
+        let intermediate_size = if intermediate_size == 0 {
+            expert_intermediate_size
         } else {
-            // Default: all attention, MoE if experts detected
-            let ffn = if num_experts > 0 { moe_ffn.clone() } else { dense_ffn.clone() };
-            (0..num_layers).map(|_| LayerConfig { layer_type: LayerType::Attention, ffn_type: ffn.clone() }).collect()
+            intermediate_size
         };
 
-        let attention_layer_indices: Vec<usize> = layers.iter().enumerate()
-            .filter(|(_, l)| l.layer_type == LayerType::Attention)
-            .map(|(i, _)| i).collect();
-
-        let intermediate_size = if intermediate_size == 0 { expert_intermediate_size } else { intermediate_size };
-
         Ok(ModelConfig {
-            hidden_size, num_layers, intermediate_size, vocab_size,
-            num_q_heads, num_kv_heads, head_dim, rope_dim, rope_theta, rms_norm_eps,
+            hidden_size,
+            num_layers,
+            intermediate_size,
+            vocab_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rope_dim,
+            rope_theta,
+            rms_norm_eps,
             mrope_section,
-            linear_num_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, linear_conv_kernel_dim,
-            layers, max_seq_len,
-            num_experts, num_active_experts, num_shared_experts,
-            expert_intermediate_size, shared_expert_intermediate_size,
-            recurrent_kind, rope_type,
-            has_qk_norm: false, has_output_gate: false, // auto-detected from tensor names at load time
-            rms_norm_one_plus_w: model_type.starts_with("qwen3_5"),  // Only Qwen3.5 uses (1+w)*x; Qwen3 uses w*x
-            use_rope: model_type != "nemotron_h",  // Nemotron-H attention has no RoPE
-            attention_layer_indices, model_type, tie_word_embeddings,
+            linear_num_heads,
+            linear_num_value_heads,
+            linear_key_head_dim,
+            linear_value_head_dim,
+            linear_conv_kernel_dim,
+            layers,
+            max_seq_len,
+            num_experts,
+            num_active_experts,
+            num_shared_experts,
+            expert_intermediate_size,
+            shared_expert_intermediate_size,
+            recurrent_kind,
+            rope_type,
+            has_qk_norm: false,
+            has_output_gate: false, // auto-detected from tensor names at load time
+            rms_norm_one_plus_w: model_type.starts_with("qwen3_5"), // Only Qwen3.5 uses (1+w)*x; Qwen3 uses w*x
+            use_rope: model_type != "nemotron_h", // Nemotron-H attention has no RoPE
+            attention_layer_indices,
+            model_type,
+            tie_word_embeddings,
             weight_quant: WeightQuantMode::Bf16,
         })
     }
-
 
     pub fn chunk_kv_bytes(&self, chunk_tokens: usize) -> usize {
         let num_attn = self.num_attn_layers();
@@ -383,12 +553,18 @@ impl ModelConfig {
 
     pub fn recurrent_state_bytes_per_layer(&self) -> usize {
         match &self.recurrent_kind {
-            RecurrentLayerKind::Gdn { num_value_heads, key_dim, value_dim, .. } => {
-                num_value_heads * key_dim * value_dim * 4
-            }
-            RecurrentLayerKind::Mamba2 { state_dim, num_heads, head_dim, .. } => {
-                num_heads * head_dim * state_dim * 4
-            }
+            RecurrentLayerKind::Gdn {
+                num_value_heads,
+                key_dim,
+                value_dim,
+                ..
+            } => num_value_heads * key_dim * value_dim * 4,
+            RecurrentLayerKind::Mamba2 {
+                state_dim,
+                num_heads,
+                head_dim,
+                ..
+            } => num_heads * head_dim * state_dim * 4,
             RecurrentLayerKind::None => 0,
         }
     }
@@ -398,10 +574,16 @@ impl ModelConfig {
     }
 
     pub fn num_attn_layers(&self) -> usize {
-        self.layers.iter().filter(|l| l.layer_type == LayerType::Attention).count()
+        self.layers
+            .iter()
+            .filter(|l| l.layer_type == LayerType::Attention)
+            .count()
     }
 
     pub fn num_recurrent_layers(&self) -> usize {
-        self.layers.iter().filter(|l| matches!(l.layer_type, LayerType::Gdn | LayerType::Mamba2)).count()
+        self.layers
+            .iter()
+            .filter(|l| matches!(l.layer_type, LayerType::Gdn | LayerType::Mamba2))
+            .count()
     }
 }

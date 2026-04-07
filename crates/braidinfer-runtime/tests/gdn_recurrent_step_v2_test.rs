@@ -29,18 +29,29 @@ fn gdn_step_v2_reference(
         let beta = sigmoid(b[h]);
         let qh = l2_normalize(&q[h * key_dim..(h + 1) * key_dim]);
         let kh = l2_normalize(&k[h * key_dim..(h + 1) * key_dim]);
+        let q_scale = 1.0 / (key_dim as f32).sqrt();
         let vh = &v[h * value_dim..(h + 1) * value_dim];
         let s = &mut state[h * key_dim * value_dim..(h + 1) * key_dim * value_dim];
-        for i in 0..key_dim {
-            for j in 0..value_dim {
-                s[i * value_dim + j] = decay * s[i * value_dim + j]
-                    + beta * vh[j] * kh[i];
+
+        for idx in 0..key_dim * value_dim {
+            s[idx] *= decay;
+        }
+
+        for j in 0..value_dim {
+            let mut kv_mem = 0.0f32;
+            for i in 0..key_dim {
+                kv_mem += s[j * key_dim + i] * kh[i];
+            }
+            let delta = (vh[j] - kv_mem) * beta;
+            for i in 0..key_dim {
+                s[j * key_dim + i] += kh[i] * delta;
             }
         }
+
         for j in 0..value_dim {
             let mut sum = 0.0f32;
             for i in 0..key_dim {
-                sum += s[i * value_dim + j] * qh[i];
+                sum += s[j * key_dim + i] * qh[i] * q_scale;
             }
             output[h * value_dim + j] = sum;
         }
@@ -73,8 +84,15 @@ fn test_gdn_recurrent_step_v2_matches_reference() {
 
     let mut cpu_state = state_data.clone();
     let expected = gdn_step_v2_reference(
-        &q_data, &k_data, &v_data, &gate_data, &b_data,
-        &mut cpu_state, num_heads, key_dim, value_dim,
+        &q_data,
+        &k_data,
+        &v_data,
+        &gate_data,
+        &b_data,
+        &mut cpu_state,
+        num_heads,
+        key_dim,
+        value_dim,
     );
 
     let stream = Stream::new(device).expect("stream");
@@ -85,8 +103,10 @@ fn test_gdn_recurrent_step_v2_matches_reference() {
     let mut d_v = DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc v");
     let mut d_gate = DeviceBuffer::<f32>::alloc(device, num_heads).expect("alloc gate");
     let mut d_b = DeviceBuffer::<f32>::alloc(device, num_heads).expect("alloc b");
-    let mut d_state = DeviceBuffer::<f32>::alloc(device, num_heads * key_dim * value_dim).expect("alloc state");
-    let mut d_output = DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc output");
+    let mut d_state =
+        DeviceBuffer::<f32>::alloc(device, num_heads * key_dim * value_dim).expect("alloc state");
+    let mut d_output =
+        DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc output");
 
     d_q.copy_from_host(&q_data).expect("copy q");
     d_k.copy_from_host(&k_data).expect("copy k");
@@ -97,9 +117,17 @@ fn test_gdn_recurrent_step_v2_matches_reference() {
 
     kernel
         .forward(
-            &d_q, &d_k, &d_v, &d_gate, &d_b,
-            &mut d_state, &mut d_output,
-            num_heads as u32, key_dim as u32, value_dim as u32,
+            &d_q,
+            &d_k,
+            &d_v,
+            &d_gate,
+            &d_b,
+            &mut d_state,
+            &mut d_output,
+            num_heads as u32,
+            key_dim as u32,
+            value_dim as u32,
+            1,
             &stream,
         )
         .expect("kernel launch");
@@ -109,8 +137,11 @@ fn test_gdn_recurrent_step_v2_matches_reference() {
     let mut result = vec![0.0f32; num_heads * value_dim];
     d_output.copy_to_host(&mut result).expect("copy output");
 
-    let max_err: f32 = result.iter().zip(expected.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_err: f32 = result
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
     assert!(
         max_err < 1e-3,

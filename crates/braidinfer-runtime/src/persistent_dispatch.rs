@@ -26,14 +26,14 @@
 //! confirming kernel exit via host-mapped completion_flag.
 
 use braidinfer_core::types::DeviceId;
+use braidinfer_hip::HipResult;
 use braidinfer_hip::device::Device;
+use braidinfer_hip::ffi;
 use braidinfer_hip::memory::MappedHostBuffer;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
-use braidinfer_hip::HipResult;
-use braidinfer_hip::ffi;
 
-use crate::megakernel::{Instruction, INST_SIZE};
+use crate::megakernel::{INST_SIZE, Instruction};
 
 /// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 64;
@@ -43,18 +43,18 @@ pub const MAX_BATCH_INSTRUCTIONS: usize = 64;
 pub struct WorkerQueueLayout {
     pub seq_num: u32,
     pub shutdown: u32,
-    pub num_instructions: u32,  // how many instructions in this batch (1..MAX_BATCH)
+    pub num_instructions: u32, // how many instructions in this batch (1..MAX_BATCH)
     pub _pad: u32,
-    pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE],  // instruction batch buffer
+    pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE], // instruction batch buffer
     pub ack: u32,
-    pub done: u32,  // kernel writes 1 when exiting after shutdown (for Drop polling)
+    pub done: u32, // kernel writes 1 when exiting after shutdown (for Drop polling)
     pub _pad2: [u32; 2],
 }
 
 /// Per-GPU worker state.
 pub struct GpuWorker {
     pub device: DeviceId,
-    pub queue: MappedHostBuffer<u8>,  // WorkerQueueLayout, host-mapped
+    pub queue: MappedHostBuffer<u8>, // WorkerQueueLayout, host-mapped
     pub stream: Stream,
     pub module: Module,
     pub seq_counter: u32,
@@ -68,27 +68,30 @@ impl GpuWorker {
         // Copy instruction words to work queue
         for i in 0..INST_SIZE {
             unsafe {
-                std::ptr::write_volatile(
-                    std::ptr::addr_of_mut!((*q_ptr).inst[i]),
-                    inst.words[i],
-                );
+                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).inst[i]), inst.words[i]);
             }
         }
 
         // Increment and write seq_num (triggers worker)
         self.seq_counter += 1;
         let seq = self.seq_counter;
-        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
+        unsafe {
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
+        }
 
         // Poll ack with timeout
         let start = std::time::Instant::now();
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-            if ack == seq { break; }
+            if ack == seq {
+                break;
+            }
             if start.elapsed().as_secs() > 10 {
                 let opcode = inst.words[0] & 0x7FFFFFFF;
                 let grid_x = (inst.words[0] >> 32) as u32;
-                panic!("PERSISTENT: dispatch timeout seq={seq} opcode={opcode} grid_x={grid_x} ack={ack}");
+                panic!(
+                    "PERSISTENT: dispatch timeout seq={seq} opcode={opcode} grid_x={grid_x} ack={ack}"
+                );
             }
             std::hint::spin_loop();
         }
@@ -122,6 +125,15 @@ fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
 }
 
 impl PersistentDispatch {
+    fn request_shutdown(&self) {
+        for worker in &self.workers {
+            let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
+            unsafe {
+                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1);
+            }
+        }
+    }
+
     /// Launch persistent workers on specified GPUs.
     /// `hidden_size`: for MoE output slot allocation (0 if no MoE).
     pub fn init(devices: &[DeviceId], shared_mem: u32, _hidden_size: usize) -> HipResult<Self> {
@@ -140,13 +152,31 @@ impl PersistentDispatch {
             let bpsm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
             let num_cus = multiprocessor_count(device)?;
             let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
-            func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), shared_mem, &stream, &mut args)?;
-            eprintln!("  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared)", device.0);
-            workers.push(std::mem::ManuallyDrop::new(GpuWorker { device, queue, stream, module, seq_counter: 0 }));
+            func.launch_cooperative(
+                (num_blocks, 1, 1),
+                (256, 1, 1),
+                shared_mem,
+                &stream,
+                &mut args,
+            )?;
+            eprintln!(
+                "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared)",
+                device.0
+            );
+            workers.push(std::mem::ManuallyDrop::new(GpuWorker {
+                device,
+                queue,
+                stream,
+                module,
+                seq_counter: 0,
+            }));
         }
 
         let moe_output_slot = MappedHostBuffer::<f32>::alloc(1)?; // placeholder for init() path
-        Ok(PersistentDispatch { workers, moe_output_slot })
+        Ok(PersistentDispatch {
+            workers,
+            moe_output_slot,
+        })
     }
 
     /// Wait for a GPU to ack a specific seq number.
@@ -154,11 +184,12 @@ impl PersistentDispatch {
         let q_ptr = self.workers[gpu_idx].queue.host_ptr() as *const WorkerQueueLayout;
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-            if ack == seq { break; }
+            if ack == seq {
+                break;
+            }
             std::hint::spin_loop();
         }
     }
-
 
     /// Dispatch a batch of instructions to a GPU. Worker executes all with grid.sync()
     /// between them, acks once at the end. One signal round-trip per batch.
@@ -181,35 +212,54 @@ impl PersistentDispatch {
         }
 
         // Write num_instructions BEFORE seq_num (worker reads num_instructions after seeing seq_num)
-        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).num_instructions), instructions.len() as u32); }
+        unsafe {
+            std::ptr::write_volatile(
+                std::ptr::addr_of_mut!((*q_ptr).num_instructions),
+                instructions.len() as u32,
+            );
+        }
 
         // Trigger worker
         w.seq_counter += 1;
         let seq = w.seq_counter;
-        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
+        unsafe {
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
+        }
 
         // Wait for ack
         let start = std::time::Instant::now();
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-            if ack == seq { break; }
+            if ack == seq {
+                break;
+            }
             if start.elapsed().as_secs() > 2 {
                 let opcode0 = instructions[0].words[0] & 0x7FFFFFFF;
-                panic!("dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} opcode0={opcode0}", instructions.len());
+                panic!(
+                    "dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} opcode0={opcode0}",
+                    instructions.len()
+                );
             }
             std::hint::spin_loop();
         }
         if std::env::var("DISPATCH_RTT").is_ok() {
             let us = start.elapsed().as_micros();
             let op0 = instructions[0].words[0] & 0x7FFFFFFF;
-            eprintln!("dispatch_batch gpu={gpu_idx} n={} op0={op0:#x} rtt={us}us", instructions.len());
+            eprintln!(
+                "dispatch_batch gpu={gpu_idx} n={} op0={op0:#x} rtt={us}us",
+                instructions.len()
+            );
         }
     }
 
     /// Fire a batch of instructions to a GPU WITHOUT waiting for ack. Returns seq for wait_ack.
     /// Caller must call wait_ack(gpu_idx, seq) before reading GPU 0 output.
     /// Used to overlap GPU 0 OP_EXPERT_FFN with kbk dispatch on GPUs 1+.
-    pub(crate) fn dispatch_batch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
+    pub(crate) fn dispatch_batch_fire(
+        &mut self,
+        gpu_idx: usize,
+        instructions: &[Instruction],
+    ) -> u32 {
         assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
         let w = &mut self.workers[gpu_idx];
         let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
@@ -225,10 +275,17 @@ impl PersistentDispatch {
             }
         }
         // Write num_instructions BEFORE seq_num (worker reads num_instructions after seeing seq_num)
-        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).num_instructions), instructions.len() as u32); }
+        unsafe {
+            std::ptr::write_volatile(
+                std::ptr::addr_of_mut!((*q_ptr).num_instructions),
+                instructions.len() as u32,
+            );
+        }
         w.seq_counter += 1;
         let seq = w.seq_counter;
-        unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq); }
+        unsafe {
+            std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
+        }
         seq
     }
 
@@ -237,7 +294,13 @@ impl PersistentDispatch {
     /// Launch persistent cooperative worker on GPU 0 only.
     /// GPUs 1+ use kbk (hipLaunchKernel) for MoE expert dispatch — cooperative kernels
     /// hold all SMs and deadlock with kbk on the same device.
-    pub fn init_multi_gpu(gpu0: DeviceId, _all_devices: &[DeviceId], shared_mem: u32, hidden_size: usize, _max_eis: usize) -> HipResult<Self> {
+    pub fn init_multi_gpu(
+        gpu0: DeviceId,
+        _all_devices: &[DeviceId],
+        shared_mem: u32,
+        hidden_size: usize,
+        _max_eis: usize,
+    ) -> HipResult<Self> {
         let kernel_dir = crate::kernel::kernel_dir();
         Device::set_current(gpu0)?;
         let queue = MappedHostBuffer::<u8>::alloc(std::mem::size_of::<WorkerQueueLayout>())?;
@@ -249,27 +312,36 @@ impl PersistentDispatch {
         let num_blocks = (blocks_per_sm as u32 * num_cus).max(num_cus);
         let mut q = queue.device_ptr() as *mut std::ffi::c_void;
         let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
-        func.launch_cooperative((num_blocks, 1, 1), (256, 1, 1), shared_mem, &stream, &mut args)?;
-        eprintln!("  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B); GPUs 1+ use kbk", gpu0.0);
+        func.launch_cooperative(
+            (num_blocks, 1, 1),
+            (256, 1, 1),
+            shared_mem,
+            &stream,
+            &mut args,
+        )?;
+        eprintln!(
+            "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B); GPUs 1+ use kbk",
+            gpu0.0
+        );
         let moe_output_slot = MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?;
         Ok(PersistentDispatch {
             workers: vec![std::mem::ManuallyDrop::new(GpuWorker {
-                device: gpu0, queue, stream, module, seq_counter: 0,
+                device: gpu0,
+                queue,
+                stream,
+                module,
+                seq_counter: 0,
             })],
             moe_output_slot,
         })
     }
 
-    /// Shut down workers (write shutdown flag, sync streams).
+    /// Request worker shutdown via host-mapped flags only.
+    ///
+    /// This intentionally does not call any HIP APIs. Cooperative kernels must
+    /// exit and signal `done` before stream or memory cleanup becomes safe.
     pub fn shutdown(&mut self) {
-        for worker in &self.workers {
-            let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
-            unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1); }
-        }
-        for worker in &self.workers {
-            let _ = Device::set_current(worker.device);
-            let _ = worker.stream.synchronize();
-        }
+        self.request_shutdown();
     }
 
     /// Number of GPUs with workers.
@@ -289,28 +361,36 @@ impl Drop for PersistentDispatch {
     /// write_volatile on host_ptr). The kernel writes `done=1` before returning so we can
     /// poll without any HIP API.
     fn drop(&mut self) {
-        // Write shutdown flags (host-mapped write, no HIP API)
-        for worker in &self.workers {
-            let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
-            unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1); }
-        }
+        self.request_shutdown();
         // Poll kernel-written `done` flag. Kernel writes done=1 before returning on shutdown.
         let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        for worker in &self.workers {
+        let mut worker_done = vec![false; self.workers.len()];
+        for (idx, worker) in self.workers.iter().enumerate() {
             let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
             loop {
                 let done = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done)) };
-                if done != 0 { break; }
+                if done != 0 {
+                    worker_done[idx] = true;
+                    break;
+                }
                 if std::time::Instant::now() > shutdown_deadline {
-                    eprintln!("braidinfer: persistent worker shutdown timeout on GPU {}", worker.device.0);
+                    eprintln!(
+                        "braidinfer: persistent worker shutdown timeout on GPU {}",
+                        worker.device.0
+                    );
                     break;
                 }
                 std::hint::spin_loop();
             }
         }
-        // Cooperative kernel has exited (or timed out). Safe to call HIP API now.
-        for worker in &mut self.workers {
-            unsafe { std::mem::ManuallyDrop::drop(worker); }
+        // Free HIP resources only for workers that confirmed exit. Timed-out
+        // workers are intentionally leaked to avoid deadlocking on HIP cleanup.
+        for (idx, worker) in self.workers.iter_mut().enumerate() {
+            if worker_done[idx] {
+                unsafe {
+                    std::mem::ManuallyDrop::drop(worker);
+                }
+            }
         }
     }
 }

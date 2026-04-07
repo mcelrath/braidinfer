@@ -10,7 +10,11 @@ fn test_residual_add_matches_reference() {
     let x_data: Vec<f32> = (0..size).map(|i| (i as f32 * 0.01).sin()).collect();
     let res_data: Vec<f32> = (0..size).map(|i| (i as f32 * 0.007).cos() * 0.5).collect();
 
-    let expected: Vec<f32> = x_data.iter().zip(res_data.iter()).map(|(a, b)| a + b).collect();
+    let expected: Vec<f32> = x_data
+        .iter()
+        .zip(res_data.iter())
+        .map(|(a, b)| a + b)
+        .collect();
 
     let stream = Stream::new(device).expect("stream");
     let kernel = ResidualAddKernel::load(device).expect("load kernel");

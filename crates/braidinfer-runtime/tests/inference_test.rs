@@ -23,10 +23,20 @@ fn test_model_trace() {
     for (name, hidden) in &traces {
         println!(
             "{:>12}: first5=[{:.6}, {:.6}, {:.6}, {:.6}, {:.6}], norm={:.6}",
-            name, hidden[0], hidden[1], hidden[2], hidden[3], hidden[4], norm(hidden)
+            name,
+            hidden[0],
+            hidden[1],
+            hidden[2],
+            hidden[3],
+            hidden[4],
+            norm(hidden)
         );
     }
 
-    let argmax = logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap()).unwrap();
+    let argmax = logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .unwrap();
     println!("argmax={}, logit={:.4}", argmax.0, argmax.1);
 }

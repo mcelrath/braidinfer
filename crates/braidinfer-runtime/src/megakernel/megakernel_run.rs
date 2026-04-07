@@ -3,19 +3,24 @@
 
 use std::ffi::c_void;
 
+use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::stream::Stream;
-use braidinfer_hip::HipResult;
 
 use crate::paged_kv::{PageAllocator, SequenceState};
 
-use super::{Instruction, MegakernelProgram, INST_SIZE, CHUNK_TOKENS,
-    OP_ATTN_PAGED_Q, OP_KV_QUANTIZE, OP_HALT};
+use super::{
+    CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_HALT,
+    OP_KV_QUANTIZE,
+};
 
 impl MegakernelProgram {
     pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
-        assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
-
+        assert!(
+            position < self.max_seq_len,
+            "position {position} >= max_seq_len {}",
+            self.max_seq_len
+        );
 
         // Update embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
@@ -40,7 +45,8 @@ impl MegakernelProgram {
         for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
             let (k_base, v_base) = self.kv_base_ptrs[layer_i];
             for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
-                let offset = (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
+                let offset =
+                    (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
                 self.instructions[k_idx].words[1] = k_base + offset as u64;
                 self.instructions[v_idx].words[1] = v_base + offset as u64;
             }
@@ -57,7 +63,11 @@ impl MegakernelProgram {
         let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
         // When dump is active, device_program has an OP_NOP header at offset 0;
         // instructions start at offset INST_SIZE words.
-        let offset_words = if self.dump_buffer.is_some() { INST_SIZE } else { 0 };
+        let offset_words = if self.dump_buffer.is_some() {
+            INST_SIZE
+        } else {
+            0
+        };
         let dev_ptr = unsafe { self.device_program.as_mut_ptr().add(offset_words) };
         let size = flat.len() * std::mem::size_of::<u64>();
         braidinfer_hip::error::check(unsafe {
@@ -89,7 +99,8 @@ impl MegakernelProgram {
         for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
             let (k_base, v_base) = self.kv_base_ptrs[layer_i];
             for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
-                let offset = (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
+                let offset =
+                    (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
                 self.instructions[k_idx].words[1] = k_base + offset as u64;
                 self.instructions[v_idx].words[1] = v_base + offset as u64;
             }
@@ -113,18 +124,32 @@ impl MegakernelProgram {
         allocator: &PageAllocator,
         stream: &Stream,
     ) -> HipResult<()> {
-        assert!(position < self.max_seq_len, "position {position} >= max_seq_len {}", self.max_seq_len);
+        assert!(
+            position < self.max_seq_len,
+            "position {position} >= max_seq_len {}",
+            self.max_seq_len
+        );
         assert!(self.paged, "update_step_paged called on non-paged program");
 
         // 1. Patch embedding token_id
         self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
 
-        // 2. Append scalar position to position_table on device at offset [position]
+        // 2. Append scalar logical position to position_table in sequence order.
         // Use synchronous hipMemcpy (not Async) because source is a stack local
         {
-            let pos_scalar = position as i32;
-            let pos_table_ptr = self.position_table.as_ref().expect("position_table not allocated").as_ptr();
-            let dst = unsafe { (pos_table_ptr as *mut u8).add(position as usize * std::mem::size_of::<i32>()) };
+            let seq_token_idx = (seq.seq_len as usize).saturating_sub(1);
+            let pos_scalar = *seq
+                .positions
+                .get(seq_token_idx)
+                .expect("position missing for appended paged token");
+            let pos_table_ptr = self
+                .position_table
+                .as_ref()
+                .expect("position_table not allocated")
+                .as_ptr();
+            let dst = unsafe {
+                (pos_table_ptr as *mut u8).add(seq_token_idx * std::mem::size_of::<i32>())
+            };
             braidinfer_hip::error::check(unsafe {
                 braidinfer_hip::ffi::hipMemcpy(
                     dst.cast(),
@@ -157,15 +182,20 @@ impl MegakernelProgram {
         let chunk_head_stride = CHUNK_TOKENS * hd; // elements between heads within chunk
 
         for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
-            let chunk_slot = if seq.chunks.is_empty() { 0 } else {
+            let chunk_slot = if seq.chunks.is_empty() {
+                0
+            } else {
                 seq.chunks.last().unwrap().slot_index()
             };
             let chunk_base = allocator.slot_ptr(chunk_slot) as u64;
             // layout: [layer0_K[nkh, chunk_tokens, hd], layer0_V[...], layer1_K, ...]
-            let layer_k_offset = (layer_i * 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
-            let layer_v_offset = layer_k_offset + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+            let layer_k_offset =
+                (layer_i * 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+            let layer_v_offset =
+                layer_k_offset + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
             for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
-                let head_byte_off = (h * chunk_head_stride + chunk_offset * hd) * std::mem::size_of::<f32>();
+                let head_byte_off =
+                    (h * chunk_head_stride + chunk_offset * hd) * std::mem::size_of::<f32>();
                 let k_ptr = chunk_base + layer_k_offset + head_byte_off as u64;
                 let v_ptr = chunk_base + layer_v_offset + head_byte_off as u64;
                 self.instructions[k_idx].words[1] = k_ptr;
@@ -174,9 +204,17 @@ impl MegakernelProgram {
         }
 
         // 4. Patch attention instructions
-        let total_seq_len = (position + 1) as i32;
-        let page_table_ptr = self.page_table.as_ref().expect("page_table not allocated").as_ptr() as u64;
-        let pos_table_ptr = self.position_table.as_ref().expect("position_table not allocated").as_ptr() as u64;
+        let total_seq_len = seq.seq_len as i32;
+        let page_table_ptr = self
+            .page_table
+            .as_ref()
+            .expect("page_table not allocated")
+            .as_ptr() as u64;
+        let pos_table_ptr = self
+            .position_table
+            .as_ref()
+            .expect("position_table not allocated")
+            .as_ptr() as u64;
 
         if self.quantized_kv && seq.chunks.len() > 1 {
             // Two-phase: quantized sealed chunks + f32 active chunk
@@ -185,13 +223,15 @@ impl MegakernelProgram {
             let active_tokens = total_seq_len - sealed_tokens;
             let nqh = self.instructions[self.attn_paged_inst_indices[0]].words[6] as u32;
 
-            let quant_pt_ptr = self.quant_page_table.as_ref()
-                .expect("quant_page_table not allocated").as_ptr() as u64;
+            let quant_pt_ptr = self
+                .quant_page_table
+                .as_ref()
+                .expect("quant_page_table not allocated")
+                .as_ptr() as u64;
 
             // Patch OP_ATTN_PAGED_Q: enable (grid_x=nqh), quant page table, sealed seq_len
             for &idx in &self.attn_quant_inst_indices {
-                self.instructions[idx].words[0] =
-                    (OP_ATTN_PAGED_Q as u64) | ((nqh as u64) << 32);
+                self.instructions[idx].words[0] = (OP_ATTN_PAGED_Q as u64) | ((nqh as u64) << 32);
                 self.instructions[idx].words[3] = quant_pt_ptr;
                 self.instructions[idx].words[4] = pos_table_ptr;
                 self.instructions[idx].set_int(9, sealed_tokens);
@@ -204,10 +244,11 @@ impl MegakernelProgram {
             // We reuse the main page_table — the active chunk ptr is at index `num_sealed`.
             for &idx in &self.attn_paged_inst_indices {
                 // Point page_table at the last entry (active chunk)
-                let active_pt_ptr = page_table_ptr + (num_sealed * std::mem::size_of::<u64>()) as u64;
+                let active_pt_ptr =
+                    page_table_ptr + (num_sealed * std::mem::size_of::<u64>()) as u64;
                 self.instructions[idx].words[3] = active_pt_ptr;
-                self.instructions[idx].words[4] = pos_table_ptr
-                    + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
+                self.instructions[idx].words[4] =
+                    pos_table_ptr + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
                 self.instructions[idx].set_int(9, active_tokens);
             }
         } else {
@@ -230,7 +271,9 @@ impl MegakernelProgram {
         // 5. Upload page_table if chunk list changed
         if seq.chunks.len() != self.last_page_table_len {
             let page_table_dev = self.page_table.as_mut().expect("page_table not allocated");
-            let host_ptrs: Vec<u64> = seq.chunks.iter()
+            let host_ptrs: Vec<u64> = seq
+                .chunks
+                .iter()
                 .map(|c| allocator.slot_ptr(c.slot_index()) as u64)
                 .collect();
             let dst = page_table_dev.as_mut_ptr() as *mut u8;
@@ -249,7 +292,11 @@ impl MegakernelProgram {
 
         // 6. Upload entire instruction buffer in one hipMemcpyAsync call.
         let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
-        let offset_words = if self.dump_buffer.is_some() { INST_SIZE } else { 0 };
+        let offset_words = if self.dump_buffer.is_some() {
+            INST_SIZE
+        } else {
+            0
+        };
         let dev_ptr = unsafe { self.device_program.as_mut_ptr().add(offset_words) };
         let size = flat.len() * std::mem::size_of::<u64>();
         braidinfer_hip::error::check(unsafe {
@@ -285,8 +332,9 @@ impl MegakernelProgram {
                     let f32_ptr = allocator.slot_ptr(sealed_chunk.slot_index());
 
                     // Allocate quantized chunk slot
-                    let (q_slot, q_ptr) = q_alloc.alloc()
-                        .ok_or(braidinfer_hip::HipError(braidinfer_hip::ffi::hipErrorOutOfMemory))?;
+                    let (q_slot, q_ptr) = q_alloc.alloc().ok_or(braidinfer_hip::HipError(
+                        braidinfer_hip::ffi::hipErrorOutOfMemory,
+                    ))?;
 
                     // Run quantize kernel
                     self.quantize_sealed_chunk(f32_ptr, q_ptr, cfg, stream)?;
@@ -297,7 +345,9 @@ impl MegakernelProgram {
 
                     // Upload quantized page table
                     let num_sealed = seq.chunks.len();
-                    let quant_pt = self.quant_page_table.as_mut()
+                    let quant_pt = self
+                        .quant_page_table
+                        .as_mut()
                         .expect("quant_page_table not allocated");
                     let q_ptr_val = q_ptr as u64;
                     let offset = (num_sealed - 1) * std::mem::size_of::<u64>();
@@ -312,8 +362,6 @@ impl MegakernelProgram {
                     self.last_quant_page_table_len = num_sealed;
                 }
             }
-            // Allocate next f32 chunk for continued writing
-            seq.append_token(allocator)?;
         }
         Ok(())
     }
@@ -325,17 +373,26 @@ impl MegakernelProgram {
             self.page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
         }
         if self.position_table.is_none() {
-            self.position_table = Some(DeviceBuffer::alloc(self.device, self.max_seq_len as usize)?);
+            self.position_table =
+                Some(DeviceBuffer::alloc(self.device, self.max_seq_len as usize)?);
         }
         Ok(())
     }
 
     /// Enable quantized KV cache. Allocates scratch buffer and quantized page table.
     /// Call after init_paged_buffers, before first decode step.
-    pub fn enable_quantized_kv(&mut self, max_chunks: usize, cfg: &crate::model::ModelConfig) -> HipResult<()> {
+    pub fn enable_quantized_kv(
+        &mut self,
+        max_chunks: usize,
+        cfg: &crate::model::ModelConfig,
+    ) -> HipResult<()> {
         let nqh = cfg.num_q_heads;
         let hd = cfg.head_dim;
-        let num_attn_layers = cfg.layers.iter().filter(|l| l.layer_type == crate::model::LayerType::Attention).count();
+        let num_attn_layers = cfg
+            .layers
+            .iter()
+            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .count();
         // Scratch: [nqh × (2+hd)] per attention layer (each layer gets its own scratch region)
         let scratch_per_layer = nqh * (2 + hd);
         let total_scratch = num_attn_layers * scratch_per_layer;
@@ -345,11 +402,13 @@ impl MegakernelProgram {
         // Patch OP_ATTN_PAGED_Q scratch pointers and OP_ATTN_PAGED partial_state pointers
         let scratch_base = self.quant_scratch.as_ref().unwrap().as_ptr() as u64;
         for (layer_i, &q_idx) in self.attn_quant_inst_indices.iter().enumerate() {
-            let scratch_ptr = scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
+            let scratch_ptr =
+                scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
             self.instructions[q_idx].words[1] = scratch_ptr;
         }
         for (layer_i, &p_idx) in self.attn_paged_inst_indices.iter().enumerate() {
-            let scratch_ptr = scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
+            let scratch_ptr =
+                scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
             self.instructions[p_idx].words[14] = scratch_ptr;
         }
         self.quantized_kv = true;
@@ -368,7 +427,11 @@ impl MegakernelProgram {
         use crate::paged_kv::quantized_kv_offsets;
         let nkh = cfg.num_kv_heads;
         let hd = cfg.head_dim;
-        let num_attn_layers = cfg.layers.iter().filter(|l| l.layer_type == crate::model::LayerType::Attention).count();
+        let num_attn_layers = cfg
+            .layers
+            .iter()
+            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .count();
         let kv_stride = nkh * hd;
         let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();
 

@@ -1,8 +1,7 @@
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
-use crate::model::{ModelError, Model};
-
+use crate::model::{Model, ModelError};
 
 pub struct SamplingParams {
     pub temperature: f32,
@@ -36,7 +35,12 @@ impl SamplingParams {
     }
 }
 
-pub fn sample(logits: &mut [f32], params: &SamplingParams, token_history: &[u32], rng: &mut impl Rng) -> u32 {
+pub fn sample(
+    logits: &mut [f32],
+    params: &SamplingParams,
+    token_history: &[u32],
+    rng: &mut impl Rng,
+) -> u32 {
     let n = logits.len();
 
     // Repetition penalty
@@ -66,7 +70,11 @@ pub fn sample(logits: &mut [f32], params: &SamplingParams, token_history: &[u32]
         let k = params.top_k;
         // Find the k-th largest value via partial sort
         let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+        indices.sort_unstable_by(|&a, &b| {
+            logits[b]
+                .partial_cmp(&logits[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let threshold = logits[indices[k - 1]];
         for &i in &indices[k..] {
             logits[i] = f32::NEG_INFINITY;
@@ -76,7 +84,9 @@ pub fn sample(logits: &mut [f32], params: &SamplingParams, token_history: &[u32]
 
     // Top-p (nucleus) filtering
     if params.top_p < 1.0 {
-        let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate()
+        let mut indexed: Vec<(usize, f32)> = logits
+            .iter()
+            .enumerate()
             .filter(|(_, v)| **v > f32::NEG_INFINITY)
             .map(|(i, &v)| (i, v))
             .collect();
@@ -155,14 +165,14 @@ pub fn generate(
 
     // Prefill: run each prompt token to populate KV/GDN state
     for (i, &tok) in prompt_tokens.iter().enumerate() {
-        model.decode_step_paged(tok, i as u32)?;
+        model.decode_step(tok, i as u32)?;
     }
 
     // Generate
     for i in 0..max_new_tokens {
         let pos = (n_prompt + i) as u32;
         let last_tok = *tokens.last().unwrap();
-        let mut logits = model.decode_step_paged(last_tok, pos)?;
+        let mut logits = model.decode_step(last_tok, pos)?;
         let next = sample(&mut logits, params, &tokens, &mut rng);
         tokens.push(next);
         generated.push(next);
@@ -207,14 +217,26 @@ mod tests {
         let max_prob_t1 = probs_t1.iter().cloned().fold(0.0f32, f32::max) / sum;
 
         // Compute softmax at temperature=0.5
-        let probs_t05: Vec<f32> = base_logits.iter().map(|&v| ((v - max_v) / 0.5).exp()).collect();
+        let probs_t05: Vec<f32> = base_logits
+            .iter()
+            .map(|&v| ((v - max_v) / 0.5).exp())
+            .collect();
         let sum2: f32 = probs_t05.iter().sum();
         let max_prob_t05 = probs_t05.iter().cloned().fold(0.0f32, f32::max) / sum2;
 
-        assert!(max_prob_t05 > max_prob_t1, "lower temperature should sharpen distribution");
+        assert!(
+            max_prob_t05 > max_prob_t1,
+            "lower temperature should sharpen distribution"
+        );
 
         // Also verify sample() with low temp is deterministic-ish (argmax-like)
-        let params_cold = SamplingParams { temperature: 0.01, top_k: 0, top_p: 1.0, repetition_penalty: 1.0, seed: Some(0) };
+        let params_cold = SamplingParams {
+            temperature: 0.01,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: Some(0),
+        };
         let mut logits = base_logits.clone();
         let tok = sample(&mut logits, &params_cold, &[], &mut rng);
         assert_eq!(tok, 4); // index 4 has highest logit
@@ -247,7 +269,11 @@ mod tests {
         let n = l2.len();
         let k = 5usize;
         let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_unstable_by(|&a, &b| l2[b].partial_cmp(&l2[a]).unwrap_or(std::cmp::Ordering::Equal));
+        indices.sort_unstable_by(|&a, &b| {
+            l2[b]
+                .partial_cmp(&l2[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for &i in &indices[k..] {
             l2[i] = f32::NEG_INFINITY;
         }
@@ -272,6 +298,9 @@ mod tests {
         let mut logits2 = vec![0.1f32, 0.2, 0.3, 1.1, 1.0];
         // logits[3] = 1.1/2.0 = 0.55, logits[4] = 1.0 -> winner = 4
         let tok = sample(&mut logits2, &params, &history, &mut rng);
-        assert_eq!(tok, 4, "repetition penalty should reduce logit[3] below logit[4]");
+        assert_eq!(
+            tok, 4,
+            "repetition penalty should reduce logit[3] below logit[4]"
+        );
     }
 }

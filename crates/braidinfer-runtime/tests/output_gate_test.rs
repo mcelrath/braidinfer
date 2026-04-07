@@ -8,7 +8,9 @@ fn test_output_gate_matches_reference() {
     let size: usize = 1024;
 
     let attn_data: Vec<f32> = (0..size).map(|i| (i as f32 * 0.01).sin()).collect();
-    let gate_data: Vec<f32> = (0..size).map(|i| (i as f32 * 0.007 - 0.5).cos() * 2.0).collect();
+    let gate_data: Vec<f32> = (0..size)
+        .map(|i| (i as f32 * 0.007 - 0.5).cos() * 2.0)
+        .collect();
 
     let expected: Vec<f32> = attn_data
         .iter()
@@ -35,9 +37,15 @@ fn test_output_gate_matches_reference() {
     let mut result = vec![0.0f32; size];
     d_output.copy_to_host(&mut result).expect("copy output");
 
-    let max_err: f32 = result.iter().zip(expected.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_err: f32 = result
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
-    assert!(max_err < 1e-5, "output_gate max error {max_err} exceeds tolerance");
+    assert!(
+        max_err < 1e-5,
+        "output_gate max error {max_err} exceeds tolerance"
+    );
     println!("output_gate test passed: max error = {max_err:.2e}");
 }

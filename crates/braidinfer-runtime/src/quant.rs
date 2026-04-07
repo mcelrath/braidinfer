@@ -4,24 +4,24 @@
 //! rnf4_g128 uses two rounds of NF4 (Normal Float 4) quantization with residual
 //! correction, achieving lossless quality (18.61 PPL vs 18.67 bf16 on Qwen3.5-0.8B).
 
-use braidinfer_core::types::DeviceId;
-use braidinfer_hip::{DeviceBuffer, Stream, HipResult};
 use crate::kernel::LinearProjKernel;
+use braidinfer_core::types::DeviceId;
+use braidinfer_hip::{DeviceBuffer, HipResult, Stream};
 
 // --- Formats and types ---
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WeightFormat {
     Bf16,
-    Rnf4G128,  // residual NF4, group_size=128, 8.25 bits/element
-    PcG32Q4,   // per-channel-group asymmetric 4-bit, group_size=32, 5.0 bits/element
+    Rnf4G128, // residual NF4, group_size=128, 8.25 bits/element
+    PcG32Q4,  // per-channel-group asymmetric 4-bit, group_size=32, 5.0 bits/element
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum WeightQuantMode {
-    Bf16,    // No quantization (default)
-    Rnf4,    // All linear weights at rnf4_g128 (8.25 bits, lossless)
-    Mixed,   // MLP at PcG32Q4 (5 bits), rest at rnf4_g128
+    Bf16,  // No quantization (default)
+    Rnf4,  // All linear weights at rnf4_g128 (8.25 bits, lossless)
+    Mixed, // MLP at PcG32Q4 (5 bits), rest at rnf4_g128
 }
 
 /// Packed quantized weight buffer on GPU.
@@ -44,7 +44,9 @@ impl LinearWeight {
     pub fn as_bf16_ptr(&self) -> *const u16 {
         match self {
             LinearWeight::Bf16(buf) => buf.as_ptr(),
-            LinearWeight::Packed(_) => panic!("Cannot use quantized weights with megakernel — use WEIGHT_QUANT=bf16 for dense models"),
+            LinearWeight::Packed(_) => panic!(
+                "Cannot use quantized weights with megakernel — use WEIGHT_QUANT=bf16 for dense models"
+            ),
         }
     }
 
@@ -131,7 +133,11 @@ impl LinearWeight {
                 kernel.forward_packed_ptr(
                     output,
                     unsafe { pw.data.as_ptr().add(byte_offset) },
-                    input, out_dim, in_dim, func_name, stream,
+                    input,
+                    out_dim,
+                    in_dim,
+                    func_name,
+                    stream,
                 )
             }
         }
@@ -160,25 +166,23 @@ impl LinearWeight {
 
 /// NF4 codebook: 16 quantile-matched levels for N(0,1), from QLoRA.
 pub const NF4_TABLE: [f32; 16] = [
-    -1.0, -0.6961928, -0.5250731, -0.3949175,
-    -0.2844414, -0.1847734, -0.0910500,  0.0,
-     0.0795803,  0.1609302,  0.2461123,  0.3379152,
-     0.4407098,  0.5626170,  0.7229568,  1.0,
+    -1.0, -0.6961928, -0.5250731, -0.3949175, -0.2844414, -0.1847734, -0.0910500, 0.0, 0.0795803,
+    0.1609302, 0.2461123, 0.3379152, 0.4407098, 0.5626170, 0.7229568, 1.0,
 ];
 
 /// NF4 decision boundaries: midpoints between adjacent codebook levels.
 /// Used by `nf4_quantize` to map normalized values to 4-bit indices.
 pub const NF4_BOUNDARIES: [f32; 15] = [
-    (NF4_TABLE[0]  + NF4_TABLE[1])  / 2.0,
-    (NF4_TABLE[1]  + NF4_TABLE[2])  / 2.0,
-    (NF4_TABLE[2]  + NF4_TABLE[3])  / 2.0,
-    (NF4_TABLE[3]  + NF4_TABLE[4])  / 2.0,
-    (NF4_TABLE[4]  + NF4_TABLE[5])  / 2.0,
-    (NF4_TABLE[5]  + NF4_TABLE[6])  / 2.0,
-    (NF4_TABLE[6]  + NF4_TABLE[7])  / 2.0,
-    (NF4_TABLE[7]  + NF4_TABLE[8])  / 2.0,
-    (NF4_TABLE[8]  + NF4_TABLE[9])  / 2.0,
-    (NF4_TABLE[9]  + NF4_TABLE[10]) / 2.0,
+    (NF4_TABLE[0] + NF4_TABLE[1]) / 2.0,
+    (NF4_TABLE[1] + NF4_TABLE[2]) / 2.0,
+    (NF4_TABLE[2] + NF4_TABLE[3]) / 2.0,
+    (NF4_TABLE[3] + NF4_TABLE[4]) / 2.0,
+    (NF4_TABLE[4] + NF4_TABLE[5]) / 2.0,
+    (NF4_TABLE[5] + NF4_TABLE[6]) / 2.0,
+    (NF4_TABLE[6] + NF4_TABLE[7]) / 2.0,
+    (NF4_TABLE[7] + NF4_TABLE[8]) / 2.0,
+    (NF4_TABLE[8] + NF4_TABLE[9]) / 2.0,
+    (NF4_TABLE[9] + NF4_TABLE[10]) / 2.0,
     (NF4_TABLE[10] + NF4_TABLE[11]) / 2.0,
     (NF4_TABLE[11] + NF4_TABLE[12]) / 2.0,
     (NF4_TABLE[12] + NF4_TABLE[13]) / 2.0,
@@ -216,10 +220,10 @@ fn unpack_bf16_group(src: &[u16], count: usize, dst: &mut [f32]) {
 pub fn nf4_quantize(x: f32) -> u8 {
     let b = &NF4_BOUNDARIES;
     let mut i: usize = 0;
-    i += if x >= b[7]     { 8 } else { 0 };
+    i += if x >= b[7] { 8 } else { 0 };
     i += if x >= b[i + 3] { 4 } else { 0 };
     i += if x >= b[i + 1] { 2 } else { 0 };
-    i += if x >= b[i]     { 1 } else { 0 };
+    i += if x >= b[i] { 1 } else { 0 };
     i as u8
 }
 
@@ -232,7 +236,10 @@ fn quantize_rnf4_group(bf16_data: &[u16], count: usize, out: &mut [u8]) {
     unpack_bf16_group(bf16_data, count, &mut vals);
 
     // Round 1: NF4 with absmax
-    let absmax1 = vals[..count].iter().fold(0.0f32, |a, &v| a.max(v.abs())).max(1e-10);
+    let absmax1 = vals[..count]
+        .iter()
+        .fold(0.0f32, |a, &v| a.max(v.abs()))
+        .max(1e-10);
     let inv1 = 1.0 / absmax1;
     let mut idx1 = [0u8; 128];
     let mut dequant1 = [0.0f32; 128];
@@ -279,14 +286,19 @@ pub fn quantize_rnf4_g128(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> V
     let total_bytes = out_dim * num_groups_per_row * group_bytes;
     let mut packed = vec![0u8; total_bytes];
 
-    packed.par_chunks_mut(num_groups_per_row * group_bytes)
+    packed
+        .par_chunks_mut(num_groups_per_row * group_bytes)
         .enumerate()
         .for_each(|(row, row_out)| {
             for g in 0..num_groups_per_row {
                 let base = row * in_dim + g * group_size;
                 let count = std::cmp::min(group_size, in_dim - g * group_size);
                 let dst = g * group_bytes;
-                quantize_rnf4_group(&bf16_data[base..base + count], count, &mut row_out[dst..dst + group_bytes]);
+                quantize_rnf4_group(
+                    &bf16_data[base..base + count],
+                    count,
+                    &mut row_out[dst..dst + group_bytes],
+                );
             }
         });
     packed
@@ -301,7 +313,8 @@ pub fn quantize_pc_g32_q4(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> V
     let total_bytes = out_dim * num_groups_per_row * group_bytes;
     let mut packed = vec![0u8; total_bytes];
 
-    packed.par_chunks_mut(num_groups_per_row * group_bytes)
+    packed
+        .par_chunks_mut(num_groups_per_row * group_bytes)
         .enumerate()
         .for_each(|(row, row_out)| {
             for g in 0..num_groups_per_row {
@@ -312,7 +325,10 @@ pub fn quantize_pc_g32_q4(bf16_data: &[u16], out_dim: usize, in_dim: usize) -> V
                 unpack_bf16_group(&bf16_data[base..base + count], count, &mut vals);
 
                 let mn = vals[..count].iter().cloned().fold(f32::INFINITY, f32::min);
-                let mx = vals[..count].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mx = vals[..count]
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let scale = ((mx - mn) / 15.0).max(1e-10);
                 let inv_scale = 1.0 / scale;
 
@@ -343,7 +359,11 @@ mod tests {
     #[test]
     fn nf4_quantize_covers_all_bins() {
         for (i, &level) in NF4_TABLE.iter().enumerate() {
-            assert_eq!(nf4_quantize(level), i as u8, "NF4_TABLE[{i}] = {level} should map to bin {i}");
+            assert_eq!(
+                nf4_quantize(level),
+                i as u8,
+                "NF4_TABLE[{i}] = {level} should map to bin {i}"
+            );
         }
     }
 

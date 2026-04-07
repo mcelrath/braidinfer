@@ -2,12 +2,20 @@ use braidinfer_core::types::DeviceId;
 use braidinfer_hip::{DeviceBuffer, Stream};
 use braidinfer_runtime::kernel::LmHeadKernel;
 
-fn matmul_reference(weight: &[f32], input: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+fn f32_to_bf16(x: f32) -> u16 {
+    (x.to_bits() >> 16) as u16
+}
+
+fn bf16_to_f32(x: u16) -> f32 {
+    f32::from_bits((x as u32) << 16)
+}
+
+fn matmul_reference(weight: &[u16], input: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
     let mut output = vec![0.0f32; out_dim];
     for i in 0..out_dim {
         let mut acc = 0.0f32;
         for j in 0..in_dim {
-            acc += weight[i * in_dim + j] * input[j];
+            acc += bf16_to_f32(weight[i * in_dim + j]) * input[j];
         }
         output[i] = acc;
     }
@@ -21,9 +29,10 @@ fn test_lm_head_matches_reference() {
     let vocab_size = 512usize;
 
     let input_data: Vec<f32> = (0..hidden_size).map(|i| (i as f32 * 0.001).sin()).collect();
-    let weight_data: Vec<f32> = (0..vocab_size * hidden_size)
+    let weight_data_f32: Vec<f32> = (0..vocab_size * hidden_size)
         .map(|i| (i as f32 * 0.0001).cos() * 0.1)
         .collect();
+    let weight_data: Vec<u16> = weight_data_f32.iter().copied().map(f32_to_bf16).collect();
 
     let expected = matmul_reference(&weight_data, &input_data, vocab_size, hidden_size);
 
@@ -31,14 +40,22 @@ fn test_lm_head_matches_reference() {
     let kernel = LmHeadKernel::load(device).expect("load kernel");
 
     let mut d_input = DeviceBuffer::<f32>::alloc(device, hidden_size).expect("alloc input");
-    let mut d_weight = DeviceBuffer::<f32>::alloc(device, vocab_size * hidden_size).expect("alloc weight");
+    let mut d_weight =
+        DeviceBuffer::<u16>::alloc(device, vocab_size * hidden_size).expect("alloc weight");
     let mut d_output = DeviceBuffer::<f32>::alloc(device, vocab_size).expect("alloc output");
 
     d_input.copy_from_host(&input_data).expect("copy input");
     d_weight.copy_from_host(&weight_data).expect("copy weight");
 
     kernel
-        .forward(&mut d_output, &d_weight, &d_input, vocab_size as u32, hidden_size as u32, &stream)
+        .forward(
+            &mut d_output,
+            &d_weight,
+            &d_input,
+            vocab_size as u32,
+            hidden_size as u32,
+            &stream,
+        )
         .expect("kernel launch");
 
     stream.synchronize().expect("sync");

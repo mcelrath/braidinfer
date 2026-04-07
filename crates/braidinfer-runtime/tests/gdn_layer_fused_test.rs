@@ -75,9 +75,7 @@ fn test_gdn_layer_fused_matches_unfused() {
     let input_data: Vec<f32> = (0..hidden_size)
         .map(|i| (i as f32 * 0.0031).sin() * 0.5)
         .collect();
-    let rms_weight: Vec<f32> = (0..hidden_size)
-        .map(|i| 1.0 + (i as f32 * 0.001))
-        .collect();
+    let rms_weight: Vec<f32> = (0..hidden_size).map(|i| 1.0 + (i as f32 * 0.001)).collect();
     let w_q: Vec<f32> = (0..nk * hidden_size)
         .map(|i| (i as f32 * 0.000013).sin() * 0.02)
         .collect();
@@ -109,11 +107,22 @@ fn test_gdn_layer_fused_matches_unfused() {
     let b_ref = linear_ref(&w_b, &normed, nh, hidden_size);
     let mut cpu_state = state_init.clone();
     let rec_out = gdn_step_ref(
-        &q_ref, &k_ref, &v_ref, &g_ref, &b_ref,
-        &mut cpu_state, num_heads, key_dim, value_dim,
+        &q_ref,
+        &k_ref,
+        &v_ref,
+        &g_ref,
+        &b_ref,
+        &mut cpu_state,
+        num_heads,
+        key_dim,
+        value_dim,
     );
     let proj_out = linear_ref(&w_o, &rec_out, hidden_size, nv);
-    let expected: Vec<f32> = proj_out.iter().zip(&input_data).map(|(p, r)| p + r).collect();
+    let expected: Vec<f32> = proj_out
+        .iter()
+        .zip(&input_data)
+        .map(|(p, r)| p + r)
+        .collect();
 
     // --- GPU: fused kernel ---
     let stream = Stream::new(device).expect("stream");
@@ -135,7 +144,9 @@ fn test_gdn_layer_fused_matches_unfused() {
         DeviceBuffer::<f32>::alloc(device, num_heads * key_dim * value_dim).expect("alloc state");
 
     d_input.copy_from_host(&input_data).expect("copy input");
-    d_rms_w.copy_from_host(&rms_weight).expect("copy rms_weight");
+    d_rms_w
+        .copy_from_host(&rms_weight)
+        .expect("copy rms_weight");
     d_wq.copy_from_host(&w_q).expect("copy w_q");
     d_wk.copy_from_host(&w_k).expect("copy w_k");
     d_wv.copy_from_host(&w_v).expect("copy w_v");

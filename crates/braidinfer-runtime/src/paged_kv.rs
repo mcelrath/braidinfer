@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use braidinfer_core::types::DeviceId;
-use braidinfer_hip::memory::{DeviceBuffer, PinnedBuffer};
-use braidinfer_hip::{ffi, HipError, HipResult};
 use braidinfer_hip::error::check as hip_check;
+use braidinfer_hip::memory::{DeviceBuffer, PinnedBuffer};
+use braidinfer_hip::{HipError, HipResult, ffi};
 
 use crate::model::ModelConfig;
 
@@ -26,7 +26,10 @@ pub fn chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
 ///   r_data:   same as q1_data
 ///   r_scale:  same as q1_scale
 pub fn quantized_chunk_kv_bytes(config: &ModelConfig, chunk_tokens: usize) -> usize {
-    debug_assert_eq!(chunk_tokens, 64, "quantized chunk_tokens must equal group_size (64)");
+    debug_assert_eq!(
+        chunk_tokens, 64,
+        "quantized chunk_tokens must equal group_size (64)"
+    );
     let num_attn_layers = config.num_attn_layers();
     let nkh = config.num_kv_heads;
     let hd = config.head_dim;
@@ -139,8 +142,17 @@ impl PageAllocator {
 
     /// Return a slot to the free-list.
     pub fn free(&mut self, slot: u32) {
-        assert!((slot as usize) < self.capacity as usize, "page slot {} >= capacity {}", slot, self.capacity);
-        assert!(!self.free_list.contains(&slot), "double-free of page slot {}", slot);
+        assert!(
+            (slot as usize) < self.capacity as usize,
+            "page slot {} >= capacity {}",
+            slot,
+            self.capacity
+        );
+        assert!(
+            !self.free_list.contains(&slot),
+            "double-free of page slot {}",
+            slot
+        );
         self.free_list.push(slot);
     }
 
@@ -260,6 +272,8 @@ pub struct SequenceState {
     pub chunks: Vec<ChunkHandle>,
     /// Total tokens in the sequence.
     pub seq_len: u32,
+    /// Logical position per token in sequence order.
+    pub positions: Vec<i32>,
     /// Monotonically increasing version; bumped on every structural change.
     pub kv_version: u32,
     /// Tokens per chunk (immutable; set at construction).
@@ -278,6 +292,7 @@ impl SequenceState {
         SequenceState {
             chunks: Vec::new(),
             seq_len: 0,
+            positions: Vec::new(),
             kv_version: 0,
             chunk_tokens,
             staging_buffer: None,
@@ -286,12 +301,17 @@ impl SequenceState {
     }
 
     /// Create with a staging buffer for quantized KV cache.
-    pub fn new_quantized(chunk_tokens: u32, device: DeviceId, config: &ModelConfig) -> HipResult<Self> {
+    pub fn new_quantized(
+        chunk_tokens: u32,
+        device: DeviceId,
+        config: &ModelConfig,
+    ) -> HipResult<Self> {
         let staging_bytes = chunk_kv_bytes(config, chunk_tokens as usize);
         let staging = DeviceBuffer::alloc(device, staging_bytes)?;
         Ok(SequenceState {
             chunks: Vec::new(),
             seq_len: 0,
+            positions: Vec::new(),
             kv_version: 0,
             chunk_tokens,
             staging_buffer: Some(staging),
@@ -308,9 +328,9 @@ impl SequenceState {
 
     /// Append a token slot. Allocates a new chunk when the current one is full.
     /// Returns `Err` only if the allocator is exhausted.
-    pub fn append_token(&mut self, allocator: &mut PageAllocator) -> HipResult<()> {
-        let needs_new_chunk = self.chunks.is_empty()
-            || self.chunks.last().unwrap().len() >= self.chunk_tokens;
+    pub fn append_token(&mut self, position: i32, allocator: &mut PageAllocator) -> HipResult<()> {
+        let needs_new_chunk =
+            self.chunks.is_empty() || self.chunks.last().unwrap().len() >= self.chunk_tokens;
         if needs_new_chunk {
             let (slot, _ptr) = allocator
                 .alloc()
@@ -320,7 +340,20 @@ impl SequenceState {
         }
         self.chunks.last().unwrap().increment_len();
         self.seq_len += 1;
+        self.positions.push(position);
         Ok(())
+    }
+
+    /// Release all owned f32 chunk slots and clear sequence metadata.
+    pub fn reset(&mut self, allocator: &mut PageAllocator) {
+        for chunk in self.chunks.drain(..) {
+            if Arc::strong_count(&chunk.inner) == 1 {
+                allocator.free(chunk.slot_index());
+            }
+        }
+        self.seq_len = 0;
+        self.positions.clear();
+        self.kv_version += 1;
     }
 
     /// Mutable access to the last (current write) chunk.
@@ -498,7 +531,10 @@ mod tests {
         assert_eq!(q_bytes, expected, "quantized_chunk_kv_bytes mismatch");
         let f32_bytes = chunk_kv_bytes(&config, 64);
         let ratio = f32_bytes as f64 / q_bytes as f64;
-        assert!((ratio - 3.56).abs() < 0.01, "expected ~3.56x reduction, got {ratio:.2}x");
+        assert!(
+            (ratio - 3.56).abs() < 0.01,
+            "expected ~3.56x reduction, got {ratio:.2}x"
+        );
     }
 
     #[test]
@@ -549,17 +585,21 @@ mod tests {
 
         assert!(seq.chunks.is_empty());
         assert_eq!(seq.seq_len, 0);
+        assert!(seq.positions.is_empty());
 
         // Mock allocator calls: track how many chunks would be needed
         // We can't call the real allocator (no GPU), so we manually drive logic
         // by checking the invariants.
 
         // Simulate: needs_new_chunk = true initially
-        assert!(seq.chunks.is_empty() || seq.chunks.last().map_or(true, |c| c.len() >= chunk_tokens));
+        assert!(
+            seq.chunks.is_empty() || seq.chunks.last().map_or(true, |c| c.len() >= chunk_tokens)
+        );
 
         // Manually create chunks as if append_token succeeded
         seq.chunks.push(ChunkHandle::new(0));
         seq.seq_len += 1;
+        seq.positions.push(7);
         seq.chunks.last().unwrap().increment_len();
 
         assert_eq!(seq.seq_len, 1);
@@ -570,6 +610,7 @@ mod tests {
         for _ in 1..chunk_tokens {
             seq.chunks.last().unwrap().increment_len();
             seq.seq_len += 1;
+            seq.positions.push(seq.seq_len as i32);
         }
         assert_eq!(seq.chunks.last().unwrap().len(), chunk_tokens);
 
@@ -582,10 +623,12 @@ mod tests {
         seq.kv_version += 1;
         seq.chunks.last().unwrap().increment_len();
         seq.seq_len += 1;
+        seq.positions.push(99);
 
         assert_eq!(seq.chunks.len(), 2);
         assert_eq!(seq.current_chunk_idx(), 1);
         assert_eq!(seq.current_chunk_offset(), 1);
+        assert_eq!(seq.positions, vec![7, 2, 3, 4, 99]);
     }
 
     #[test]

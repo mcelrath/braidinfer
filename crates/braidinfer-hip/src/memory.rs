@@ -1,4 +1,4 @@
-use crate::{error, ffi, HipResult};
+use crate::{HipResult, error, ffi};
 use braidinfer_core::types::DeviceId;
 use std::marker::PhantomData;
 use std::ptr;
@@ -112,12 +112,7 @@ pub fn memcpy_h2d(dst: *mut u8, src: &[u8], len: usize) -> HipResult<()> {
 /// Copy `len` bytes between two device pointers (same or different GPU).
 pub fn memcpy_d2d(dst: *mut u8, src: *const u8, len: usize) -> HipResult<()> {
     error::check(unsafe {
-        ffi::hipMemcpy(
-            dst.cast(),
-            src.cast(),
-            len,
-            ffi::hipMemcpyDeviceToDevice,
-        )
+        ffi::hipMemcpy(dst.cast(), src.cast(), len, ffi::hipMemcpyDeviceToDevice)
     })
 }
 
@@ -162,9 +157,7 @@ impl<T> PinnedBuffer<T> {
     pub fn alloc(len: usize) -> HipResult<Self> {
         let size = len * std::mem::size_of::<T>();
         let mut ptr: *mut std::ffi::c_void = ptr::null_mut();
-        error::check(unsafe {
-            ffi::hipHostMalloc(&mut ptr, size, ffi::hipHostMallocDefault)
-        })?;
+        error::check(unsafe { ffi::hipHostMalloc(&mut ptr, size, ffi::hipHostMallocDefault) })?;
         Ok(PinnedBuffer {
             ptr: ptr.cast(),
             len,
@@ -235,16 +228,14 @@ impl<T> MappedHostBuffer<T> {
     fn alloc_impl(len: usize, flags: u32) -> HipResult<Self> {
         let size = len * std::mem::size_of::<T>();
         let mut host_ptr: *mut std::ffi::c_void = ptr::null_mut();
-        error::check(unsafe {
-            ffi::hipHostMalloc(&mut host_ptr, size, flags)
-        })?;
+        error::check(unsafe { ffi::hipHostMalloc(&mut host_ptr, size, flags) })?;
         let mut device_ptr: *mut std::ffi::c_void = ptr::null_mut();
-        error::check(unsafe {
-            ffi::hipHostGetDevicePointer(&mut device_ptr, host_ptr, 0)
-        })?;
+        error::check(unsafe { ffi::hipHostGetDevicePointer(&mut device_ptr, host_ptr, 0) })?;
         // Zero-initialize: hipHostMalloc does not guarantee zeroed memory.
         let typed_ptr = host_ptr.cast::<T>();
-        unsafe { ptr::write_bytes(typed_ptr, 0, len); }
+        unsafe {
+            ptr::write_bytes(typed_ptr, 0, len);
+        }
         Ok(MappedHostBuffer {
             host_ptr: typed_ptr,
             device_ptr: device_ptr.cast(),

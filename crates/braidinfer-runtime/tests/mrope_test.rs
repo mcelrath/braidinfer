@@ -5,12 +5,12 @@ use braidinfer_runtime::kernel::MRoPEKernel;
 // Qwen3.5-0.8B mRoPE parameters (from config.json text_config)
 const NUM_Q_HEADS: u32 = 8;
 const NUM_KV_HEADS: u32 = 2;
-const HEAD_DIM: u32 = 256;    // config.json text_config.head_dim = 256
-const ROPE_DIM: u32 = 64;     // head_dim(256) * partial_rotary_factor(0.25) = 64
-const SECTION0_PAIRS: u32 = 11;  // temporal
-const SECTION1_PAIRS: u32 = 11;  // height
-const SECTION2_PAIRS: u32 = 10;  // width — total 32 pairs = rope_dim/2
-const ROPE_THETA: f32 = 10_000_000.0;  // rope_theta from config
+const HEAD_DIM: u32 = 256; // config.json text_config.head_dim = 256
+const ROPE_DIM: u32 = 64; // head_dim(256) * partial_rotary_factor(0.25) = 64
+const SECTION0_PAIRS: u32 = 11; // temporal
+const SECTION1_PAIRS: u32 = 11; // height
+const SECTION2_PAIRS: u32 = 10; // width — total 32 pairs = rope_dim/2
+const ROPE_THETA: f32 = 10_000_000.0; // rope_theta from config
 
 fn compute_inv_freq() -> Vec<f32> {
     let num_pairs = (ROPE_DIM / 2) as usize;
@@ -23,7 +23,7 @@ fn compute_inv_freq() -> Vec<f32> {
 }
 
 fn mrope_reference(
-    data: &mut [f32],  // [num_heads, head_dim]
+    data: &mut [f32], // [num_heads, head_dim]
     num_heads: usize,
     head_dim: usize,
     rope_dim: usize,
@@ -68,8 +68,8 @@ fn test_mrope_matches_reference() {
     let position_ids: [i32; 3] = [42, 7, 13]; // use different pos_ids to test all 3 sections
 
     // Random-ish Q and K data
-    let q_data: Vec<f32> = (0..nqh * hd).map(|i| ((i as f32 * 0.017).sin())).collect();
-    let k_data: Vec<f32> = (0..nkh * hd).map(|i| ((i as f32 * 0.013).cos())).collect();
+    let q_data: Vec<f32> = (0..nqh * hd).map(|i| (i as f32 * 0.017).sin()).collect();
+    let k_data: Vec<f32> = (0..nkh * hd).map(|i| (i as f32 * 0.013).cos()).collect();
 
     // CPU reference
     let mut q_ref = q_data.clone();
@@ -101,7 +101,8 @@ fn test_mrope_matches_reference() {
 
     let mut d_q = DeviceBuffer::<f32>::alloc(device, nqh * hd).expect("alloc q");
     let mut d_k = DeviceBuffer::<f32>::alloc(device, nkh * hd).expect("alloc k");
-    let mut d_inv_freq = DeviceBuffer::<f32>::alloc(device, inv_freq.len()).expect("alloc inv_freq");
+    let mut d_inv_freq =
+        DeviceBuffer::<f32>::alloc(device, inv_freq.len()).expect("alloc inv_freq");
     let mut d_pos = DeviceBuffer::<i32>::alloc(device, 3).expect("alloc pos");
 
     d_q.copy_from_host(&q_data).expect("copy q");
@@ -114,7 +115,7 @@ fn test_mrope_matches_reference() {
             &mut d_q,
             &mut d_k,
             &d_inv_freq,
-            &d_pos,
+            d_pos.as_ptr(),
             NUM_Q_HEADS,
             NUM_KV_HEADS,
             HEAD_DIM,

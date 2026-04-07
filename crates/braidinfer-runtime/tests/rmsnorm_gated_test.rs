@@ -43,12 +43,14 @@ fn test_rmsnorm_gated_matches_reference() {
         .collect();
     let weight_data: Vec<f32> = (0..value_dim).map(|i| 1.0 + i as f32 * 0.002).collect();
 
-    let expected = rmsnorm_gated_reference(&x_data, &z_data, &weight_data, num_heads, value_dim, eps);
+    let expected =
+        rmsnorm_gated_reference(&x_data, &z_data, &weight_data, num_heads, value_dim, eps);
 
     let stream = Stream::new(device).expect("stream");
     let kernel = RmsNormGatedKernel::load(device).expect("load kernel");
 
-    let mut d_output = DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc output");
+    let mut d_output =
+        DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc output");
     let mut d_x = DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc x");
     let mut d_z = DeviceBuffer::<f32>::alloc(device, num_heads * value_dim).expect("alloc z");
     let mut d_w = DeviceBuffer::<f32>::alloc(device, value_dim).expect("alloc w");
@@ -75,9 +77,15 @@ fn test_rmsnorm_gated_matches_reference() {
     let mut result = vec![0.0f32; num_heads * value_dim];
     d_output.copy_to_host(&mut result).expect("copy output");
 
-    let max_err: f32 = result.iter().zip(expected.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let max_err: f32 = result
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
-    assert!(max_err < 1e-4, "rmsnorm_gated max error {max_err} exceeds tolerance");
+    assert!(
+        max_err < 1e-4,
+        "rmsnorm_gated max error {max_err} exceeds tolerance"
+    );
     println!("rmsnorm_gated test passed: max error = {max_err:.2e}");
 }

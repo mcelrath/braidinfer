@@ -1399,9 +1399,6 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 
     int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
 
-    // Trig recurrence state per thread (for tid < rope_pairs)
-    float cos_state = 0.0f, sin_state = 0.0f;
-
     for (int c = 0; c < num_chunks; c++) {
         const char* chunk_base = (const char*)(page_table[c]);
         const float* k_base = (const float*)(chunk_base + layer_k_offset);
@@ -1409,14 +1406,6 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
         int tokens_in_chunk = chunk_tokens;
         if (c == num_chunks - 1) {
             tokens_in_chunk = seq_len - c * chunk_tokens;
-        }
-
-        // Seed trig recurrence at chunk start from position_table
-        if (tid < rope_pairs) {
-            int pos0 = position_table[c * chunk_tokens];
-            float theta0 = (float)pos0 * inv_freq[tid];
-            cos_state = cosf(theta0);
-            sin_state = sinf(theta0);
         }
 
         for (int t = 0; t < tokens_in_chunk; t++) {
@@ -1454,6 +1443,10 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
             // Apply lazy RoPE rotation to sh_k (in-place, rope_dim elements only)
             // Threads 0..rope_pairs-1 handle pairs (tid*2, tid*2+1)
             if (tid < rope_pairs) {
+                int pos = position_table[c * chunk_tokens + t];
+                float theta = (float)pos * inv_freq[tid];
+                float cos_state = cosf(theta);
+                float sin_state = sinf(theta);
                 int i0 = tid * 2;
                 int i1 = tid * 2 + 1;
                 float x0 = sh_k[i0];
@@ -1490,17 +1483,6 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
             }
             m = m_new;
 
-            // Advance trig recurrence to next token (assumes contiguous positions within chunk).
-            // TODO(braidinfer-lcl): For prefix caching with non-contiguous positions,
-            // recompute cos/sin from position_table[c*chunk_tokens+t] instead.
-            // cos(θ+Δ) = cosθ·cosΔ - sinθ·sinΔ
-            // sin(θ+Δ) = sinθ·cosΔ + cosθ·sinΔ
-            if (tid < rope_pairs) {
-                float cos_new = cos_state * cos_freq - sin_state * sin_freq;
-                float sin_new = sin_state * cos_freq + cos_state * sin_freq;
-                cos_state = cos_new;
-                sin_state = sin_new;
-            }
         }
     }
 
@@ -1568,18 +1550,10 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
 
     int rope_pairs = rope_dim / 2;
 
-    float cos_freq = 0.0f, sin_freq = 0.0f;
-    if (tid < rope_pairs) {
-        float freq = inv_freq[tid];
-        cos_freq = cosf(freq);
-        sin_freq = sinf(freq);
-    }
-
     float m = -1e30f, d_softmax = 0.0f;
     float v_acc = 0.0f;
 
     int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
-    float cos_state = 0.0f, sin_state = 0.0f;
 
     for (int c = 0; c < num_chunks; c++) {
         const char* chunk_base = (const char*)(page_table[c]);
@@ -1612,14 +1586,6 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
         const unsigned char* k_rd  = (const unsigned char*)(chunk_base + k_rdata_off);
         const unsigned char* v_q1d = (const unsigned char*)(chunk_base + v_q1data_off);
         const unsigned char* v_rd  = (const unsigned char*)(chunk_base + v_rdata_off);
-
-        // Seed trig recurrence
-        if (tid < rope_pairs) {
-            int pos0 = position_table[c * chunk_tokens];
-            float theta0 = (float)pos0 * inv_freq[tid];
-            cos_state = cosf(theta0);
-            sin_state = sinf(theta0);
-        }
 
         for (int t = 0; t < tokens_in_chunk; t++) {
             // Dequantize K for this token into shared memory
@@ -1667,6 +1633,10 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
 
             // Apply lazy RoPE
             if (tid < rope_pairs) {
+                int pos = position_table[c * chunk_tokens + t];
+                float theta = (float)pos * inv_freq[tid];
+                float cos_state = cosf(theta);
+                float sin_state = sinf(theta);
                 int i0 = tid * 2;
                 int i1 = tid * 2 + 1;
                 float x0 = sh_k[i0];
@@ -1714,13 +1684,6 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
             }
             m = m_new;
 
-            // Advance trig recurrence
-            if (tid < rope_pairs) {
-                float cos_new = cos_state * cos_freq - sin_state * sin_freq;
-                float sin_new = sin_state * cos_freq + cos_state * sin_freq;
-                cos_state = cos_new;
-                sin_state = sin_new;
-            }
         }
     }
 

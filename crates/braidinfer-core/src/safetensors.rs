@@ -48,7 +48,11 @@ impl MmapSafeTensors {
         let file = fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let (header_size, metadata) = SafeTensors::read_metadata(&mmap)?;
-        Ok(MmapSafeTensors { mmap, header_size, metadata })
+        Ok(MmapSafeTensors {
+            mmap,
+            header_size,
+            metadata,
+        })
     }
 
     pub fn mmap(&self) -> &Mmap {
@@ -65,7 +69,9 @@ impl MmapSafeTensors {
 
     /// Get raw tensor data directly from mmap, zero-copy.
     pub fn tensor_data(&self, name: &str) -> Result<&[u8], SafeTensorsError> {
-        let info = self.metadata.info(name)
+        let info = self
+            .metadata
+            .info(name)
             .ok_or_else(|| SafeTensorsError::TensorNotFound(name.to_string()))?;
         let data_start = 8 + self.header_size;
         let start = data_start + info.data_offsets.0;
@@ -91,21 +97,28 @@ impl SafeTensorSet {
             for name in single.names() {
                 index.insert(name, 0);
             }
-            Ok(SafeTensorSet { shards: vec![single], index })
+            Ok(SafeTensorSet {
+                shards: vec![single],
+                index,
+            })
         }
     }
 
     fn open_with_index(dir: &Path, index_path: &Path) -> Result<Self, SafeTensorsError> {
         let content = fs::read_to_string(index_path)?;
-        let parsed: serde_json::Value = serde_json::from_str(&content)
-            .map_err(|e| SafeTensorsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+        let parsed: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+            SafeTensorsError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
 
-        let weight_map = parsed.get("weight_map")
+        let weight_map = parsed
+            .get("weight_map")
             .and_then(|v| v.as_object())
-            .ok_or_else(|| SafeTensorsError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "missing weight_map in index",
-            )))?;
+            .ok_or_else(|| {
+                SafeTensorsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "missing weight_map in index",
+                ))
+            })?;
 
         let mut file_order: Vec<String> = Vec::new();
         let mut file_to_idx: HashMap<String, usize> = HashMap::new();
@@ -139,7 +152,9 @@ impl SafeTensorSet {
 
     /// Get raw tensor data as &[u8], zero-copy from mmap.
     pub fn tensor_data(&self, name: &str) -> Result<&[u8], SafeTensorsError> {
-        let &shard_idx = self.index.get(name)
+        let &shard_idx = self
+            .index
+            .get(name)
             .ok_or_else(|| SafeTensorsError::TensorNotFound(name.to_string()))?;
         self.shards[shard_idx].tensor_data(name)
     }

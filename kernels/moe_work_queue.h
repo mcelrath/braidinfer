@@ -49,7 +49,7 @@ struct MoeWorkerConfig {
     uint32_t _pad[2];
     // Map: global_expert_id → local entry (or NULL if not on this GPU).
     // Indexed by global expert ID. Only populated entries have valid pointers.
-    MoeExpertEntry entries[256];
+    MoeExpertEntry entries[512];
 };
 
 // Shutdown flag (host-mapped, one per worker).

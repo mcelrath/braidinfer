@@ -1,15 +1,17 @@
+use braidinfer_core::types::DeviceId;
+use braidinfer_runtime::generate::{TokenConfig, chat_generate, greedy_generate, load_tokenizer};
+use braidinfer_runtime::model::Model;
 use std::path::Path;
 use std::time::Instant;
-use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::generate::{chat_generate, greedy_generate, load_tokenizer, TokenConfig};
-use braidinfer_runtime::model::Model;
 
 const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
 fn vram_usage_mb() -> (f64, f64) {
     let mut free: usize = 0;
     let mut total: usize = 0;
-    unsafe { braidinfer_hip::ffi::hipMemGetInfo(&mut free, &mut total); }
+    unsafe {
+        braidinfer_hip::ffi::hipMemGetInfo(&mut free, &mut total);
+    }
     let used = (total - free) as f64 / (1024.0 * 1024.0);
     let total_mb = total as f64 / (1024.0 * 1024.0);
     (used, total_mb)
@@ -31,7 +33,8 @@ fn main() {
     let raw_mode = std::env::var("RAW").is_ok();
 
     fn resolve_hf_dir(bqnt_path: &str) -> Option<String> {
-        let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(std::path::Path::new(bqnt_path)).ok()?;
+        let bqnt =
+            braidinfer_runtime::bqnt::MmapBqnt::open(std::path::Path::new(bqnt_path)).ok()?;
         let model_name = bqnt.model_name()?;
         // If model_name is an absolute path that exists as a directory, use it directly
         if model_name.starts_with('/') {
@@ -46,12 +49,14 @@ fn main() {
             .join(format!("models--{hf_name}"))
             .join("snapshots");
         // Prefer snapshot that has tokenizer.json; fall back to first dir found
-        let mut snapshots: Vec<_> = std::fs::read_dir(&cache_dir).ok()?
+        let mut snapshots: Vec<_> = std::fs::read_dir(&cache_dir)
+            .ok()?
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .collect();
         snapshots.sort_by_key(|e| e.file_name());
-        snapshots.iter()
+        snapshots
+            .iter()
             .find(|e| e.path().join("tokenizer.json").exists())
             .or_else(|| snapshots.first())
             .map(|e| e.path().to_string_lossy().to_string())
@@ -69,12 +74,19 @@ fn main() {
         Some(p) => (p, None),
         None => {
             // Auto-resolve model dir from BQNT_PATH metadata
-            let from_bqnt = std::env::var("BQNT_PATH").ok().and_then(|p| resolve_hf_dir(&p));
-            (from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()), None)
+            let from_bqnt = std::env::var("BQNT_PATH")
+                .ok()
+                .and_then(|p| resolve_hf_dir(&p));
+            (
+                from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()),
+                None,
+            )
         }
     };
     if let Some(ref bqnt_path) = bqnt_override {
-        unsafe { std::env::set_var("BQNT_PATH", bqnt_path); }
+        unsafe {
+            std::env::set_var("BQNT_PATH", bqnt_path);
+        }
     }
     let model_dir = Path::new(&model_path);
     if !model_dir.exists() {
@@ -85,8 +97,11 @@ fn main() {
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
-    let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN").ok().and_then(|v| v.parse().ok());
-    let mut model = Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
+    let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut model =
+        Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
     // Enable multi-GPU if NUM_GPUS > 1 or MULTI_GPU is set
     if std::env::var("MULTI_GPU").is_ok() {
@@ -102,8 +117,16 @@ fn main() {
     let result = if raw_mode {
         greedy_generate(&mut model, &tokenizer, &token_config, &prompt, max_tokens)
     } else {
-        chat_generate(&mut model, &tokenizer, &token_config, &prompt, None, max_tokens)
-    }.expect("generate");
+        chat_generate(
+            &mut model,
+            &tokenizer,
+            &token_config,
+            &prompt,
+            None,
+            max_tokens,
+        )
+    }
+    .expect("generate");
 
     let elapsed = start.elapsed().as_secs_f64();
     let n_tokens = result.tokens.len();
@@ -114,6 +137,13 @@ fn main() {
     }
     println!();
 
-    let tok_per_sec = if elapsed > 0.0 { n_tokens as f64 / elapsed } else { 0.0 };
-    eprintln!("{} tokens in {:.3}s = {:.1} tok/s", n_tokens, elapsed, tok_per_sec);
+    let tok_per_sec = if elapsed > 0.0 {
+        n_tokens as f64 / elapsed
+    } else {
+        0.0
+    };
+    eprintln!(
+        "{} tokens in {:.3}s = {:.1} tok/s",
+        n_tokens, elapsed, tok_per_sec
+    );
 }

@@ -14,7 +14,7 @@ const SECTION2_PAIRS: usize = 10;
 const ROPE_THETA: f32 = 10_000_000.0;
 const EPS: f32 = 1e-6;
 
-const Q_OUT_DIM: usize = NUM_Q_HEADS * HEAD_DIM;   // 2048
+const Q_OUT_DIM: usize = NUM_Q_HEADS * HEAD_DIM; // 2048
 const KV_OUT_DIM: usize = NUM_KV_HEADS * HEAD_DIM; // 512
 const SCRATCH_SIZE: usize = Q_OUT_DIM + KV_OUT_DIM * 2 + Q_OUT_DIM; // 5120
 
@@ -32,7 +32,11 @@ fn rmsnorm_reference(input: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = input.len();
     let sum_sq: f32 = input.iter().map(|v| v * v).sum();
     let rms = (sum_sq / n as f32 + eps).sqrt().recip();
-    input.iter().zip(weight.iter()).map(|(x, w)| x * rms * (1.0 + w)).collect()
+    input
+        .iter()
+        .zip(weight.iter())
+        .map(|(x, w)| x * rms * (1.0 + w))
+        .collect()
 }
 
 fn linear_proj_reference(weight: &[f32], input: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
@@ -84,7 +88,7 @@ fn mrope_reference(
 
 fn gqa_attention_reference(
     q: &[f32],
-    k_cache: &[f32],   // [num_kv_heads, max_seq_len, head_dim]
+    k_cache: &[f32], // [num_kv_heads, max_seq_len, head_dim]
     v_cache: &[f32],
     num_q_heads: usize,
     num_kv_heads: usize,
@@ -102,8 +106,8 @@ fn gqa_attention_reference(
 
         let scores: Vec<f32> = (0..seq_len)
             .map(|t| {
-                let k_ptr = &k_cache[(kv_h * max_seq_len + t) * head_dim
-                    ..(kv_h * max_seq_len + t + 1) * head_dim];
+                let k_ptr = &k_cache
+                    [(kv_h * max_seq_len + t) * head_dim..(kv_h * max_seq_len + t + 1) * head_dim];
                 let dot: f32 = q_head.iter().zip(k_ptr.iter()).map(|(a, b)| a * b).sum();
                 dot * scale
             })
@@ -116,8 +120,8 @@ fn gqa_attention_reference(
 
         let out = &mut output[h * head_dim..(h + 1) * head_dim];
         for t in 0..seq_len {
-            let v_ptr = &v_cache[(kv_h * max_seq_len + t) * head_dim
-                ..(kv_h * max_seq_len + t + 1) * head_dim];
+            let v_ptr = &v_cache
+                [(kv_h * max_seq_len + t) * head_dim..(kv_h * max_seq_len + t + 1) * head_dim];
             for i in 0..head_dim {
                 out[i] += attn[t] * v_ptr[i];
             }
@@ -188,7 +192,11 @@ fn attn_layer_reference(
     );
 
     let out_proj = linear_proj_reference(w_o, &attn_out, HIDDEN_SIZE, Q_OUT_DIM);
-    out_proj.iter().zip(input.iter()).map(|(o, r)| o + r).collect()
+    out_proj
+        .iter()
+        .zip(input.iter())
+        .map(|(o, r)| o + r)
+        .collect()
 }
 
 #[test]
@@ -259,29 +267,37 @@ fn test_attn_layer_fused_matches_unfused() {
         .map(|i| ((i as f32 * 0.009).sin()) * 0.4)
         .collect();
 
-    let mut d_output   = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc output");
-    let mut d_scratch  = DeviceBuffer::<f32>::alloc(device, SCRATCH_SIZE).expect("alloc scratch");
-    let mut d_input    = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc input");
-    let mut d_rms_w    = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc rms_weight");
-    let mut d_wq       = DeviceBuffer::<f32>::alloc(device, Q_OUT_DIM * HIDDEN_SIZE).expect("alloc w_q");
-    let mut d_wk       = DeviceBuffer::<f32>::alloc(device, KV_OUT_DIM * HIDDEN_SIZE).expect("alloc w_k");
-    let mut d_wv       = DeviceBuffer::<f32>::alloc(device, KV_OUT_DIM * HIDDEN_SIZE).expect("alloc w_v");
-    let mut d_wo       = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE * Q_OUT_DIM).expect("alloc w_o");
+    let mut d_output = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc output");
+    let mut d_scratch = DeviceBuffer::<f32>::alloc(device, SCRATCH_SIZE).expect("alloc scratch");
+    let mut d_input = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc input");
+    let mut d_rms_w = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE).expect("alloc rms_weight");
+    let mut d_wq = DeviceBuffer::<f32>::alloc(device, Q_OUT_DIM * HIDDEN_SIZE).expect("alloc w_q");
+    let mut d_wk = DeviceBuffer::<f32>::alloc(device, KV_OUT_DIM * HIDDEN_SIZE).expect("alloc w_k");
+    let mut d_wv = DeviceBuffer::<f32>::alloc(device, KV_OUT_DIM * HIDDEN_SIZE).expect("alloc w_v");
+    let mut d_wo = DeviceBuffer::<f32>::alloc(device, HIDDEN_SIZE * Q_OUT_DIM).expect("alloc w_o");
     let mut d_inv_freq = DeviceBuffer::<f32>::alloc(device, ROPE_DIM / 2).expect("alloc inv_freq");
-    let mut d_pos      = DeviceBuffer::<i32>::alloc(device, 3).expect("alloc pos");
-    let mut d_k_cache  = DeviceBuffer::<f32>::alloc(device, max_seq_len * NUM_KV_HEADS * HEAD_DIM).expect("alloc k_cache");
-    let mut d_v_cache  = DeviceBuffer::<f32>::alloc(device, max_seq_len * NUM_KV_HEADS * HEAD_DIM).expect("alloc v_cache");
+    let mut d_pos = DeviceBuffer::<i32>::alloc(device, 3).expect("alloc pos");
+    let mut d_k_cache = DeviceBuffer::<f32>::alloc(device, max_seq_len * NUM_KV_HEADS * HEAD_DIM)
+        .expect("alloc k_cache");
+    let mut d_v_cache = DeviceBuffer::<f32>::alloc(device, max_seq_len * NUM_KV_HEADS * HEAD_DIM)
+        .expect("alloc v_cache");
 
     d_input.copy_from_host(&input).expect("copy input");
-    d_rms_w.copy_from_host(&rms_weight).expect("copy rms_weight");
+    d_rms_w
+        .copy_from_host(&rms_weight)
+        .expect("copy rms_weight");
     d_wq.copy_from_host(&w_q).expect("copy w_q");
     d_wk.copy_from_host(&w_k).expect("copy w_k");
     d_wv.copy_from_host(&w_v).expect("copy w_v");
     d_wo.copy_from_host(&w_o).expect("copy w_o");
     d_inv_freq.copy_from_host(&inv_freq).expect("copy inv_freq");
     d_pos.copy_from_host(&position_ids).expect("copy pos");
-    d_k_cache.copy_from_host(&k_cache_init).expect("copy k_cache");
-    d_v_cache.copy_from_host(&v_cache_init).expect("copy v_cache");
+    d_k_cache
+        .copy_from_host(&k_cache_init)
+        .expect("copy k_cache");
+    d_v_cache
+        .copy_from_host(&v_cache_init)
+        .expect("copy v_cache");
 
     kernel
         .forward(
@@ -294,7 +310,7 @@ fn test_attn_layer_fused_matches_unfused() {
             &d_wv,
             &d_wo,
             &d_inv_freq,
-            &d_pos,
+            d_pos.as_ptr(),
             &mut d_k_cache,
             &mut d_v_cache,
             HIDDEN_SIZE as u32,

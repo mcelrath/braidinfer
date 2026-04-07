@@ -22,14 +22,14 @@
 //! `shutdown.write_volatile(1)` → worker kernel writes `done_flag=1` before return.
 //! Drop polls done_flag (30s timeout) before freeing GPU resources.
 
-use std::mem::ManuallyDrop;
 use braidinfer_core::types::DeviceId;
+use braidinfer_hip::HipResult;
 use braidinfer_hip::device::Device;
+use braidinfer_hip::ffi;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
-use braidinfer_hip::HipResult;
-use braidinfer_hip::ffi;
+use std::mem::ManuallyDrop;
 
 use crate::weights::DistributedMoeWeights;
 
@@ -143,12 +143,21 @@ impl MoeP2pContext {
         let output_slots = DeviceBuffer::<f32>::alloc(gpu0, num_gpus * hidden_size)?;
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
-            gpu0, 0, num_total_layers, dist_moe_by_layer, hidden_size, expert_intermediate_size,
+            gpu0,
+            0,
+            num_total_layers,
+            dist_moe_by_layer,
+            hidden_size,
+            expert_intermediate_size,
             |dist, eid| {
                 let buf = &dist.expert_buffers[0];
                 buf.slot_map[eid].map(|slot| {
-                    let gu = unsafe { dist.gpu0_gate_up_base.add(slot * dist.gate_up_expert_stride) } as u64;
-                    let dn = unsafe { dist.gpu0_down_base.add(slot * dist.down_expert_stride) } as u64;
+                    let gu = unsafe {
+                        dist.gpu0_gate_up_base
+                            .add(slot * dist.gate_up_expert_stride)
+                    } as u64;
+                    let dn =
+                        unsafe { dist.gpu0_down_base.add(slot * dist.down_expert_stride) } as u64;
                     (gu, dn, buf.local_expert_count as u32)
                 })
             },
@@ -165,12 +174,20 @@ impl MoeP2pContext {
             Device::set_current(device)?;
 
             let (layer_config_ptrs, config_storage) = build_layer_configs(
-                device, gpu_id, num_total_layers, dist_moe_by_layer, hidden_size, expert_intermediate_size,
+                device,
+                gpu_id,
+                num_total_layers,
+                dist_moe_by_layer,
+                hidden_size,
+                expert_intermediate_size,
                 |dist, eid| {
                     let buf = &dist.expert_buffers[gpu_id as usize];
                     buf.slot_map[eid].map(|slot| {
-                        let gu = unsafe { buf.gate_up.as_ptr().add(slot * dist.gate_up_expert_stride) } as u64;
-                        let dn = unsafe { buf.down.as_ptr().add(slot * dist.down_expert_stride) } as u64;
+                        let gu =
+                            unsafe { buf.gate_up.as_ptr().add(slot * dist.gate_up_expert_stride) }
+                                as u64;
+                        let dn =
+                            unsafe { buf.down.as_ptr().add(slot * dist.down_expert_stride) } as u64;
                         (gu, dn, buf.local_expert_count as u32)
                     })
                 },
@@ -215,9 +232,16 @@ impl MoeP2pContext {
             let num_cus = multiprocessor_count(device)?;
             let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
             func.launch_cooperative(
-                (num_blocks, 1, 1), (256, 1, 1), shared_mem, &stream, &mut args,
+                (num_blocks, 1, 1),
+                (256, 1, 1),
+                shared_mem,
+                &stream,
+                &mut args,
             )?;
-            eprintln!("  MoE worker GPU {}: launched ({num_blocks} blocks, {shared_mem}B shared)", device.0);
+            eprintln!(
+                "  MoE worker GPU {}: launched ({num_blocks} blocks, {shared_mem}B shared)",
+                device.0
+            );
 
             workers.push(ManuallyDrop::new(MoeWorkerGpu {
                 device,
@@ -254,22 +278,31 @@ impl MoeP2pContext {
 impl Drop for MoeP2pContext {
     fn drop(&mut self) {
         for worker in &self.workers {
-            unsafe { std::ptr::write_volatile(worker.shutdown.host_ptr(), 1u32); }
+            unsafe {
+                std::ptr::write_volatile(worker.shutdown.host_ptr(), 1u32);
+            }
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         for worker in &self.workers {
             loop {
                 let done = unsafe { std::ptr::read_volatile(worker.done.host_ptr()) };
-                if done != 0 { break; }
+                if done != 0 {
+                    break;
+                }
                 if std::time::Instant::now() > deadline {
-                    eprintln!("braidinfer: moe_worker shutdown timeout on GPU {}", worker.device.0);
+                    eprintln!(
+                        "braidinfer: moe_worker shutdown timeout on GPU {}",
+                        worker.device.0
+                    );
                     break;
                 }
                 std::hint::spin_loop();
             }
         }
         for worker in &mut self.workers {
-            unsafe { ManuallyDrop::drop(worker); }
+            unsafe {
+                ManuallyDrop::drop(worker);
+            }
         }
     }
 }
@@ -290,7 +323,9 @@ fn build_layer_configs(
     let mut config_storage: Vec<DeviceBuffer<u8>> = Vec::new();
 
     for (layer_idx, maybe_dist) in dist_moe_by_layer.iter().enumerate() {
-        if layer_idx >= num_layers { break; }
+        if layer_idx >= num_layers {
+            break;
+        }
         let Some(dist) = maybe_dist else { continue };
 
         // Row strides for Q4 PcG32: num_groups * 20 bytes/group.

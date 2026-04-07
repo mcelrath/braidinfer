@@ -1,7 +1,7 @@
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-use crate::model::{ModelError, Model};
+use crate::model::{Model, ModelError};
 
 pub struct ChatMessage<'a> {
     pub role: &'a str,
@@ -33,8 +33,12 @@ impl TokenConfig {
 
         // Collect all stop token IDs
         let mut eos_token_ids = Vec::new();
-        if let Some(id) = im_end_id { eos_token_ids.push(id); }
-        if let Some(id) = endoftext_id { eos_token_ids.push(id); }
+        if let Some(id) = im_end_id {
+            eos_token_ids.push(id);
+        }
+        if let Some(id) = endoftext_id {
+            eos_token_ids.push(id);
+        }
 
         // Also check config.json text_config.eos_token_id
         if let Ok(data) = std::fs::read_to_string(model_dir.join("config.json")) {
@@ -43,7 +47,9 @@ impl TokenConfig {
                     let ids: Vec<u32> = if let Some(n) = val.as_u64() {
                         vec![n as u32]
                     } else if let Some(arr) = val.as_array() {
-                        arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect()
+                        arr.iter()
+                            .filter_map(|v| v.as_u64().map(|n| n as u32))
+                            .collect()
                     } else {
                         vec![]
                     };
@@ -57,23 +63,37 @@ impl TokenConfig {
         }
 
         // Load chat template from jinja file
-        let chat_template = std::fs::read_to_string(model_dir.join("chat_template.jinja")).ok()
+        let chat_template = std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+            .ok()
             .or_else(|| {
                 // Fallback: check tokenizer_config.json chat_template field
                 let data = std::fs::read_to_string(model_dir.join("tokenizer_config.json")).ok()?;
                 let cfg: serde_json::Value = serde_json::from_str(&data).ok()?;
-                cfg.get("chat_template").and_then(|v| v.as_str()).map(|s| s.to_string())
+                cfg.get("chat_template")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
             });
 
         // BOS token: check config.json bos_token_id
-        let bos_token_id = std::fs::read_to_string(model_dir.join("config.json")).ok()
+        let bos_token_id = std::fs::read_to_string(model_dir.join("config.json"))
+            .ok()
             .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
             .and_then(|cfg| {
-                cfg.get("bos_token_id").and_then(|v| v.as_u64().map(|n| n as u32))
-                    .or_else(|| cfg.pointer("/text_config/bos_token_id").and_then(|v| v.as_u64().map(|n| n as u32)))
+                cfg.get("bos_token_id")
+                    .and_then(|v| v.as_u64().map(|n| n as u32))
+                    .or_else(|| {
+                        cfg.pointer("/text_config/bos_token_id")
+                            .and_then(|v| v.as_u64().map(|n| n as u32))
+                    })
             });
 
-        TokenConfig { im_start_id, im_end_id, eos_token_ids, bos_token_id, chat_template }
+        TokenConfig {
+            im_start_id,
+            im_end_id,
+            eos_token_ids,
+            bos_token_id,
+            chat_template,
+        }
     }
 
     pub fn is_stop_token(&self, token: u32) -> bool {
@@ -103,32 +123,60 @@ pub fn apply_chat_template_thinking(
     messages: &[ChatMessage<'_>],
     enable_thinking: bool,
 ) -> Result<Vec<u32>, ModelError> {
-    let template_src = token_config.chat_template.as_deref()
+    let template_src = token_config
+        .chat_template
+        .as_deref()
         .ok_or_else(|| ModelError::MissingWeight("no chat_template found in model files".into()))?;
 
     let mut env = minijinja::Environment::new();
     env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
-        Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-    });
-    env.add_template("chat", template_src)
-        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad chat template: {e}"))))?;
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+    env.add_template("chat", template_src).map_err(|e| {
+        ModelError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad chat template: {e}"),
+        ))
+    })?;
 
-    let tmpl = env.get_template("chat")
-        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+    let tmpl = env.get_template("chat").map_err(|e| {
+        ModelError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
 
-    let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
-        serde_json::json!({ "role": m.role, "content": m.content })
-    }).collect();
+    let msgs: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
 
-    let rendered = tmpl.render(minijinja::context! {
-        messages => msgs,
-        add_generation_prompt => true,
-        enable_thinking => enable_thinking,
-    }).map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("template render: {e}"))))?;
+    let rendered = tmpl
+        .render(minijinja::context! {
+            messages => msgs,
+            add_generation_prompt => true,
+            enable_thinking => enable_thinking,
+        })
+        .map_err(|e| {
+            ModelError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("template render: {e}"),
+            ))
+        })?;
 
-    let encoding = tokenizer.encode(rendered.as_str(), false)
-        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+    let encoding = tokenizer.encode(rendered.as_str(), false).map_err(|e| {
+        ModelError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
     Ok(encoding.get_ids().to_vec())
 }
 
@@ -142,7 +190,10 @@ pub fn generate_from_ids(
 ) -> Result<GenerateResult, ModelError> {
     let n_prompt = prompt_ids.len();
     let last_logits = if n_prompt == 0 {
-        return Ok(GenerateResult { tokens: vec![], text_pieces: vec![] });
+        return Ok(GenerateResult {
+            tokens: vec![],
+            text_pieces: vec![],
+        });
     } else if n_prompt == 1 {
         model.decode_step(prompt_ids[0], 0)?
     } else {
@@ -151,7 +202,11 @@ pub fn generate_from_ids(
 
     // Debug: print top-5 logits and dump hidden state for first token
     if model.debug_nan {
-        let mut indexed: Vec<(usize, f32)> = last_logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        let mut indexed: Vec<(usize, f32)> = last_logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         eprintln!("Top-5 logits:");
         for &(id, val) in &indexed[..5] {
@@ -162,8 +217,16 @@ pub fn generate_from_ids(
         if let Ok(hidden) = model.read_hidden() {
             let max_abs = hidden.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
             let sum: f32 = hidden.iter().sum();
-            let std = (hidden.iter().map(|x| (x - sum / hidden.len() as f32).powi(2)).sum::<f32>() / hidden.len() as f32).sqrt();
-            eprintln!("Final hidden: max_abs={max_abs:.4}, std={std:.4}, sum={sum:.2}, first10={:.4?}", &hidden[..10]);
+            let std = (hidden
+                .iter()
+                .map(|x| (x - sum / hidden.len() as f32).powi(2))
+                .sum::<f32>()
+                / hidden.len() as f32)
+                .sqrt();
+            eprintln!(
+                "Final hidden: max_abs={max_abs:.4}, std={std:.4}, sum={sum:.2}, first10={:.4?}",
+                &hidden[..10]
+            );
         }
     }
 
@@ -205,9 +268,15 @@ pub fn chat_generate(
 ) -> Result<GenerateResult, ModelError> {
     let mut messages = Vec::new();
     if let Some(sys) = system_prompt {
-        messages.push(ChatMessage { role: "system", content: sys });
+        messages.push(ChatMessage {
+            role: "system",
+            content: sys,
+        });
     }
-    messages.push(ChatMessage { role: "user", content: user_message });
+    messages.push(ChatMessage {
+        role: "user",
+        content: user_message,
+    });
     let prompt_ids = apply_chat_template(tokenizer, token_config, &messages)?;
     generate_from_ids(model, tokenizer, token_config, &prompt_ids, max_tokens)
 }
@@ -220,9 +289,12 @@ pub fn greedy_generate(
     prompt: &str,
     max_tokens: usize,
 ) -> Result<GenerateResult, ModelError> {
-    let encoding = tokenizer
-        .encode(prompt, false)
-        .map_err(|e| ModelError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())))?;
+    let encoding = tokenizer.encode(prompt, false).map_err(|e| {
+        ModelError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
     let mut prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     // Prepend BOS if the model has one and the tokenizer didn't add it
     if let Some(bos) = token_config.bos_token_id {

@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::generate::{
-    apply_chat_template_thinking, load_tokenizer, ChatMessage, TokenConfig,
+    ChatMessage, TokenConfig, apply_chat_template_thinking, load_tokenizer,
 };
 use braidinfer_runtime::model::Model;
 
@@ -29,13 +29,15 @@ async fn main() {
             .join(".cache/huggingface/hub")
             .join(format!("models--{hf_name}"))
             .join("snapshots");
-        std::fs::read_dir(&cache_dir).ok()?
+        std::fs::read_dir(&cache_dir)
+            .ok()?
             .filter_map(|e| e.ok())
             .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .map(|e| e.path().to_string_lossy().to_string())
     }
 
-    let model_arg = std::env::var("MODEL").ok()
+    let model_arg = std::env::var("MODEL")
+        .ok()
         .or_else(|| std::env::args().nth(1));
 
     let (model_path, bqnt_override) = match model_arg {
@@ -48,12 +50,19 @@ async fn main() {
         }
         Some(p) => (p, None),
         None => {
-            let from_bqnt = std::env::var("BQNT_PATH").ok().and_then(|p| resolve_hf_dir(&p));
-            (from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()), None)
+            let from_bqnt = std::env::var("BQNT_PATH")
+                .ok()
+                .and_then(|p| resolve_hf_dir(&p));
+            (
+                from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()),
+                None,
+            )
         }
     };
     if let Some(ref bqnt_path) = bqnt_override {
-        unsafe { std::env::set_var("BQNT_PATH", bqnt_path); }
+        unsafe {
+            std::env::set_var("BQNT_PATH", bqnt_path);
+        }
     }
 
     let model_dir = Path::new(&model_path);
@@ -64,8 +73,11 @@ async fn main() {
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
     let device = DeviceId(0);
-    let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN").ok().and_then(|v| v.parse().ok());
-    let mut model = Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
+    let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let mut model =
+        Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
     if std::env::var("MULTI_GPU").is_ok() {
         model.enable_multi_gpu().expect("enable multi-GPU");
@@ -96,15 +108,32 @@ async fn main() {
 
         let mut messages: Vec<ChatMessage<'_>> = Vec::new();
         if let Some(sys) = &system_prompt {
-            messages.push(ChatMessage { role: "system", content: sys });
+            messages.push(ChatMessage {
+                role: "system",
+                content: sys,
+            });
         }
         for (u, a) in &history {
-            messages.push(ChatMessage { role: "user", content: u });
-            messages.push(ChatMessage { role: "assistant", content: a });
+            messages.push(ChatMessage {
+                role: "user",
+                content: u,
+            });
+            messages.push(ChatMessage {
+                role: "assistant",
+                content: a,
+            });
         }
-        messages.push(ChatMessage { role: "user", content: &user_input });
+        messages.push(ChatMessage {
+            role: "user",
+            content: &user_input,
+        });
 
-        let prompt_ids = match apply_chat_template_thinking(&tokenizer, &token_config, &messages, enable_thinking) {
+        let prompt_ids = match apply_chat_template_thinking(
+            &tokenizer,
+            &token_config,
+            &messages,
+            enable_thinking,
+        ) {
             Ok(ids) => ids,
             Err(e) => {
                 eprintln!("template error: {e}");
@@ -121,12 +150,18 @@ async fn main() {
         let last_logits = if n_prompt <= 1 {
             match model.decode_step(prompt_ids[0], 0) {
                 Ok(l) => l,
-                Err(e) => { eprintln!("prefill error: {e}"); continue; }
+                Err(e) => {
+                    eprintln!("prefill error: {e}");
+                    continue;
+                }
             }
         } else {
             match model.prefill(&prompt_ids) {
                 Ok(l) => l,
-                Err(e) => { eprintln!("prefill error: {e}"); continue; }
+                Err(e) => {
+                    eprintln!("prefill error: {e}");
+                    continue;
+                }
             }
         };
 
@@ -134,9 +169,12 @@ async fn main() {
         eprintln!("[prefill {n_prompt} tokens in {prefill_elapsed:.2}s]");
 
         // Streaming decode — print each token as it's generated
-        let mut next_token = last_logits.iter().enumerate()
+        let mut next_token = last_logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i as u32).unwrap_or(0);
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
         let mut position = n_prompt as u32;
         let mut response = String::new();
         let mut n_gen = 0u32;
@@ -148,7 +186,9 @@ async fn main() {
         let think_end_id = tokenizer.token_to_id("</think>");
 
         for _ in 0..max_tokens {
-            if token_config.is_stop_token(next_token) { break; }
+            if token_config.is_stop_token(next_token) {
+                break;
+            }
 
             // Handle thinking block display
             if Some(next_token) == think_start_id {
@@ -173,15 +213,20 @@ async fn main() {
 
             next_token = match model.decode_step_token(next_token, position) {
                 Ok(t) => t,
-                Err(e) => { eprintln!("\ngenerate error: {e}"); break; }
+                Err(e) => {
+                    eprintln!("\ngenerate error: {e}");
+                    break;
+                }
             };
             position += 1;
         }
         println!();
 
         let decode_elapsed = decode_start.elapsed().as_secs_f64();
-        eprintln!("[{n_gen} tokens in {decode_elapsed:.2}s = {:.1} tok/s]",
-                  n_gen as f64 / decode_elapsed);
+        eprintln!(
+            "[{n_gen} tokens in {decode_elapsed:.2}s = {:.1} tok/s]",
+            n_gen as f64 / decode_elapsed
+        );
 
         history.push((user_input, response));
     }

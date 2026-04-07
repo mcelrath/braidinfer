@@ -1,12 +1,11 @@
 use braidinfer_core::types::DeviceId;
+use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
-use braidinfer_hip::HipResult;
 use std::ffi::c_void;
 
 use super::kernel_dir;
-
 
 pub struct LinearProjKernel {
     module: Module,
@@ -126,7 +125,11 @@ impl LinearProjKernel {
         ];
 
         let block_size = 256u32;
-        let rows_per_block = if func_name == "linear_proj_rnf4_g128" { 4u32 } else { 1 };
+        let rows_per_block = if func_name == "linear_proj_rnf4_g128" {
+            4u32
+        } else {
+            1
+        };
         let grid = (out_dim + rows_per_block - 1) / rows_per_block;
         // Shared memory: input cache (in_dim * 4 bytes) + wave reduction (rows_per_block * 2 * 4 bytes)
         let shared_bytes = (in_dim as u32) * 4 + rows_per_block * 2 * 4;
@@ -164,7 +167,11 @@ impl LinearProjKernel {
             std::ptr::addr_of_mut!(id).cast(),
         ];
         let block_size = 256u32;
-        let rows_per_block = if func_name == "linear_proj_rnf4_g128" { 4u32 } else { 1 };
+        let rows_per_block = if func_name == "linear_proj_rnf4_g128" {
+            4u32
+        } else {
+            1
+        };
         let grid = (out_dim + rows_per_block - 1) / rows_per_block;
         let shared_bytes = in_dim * 4 + rows_per_block * 2 * 4;
         func.launch(
@@ -177,7 +184,6 @@ impl LinearProjKernel {
     }
 }
 
-
 pub struct MoeGateKernel {
     module: Module,
     _device: DeviceId,
@@ -187,7 +193,10 @@ impl MoeGateKernel {
     pub fn load(device: DeviceId) -> HipResult<Self> {
         let path = kernel_dir().join("moe_gate.hsaco");
         let module = Module::load(device, &path)?;
-        Ok(Self { module, _device: device })
+        Ok(Self {
+            module,
+            _device: device,
+        })
     }
 
     /// Run GPU-side top-k selection + weight computation.

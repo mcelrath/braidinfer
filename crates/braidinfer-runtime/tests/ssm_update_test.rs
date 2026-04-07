@@ -32,7 +32,8 @@ fn reference_ssm_update(
         for dd in 0..head_dim {
             for s in 0..state_size {
                 let idx = h * head_dim * state_size + dd * state_size + s;
-                ssm_state[idx] = da * ssm_state[idx] + dt_val * x[h * head_dim + dd] * b[g * state_size + s];
+                ssm_state[idx] =
+                    da * ssm_state[idx] + dt_val * x[h * head_dim + dd] * b[g * state_size + s];
             }
         }
 
@@ -63,7 +64,9 @@ fn test_selective_state_update_small() {
     let ss = state_size as usize;
     let ng = n_groups as usize;
 
-    let x: Vec<f32> = (0..nh * hd).map(|i| ((i as f32) * 0.1 - 1.6).sin()).collect();
+    let x: Vec<f32> = (0..nh * hd)
+        .map(|i| ((i as f32) * 0.1 - 1.6).sin())
+        .collect();
     let dt: Vec<f32> = (0..nh).map(|i| 0.5 + 0.1 * i as f32).collect();
     let dt_bias: Vec<f32> = vec![0.1; nh];
     let a_log: Vec<f32> = (0..nh).map(|i| (1.0 + i as f32).ln()).collect();
@@ -74,12 +77,25 @@ fn test_selective_state_update_small() {
     let mut output_cpu: Vec<f32> = vec![0.0; nh * hd];
 
     reference_ssm_update(
-        &mut state_cpu, &x, &dt, &dt_bias, &a_log, &b_data, &c_data, &d_data,
-        &mut output_cpu, nh, hd, ss, ng,
+        &mut state_cpu,
+        &x,
+        &dt,
+        &dt_bias,
+        &a_log,
+        &b_data,
+        &c_data,
+        &d_data,
+        &mut output_cpu,
+        nh,
+        hd,
+        ss,
+        ng,
     );
 
     let mut state_dev = DeviceBuffer::<f32>::alloc(device, nh * hd * ss).unwrap();
-    state_dev.copy_from_host(&vec![0.0f32; nh * hd * ss]).unwrap();
+    state_dev
+        .copy_from_host(&vec![0.0f32; nh * hd * ss])
+        .unwrap();
     let mut x_dev = DeviceBuffer::<f32>::alloc(device, nh * hd).unwrap();
     x_dev.copy_from_host(&x).unwrap();
     let mut dt_dev = DeviceBuffer::<f32>::alloc(device, nh).unwrap();
@@ -96,28 +112,48 @@ fn test_selective_state_update_small() {
     d_dev.copy_from_host(&d_data).unwrap();
     let mut output_dev = DeviceBuffer::<f32>::alloc(device, nh * hd).unwrap();
 
-    kernel.forward(
-        &mut state_dev, &x_dev, &dt_dev, &dt_bias_dev, &a_log_dev,
-        &b_dev, &c_dev, &d_dev, &mut output_dev,
-        num_heads, head_dim, state_size, n_groups, &stream,
-    ).unwrap();
+    kernel
+        .forward(
+            &mut state_dev,
+            &x_dev,
+            &dt_dev,
+            &dt_bias_dev,
+            &a_log_dev,
+            &b_dev,
+            &c_dev,
+            &d_dev,
+            &mut output_dev,
+            num_heads,
+            head_dim,
+            state_size,
+            n_groups,
+            &stream,
+        )
+        .unwrap();
     stream.synchronize().unwrap();
 
     let mut output_gpu = vec![0.0f32; nh * hd];
     output_dev.copy_to_host(&mut output_gpu).unwrap();
 
-    let max_abs_diff = output_cpu.iter().zip(&output_gpu)
+    let max_abs_diff = output_cpu
+        .iter()
+        .zip(&output_gpu)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
     println!("CPU first 8: {:?}", &output_cpu[..8]);
     println!("GPU first 8: {:?}", &output_gpu[..8]);
     println!("Max abs diff: {max_abs_diff}");
-    assert!(max_abs_diff < 1e-4, "output mismatch: max_abs_diff={max_abs_diff}");
+    assert!(
+        max_abs_diff < 1e-4,
+        "output mismatch: max_abs_diff={max_abs_diff}"
+    );
 
     let mut state_gpu = vec![0.0f32; nh * hd * ss];
     state_dev.copy_to_host(&mut state_gpu).unwrap();
-    let state_diff = state_cpu.iter().zip(&state_gpu)
+    let state_diff = state_cpu
+        .iter()
+        .zip(&state_gpu)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     println!("State max abs diff: {state_diff}");
@@ -151,12 +187,25 @@ fn test_selective_state_update_nemotron_dims() {
     let mut output_cpu: Vec<f32> = vec![0.0; nh * hd];
 
     reference_ssm_update(
-        &mut state_cpu, &x, &dt, &dt_bias, &a_log, &b_data, &c_data, &d_data,
-        &mut output_cpu, nh, hd, ss, ng,
+        &mut state_cpu,
+        &x,
+        &dt,
+        &dt_bias,
+        &a_log,
+        &b_data,
+        &c_data,
+        &d_data,
+        &mut output_cpu,
+        nh,
+        hd,
+        ss,
+        ng,
     );
 
     let mut state_dev = DeviceBuffer::<f32>::alloc(device, nh * hd * ss).unwrap();
-    state_dev.copy_from_host(&vec![0.0f32; nh * hd * ss]).unwrap();
+    state_dev
+        .copy_from_host(&vec![0.0f32; nh * hd * ss])
+        .unwrap();
     let mut x_dev = DeviceBuffer::<f32>::alloc(device, nh * hd).unwrap();
     x_dev.copy_from_host(&x).unwrap();
     let mut dt_dev = DeviceBuffer::<f32>::alloc(device, nh).unwrap();
@@ -173,21 +222,39 @@ fn test_selective_state_update_nemotron_dims() {
     d_dev.copy_from_host(&d_data).unwrap();
     let mut output_dev = DeviceBuffer::<f32>::alloc(device, nh * hd).unwrap();
 
-    kernel.forward(
-        &mut state_dev, &x_dev, &dt_dev, &dt_bias_dev, &a_log_dev,
-        &b_dev, &c_dev, &d_dev, &mut output_dev,
-        num_heads, head_dim, state_size, n_groups, &stream,
-    ).unwrap();
+    kernel
+        .forward(
+            &mut state_dev,
+            &x_dev,
+            &dt_dev,
+            &dt_bias_dev,
+            &a_log_dev,
+            &b_dev,
+            &c_dev,
+            &d_dev,
+            &mut output_dev,
+            num_heads,
+            head_dim,
+            state_size,
+            n_groups,
+            &stream,
+        )
+        .unwrap();
     stream.synchronize().unwrap();
 
     let mut output_gpu = vec![0.0f32; nh * hd];
     output_dev.copy_to_host(&mut output_gpu).unwrap();
 
-    let max_abs_diff = output_cpu.iter().zip(&output_gpu)
+    let max_abs_diff = output_cpu
+        .iter()
+        .zip(&output_gpu)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
     println!("Nemotron dims ({nh} heads, {hd} head_dim, {ss} state_size, {ng} groups)");
     println!("Max abs diff: {max_abs_diff}");
-    assert!(max_abs_diff < 1e-3, "output mismatch at Nemotron dims: max_abs_diff={max_abs_diff}");
+    assert!(
+        max_abs_diff < 1e-3,
+        "output mismatch at Nemotron dims: max_abs_diff={max_abs_diff}"
+    );
 }

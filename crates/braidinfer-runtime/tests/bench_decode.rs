@@ -27,5 +27,8 @@ fn bench_decode_step() {
     let elapsed = start.elapsed();
     let per_token_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
     let tokens_per_sec = n as f64 / elapsed.as_secs_f64();
-    println!("{n} decode steps in {:.3}s = {per_token_ms:.3} ms/token = {tokens_per_sec:.1} tok/s", elapsed.as_secs_f64());
+    println!(
+        "{n} decode steps in {:.3}s = {per_token_ms:.3} ms/token = {tokens_per_sec:.1} tok/s",
+        elapsed.as_secs_f64()
+    );
 }

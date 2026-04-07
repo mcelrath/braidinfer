@@ -1,6 +1,6 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::{DeviceBuffer, Stream};
-use braidinfer_runtime::kernel::GdnRecurrentStepKernel;
+use braidinfer_runtime::kernel::GdnRecurrentStepV2Kernel;
 
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
@@ -17,8 +17,8 @@ fn gdn_step_reference(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    gate: &[f32],   // pre-computed decay in (0,1)
-    b: &[f32],      // beta logits (sigmoid applied here)
+    gate: &[f32], // pre-computed decay in (0,1)
+    b: &[f32],    // beta logits (sigmoid applied here)
     state: &mut [f32],
     num_heads: usize,
     key_dim: usize,
@@ -82,7 +82,9 @@ fn test_gdn_recurrent_step_matches_reference() {
         .map(|i| (i as f32 * 0.013).sin())
         .collect();
     // Gate values are pre-computed decay in (0,1) — apply sigmoid to raw logits
-    let g_data: Vec<f32> = (0..num_heads).map(|i| sigmoid((i as f32 * 0.1) - 0.8)).collect();
+    let g_data: Vec<f32> = (0..num_heads)
+        .map(|i| sigmoid((i as f32 * 0.1) - 0.8))
+        .collect();
     let b_data: Vec<f32> = (0..num_heads).map(|i| (i as f32 * 0.05) - 0.4).collect();
 
     // Initial state: small random-ish values
@@ -93,13 +95,20 @@ fn test_gdn_recurrent_step_matches_reference() {
     // CPU reference (consumes state)
     let mut cpu_state = state_data.clone();
     let expected = gdn_step_reference(
-        &q_data, &k_data, &v_data, &g_data, &b_data,
-        &mut cpu_state, num_heads, key_dim, value_dim,
+        &q_data,
+        &k_data,
+        &v_data,
+        &g_data,
+        &b_data,
+        &mut cpu_state,
+        num_heads,
+        key_dim,
+        value_dim,
     );
 
     // GPU computation
     let stream = Stream::new(device).expect("stream");
-    let kernel = GdnRecurrentStepKernel::load(device).expect("load kernel");
+    let kernel = GdnRecurrentStepV2Kernel::load(device).expect("load kernel");
 
     let mut d_q = DeviceBuffer::<f32>::alloc(device, num_heads * key_dim).expect("alloc q");
     let mut d_k = DeviceBuffer::<f32>::alloc(device, num_heads * key_dim).expect("alloc k");
@@ -130,6 +139,7 @@ fn test_gdn_recurrent_step_matches_reference() {
             num_heads as u32,
             key_dim as u32,
             value_dim as u32,
+            1,
             &stream,
         )
         .expect("kernel launch");

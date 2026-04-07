@@ -180,14 +180,19 @@ fn main() {
     eprintln!("Found {} safetensors shard(s)", shards.len());
 
     // First pass: count tensors to size the entry table reservation correctly.
-    let max_tensors: usize = shards.iter().map(|shard_path| {
-        let data = std::fs::read(shard_path).expect("Failed to read shard");
-        SafeTensors::deserialize(&data).map(|st| st.names().len()).unwrap_or(0)
-    }).sum();
+    let max_tensors: usize = shards
+        .iter()
+        .map(|shard_path| {
+            let data = std::fs::read(shard_path).expect("Failed to read shard");
+            SafeTensors::deserialize(&data)
+                .map(|st| st.names().len())
+                .unwrap_or(0)
+        })
+        .sum();
     eprintln!("Total tensors (first pass): {max_tensors}");
 
-    let mut writer =
-        BqntWriter::create(Path::new(&output_path), max_tensors).expect("Failed to create output file");
+    let mut writer = BqntWriter::create(Path::new(&output_path), max_tensors)
+        .expect("Failed to create output file");
 
     let mut total_params: u64 = 0;
     let mut quantized_params: u64 = 0;

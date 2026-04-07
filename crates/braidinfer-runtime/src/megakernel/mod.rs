@@ -1,8 +1,8 @@
 use braidinfer_core::types::DeviceId;
+use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
-use braidinfer_hip::HipResult;
 use std::ffi::c_void;
 
 use crate::model::ModelConfig;
@@ -103,21 +103,21 @@ pub struct MegakernelProgram {
     pub(crate) max_seq_len: u32,
     // Paged KV cache support
     pub(crate) paged: bool,
-    pub(crate) page_table: Option<DeviceBuffer<u64>>,     // array of chunk base pointers, uploaded per step
+    pub(crate) page_table: Option<DeviceBuffer<u64>>, // array of chunk base pointers, uploaded per step
     pub(crate) position_table: Option<DeviceBuffer<i32>>, // position per token, uploaded per step
-    pub(crate) attn_paged_inst_indices: Vec<usize>,        // indices of OP_ATTN_PAGED instructions
-    pub(crate) attn_quant_inst_indices: Vec<usize>,        // indices of OP_ATTN_PAGED_Q instructions (quantized KV)
-    pub(crate) last_page_table_len: usize,                 // track when a new chunk was added
+    pub(crate) attn_paged_inst_indices: Vec<usize>,   // indices of OP_ATTN_PAGED instructions
+    pub(crate) attn_quant_inst_indices: Vec<usize>, // indices of OP_ATTN_PAGED_Q instructions (quantized KV)
+    pub(crate) last_page_table_len: usize,          // track when a new chunk was added
     // kv_stride for paged KV write offset computation (nkh * hd)
     pub(crate) kv_stride_paged: usize,
     // Quantized KV support
-    pub(crate) quant_scratch: Option<DeviceBuffer<f32>>,   // partial state: [nqh × (2+hd)] per attn layer
-    pub(crate) quant_page_table: Option<DeviceBuffer<u64>>,// page table for sealed quantized chunks
+    pub(crate) quant_scratch: Option<DeviceBuffer<f32>>, // partial state: [nqh × (2+hd)] per attn layer
+    pub(crate) quant_page_table: Option<DeviceBuffer<u64>>, // page table for sealed quantized chunks
     pub(crate) last_quant_page_table_len: usize,
-    pub quantized_kv: bool,                      // whether this program uses quantized KV
+    pub quantized_kv: bool, // whether this program uses quantized KV
     // Dump mode: per-instruction activation capture
-    pub(crate) dump_buffer: Option<DeviceBuffer<u8>>,        // slot data
-    pub(crate) dump_counter: Option<DeviceBuffer<i32>>,       // atomic slot counter
+    pub(crate) dump_buffer: Option<DeviceBuffer<u8>>, // slot data
+    pub(crate) dump_counter: Option<DeviceBuffer<i32>>, // atomic slot counter
     pub(crate) dump_capacity: i32,
     // Multi-GPU MoE barrier: OP_BARRIER instructions park here; CPU dispatches, resumes
     pub(crate) moe_barrier: Option<MoeBarrierState>,
@@ -137,24 +137,24 @@ pub struct MegakernelProgram {
 /// Activation buffers sized for N-token prefill chunks.
 /// All buffers are [batch × dim] where batch = chunk_tokens.
 pub struct PrefillBuffers {
-    pub hidden: DeviceBuffer<f32>,       // [N × hidden_size] — main hidden state
-    pub normed: DeviceBuffer<f32>,       // [N × hidden_size]
-    pub qkv: DeviceBuffer<f32>,          // [N × conv_dim] (6144 for Qwen3.5)
-    pub a_proj: DeviceBuffer<f32>,       // [N × num_heads]
-    pub b_proj: DeviceBuffer<f32>,       // [N × num_heads]
-    pub z_proj: DeviceBuffer<f32>,       // [N × num_heads * value_dim]
-    pub ffn_act: DeviceBuffer<f32>,      // [N × intermediate_size]
-    pub residual: DeviceBuffer<f32>,     // [N × hidden_size]
+    pub hidden: DeviceBuffer<f32>,  // [N × hidden_size] — main hidden state
+    pub normed: DeviceBuffer<f32>,  // [N × hidden_size]
+    pub qkv: DeviceBuffer<f32>,     // [N × conv_dim] (6144 for Qwen3.5)
+    pub a_proj: DeviceBuffer<f32>,  // [N × num_heads]
+    pub b_proj: DeviceBuffer<f32>,  // [N × num_heads]
+    pub z_proj: DeviceBuffer<f32>,  // [N × num_heads * value_dim]
+    pub ffn_act: DeviceBuffer<f32>, // [N × intermediate_size]
+    pub residual: DeviceBuffer<f32>, // [N × hidden_size]
     pub position_ids: DeviceBuffer<i32>, // [N × 3] — mRoPE positions per token
     // Attention layer intermediates
-    pub q_gate_attn: DeviceBuffer<f32>,  // [N × nqh × hd × 2]
-    pub q_attn: DeviceBuffer<f32>,       // [N × nqh × hd]
-    pub k_attn: DeviceBuffer<f32>,       // [N × nkh × hd]
-    pub v_attn: DeviceBuffer<f32>,       // [N × nkh × hd]
-    pub gate_attn: DeviceBuffer<f32>,    // [N × nqh × hd]
-    pub attn_out: DeviceBuffer<f32>,     // [N × nqh × hd]
-    pub gated_out: DeviceBuffer<f32>,    // [N × nqh × hd]
-    pub out_proj: DeviceBuffer<f32>,     // [N × hidden_size]
+    pub q_gate_attn: DeviceBuffer<f32>, // [N × nqh × hd × 2]
+    pub q_attn: DeviceBuffer<f32>,      // [N × nqh × hd]
+    pub k_attn: DeviceBuffer<f32>,      // [N × nkh × hd]
+    pub v_attn: DeviceBuffer<f32>,      // [N × nkh × hd]
+    pub gate_attn: DeviceBuffer<f32>,   // [N × nqh × hd]
+    pub attn_out: DeviceBuffer<f32>,    // [N × nqh × hd]
+    pub gated_out: DeviceBuffer<f32>,   // [N × nqh × hd]
+    pub out_proj: DeviceBuffer<f32>,    // [N × hidden_size]
     // Single-token scratch for quantized FFN unfused path (Q4 prefill)
     pub ffn_gate_scratch: DeviceBuffer<f32>, // [intermediate_size]
     pub ffn_up_scratch: DeviceBuffer<f32>,   // [intermediate_size]
@@ -184,7 +184,10 @@ impl PrefillBuffers {
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
             position_ids: DeviceBuffer::alloc(device, n * 3)?,
-            q_gate_attn: DeviceBuffer::alloc(device, n * nqh * hd * if cfg.has_output_gate { 2 } else { 1 })?,
+            q_gate_attn: DeviceBuffer::alloc(
+                device,
+                n * nqh * hd * if cfg.has_output_gate { 2 } else { 1 },
+            )?,
             q_attn: DeviceBuffer::alloc(device, n * nqh * hd)?,
             k_attn: DeviceBuffer::alloc(device, n * nkh * hd)?,
             v_attn: DeviceBuffer::alloc(device, n * nkh * hd)?,
@@ -199,14 +202,16 @@ impl PrefillBuffers {
     }
 }
 
-
 mod megakernel_compile;
 mod megakernel_run;
 
 impl MegakernelProgram {
-    pub fn instruction_count(&self) -> usize { self.instructions.len() }
-    pub fn block_count(&self) -> u32 { self.num_blocks }
-
+    pub fn instruction_count(&self) -> usize {
+        self.instructions.len()
+    }
+    pub fn block_count(&self) -> u32 {
+        self.num_blocks
+    }
 
     /// Enable per-instruction dump mode. Allocates GPU buffer and prepends
     /// an OP_NOP header instruction encoding dump pointers (words[1-3]).
@@ -271,10 +276,12 @@ impl MegakernelProgram {
             let opcode = u32::from_le_bytes(slot[0..4].try_into().unwrap());
             let inst_idx = u32::from_le_bytes(slot[4..8].try_into().unwrap());
             let size = u32::from_le_bytes(slot[8..12].try_into().unwrap()) as usize;
-            let data: Vec<f32> = (0..size).map(|j| {
-                let off = 16 + j * 4;
-                f32::from_le_bytes(slot[off..off+4].try_into().unwrap())
-            }).collect();
+            let data: Vec<f32> = (0..size)
+                .map(|j| {
+                    let off = 16 + j * 4;
+                    f32::from_le_bytes(slot[off..off + 4].try_into().unwrap())
+                })
+                .collect();
             results.push((opcode, inst_idx, data));
         }
         Ok(results)
@@ -310,7 +317,11 @@ impl MegakernelProgram {
             tw.write_checkpoint(&name, data);
         }
         tw.close().expect("failed to close dump trace file");
-        eprintln!("Megakernel dump: {} instructions written to {}", slots.len(), path);
+        eprintln!(
+            "Megakernel dump: {} instructions written to {}",
+            slots.len(),
+            path
+        );
         Ok(())
     }
 

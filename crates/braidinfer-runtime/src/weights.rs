@@ -12,8 +12,8 @@ use crate::config::*;
 use crate::kernel::{
     ArgmaxKernel, CausalConv1dUpdateKernel, EmbeddingKernel, FfnFusedKernel, GdnGateKernel,
     GdnRecurrentStepV2Kernel, GqaAttentionKernel, LinearProjKernel, LmHeadKernel, MRoPEKernel,
-    MoeGateKernel, OutputGateKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel,
-    RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
+    MoeGateKernel, OutputGateKernel, PagedAttentionKernel, QkNormKernel, ResidualAddKernel,
+    RmsNormGatedKernel, RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
 };
 pub use crate::quant::{
     LinearWeight, PackedWeights, WeightFormat, WeightQuantMode, quantize_pc_g32_q4,
@@ -219,6 +219,7 @@ pub struct AllKernels {
     pub lm_head: LmHeadKernel,
     pub mrope: MRoPEKernel,
     pub gqa_attention: GqaAttentionKernel,
+    pub paged_attention: PagedAttentionKernel,
     pub gdn_recurrent_v2: GdnRecurrentStepV2Kernel,
     pub causal_conv1d: CausalConv1dUpdateKernel,
     pub qk_norm: QkNormKernel,
@@ -242,6 +243,7 @@ impl AllKernels {
             lm_head: LmHeadKernel::load(device)?,
             mrope: MRoPEKernel::load(device)?,
             gqa_attention: GqaAttentionKernel::load(device)?,
+            paged_attention: PagedAttentionKernel::load(device)?,
             gdn_recurrent_v2: GdnRecurrentStepV2Kernel::load(device)?,
             causal_conv1d: CausalConv1dUpdateKernel::load(device)?,
             qk_norm: QkNormKernel::load(device)?,

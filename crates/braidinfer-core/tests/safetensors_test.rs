@@ -13,11 +13,15 @@ fn test_load_qwen_model() {
     println!("total tensors: {}", names.len());
 
     let embed_name = "model.language_model.embed_tokens.weight";
-    let info = set.tensor_info(embed_name).expect("embed_tokens.weight not found");
+    let info = set
+        .tensor_info(embed_name)
+        .expect("embed_tokens.weight not found");
     assert_eq!(info.dtype, safetensors::Dtype::BF16, "expected BF16");
     assert_eq!(info.shape, vec![248320, 1024], "unexpected shape");
 
-    let raw = set.tensor_data(embed_name).expect("failed to get tensor data");
+    let raw = set
+        .tensor_data(embed_name)
+        .expect("failed to get tensor data");
     assert_eq!(raw.len(), 248320 * 1024 * 2);
 
     println!("first 10 embed_tokens.weight values:");

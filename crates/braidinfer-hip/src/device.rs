@@ -1,4 +1,4 @@
-use crate::{error, ffi, HipResult};
+use crate::{HipResult, error, ffi};
 use braidinfer_core::types::DeviceId;
 
 pub struct Device {
