@@ -372,6 +372,13 @@ impl Model {
     /// MoE FFN forward: route to top-k experts, run expert FFNs, combine.
     /// Uses individual kernel launches (no megakernel).
     pub(crate) fn moe_ffn_forward(&mut self, layer_idx: usize) -> HipResult<()> {
+        let sync_debug_entry = std::env::var("SYNC_DEBUG").is_ok();
+        if sync_debug_entry {
+            let has_mgpu = self.multi_gpu.is_some();
+            let dist_len = self.distributed_moe.len();
+            let has_dist = self.distributed_moe.get(layer_idx).and_then(|x| x.as_ref()).is_some();
+            eprintln!("SYNC_DEBUG: moe_ffn_forward L{layer_idx} multi_gpu={has_mgpu} dist_len={dist_len} has_dist={has_dist}");
+        }
         let moe = self.moe_weights[layer_idx]
             .as_ref()
             .expect("moe_ffn_forward called on non-MoE layer");
@@ -379,7 +386,14 @@ impl Model {
         let eis = moe.expert_intermediate_size;
         let ne = moe.num_experts;
         let eps = self.config.rms_norm_eps;
-
+        // Expert input/output dimension: moe_latent_size (1024) for Nemotron-H, hs for standard models.
+        let latent_size = moe.gate_up_in_dim;
+        // SAFETY: Raw pointers break borrow on self.moe_weights to allow mutable access to
+        // self.activations. Pointers valid for duration of this function (moe_weights not modified).
+        let fc1_ptr: Option<*const crate::quant::LinearWeight> =
+            moe.fc1_latent_proj.as_ref().map(|w| w as *const _);
+        let fc2_ptr: Option<*const crate::quant::LinearWeight> =
+            moe.fc2_latent_proj.as_ref().map(|w| w as *const _);
         // SAFETY: Raw pointer breaks borrow on self.layers to allow mutable access to
         // self.activations. Pointer valid for duration of this function (layers not modified).
         let norm_weight = match &self.layers[layer_idx] {
@@ -464,42 +478,84 @@ impl Model {
         // Multi-GPU path: dispatch routed experts across GPUs (non-megakernel path)
         let used_multi_gpu = if self.multi_gpu.is_some() && !self.distributed_moe.is_empty() {
             if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
-                // D2D copy normed → normed_stage (MappedHostBuffer) on GPU 0 stream.
-                // normed_stage.host_ptr() is then CPU-visible without a sync D2H copy.
+                // Apply fc1_latent_proj if present: normed(hs) → moe_latent(latent_size).
+                // Otherwise copy normed to moe_latent (or just use normed directly).
+                if let Some(fc1) = fc1_ptr {
+                    unsafe { &*fc1 }.forward(
+                        &self.kernels.linear_proj,
+                        &mut self.activations.moe_latent,
+                        &self.activations.normed,
+                        latent_size as u32,
+                        hs as u32,
+                        &self.stream,
+                    )?;
+                }
                 self.stream.synchronize()?;
+                // Copy latent input (moe_latent if fc1 exists, else normed) to normed_stage.
+                let (src_ptr, src_size) = if fc1_ptr.is_some() {
+                    (self.activations.moe_latent.as_ptr() as *const u8, latent_size)
+                } else {
+                    (self.activations.normed.as_ptr() as *const u8, hs)
+                };
                 braidinfer_hip::memory::memcpy_d2d(
                     self.activations.normed_stage.as_write_ptr() as *mut u8,
-                    self.activations.normed.as_ptr() as *const u8,
-                    hs * 4,
+                    src_ptr,
+                    src_size * 4,
                 )?;
-                let normed_host: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), hs)
+                let dispatch_input: &[f32] = unsafe {
+                    std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), src_size)
                 };
                 let mgpu = self.multi_gpu.as_mut().unwrap();
+                let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
+                if sync_debug { eprintln!("SYNC_DEBUG: L{layer_idx}.moe_dispatch_start eis={eis}"); }
                 crate::moe_dispatch::dispatch_moe_layer_sync(
                     mgpu,
                     &self.worker_kernels,
                     dist_moe,
-                    normed_host,
+                    dispatch_input,
                     &mut self.activations.ffn_down_stage,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_expert_weights,
                     k,
-                    hs,
+                    src_size,  // latent_size for Nemotron-H, hs for standard
                     eis,
                     &self.stream,
                 )?;
-                // Copy ffn_down_stage (host-mapped) → ffn_down (GPU 0 VRAM)
-                braidinfer_hip::memory::memcpy_h2d(
-                    self.activations.ffn_down.as_write_ptr() as *mut u8,
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            self.activations.ffn_down_stage.host_ptr() as *const u8,
-                            hs * 4,
-                        )
-                    },
-                    hs * 4,
-                )?;
+                if sync_debug { eprintln!("SYNC_DEBUG: L{layer_idx}.moe_dispatch_done"); }
+
+                if let Some(fc2) = fc2_ptr {
+                    // Gathered output is latent-sized; apply fc2 → ffn_down (hs-sized).
+                    braidinfer_hip::memory::memcpy_h2d(
+                        self.activations.moe_latent.as_write_ptr() as *mut u8,
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                self.activations.ffn_down_stage.host_ptr() as *const u8,
+                                latent_size * 4,
+                            )
+                        },
+                        latent_size * 4,
+                    )?;
+                    unsafe { &*fc2 }.forward(
+                        &self.kernels.linear_proj,
+                        &mut self.activations.ffn_down,
+                        &self.activations.moe_latent,
+                        hs as u32,
+                        latent_size as u32,
+                        &self.stream,
+                    )?;
+                } else {
+                    // No fc2: copy gathered output directly to ffn_down.
+                    braidinfer_hip::memory::memcpy_h2d(
+                        self.activations.ffn_down.as_write_ptr() as *mut u8,
+                        unsafe {
+                            std::slice::from_raw_parts(
+                                self.activations.ffn_down_stage.host_ptr() as *const u8,
+                                hs * 4,
+                            )
+                        },
+                        hs * 4,
+                    )?;
+                }
                 true
             } else {
                 false
@@ -554,14 +610,29 @@ impl Model {
                 .to_vec()
             };
 
-            // 4. Zero accumulation buffer on GPU
+            // 4a. Apply fc1_latent_proj if present: normed(hs) → moe_latent(latent_size).
+            // moe_latent is the expert input and is READ-ONLY during the expert loop.
+            if let Some(fc1) = fc1_ptr {
+                unsafe { &*fc1 }.forward(
+                    &self.kernels.linear_proj,
+                    &mut self.activations.moe_latent,
+                    &self.activations.normed,
+                    latent_size as u32,
+                    hs as u32,
+                    &self.stream,
+                )?;
+            }
+
+            // 4b. Zero accumulation buffer: moe_expert_out[0..latent_size] (if fc2) else ffn_down.
+            // When fc2 is present, accumulate latent_size floats into moe_expert_out (reused as
+            // latent accumulator), then fc2 projects moe_expert_out → ffn_down after the loop.
+            let (accum_ptr, accum_size) = if fc2_ptr.is_some() {
+                (self.activations.moe_expert_out.as_mut_ptr() as *mut std::ffi::c_void, latent_size)
+            } else {
+                (self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void, hs)
+            };
             unsafe {
-                let rc = braidinfer_hip::ffi::hipMemsetAsync(
-                    self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
-                    0,
-                    hs * 4,
-                    self.stream.raw(),
-                );
+                let rc = braidinfer_hip::ffi::hipMemsetAsync(accum_ptr, 0, accum_size * 4, self.stream.raw());
                 if rc != 0 {
                     return Err(braidinfer_hip::HipError(rc).into());
                 }
@@ -576,36 +647,45 @@ impl Model {
             }
 
             // 5. For each selected expert: run FFN and GPU-accumulate
+            // Input: moe_latent (if fc1 present) else normed.
+            // Per-expert temp: moe_expert_gate, moe_expert_up, moe_expert_act, then moe_expert_out.
+            // Accumulate: moe_expert_out (reused as latent accumulator if fc2) else ffn_down.
+            let expert_in_dim = moe.gate_up_in_dim;
+            let expert_input_ptr: *const f32 = if fc1_ptr.is_some() {
+                self.activations.moe_latent.as_ptr()
+            } else {
+                self.activations.normed.as_ptr()
+            };
             for j in 0..k {
                 let expert_id = expert_ids[j] as usize;
                 let w = expert_weights[j];
 
-                let down_offset = moe.expert_down.row_byte_offset_dim(expert_id * hs, eis);
+                let down_offset = moe.expert_down.row_byte_offset_dim(expert_id * expert_in_dim, eis);
 
                 if moe.has_gate_proj {
                     // SwiGLU: gate_proj → silu → * up_proj
                     let gate_offset = moe
                         .expert_gate_up
-                        .row_byte_offset_dim(expert_id * 2 * eis, hs);
+                        .row_byte_offset_dim(expert_id * 2 * eis, expert_in_dim);
                     let up_offset = moe
                         .expert_gate_up
-                        .row_byte_offset_dim(expert_id * 2 * eis + eis, hs);
+                        .row_byte_offset_dim(expert_id * 2 * eis + eis, expert_in_dim);
 
                     moe.expert_gate_up.forward_sub(
                         &self.kernels.linear_proj,
                         self.activations.moe_expert_gate.as_mut_ptr(),
-                        self.activations.normed.as_ptr(),
+                        expert_input_ptr,
                         eis as u32,
-                        hs as u32,
+                        expert_in_dim as u32,
                         gate_offset,
                         &self.stream,
                     )?;
                     moe.expert_gate_up.forward_sub(
                         &self.kernels.linear_proj,
                         self.activations.moe_expert_up.as_mut_ptr(),
-                        self.activations.normed.as_ptr(),
+                        expert_input_ptr,
                         eis as u32,
-                        hs as u32,
+                        expert_in_dim as u32,
                         up_offset,
                         &self.stream,
                     )?;
@@ -618,13 +698,13 @@ impl Model {
                     )?;
                 } else {
                     // relu²: up_proj → relu² (no gate_proj)
-                    let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * eis, hs);
+                    let up_offset = moe.expert_gate_up.row_byte_offset_dim(expert_id * eis, expert_in_dim);
                     moe.expert_gate_up.forward_sub(
                         &self.kernels.linear_proj,
                         self.activations.moe_expert_up.as_mut_ptr(),
-                        self.activations.normed.as_ptr(),
+                        expert_input_ptr,
                         eis as u32,
-                        hs as u32,
+                        expert_in_dim as u32,
                         up_offset,
                         &self.stream,
                     )?;
@@ -636,42 +716,54 @@ impl Model {
                     )?;
                 }
 
-                // Debug: check intermediate values
-                if self.debug_nan && layer_idx <= 1 && j == 0 {
-                    self.stream.synchronize()?;
-                    let up_len = self.activations.moe_expert_up.len();
-                    let act_len = self.activations.moe_expert_act.len();
-                    let mut up_buf = vec![0.0f32; up_len];
-                    let mut act_buf = vec![0.0f32; act_len];
-                    self.activations.moe_expert_up.copy_to_host(&mut up_buf)?;
-                    self.activations.moe_expert_act.copy_to_host(&mut act_buf)?;
-                    let up_max = up_buf[..eis].iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-                    let act_max = act_buf[..eis]
-                        .iter()
-                        .map(|x| x.abs())
-                        .fold(0.0f32, f32::max);
-                    eprintln!(
-                        "  Expert {expert_id}: up_max={up_max:.4}, act_max(relu²)={act_max:.4}, w={w:.6}"
-                    );
+                if fc2_ptr.is_some() {
+                    // With fc2: use ffn_down as per-expert temp, accumulate into moe_expert_out.
+                    // After loop: fc2(moe_expert_out) → ffn_down.
+                    moe.expert_down.forward_sub(
+                        &self.kernels.linear_proj,
+                        self.activations.ffn_down.as_mut_ptr(),
+                        self.activations.moe_expert_act.as_ptr(),
+                        expert_in_dim as u32,
+                        eis as u32,
+                        down_offset,
+                        &self.stream,
+                    )?;
+                    self.kernels.residual_add.weighted_accumulate(
+                        &mut self.activations.moe_expert_out,
+                        &self.activations.ffn_down,
+                        w,
+                        expert_in_dim as u32,
+                        &self.stream,
+                    )?;
+                } else {
+                    // Without fc2: use moe_expert_out as per-expert temp, accumulate into ffn_down.
+                    moe.expert_down.forward_sub(
+                        &self.kernels.linear_proj,
+                        self.activations.moe_expert_out.as_mut_ptr(),
+                        self.activations.moe_expert_act.as_ptr(),
+                        expert_in_dim as u32,
+                        eis as u32,
+                        down_offset,
+                        &self.stream,
+                    )?;
+                    self.kernels.residual_add.weighted_accumulate(
+                        &mut self.activations.ffn_down,
+                        &self.activations.moe_expert_out,
+                        w,
+                        expert_in_dim as u32,
+                        &self.stream,
+                    )?;
                 }
+            }
 
-                // Down projection (pre-allocated buffer)
-                moe.expert_down.forward_sub(
+            // 5b. Apply fc2_latent_proj if present: accumulated moe_expert_out → ffn_down.
+            if let Some(fc2) = fc2_ptr {
+                unsafe { &*fc2 }.forward(
                     &self.kernels.linear_proj,
-                    self.activations.moe_expert_out.as_mut_ptr(),
-                    self.activations.moe_expert_act.as_ptr(),
-                    hs as u32,
-                    eis as u32,
-                    down_offset,
-                    &self.stream,
-                )?;
-
-                // GPU-side weighted accumulate: ffn_down += w * expert_out
-                self.kernels.residual_add.weighted_accumulate(
                     &mut self.activations.ffn_down,
                     &self.activations.moe_expert_out,
-                    w,
                     hs as u32,
+                    latent_size as u32,
                     &self.stream,
                 )?;
             }

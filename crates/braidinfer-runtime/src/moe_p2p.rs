@@ -52,7 +52,7 @@ struct MoeWorkerConfig {
     hidden_size: u32,
     expert_intermediate_size: u32,
     _pad: [u32; 2],
-    entries: [MoeExpertEntry; 256],
+    entries: [MoeExpertEntry; 512],
 }
 
 const CONFIG_SIZE: usize = std::mem::size_of::<MoeWorkerConfig>();
@@ -346,7 +346,7 @@ fn build_layer_configs(
             entries: unsafe { std::mem::zeroed() },
         };
         let mut local_count = 0u32;
-        for eid in 0..dist.num_experts.min(256) {
+        for eid in 0..dist.num_experts.min(512) {
             if let Some((gu_ptr, dn_ptr, cnt)) = get_expert_ptrs(dist, eid) {
                 cfg.entries[eid] = MoeExpertEntry {
                     global_expert_id: eid as u32,

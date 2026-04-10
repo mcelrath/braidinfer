@@ -344,6 +344,12 @@ impl Model {
                 .map_err(ModelError::Hip)?;
                 let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
                     .map_err(ModelError::Hip)?;
+                eprintln!(
+                    "  P2P debug: act.normed={:#x} act.normed_stage={:#x} p2p.output_slots={:#x}",
+                    self.activations.normed.as_ptr() as u64,
+                    self.activations.normed_stage.as_ptr() as u64,
+                    p2p.output_slots.as_ptr() as u64,
+                );
                 self.moe_p2p = Some(p2p);
                 self.megakernel_multi_gpu_p2p = Some(mk_p2p);
                 eprintln!(

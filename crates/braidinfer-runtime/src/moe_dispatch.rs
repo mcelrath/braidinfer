@@ -529,6 +529,7 @@ pub fn dispatch_moe_layer_sync(
         worker.broadcast_done.record(&worker.transfer_stream)?;
     }
 
+    let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
     for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() {
             continue;
@@ -538,6 +539,16 @@ pub fn dispatch_moe_layer_sync(
         let buf = &moe.expert_buffers[gpu];
         MultiGpuContext::stream_wait_event(&worker.compute_stream, &worker.broadcast_done)?;
         Device::set_current(worker.device)?;
+        if sync_debug {
+            eprintln!("SYNC_DEBUG: dispatch GPU{gpu} {} experts gate_up_base={:#x} down_base={:#x} gate_up_stride={} down_stride={} gate_up_row_stride={}",
+                per_gpu[gpu].len(),
+                buf.gate_up.as_ptr() as usize,
+                buf.down.as_ptr() as usize,
+                moe.gate_up_expert_stride,
+                moe.down_expert_stride,
+                moe.gate_up_row_stride,
+            );
+        }
         let input_ptr = worker.activation_in.as_ptr();
         let gate_up_base = buf.gate_up.as_ptr();
         let down_base = buf.down.as_ptr();
@@ -548,6 +559,8 @@ pub fn dispatch_moe_layer_sync(
             let gate_up_offset = local_slot * moe.gate_up_expert_stride;
             let down_offset = local_slot * moe.down_expert_stride;
 
+            // Use actual expert in_dim (moe_latent_size for Nemotron, hs for standard models).
+            let expert_in_dim = moe.gate_up_in_dim as u32;
             if moe.has_gate_proj {
                 let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
                 dispatch_proj(
@@ -556,7 +569,7 @@ pub fn dispatch_moe_layer_sync(
                     unsafe { gate_up_base.add(gate_up_offset) },
                     input_ptr,
                     eis as u32,
-                    hs as u32,
+                    expert_in_dim,
                     fmt,
                     &worker.compute_stream,
                 )?;
@@ -566,7 +579,7 @@ pub fn dispatch_moe_layer_sync(
                     unsafe { gate_up_base.add(up_byte_offset) },
                     input_ptr,
                     eis as u32,
-                    hs as u32,
+                    expert_in_dim,
                     fmt,
                     &worker.compute_stream,
                 )?;
@@ -584,7 +597,7 @@ pub fn dispatch_moe_layer_sync(
                     unsafe { gate_up_base.add(gate_up_offset) },
                     input_ptr,
                     eis as u32,
-                    hs as u32,
+                    expert_in_dim,
                     fmt,
                     &worker.compute_stream,
                 )?;
@@ -601,7 +614,7 @@ pub fn dispatch_moe_layer_sync(
                 worker.scratch_gate.as_ptr() as *mut f32,
                 unsafe { down_base.add(down_offset) },
                 worker.scratch_act.as_ptr(),
-                hs as u32,
+                expert_in_dim,
                 eis as u32,
                 fmt,
                 &worker.compute_stream,
@@ -610,11 +623,15 @@ pub fn dispatch_moe_layer_sync(
                 &mut worker.expert_out,
                 &worker.scratch_gate,
                 weight,
-                hs as u32,
+                expert_in_dim,
                 &worker.compute_stream,
             )?;
         }
         worker.compute_done.record(&worker.compute_stream)?;
+        if sync_debug {
+            worker.compute_done.synchronize()?;
+            eprintln!("SYNC_DEBUG: GPU{gpu} compute done OK");
+        }
     }
 
     // Async gather: overlap D2H transfers from all GPUs

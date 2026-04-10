@@ -117,6 +117,8 @@ impl MultiGpuContext {
                         && rc != ffi::hipErrorPeerAccessAlreadyEnabled
                     {
                         eprintln!("Warning: hipDeviceEnablePeerAccess({i}→{j}) failed: rc={rc}");
+                    } else {
+                        eprintln!("P2P: GPU {i}→{j} enabled (can_access={can_access})");
                     }
                 } else {
                     eprintln!("Warning: P2P not available between GPU {i} and GPU {j}");

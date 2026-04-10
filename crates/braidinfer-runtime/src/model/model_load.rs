@@ -979,6 +979,7 @@ impl Model {
                     .unwrap_or(1),
             )?,
             moe_expert_out: DeviceBuffer::<f32>::alloc(device, hs)?,
+            moe_latent: DeviceBuffer::<f32>::alloc(device, config.moe_latent_size.unwrap_or(hs))?,
             // Mamba2 scratch: sized from recurrent_kind if Mamba2
             mamba2_in_proj: {
                 let size = match &config.recurrent_kind {

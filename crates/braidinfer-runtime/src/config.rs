@@ -111,6 +111,9 @@ pub struct ModelConfig {
     pub model_type: String,
     pub tie_word_embeddings: bool,
     pub weight_quant: WeightQuantMode,
+    /// Latent space dimensionality for MoE expert FFN (e.g. Nemotron-H: 1024).
+    /// None for standard models where experts operate in hidden_size space.
+    pub moe_latent_size: Option<usize>,
 }
 
 impl ModelConfig {
@@ -170,6 +173,7 @@ impl ModelConfig {
             model_type: "qwen3_5".to_string(),
             tie_word_embeddings: true, // 0.8B fallback for tests
             weight_quant: WeightQuantMode::Bf16,
+            moe_latent_size: None,
         }
     }
 
@@ -542,6 +546,7 @@ impl ModelConfig {
             model_type,
             tie_word_embeddings,
             weight_quant: WeightQuantMode::Bf16,
+            moe_latent_size: get_usize("moe_latent_size"),
         })
     }
 

@@ -20,8 +20,11 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
-    // my_gpu_id comes from the first config (same for all layers on this worker)
-    const uint32_t my_gpu = layer_configs[0]->my_gpu_id;
+    // my_gpu_id comes from the first non-null config (same for all MoE layers on this worker)
+    uint32_t my_gpu = 0;
+    for (int _li = 0; ; _li++) {
+        if (layer_configs[_li] != nullptr) { my_gpu = layer_configs[_li]->my_gpu_id; break; }
+    }
     uint32_t last_seq = 0;
 
     while (true) {
@@ -70,7 +73,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         for (uint32_t j = 0; j < k; j++) {
             int32_t eid = work_queue->expert_ids[j];
             float ew = work_queue->expert_weights[j];
-            if (eid < 0 || eid >= 256) continue;
+            if (eid < 0 || eid >= 512) continue;
 
             MoeExpertEntry& entry = config->entries[eid];
             if (entry.gate_up_ptr == 0) continue;

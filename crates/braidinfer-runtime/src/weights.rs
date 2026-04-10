@@ -99,6 +99,15 @@ pub struct MoeWeights {
     pub score_correction_bias_gpu: Option<DeviceBuffer<f32>>, // GPU copy of correction_bias
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
+    /// Input dimension of the expert gate/up weight matrices.
+    /// For models with moe_latent_size (e.g. Nemotron-H), this is moe_latent_size (<hidden_size).
+    pub gate_up_in_dim: usize,
+    /// fc1_latent_proj: [moe_latent_size, hidden_size] — projects hidden→latent before expert dispatch.
+    /// None for models without moe_latent_size.
+    pub fc1_latent_proj: Option<LinearWeight>,
+    /// fc2_latent_proj: [hidden_size, moe_latent_size] — projects accumulated latent→hidden after experts.
+    /// None for models without moe_latent_size.
+    pub fc2_latent_proj: Option<LinearWeight>,
 }
 
 /// Per-GPU expert weight buffer for distributed MoE.
@@ -121,6 +130,9 @@ pub struct DistributedMoeWeights {
     pub has_gate_proj: bool,
     pub num_experts: usize,
     pub expert_intermediate_size: usize,
+    /// Input dimension of the expert gate/up weight matrices.
+    /// For models with moe_latent_size (e.g. Nemotron-H), this is moe_latent_size (< hidden_size).
+    pub gate_up_in_dim: usize,
     pub gate_up_expert_stride: usize,
     pub down_expert_stride: usize,
     pub gate_up_row_stride: usize,
@@ -200,6 +212,7 @@ pub struct ActivationBuffers {
     pub moe_expert_up: DeviceBuffer<f32>,      // [max_expert_intermediate_size]
     pub moe_expert_act: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
     pub moe_expert_out: DeviceBuffer<f32>,     // [hidden_size]
+    pub moe_latent: DeviceBuffer<f32>,         // [moe_latent_size or hidden_size] — fc1/fc2 staging
     // Mamba2 scratch buffers
     pub mamba2_in_proj: DeviceBuffer<f32>, // [in_proj_size] (gate + xBC + dt)
     pub mamba2_conv_out: DeviceBuffer<f32>, // [conv_dim] (after conv1d + activation)
@@ -720,6 +733,49 @@ pub fn load_moe_weights_lite(
     load_moe_weights_inner(st, prefix, config, ffn_type, device, wq, bqnt, true, None)
 }
 
+/// Load an optional latent projection weight (fc1_latent_proj or fc2_latent_proj).
+/// Tries BQNT first, then safetensors. Returns None if not found in either source.
+fn load_latent_proj(
+    prefix: &str,
+    proj_name: &str,
+    device: DeviceId,
+    bqnt: Option<&MmapBqnt>,
+    st: &SafeTensorSet,
+    wq: WeightQuantMode,
+) -> Result<Option<LinearWeight>, ModelError> {
+    let tensor_name = format!("{prefix}{proj_name}.weight");
+
+    // Try BQNT first
+    if let Some(b) = bqnt {
+        if let Some(entry) = b.entry(&tensor_name) {
+            let fmt = crate::bqnt::code_to_format(entry.format).ok_or_else(|| {
+                ModelError::InvalidConfig(format!("{tensor_name}: unknown bqnt format"))
+            })?;
+            let out_dim = entry.out_features as usize;
+            let in_dim = entry.in_features as usize;
+            if let Some(data) = b.tensor_data(&tensor_name) {
+                let mut buf = DeviceBuffer::<u8>::alloc(device, data.len())?;
+                buf.copy_from_host(data)?;
+                return Ok(Some(LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim, in_dim })));
+            }
+        }
+    }
+
+    // Try safetensors
+    if let Ok(raw) = st.tensor_data(&tensor_name) {
+        let shape = st.tensor_info(&tensor_name).map(|i| i.shape.clone()).unwrap_or_default();
+        let out_dim = shape.first().copied().unwrap_or(0);
+        let in_dim = shape.get(1).copied().unwrap_or(0);
+        let slice_u16 = unsafe {
+            std::slice::from_raw_parts(raw.as_ptr() as *const u16, out_dim * in_dim)
+        };
+        let lw = host_bf16_to_linear_weight(slice_u16, out_dim, in_dim, weight_format_for(&tensor_name, wq), device)?;
+        return Ok(Some(lw));
+    }
+
+    Ok(None)
+}
+
 fn load_moe_weights_inner(
     st: &SafeTensorSet,
     prefix: &str,
@@ -1125,6 +1181,17 @@ fn load_moe_weights_inner(
         None
     };
 
+    // Use actual expert in_dim from packed weights when available and non-zero.
+    // Fall back to moe_latent_size (if set in config) or hs.
+    let gate_up_in_dim = expert_gate_up.in_dim()
+        .filter(|&d| d > 0)
+        .unwrap_or_else(|| config.moe_latent_size.unwrap_or(hs));
+
+    // fc1_latent_proj / fc2_latent_proj: optional projections between hidden↔latent space.
+    // Present on models with moe_latent_size (e.g. Nemotron-H: fc1=[1024,4096], fc2=[4096,1024]).
+    let fc1_latent_proj = load_latent_proj(prefix, "fc1_latent_proj", device, bqnt, st, wq)?;
+    let fc2_latent_proj = load_latent_proj(prefix, "fc2_latent_proj", device, bqnt, st, wq)?;
+
     Ok(MoeWeights {
         gate,
         expert_gate_up,
@@ -1134,6 +1201,9 @@ fn load_moe_weights_inner(
         num_experts: ne,
         expert_intermediate_size: eis,
         has_gate_proj,
+        gate_up_in_dim,
+        fc1_latent_proj,
+        fc2_latent_proj,
         score_correction_bias,
         score_correction_bias_gpu,
     })
@@ -1253,13 +1323,14 @@ pub fn distribute_moe_weights_from_ref(
     let ne = moe.num_experts;
     let eis = moe.expert_intermediate_size;
 
-    // Compute byte strides
+    // Compute byte strides. Use actual in_dim from weight (may be moe_latent_size, not hs).
+    let gate_up_in_dim = moe.expert_gate_up.in_dim().unwrap_or(hs);
     let gate_up_rows_per_expert = if moe.has_gate_proj { 2 * eis } else { eis };
     let gate_up_expert_stride = moe
         .expert_gate_up
-        .row_byte_offset_dim(gate_up_rows_per_expert, hs);
-    let down_expert_stride = moe.expert_down.row_byte_offset_dim(hs, eis);
-    let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, hs);
+        .row_byte_offset_dim(gate_up_rows_per_expert, gate_up_in_dim);
+    let down_expert_stride = moe.expert_down.row_byte_offset_dim(gate_up_in_dim, eis);
+    let gate_up_row_stride = moe.expert_gate_up.row_byte_offset_dim(1, gate_up_in_dim);
 
     // Round-robin across GPUs start_gpu..num_devices-1.
     let worker_count = num_devices - start_gpu;
@@ -1373,6 +1444,7 @@ pub fn distribute_moe_weights_from_ref(
         has_gate_proj: moe.has_gate_proj,
         num_experts: ne,
         expert_intermediate_size: eis,
+        gate_up_in_dim,
         gate_up_expert_stride,
         down_expert_stride,
         gate_up_row_stride,
@@ -1391,7 +1463,7 @@ pub fn distribute_moe_weights_from_bqnt(
     layer_idx: usize,
     prefix: &str,
     num_devices: usize,
-    hs: usize,
+    _hs: usize,
     start_gpu: usize,
 ) -> Result<DistributedMoeWeights, ModelError> {
     use braidinfer_hip::device::Device;
@@ -1457,21 +1529,23 @@ pub fn distribute_moe_weights_from_bqnt(
         })?
     };
 
-    // Get byte sizes per expert from bqnt entries
-    let (gu_bytes_per_expert, down_bytes_per_expert) = if has_fused {
+    // Get byte sizes per expert from bqnt entries, and the actual in_dim of gate/up weights.
+    let (gu_bytes_per_expert, down_bytes_per_expert, gate_up_in_dim) = if has_fused {
         let entry = bqnt.entry(&fused_name).unwrap();
         let gu_total = entry.data_bytes as usize;
+        let in_dim = entry.in_features as usize;
         let down_name = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.down_proj");
         let down_entry = bqnt
             .entry(&down_name)
             .ok_or_else(|| ModelError::MissingWeight(down_name))?;
-        (gu_total / ne, down_entry.data_bytes as usize / ne)
+        (gu_total / ne, down_entry.data_bytes as usize / ne, in_dim)
     } else {
         let first_up = format!("{prefix}layers.{layer_idx}.{ffn_key}.experts.0.up_proj.weight");
         let entry = bqnt
             .entry(&first_up)
             .ok_or_else(|| ModelError::MissingWeight(first_up))?;
         let up_bytes = entry.data_bytes as usize;
+        let in_dim = entry.in_features as usize;
         let gu = if has_gate_proj {
             up_bytes * 2
         } else {
@@ -1481,11 +1555,15 @@ pub fn distribute_moe_weights_from_bqnt(
         let down_entry = bqnt
             .entry(&first_down)
             .ok_or_else(|| ModelError::MissingWeight(first_down))?;
-        (gu, down_entry.data_bytes as usize)
+        (gu, down_entry.data_bytes as usize, in_dim)
     };
 
-    let groups_per_row = (hs + 31) / 32;
-    let gate_up_row_stride = groups_per_row * 20;
+    // Use actual expert weight in_dim (may differ from hs when model uses an adapter projection).
+    let gate_up_row_stride = match weight_format {
+        crate::quant::WeightFormat::PcG32Q4 => (gate_up_in_dim + 31) / 32 * 20,
+        crate::quant::WeightFormat::Rnf4G128 => (gate_up_in_dim + 127) / 128 * 132,
+        crate::quant::WeightFormat::Bf16 => gate_up_in_dim * 2,
+    };
 
     // Round-robin across GPUs start_gpu..num_devices-1.
     let worker_count = num_devices - start_gpu;
@@ -1640,6 +1718,7 @@ pub fn distribute_moe_weights_from_bqnt(
         has_gate_proj,
         num_experts: ne,
         expert_intermediate_size: eis,
+        gate_up_in_dim,
         gate_up_expert_stride: gu_bytes_per_expert,
         down_expert_stride: down_bytes_per_expert,
         gate_up_row_stride,

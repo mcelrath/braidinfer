@@ -83,6 +83,14 @@ impl LinearWeight {
         }
     }
 
+    /// Input dimension of the weight matrix. Returns None for Bf16 (no stored dim).
+    pub fn in_dim(&self) -> Option<usize> {
+        match self {
+            LinearWeight::Bf16(_) => None,
+            LinearWeight::Packed(pw) => Some(pw.in_dim),
+        }
+    }
+
     /// Device this weight resides on.
     pub fn device(&self) -> DeviceId {
         match self {
