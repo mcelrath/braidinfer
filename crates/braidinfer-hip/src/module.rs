@@ -1,5 +1,7 @@
 use crate::{HipError, HipResult, error, ffi};
 use braidinfer_core::types::DeviceId;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CString, c_void};
 use std::marker::PhantomData;
 use std::path::Path;
@@ -8,6 +10,8 @@ use std::path::Path;
 pub struct Module {
     raw: ffi::hipModule_t,
     device: DeviceId,
+    /// Cached function handles — hipModuleGetFunction is ~100μs on AMD, cache on first call.
+    cache: RefCell<HashMap<String, ffi::hipFunction_t>>,
 }
 
 impl Module {
@@ -17,7 +21,7 @@ impl Module {
         let path_c = CString::new(path_str).map_err(|_| HipError(ffi::hipErrorInvalidValue))?;
         let mut raw = std::ptr::null_mut();
         error::check(unsafe { ffi::hipModuleLoad(&mut raw, path_c.as_ptr()) })?;
-        Ok(Module { raw, device })
+        Ok(Module { raw, device, cache: RefCell::new(HashMap::new()) })
     }
 
     pub fn device(&self) -> DeviceId {
@@ -25,13 +29,17 @@ impl Module {
     }
 
     pub fn get_function(&self, name: &str) -> HipResult<Function<'_>> {
+        {
+            let cache = self.cache.borrow();
+            if let Some(&raw) = cache.get(name) {
+                return Ok(Function { raw, _module: PhantomData });
+            }
+        }
         let name_c = CString::new(name).map_err(|_| HipError(ffi::hipErrorInvalidValue))?;
         let mut func = std::ptr::null_mut();
         error::check(unsafe { ffi::hipModuleGetFunction(&mut func, self.raw, name_c.as_ptr()) })?;
-        Ok(Function {
-            raw: func,
-            _module: PhantomData,
-        })
+        self.cache.borrow_mut().insert(name.to_string(), func);
+        Ok(Function { raw: func, _module: PhantomData })
     }
 }
 

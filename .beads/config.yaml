@@ -1,3 +1,7 @@
+dolt:
+  shared-server: true
+no-git-ops: true
+
 # Beads Configuration File
 # This file configures default behavior for all bd commands in this repository
 # All settings can also be set via environment variables (BD_* prefix)
@@ -52,3 +56,5 @@
 # - linear.api-key
 # - github.org
 # - github.repo
+
+dolt.shared-server: true

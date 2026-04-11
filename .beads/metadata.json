@@ -2,8 +2,6 @@
   "database": "dolt",
   "backend": "dolt",
   "dolt_mode": "server",
-  "dolt_server_host": "tardis",
-  "dolt_server_port": 3308,
   "dolt_database": "braidinfer",
   "project_id": "6c5ebc79-ce02-4ac6-b46a-844752baecf4"
 }
