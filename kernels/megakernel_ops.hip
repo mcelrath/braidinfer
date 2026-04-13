@@ -88,7 +88,9 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
             if (tid < s) shared[tid] += shared[tid + s];
             __syncthreads();
         }
-        if (tid == 0) output_base[row] = shared[0];
+        if (tid == 0) {
+            output_base[row] = shared[0];
+        }
         return;
     }
 
@@ -344,7 +346,9 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
             acc = shared[tid];
             for (int offset = 4; offset > 0; offset >>= 1)
                 acc += __shfl_down(acc, offset);
-            if (tid == 0) output_base[row] = acc;
+            if (tid == 0) {
+                output_base[row] = acc;
+            }
         }
         return;
     }
@@ -462,7 +466,9 @@ __device__ void op_linear_proj_pcg32_full(const u64* inst, u32 grid_x) {
         }
 
         for (u32 row = blockIdx.x, ri = 0; row < (u32)out_dim; row += gridDim.x, ri++) {
-            if (tid == 0) output_base[row] = row_partial[ri];
+            if (tid == 0) {
+                output_base[row] = row_partial[ri];
+            }
         }
         return;
     }
@@ -545,7 +551,9 @@ __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
             acc = shared[tid];
             for (int offset = 4; offset > 0; offset >>= 1)
                 acc += __shfl_down(acc, offset);
-            if (tid == 0) output_base[row] = acc;
+            if (tid == 0) {
+                output_base[row] = acc;
+            }
         }
         return;
     }
@@ -588,6 +596,7 @@ __device__ void op_rmsnorm_wx(const u64* inst, u32 vblock) {
     int hidden_size = inst_int(inst, 4);
     float eps = inst_float(inst, 5);
 
+    // DEBUG: print input[0] to track hidden state evolution
     // vblock = batch index (same as op_rmsnorm)
     float* output = output_base + (long long)vblock * hidden_size;
     const float* input = input_base + (long long)vblock * hidden_size;
@@ -827,6 +836,131 @@ __device__ void op_scale_add(const u64* inst, u32 vblock) {
     int size = inst_int(inst, 4);
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] += scale * src[idx];
+}
+
+// OP_MAMBA2_CONV1D: causal conv1d with f32 bias + SiLU activation (Mamba2)
+// args: [1]=state(w), [2]=input, [3]=weight(u16/bf16), [4]=bias(f32), [5]=output(w), [6]=conv_dim, [7]=kernel_size
+// One virtual block per 256 channels. grid_x = ceil(conv_dim / 256).
+__device__ void op_mamba2_conv1d(const u64* inst, u32 vblock) {
+    float* state = inst_fptr(inst, 1);
+    const float* input = inst_fptr(inst, 2);
+    const unsigned short* weight = inst_u16ptr(inst, 3);
+    const float* bias = inst_fptr(inst, 4);
+    float* output = inst_fptr(inst, 5);
+    int conv_dim = inst_int(inst, 6);
+    int kernel_size = inst_int(inst, 7);
+
+    int ch = vblock * blockDim.x + threadIdx.x;
+    if (ch >= conv_dim) return;
+
+    int hist = kernel_size - 1;
+    float* s = state + ch * hist;
+    const unsigned short* w = weight + ch * kernel_size;
+
+    float acc = 0.0f;
+    for (int k = 0; k < hist; k++) acc += s[k] * bf16_to_f32(w[k]);
+    acc += input[ch] * bf16_to_f32(w[hist]);
+    acc += bias[ch];
+    output[ch] = acc / (1.0f + expf(-acc));
+
+    for (int i = 0; i < hist - 1; i++) s[i] = s[i + 1];
+    s[hist - 1] = input[ch];
+}
+
+// OP_SSM_UPDATE: Mamba2 selective state update (one block per head)
+// args: [1]=state(w), [2]=x, [3]=dt, [4]=dt_bias, [5]=A_log, [6]=B, [7]=C, [8]=D, [9]=output(w),
+//       [10]=num_heads, [11]=head_dim, [12]=state_size, [13]=n_groups
+// grid_x = num_heads. One block per head, 256 threads.
+__device__ void op_ssm_update(const u64* inst, u32 vblock) {
+    float* ssm_state = inst_fptr(inst, 1);
+    const float* x = inst_fptr(inst, 2);
+    const float* dt = inst_fptr(inst, 3);
+    const float* dt_bias = inst_fptr(inst, 4);
+    const float* A_log = inst_fptr(inst, 5);
+    const float* B = inst_fptr(inst, 6);
+    const float* C = inst_fptr(inst, 7);
+    const float* D = inst_fptr(inst, 8);
+    float* output = inst_fptr(inst, 9);
+    int num_heads = inst_int(inst, 10);
+    int head_dim = inst_int(inst, 11);
+    int state_size = inst_int(inst, 12);
+    int n_groups = inst_int(inst, 13);
+
+    const int h = vblock;
+    if (h >= num_heads) return;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const int heads_per_group = num_heads / n_groups;
+    const int g = h / heads_per_group;
+
+    float dt_val = dt[h] + dt_bias[h];
+    dt_val = dt_val > 20.0f ? dt_val : logf(1.0f + expf(dt_val)); // softplus
+    float dA = expf(dt_val * (-expf(A_log[h])));
+
+    float* state_h = ssm_state + (long long)h * head_dim * state_size;
+    const float* x_h = x + h * head_dim;
+    const float* B_g = B + g * state_size;
+    const float* C_g = C + g * state_size;
+    float D_h = D[h];
+
+    int total = head_dim * state_size;
+    for (int idx = tid; idx < total; idx += stride) {
+        int d = idx / state_size;
+        int s = idx % state_size;
+        state_h[d * state_size + s] = dA * state_h[d * state_size + s] + dt_val * x_h[d] * B_g[s];
+    }
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += stride) {
+        float sum = 0.0f;
+        for (int s = 0; s < state_size; s++) sum += state_h[d * state_size + s] * C_g[s];
+        output[h * head_dim + d] = sum + D_h * x_h[d];
+    }
+}
+
+// OP_MAMBA2_NORM_GATED: rms_norm(x * silu(z)) * weight (norm_before_gate=False, Mamba2 style)
+// args: [1]=output(w), [2]=x(ssm_out), [3]=z(gate), [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
+// grid_x = num_heads. One block per head.
+__device__ void op_mamba2_norm_gated(const u64* inst, u32 vblock) {
+    float* output = inst_fptr(inst, 1);
+    const float* x = inst_fptr(inst, 2);
+    const float* z = inst_fptr(inst, 3);
+    const float* weight = inst_fptr(inst, 4);
+    int value_dim = inst_int(inst, 6);
+    float eps = inst_float(inst, 7);
+
+    int h = vblock;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    const float* xh = x + h * value_dim;
+    const float* zh = z + h * value_dim;
+    float* oh = output + h * value_dim;
+    const float* wh = weight + h * value_dim;
+
+    extern __shared__ float shared[];
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < value_dim; i += stride) {
+        float zi = zh[i];
+        float silu_z = zi / (1.0f + expf(-zi));
+        float v = xh[i] * silu_z;
+        sum_sq += v * v;
+    }
+    shared[tid] = sum_sq;
+    __syncthreads();
+    for (int s = stride / 2; s > 0; s >>= 1) {
+        if (tid < s) shared[tid] += shared[tid + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(shared[0] / (float)value_dim + eps);
+
+    for (int i = tid; i < value_dim; i += stride) {
+        float zi = zh[i];
+        float silu_z = zi / (1.0f + expf(-zi));
+        oh[i] = xh[i] * silu_z * rms * wh[i];
+    }
 }
 
 // OP_RELU_SQ: output[i] = relu(input[i])^2
@@ -1263,15 +1397,16 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
     const float* q = inst_fptr(inst, 2);
     const float* k_cache = inst_fptr(inst, 3);
     const float* v_cache = inst_fptr(inst, 4);
-    int num_q_heads = inst_int(inst, 5);
-    int num_kv_heads = inst_int(inst, 6);
+    int num_q_heads = inst_int(inst, 5);   // global nqh (for gqa_group)
+    int num_kv_heads = inst_int(inst, 6);  // global nkh
     int head_dim = inst_int(inst, 7);
     int seq_len = inst_int(inst, 8);
     int max_seq_len = inst_int(inst, 9);
+    int q_head_start = inst_int(inst, 10); // gpu_i * local_nqh
 
-    int q_head = vblock;
+    int q_head = vblock;                   // local Q head index (q buffer offset)
     int gqa_group = num_q_heads / num_kv_heads;
-    int kv_head = q_head / gqa_group;
+    int kv_head = (q_head + q_head_start) / gqa_group;
     float scale = rsqrtf((float)head_dim);
     const float* q_ptr = q + q_head * head_dim;
 

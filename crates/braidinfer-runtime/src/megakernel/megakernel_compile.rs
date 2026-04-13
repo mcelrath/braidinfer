@@ -11,12 +11,14 @@ use super::{
     OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP,
     OP_FFN_GATE_UP_RNF4, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT, OP_KV_QUANTIZE,
-    OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_LM_HEAD, OP_MOE_DISPATCH,
-    OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM, OP_RESIDUAL_ADD, OP_RMSNORM,
-    OP_RMSNORM_GATE, OP_RMSNORM_WX, OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL,
+    OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_LM_HEAD, OP_MAMBA2_CONV1D,
+    OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH, OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE,
+    OP_QK_NORM, OP_RELU_SQ, OP_RESIDUAL_ADD, OP_RMSNORM, OP_RMSNORM_GATE, OP_RMSNORM_WX,
+    OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
 use crate::model::{
-    ActivationBuffers, AttentionLayerWeights, GdnState, KvCache, LayerWeights, Model, ModelConfig,
+    ActivationBuffers, AttentionLayerWeights, GdnState, KvCache, LayerWeights, Mamba2State, Model,
+    ModelConfig, RecurrentLayerKind,
 };
 
 fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight, ptr_slot: usize) {
@@ -129,13 +131,6 @@ impl MegakernelProgram {
         let device = model.device;
         let act = &model.activations;
 
-        // Guard: only GDN recurrent layers are supported by the megakernel
-        if matches!(
-            cfg.recurrent_kind,
-            crate::model::RecurrentLayerKind::Mamba2 { .. }
-        ) {
-            panic!("Mamba2 recurrent layers not yet supported by megakernel");
-        }
 
         let module = Module::load(
             device,
@@ -204,6 +199,7 @@ impl MegakernelProgram {
         let mut attn_layer_count = 0usize;
 
         let mut gdn_idx = 0usize;
+        let mut mamba2_idx = 0usize;
         let mut kv_idx = 0usize;
         for layer_i in 0..cfg.num_layers {
             use crate::model::LayerType;
@@ -265,7 +261,14 @@ impl MegakernelProgram {
                     gdn_idx += 1;
                 }
                 LayerType::Mamba2 => {
-                    panic!("Mamba2 layers not yet implemented in megakernel (braidinfer-ce9)");
+                    Self::compile_mamba2_layer(
+                        cfg,
+                        &model.layers[layer_i],
+                        act,
+                        &model.mamba2_states[mamba2_idx],
+                        &mut instructions,
+                    );
+                    mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
                     // Standalone MoE FFN layer (Nemotron 'E' layers): norm + MoE dispatch + residual
@@ -1496,6 +1499,137 @@ impl MegakernelProgram {
         instructions.push(inst);
     }
 
+    fn compile_mamba2_layer(
+        cfg: &ModelConfig,
+        layer: &LayerWeights,
+        act: &ActivationBuffers,
+        state: &Mamba2State,
+        instructions: &mut Vec<Instruction>,
+    ) {
+        let w = match layer {
+            LayerWeights::Mamba2(w) => w,
+            _ => panic!("expected Mamba2 layer"),
+        };
+        let (nh, hd, sd, ck, ng, cd) = match &cfg.recurrent_kind {
+            RecurrentLayerKind::Mamba2 {
+                num_heads,
+                head_dim,
+                state_dim,
+                conv_kernel,
+                n_groups,
+                conv_dim,
+                ..
+            } => (*num_heads, *head_dim, *state_dim, *conv_kernel, *n_groups, *conv_dim),
+            _ => panic!("compile_mamba2_layer but no Mamba2 config"),
+        };
+        let hs = cfg.hidden_size;
+        let intermediate = nh * hd;         // gate size + ssm output size
+        let in_proj_size = intermediate + cd + nh; // gate + xBC + dt
+        let eps = cfg.rms_norm_eps;
+        let group_size = intermediate / ng; // value_dim per norm group
+
+        // 1. RMSNorm: hidden → normed
+        {
+            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
+            inst.set_output_ptr(1, act.normed.as_write_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_ptr(3, w.input_norm.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_float(5, eps);
+            instructions.push(inst);
+        }
+
+        // 2. in_proj: normed → mamba2_in_proj [gate(intermediate) | xBC(conv_dim) | dt(num_heads)]
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, in_proj_size as u32);
+            inst.set_output_ptr(1, act.mamba2_in_proj.as_write_ptr());
+            emit_linear_proj(&mut inst, &w.in_proj, 2);
+            inst.set_ptr(3, act.normed.as_ptr());
+            inst.set_int(4, in_proj_size as i32);
+            inst.set_int(5, hs as i32);
+            instructions.push(inst);
+        }
+
+        // 3. conv1d: mamba2_in_proj[intermediate..intermediate+cd] → mamba2_conv_out[cd]
+        //    grid_x = ceil(cd / 256)
+        {
+            let mut inst = Instruction::new(OP_MAMBA2_CONV1D, div_ceil(cd as u32, 256));
+            inst.set_output_ptr(1, state.conv.as_write_ptr());
+            inst.set_ptr(2, unsafe { act.mamba2_in_proj.as_ptr().add(intermediate) });
+            inst.set_ptr(3, w.conv1d_weight.as_ptr());
+            inst.set_ptr(4, w.conv1d_bias.as_ptr());
+            inst.set_output_ptr(5, act.mamba2_conv_out.as_write_ptr());
+            inst.set_int(6, cd as i32);
+            inst.set_int(7, ck as i32);
+            instructions.push(inst);
+        }
+
+        // 4. SSM update: conv_out[x,B,C] + dt + state → mamba2_ssm_out
+        //    x = conv_out[0..intermediate], B = conv_out[intermediate..intermediate+ng*sd],
+        //    C = conv_out[intermediate+ng*sd..]
+        //    dt = mamba2_in_proj[intermediate+cd..] (num_heads elements)
+        //    grid_x = num_heads (one block per head)
+        {
+            let mut inst = Instruction::new(OP_SSM_UPDATE, nh as u32);
+            inst.set_output_ptr(1, state.ssm.as_write_ptr());
+            inst.set_ptr(2, act.mamba2_conv_out.as_ptr()); // x = conv_out[0..intermediate]
+            inst.set_ptr(3, unsafe { act.mamba2_in_proj.as_ptr().add(intermediate + cd) }); // dt
+            inst.set_ptr(4, w.dt_bias.as_ptr());
+            inst.set_ptr(5, w.a_log.as_ptr());
+            inst.set_ptr(6, unsafe { act.mamba2_conv_out.as_ptr().add(intermediate) }); // B
+            inst.set_ptr(7, unsafe { act.mamba2_conv_out.as_ptr().add(intermediate + ng * sd) }); // C
+            inst.set_ptr(8, w.d.as_ptr());
+            inst.set_output_ptr(9, act.mamba2_ssm_out.as_write_ptr());
+            inst.set_int(10, nh as i32);
+            inst.set_int(11, hd as i32);
+            inst.set_int(12, sd as i32);
+            inst.set_int(13, ng as i32);
+            instructions.push(inst);
+        }
+
+        // 5. mamba2_norm_gated: rms_norm(ssm_out * silu(gate)) * weight → mamba2_conv_out (reused)
+        //    ng groups, each group_size elements: treat as ng "heads" each of value_dim=group_size
+        {
+            let mut inst = Instruction::new(OP_MAMBA2_NORM_GATED, ng as u32);
+            inst.set_output_ptr(1, act.mamba2_conv_out.as_write_ptr()); // reuse as output
+            inst.set_ptr(2, act.mamba2_ssm_out.as_ptr()); // x = ssm_out
+            inst.set_ptr(3, act.mamba2_in_proj.as_ptr()); // z = gate (first intermediate floats)
+            inst.set_ptr(4, w.norm_weight.as_ptr());
+            inst.set_int(5, ng as i32);
+            inst.set_int(6, group_size as i32);
+            inst.set_float(7, eps);
+            instructions.push(inst);
+        }
+
+        // 6. out_proj: mamba2_conv_out[intermediate] → out_proj[hs]
+        {
+            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+            inst.set_output_ptr(1, act.out_proj.as_write_ptr());
+            emit_linear_proj(&mut inst, &w.out_proj, 2);
+            inst.set_ptr(3, act.mamba2_conv_out.as_ptr());
+            inst.set_int(4, hs as i32);
+            inst.set_int(5, intermediate as i32);
+            instructions.push(inst);
+        }
+
+        // 7. Residual: hidden = out_proj + hidden
+        {
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.residual.as_write_ptr());
+            inst.set_ptr(2, act.hidden.as_ptr());
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+        }
+        {
+            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.hidden.as_write_ptr());
+            inst.set_ptr(2, act.out_proj.as_ptr());
+            inst.set_ptr(3, act.residual.as_ptr());
+            inst.set_int(4, hs as i32);
+            instructions.push(inst);
+        }
+    }
+
     fn compile_attention_layer(
         cfg: &ModelConfig,
         layer: &LayerWeights,
@@ -1559,7 +1693,6 @@ impl MegakernelProgram {
         let out_proj_ptr = act.out_proj.as_write_ptr();
 
         // 1. RMSNorm
-        let rmsnorm_idx = instructions.len();
         {
             let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
             inst.set_output_ptr(1, normed_ptr);
@@ -1569,9 +1702,21 @@ impl MegakernelProgram {
             inst.set_float(5, eps);
             instructions.push(inst);
         }
+        // 1b. Copy normed → normed_stage (GART/MappedHostBuffer, write-through to system RAM).
+        // This is the flush boundary for P2P dispatch: after GPU 0 acks this instruction,
+        // normed_stage is coherently visible to GPUs 1-3 without L2 cache coherence issues.
+        // (Regular device VRAM is NOT coherent for PCIe P2P on RDNA3; GART is.)
+        let normed_stage_copy_idx = instructions.len();
+        {
+            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
+            inst.set_output_ptr(1, act.normed_stage.as_write_ptr());
+            inst.set_ptr(2, normed_ptr);
+            inst.set_int(3, hs as i32);
+            instructions.push(inst);
+        }
         // Steps 2–9 (QKV proj, deinterleave, QK-norm, KV write, mRoPE, GQA) handled by dispatcher.
         // output_gate_idx points to the first instruction AFTER the dispatched block.
-        let output_gate_idx = instructions.len(); // == rmsnorm_idx + 1
+        let output_gate_idx = instructions.len(); // == normed_stage_copy_idx + 1
 
         // 10. Output gate (Qwen3.5) or pass-through
         let final_attn_ptr = if cfg.has_output_gate {
@@ -1615,7 +1760,7 @@ impl MegakernelProgram {
             instructions.push(inst);
         }
 
-        multi_gpu_boundaries.push((rmsnorm_idx, output_gate_idx));
+        multi_gpu_boundaries.push((normed_stage_copy_idx, output_gate_idx));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2389,25 +2534,29 @@ impl MegakernelProgram {
 
     /// Compile the full instruction stream for GPU-native P2P MoE dispatch.
     /// MoE layers emit OP_MOE_DISPATCH; all other layers are identical to compile_inner.
+    ///
+    /// For models with moe_latent_size (e.g. Nemotron-H):
+    ///   - fc1_latent_proj (normed→moe_latent) is emitted before OP_MOE_DISPATCH
+    ///   - OP_MOE_DISPATCH uses moe_latent as activation and writes to moe_latent
+    ///   - fc2_latent_proj (moe_latent→ffn_down_stage) + residual_add are emitted after
     fn compile_inner_p2p(model: &Model, p2p: &crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
-        // Start from the same compiled base (multi_gpu=true gives us the right shared_mem etc.)
-        // but we'll re-emit MoE FFN layers using compile_moe_ffn_p2p instead of compile_moe_ffn_multi_gpu.
-        // Simplest: call compile_inner with multi_gpu=false (gets single-GPU path for everything),
-        // then patch MoE layers. But easier: build from scratch mirroring compile_inner.
-        //
-        // We reuse compile_inner with multi_gpu=false and then patch only the MoE layers.
-        // Actually, the cleanest approach is a full parallel compile path.
-        // For now: call compile_inner(multi_gpu=true) which creates OP_BARRIER entries, then
-        // replace each OP_BARRIER instruction with the corresponding OP_MOE_DISPATCH.
         let mut prog = Self::compile_inner(model, false, true)?;
 
         let cfg = &model.config;
         let act = &model.activations;
         let hs = cfg.hidden_size;
 
-        // Replace every OP_BARRIER instruction with OP_MOE_DISPATCH
+        // Collect: (barrier_idx → layer_idx) for all MoE barriers
+        let barrier_map: std::collections::HashMap<usize, usize> = prog
+            .barrier_layer_map
+            .iter()
+            .map(|&(bi, li)| (bi, li))
+            .collect();
+
+        // Pass 1: patch OP_BARRIER → OP_MOE_DISPATCH and surrounding instructions in-place
         for &(barrier_idx, layer_idx) in &prog.barrier_layer_map {
             let moe = model.moe_weights[layer_idx].as_ref().unwrap();
+            let dist = model.distributed_moe[layer_idx].as_ref();
             let (k, eis) = match &cfg.layers[layer_idx].ffn_type {
                 crate::model::FfnType::MoE {
                     num_active,
@@ -2419,47 +2568,224 @@ impl MegakernelProgram {
             let has_gate = if moe.has_gate_proj { 1u64 } else { 0u64 };
             let num_workers = p2p.workers.len();
             let num_gpus = p2p.num_gpus;
+            // gate_up_in_dim: expert input dimension (hs for standard MoE, moe_latent_size for Nemotron-H)
+            let gupd = dist.map(|d| d.gate_up_in_dim).unwrap_or(hs);
+            let has_latent = moe.fc1_latent_proj.is_some();
+
+            // Replace D2D_COPY(normed→normed_stage) at barrier_idx-2 with:
+            //   - fc1_latent_proj(normed→moe_latent) if fc1 exists, else NOP
+            // compile_moe_ffn_multi_gpu order: ..., D2D_COPY(normed→normed_stage), OP_MOE_GATE, OP_BARRIER
+            if barrier_idx >= 2 {
+                let prev2 = &prog.instructions[barrier_idx - 2];
+                let prev2_opcode = (prev2.words[0] & 0x7FFFFFFF) as u32;
+                let normed_stage_ptr = act.normed_stage.as_ptr() as u64;
+                if prev2_opcode == OP_D2D_COPY && prev2.words[1] == normed_stage_ptr {
+                    if let Some(ref fc1) = moe.fc1_latent_proj {
+                        // Emit fc1: normed(hs) → moe_latent(gupd)
+                        let mut fc1_inst = Instruction::new(OP_LINEAR_PROJ, gupd as u32);
+                        fc1_inst.set_output_ptr(1, act.moe_latent.as_write_ptr());
+                        emit_linear_proj(&mut fc1_inst, fc1, 2);
+                        fc1_inst.set_ptr(3, act.normed.as_ptr());
+                        fc1_inst.set_int(4, gupd as i32);
+                        fc1_inst.set_int(5, hs as i32);
+                        prog.instructions[barrier_idx - 2] = fc1_inst;
+                    } else {
+                        // NOP: no normed_stage copy needed in P2P path
+                        prog.instructions[barrier_idx - 2] = Instruction::new(OP_D2D_COPY, 0);
+                    }
+                }
+            }
+
+            // Build OP_MOE_DISPATCH instruction
+            // For Nemotron-H (has_latent): activation = moe_latent (gupd elements)
+            //                              final_output = moe_latent (gupd; fc2 projects to hs after)
+            // For standard MoE:           activation = normed (hs)
+            //                              final_output = ffn_down_stage (hs)
+            let activation_ptr = if has_latent {
+                act.moe_latent.as_ptr() as u64
+            } else {
+                act.normed.as_ptr() as u64
+            };
+            let final_output_ptr = if moe.fc2_latent_proj.is_some() {
+                act.moe_latent.as_ptr() as u64  // experts write latent; fc2 projects to ffn_down_stage
+            } else {
+                act.ffn_down_stage.as_ptr() as u64
+            };
 
             let mut inst = Instruction::new(OP_MOE_DISPATCH, 0);
-            // inst[0] = opcode (grid_x=0 means all blocks, op_moe_dispatch manages its own blocks)
-            inst.words[1] = p2p.work_queue.device_ptr() as u64; // MoeWorkItem* (GART)
-            inst.words[2] = p2p.output_slots.as_ptr() as u64; // float* [num_gpus*hs] GPU 0 VRAM
-            inst.words[3] = act.ffn_down_stage.as_ptr() as u64; // final_output (written by op_moe_dispatch)
-            inst.words[4] = act.moe_expert_ids.as_ptr() as u64; // int32_t* expert_ids (GPU 0 VRAM)
-            inst.words[5] = act.moe_expert_weights.as_ptr() as u64; // float* expert_weights
-            inst.words[6] = p2p.seq_counter.device_ptr() as u64; // volatile uint32_t* seq_counter (GART)
-            inst.words[7] = ((num_workers as u64) << 32) | (hs as u64); // num_workers | hidden_size
-            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64); // layer_idx | num_active
-            inst.words[9] = ((eis as u64) << 32) | has_gate; // expert_intermediate_size | has_gate
-            inst.words[10] = act.normed.as_ptr() as u64; // activation (GPU 0 VRAM)
-            inst.words[11] = p2p.gpu0_layer_config_ptrs.as_ptr() as u64; // MoeWorkerConfig**[num_layers]
+            inst.words[1] = p2p.work_queue.device_ptr() as u64;
+            inst.words[2] = p2p.output_slots.as_ptr() as u64;
+            inst.words[3] = final_output_ptr;
+            inst.words[4] = act.moe_expert_ids.as_ptr() as u64;
+            inst.words[5] = act.moe_expert_weights.as_ptr() as u64;
+            inst.words[6] = p2p.seq_counter.device_ptr() as u64;
+            inst.words[7] = ((num_workers as u64) << 32) | (hs as u64); // num_workers | hidden_size (slot stride)
+            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64);
+            inst.words[9] = ((eis as u64) << 32) | has_gate;
+            inst.words[10] = activation_ptr;
+            inst.words[11] = p2p.gpu0_layer_config_ptrs.as_ptr() as u64;
             inst.words[12] = p2p.gpu0_scratch_gate.as_ptr() as u64;
             inst.words[13] = p2p.gpu0_scratch_up.as_ptr() as u64;
             inst.words[14] = p2p.gpu0_scratch_act.as_ptr() as u64;
-            inst.words[15] = num_gpus as u64; // total_gpus (for output_slots indexing)
+            inst.words[15] = num_gpus as u64;
+            inst.words[16] = gupd as u64; // gate_up_in_dim (0 → kernel defaults to hs)
+            inst.words[17] = act.hidden.as_ptr() as u64; // DEBUG: hidden_ptr for GPU-side print
 
             prog.instructions[barrier_idx] = inst;
         }
 
-        // Also patch the D2D_COPY normed→normed_stage instruction that precedes each OP_BARRIER.
-        // With GPU-native P2P, workers P2P-read activation directly from act.normed (GPU 0 VRAM).
-        // The normed_stage copy is no longer needed. Replace it with a NOP (OP_D2D_COPY of 0 bytes).
-        // We identify the normed_stage copy as the instruction immediately before each OP_BARRIER.
-        // (compile_moe_ffn_multi_gpu emits: ... MOE_GATE, D2D_COPY(normed→normed_stage), OP_BARRIER ...)
-        for &(barrier_idx, _layer_idx) in &prog.barrier_layer_map {
-            if barrier_idx > 0 {
-                let prev = &prog.instructions[barrier_idx - 1];
-                let prev_opcode = prev.words[0] & 0x7FFFFFFF;
-                // D2D_COPY is OP_D2D_COPY = 17; check destination is normed_stage
-                if prev_opcode == 17 {
-                    let dst = prev.words[1];
-                    let normed_stage_ptr = act.normed_stage.as_ptr() as u64;
-                    if dst == normed_stage_ptr {
-                        // Replace with a NOP-like D2D_COPY of 0 elements (grid_x=0 → no-op)
-                        prog.instructions[barrier_idx - 1] = Instruction::new(17, 0);
+        // Pass 2: rebuild instruction stream to insert fc2+residual_add after OP_MOE_DISPATCH
+        // (needed for Nemotron-H). Also skip stale shared_up_proj at barrier_idx+1 for those layers.
+        //
+        // For models with fc2_latent_proj:
+        //   - compile_moe_ffn_multi_gpu returns early → emits LINEAR_PROJ(shared_up) at barrier_idx+1
+        //     and NO residual_add. We skip that stale instruction and insert fc2+residual_add instead.
+        // For models without fc2:
+        //   - normal flow: no insertion needed (residual_add already present).
+        let stale_positions: std::collections::HashSet<usize> = prog
+            .barrier_layer_map
+            .iter()
+            .filter(|&&(bi, li)| {
+                model.moe_weights[li]
+                    .as_ref()
+                    .map(|m| m.fc2_latent_proj.is_some())
+                    .unwrap_or(false)
+                    && bi + 1 < prog.instructions.len()
+            })
+            .map(|&(bi, _)| bi + 1)
+            .collect();
+
+        let has_fc2_layers: bool = prog
+            .barrier_layer_map
+            .iter()
+            .any(|&(_, li)| {
+                model.moe_weights[li]
+                    .as_ref()
+                    .map(|m| m.fc2_latent_proj.is_some())
+                    .unwrap_or(false)
+            });
+
+        eprintln!("DBG compile_inner_p2p: has_fc2_layers={has_fc2_layers} stale_positions={stale_positions:?} barrier_map.len()={}", barrier_map.len());
+        if has_fc2_layers {
+            let mut new_instructions =
+                Vec::with_capacity(prog.instructions.len() + 2 * barrier_map.len());
+            // old_to_new[i] = index of old instruction i in new_instructions (-1 if skipped)
+            let mut old_to_new: Vec<i64> = vec![-1i64; prog.instructions.len()];
+            for (i, inst) in prog.instructions.iter().enumerate() {
+                if stale_positions.contains(&i) {
+                    // Skip the stale shared_up_proj left by compile_moe_ffn_multi_gpu's early return
+                    continue;
+                }
+                old_to_new[i] = new_instructions.len() as i64;
+                new_instructions.push(inst.clone());
+                // After OP_MOE_DISPATCH: insert fc2_latent_proj + residual_add (when fc2 exists)
+                if let Some(&layer_idx) = barrier_map.get(&i) {
+                    let moe = model.moe_weights[layer_idx].as_ref().unwrap();
+                    let dist = model.distributed_moe[layer_idx].as_ref();
+                    let gupd = dist.map(|d| d.gate_up_in_dim).unwrap_or(hs);
+                    let cfg = &model.config;
+                    eprintln!("DBG Pass2: inserting fc2 after OP_MOE_DISPATCH at i={i} layer_idx={layer_idx} gupd={gupd} fc2={}", moe.fc2_latent_proj.is_some());
+                    if let Some(ref fc2) = moe.fc2_latent_proj {
+                        // fc2: moe_latent(gupd) → ffn_down_stage(hs)
+                        let mut fc2_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                        fc2_inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
+                        emit_linear_proj(&mut fc2_inst, fc2, 2);
+                        fc2_inst.set_ptr(3, act.moe_latent.as_ptr());
+                        fc2_inst.set_int(4, hs as i32);
+                        fc2_inst.set_int(5, gupd as i32);
+                        new_instructions.push(fc2_inst);
+
+                        // Shared expert (relu² + down_proj, missing in compile_moe_ffn_multi_gpu early return)
+                        if let Some(ref se) = moe.shared_expert {
+                            let se_is = match &cfg.layers[layer_idx].ffn_type {
+                                crate::model::FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
+                                }
+                                _ => { let Some(ref d) = model.distributed_moe[layer_idx] else { continue }; d.expert_intermediate_size }
+                            };
+                            if !moe.has_gate_proj {
+                                // relu² path (Nemotron-H): up_proj → relu² → down_proj
+                                let mut up_inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
+                                up_inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
+                                emit_linear_proj(&mut up_inst, &se.up_proj, 2);
+                                up_inst.set_ptr(3, act.normed.as_ptr());
+                                up_inst.set_int(4, se_is as i32);
+                                up_inst.set_int(5, hs as i32);
+                                new_instructions.push(up_inst);
+
+                                let mut relu_inst = Instruction::new(OP_RELU_SQ, div_ceil(se_is as u32, 256));
+                                relu_inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
+                                relu_inst.set_ptr(2, act.moe_expert_up.as_ptr());
+                                relu_inst.set_int(3, se_is as i32);
+                                new_instructions.push(relu_inst);
+
+                                let mut dn_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                                dn_inst.set_output_ptr(1, act.moe_expert_out.as_write_ptr());
+                                emit_linear_proj(&mut dn_inst, &se.down_proj, 2);
+                                dn_inst.set_ptr(3, act.moe_expert_act.as_ptr());
+                                dn_inst.set_int(4, hs as i32);
+                                dn_inst.set_int(5, se_is as i32);
+                                new_instructions.push(dn_inst);
+
+                                if let Some(ref gate_buf) = moe.shared_expert_gate {
+                                    // gate @ normed → moe_scores (1 scalar)
+                                    let mut g_inst = Instruction::new(OP_LINEAR_PROJ, 1);
+                                    g_inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
+                                    g_inst.set_ptr(2, gate_buf.as_ptr());
+                                    g_inst.set_ptr(3, act.normed.as_ptr());
+                                    g_inst.set_int(4, 1i32);
+                                    g_inst.set_int(5, hs as i32);
+                                    new_instructions.push(g_inst);
+
+                                    // ffn_down_stage += sigmoid(moe_scores[0]) * moe_expert_out
+                                    let mut sw_inst = Instruction::new(OP_SIGMOID_WEIGHTED_ADD, div_ceil(hs as u32, 256));
+                                    sw_inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
+                                    sw_inst.set_ptr(2, act.moe_scores.as_ptr());
+                                    sw_inst.set_ptr(3, act.moe_expert_out.as_ptr());
+                                    sw_inst.set_int(4, hs as i32);
+                                    new_instructions.push(sw_inst);
+                                } else {
+                                    // ffn_down_stage += moe_expert_out
+                                    let mut add_inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+                                    add_inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
+                                    add_inst.set_ptr(2, act.ffn_down_stage.as_ptr() as *const f32);
+                                    add_inst.set_ptr(3, act.moe_expert_out.as_ptr());
+                                    add_inst.set_int(4, hs as i32);
+                                    new_instructions.push(add_inst);
+                                }
+                            }
+                            // Note: has_gate_proj shared expert already handled correctly by
+                            // compile_moe_ffn_multi_gpu (no early return in that branch).
+                        }
+
+                        // residual_add: hidden = residual + ffn_down_stage
+                        // (missing for Nemotron-H because compile_moe_ffn_multi_gpu returns early)
+                        let mut res_inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
+                        res_inst.set_output_ptr(1, act.hidden.as_write_ptr());
+                        res_inst.set_ptr(2, act.residual.as_ptr());
+                        res_inst.set_ptr(3, act.ffn_down_stage.as_ptr() as *const f32);
+                        res_inst.set_int(4, hs as i32);
+                        new_instructions.push(res_inst);
                     }
                 }
             }
+            prog.instructions = new_instructions;
+
+            // Remap multi_gpu_attn_boundaries to new instruction indices.
+            // old_to_new maps old index → new index (-1 if skipped).
+            prog.multi_gpu_attn_boundaries = prog.multi_gpu_attn_boundaries.iter().enumerate().map(|(attn_i, &(flush, resume))| {
+                let new_flush = old_to_new[flush];
+                let new_resume = old_to_new[resume];
+                assert!(new_flush >= 0, "attn flush_idx {flush} was in stale_positions — logic error");
+                assert!(new_resume >= 0, "attn resume_idx {resume} was in stale_positions — logic error");
+                let nf = new_flush as usize;
+                let nr = new_resume as usize;
+                // Verify: flush instruction should be OP_RMSNORM
+                let flush_op = prog.instructions.get(nf).map(|i| i.words[0] & 0x7FFFFFFF).unwrap_or(0xDEAD);
+                let resume_op = prog.instructions.get(nr).map(|i| i.words[0] & 0x7FFFFFFF).unwrap_or(0xDEAD);
+                eprintln!("DBG attn_boundary[{attn_i}]: old=({flush},{resume}) → new=({nf},{nr}) flush_op={flush_op:#x} resume_op={resume_op:#x}");
+                (nf, nr)
+            }).collect();
         }
 
         // Clear barrier_layer_map so decode loop doesn't try to handle OP_BARRIER

@@ -69,6 +69,23 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
+    /// Async H2D copy using an explicit stream. Avoids synchronizing with other streams
+    /// (e.g. a running cooperative kernel on the same device). Note: heap-allocated src
+    /// may degrade to synchronous transfer internally, but will NOT block on other streams.
+    pub fn copy_from_host_async(&mut self, data: &[T], stream: &crate::stream::Stream) -> HipResult<()> {
+        assert!(data.len() <= self.len, "source larger than buffer");
+        let size = data.len() * std::mem::size_of::<T>();
+        error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                self.ptr.cast(),
+                data.as_ptr().cast(),
+                size,
+                ffi::hipMemcpyHostToDevice,
+                stream.raw(),
+            )
+        })
+    }
+
     pub fn copy_to_host(&self, data: &mut [T]) -> HipResult<()> {
         assert!(data.len() >= self.len, "destination smaller than buffer");
         let size = self.len * std::mem::size_of::<T>();
@@ -85,6 +102,7 @@ impl<T> DeviceBuffer<T> {
 
 /// Copy `len` bytes from a device pointer to a host slice.
 pub fn memcpy_d2h(dst: &mut [u8], src: *const u8, len: usize) -> HipResult<()> {
+    crate::assert_no_persistent_worker("memcpy_d2h");
     assert!(dst.len() >= len, "destination buffer too small");
     error::check(unsafe {
         ffi::hipMemcpy(
@@ -98,6 +116,7 @@ pub fn memcpy_d2h(dst: &mut [u8], src: *const u8, len: usize) -> HipResult<()> {
 
 /// Copy `len` bytes from a host slice to a device pointer.
 pub fn memcpy_h2d(dst: *mut u8, src: &[u8], len: usize) -> HipResult<()> {
+    crate::assert_no_persistent_worker("memcpy_h2d");
     assert!(src.len() >= len, "source buffer too small");
     error::check(unsafe {
         ffi::hipMemcpy(

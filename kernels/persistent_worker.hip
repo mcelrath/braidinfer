@@ -8,6 +8,7 @@
 // Include all megakernel op implementations (same as megakernel.hip)
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
+#include "megakernel_moe_barrier.hip"
 
 // Work queue for CPU → GPU communication (host-mapped memory).
 // CPU writes an instruction + increments seq_num. Worker polls seq_num.
@@ -21,12 +22,17 @@ struct WorkerQueue {
     uint64_t inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]; // instruction batch
     volatile uint32_t ack;          // worker writes seq_num when done
     volatile uint32_t done;         // kernel writes 1 when exiting (for Drop polling)
-    uint32_t _pad2[2];
+    volatile uint32_t progress_pc;  // worker writes pc before each instruction (for timeout diagnosis)
+    uint32_t _pad2;
 };
 
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     volatile WorkerQueue* queue
 ) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("persistent_worker: started, queue=%p\n", (void*)queue);
+    }
+
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
@@ -59,6 +65,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
 
         // Process batch of instructions with grid.sync() between each
         for (uint32_t pc = 0; pc < num_inst; pc++) {
+        // Report progress so CPU can identify stuck instruction on timeout.
+        if (threadIdx.x == 0 && blockIdx.x == 0) queue->progress_pc = pc;
         // Copy instruction to shared memory (avoids PCIe reads in virtual block loop)
         __shared__ u64 sinst[INST_SIZE_WORDS];
         const u64* src = (const u64*)(queue->inst + pc * INST_SIZE_WORDS);
@@ -75,6 +83,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         if (opcode == OP_MOE_FFN) {
         } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
+        } else if (opcode == OP_MOE_DISPATCH) {
+            op_moe_dispatch(inst, grid);
         } else if (opcode == OP_LINEAR_PROJ_PCG32) {
             op_linear_proj_pcg32_full(inst, grid_x);
             grid.sync();
@@ -116,6 +126,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
                     case OP_SCALE_ADD:   op_scale_add(inst, vb); break;
                     case OP_RELU_SQ:     op_relu_sq(inst, vb); break;
+                    case OP_MAMBA2_CONV1D:    op_mamba2_conv1d(inst, vb); break;
+                    case OP_SSM_UPDATE:       op_ssm_update(inst, vb); break;
+                    case OP_MAMBA2_NORM_GATED: op_mamba2_norm_gated(inst, vb); break;
                     default: break;
                 }
             }
@@ -124,9 +137,13 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
 
         } // end for (pc = 0; pc < num_inst; pc++)
 
-        // Ack: sync all blocks FIRST, then write ack.
-        // Write ack, then update last_seq for next iteration.
-        ack:
+        // Ack: flush ALL threads' writes to system-visible memory, then write ack.
+        // grid.sync() ensures all threads completed (device-scope). But P2P readers on
+        // GPUs 1-3 bypass GPU 0's L2 and read VRAM directly. grid.sync() alone does NOT
+        // flush L2 → VRAM for P2P visibility. __threadfence_system() from EACH thread
+        // ensures that thread's cache lines are written back to system-visible memory.
+        // Must be called by ALL threads (not just thread 0,0) to cover all written cache lines.
+        __threadfence_system();
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             queue->ack = seq;
         }

@@ -138,11 +138,22 @@ impl Model {
     pub fn decode_step_token(&mut self, token_id: u32, position: u32) -> Result<u32, ModelError> {
         let logits = self.decode_step(token_id, position)?;
         if self.persistent_workers.is_some() {
-            let (idx, _) = logits
+            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+            if nan_count > 0 {
+                eprintln!("WARN: {nan_count}/{} NaN in logits", logits.len());
+            }
+            let (idx, best_val) = logits
                 .iter()
                 .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
                 .unwrap();
+            // DBG: print top token and surrounding logits
+            let mut top5: Vec<(usize, f32)> = logits.iter().enumerate()
+                .map(|(i, &v)| (i, v))
+                .collect::<Vec<_>>();
+            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            top5.truncate(5);
+            eprintln!("DBG argmax: token={idx} val={best_val:.4} top5={top5:?} logits[0]={:.4} logits[11]={:.4}", logits[0], logits[11]);
             Ok(idx as u32)
         } else {
             let result = self.kernels.argmax.forward(
@@ -157,13 +168,8 @@ impl Model {
 
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        let has_mamba2 = self
-            .config
-            .layers
-            .iter()
-            .any(|l| l.layer_type == crate::config::LayerType::Mamba2);
         let is_multi_gpu = self.multi_gpu.is_some();
-        if has_mamba2 || self.trace.is_some() {
+        if self.trace.is_some() {
             return self.decode_step_moe(token_id, position);
         }
         if is_multi_gpu {
@@ -291,7 +297,11 @@ impl Model {
                 self.megakernel_multi_gpu = Some(mk);
             }
             let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-            let shared_mem = 1024u32 * 4 + 256;
+            // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS needs (8+7680+256)*4 = 31776 bytes per block.
+            // moe_worker_kernel (GPUs 1-3) only needs 4352B; persistent_worker (GPU 0) needs 31776B.
+            // Pass the larger value; moe_worker has its own calculation in moe_p2p.rs.
+            let moe_worker_shared_mem = 1024u32 * 4 + 256; // 4352B for moe_worker_kernel
+            let shared_mem = moe_worker_shared_mem.max(31776u32); // 31776B for persistent_worker
             let hs = self.config.hidden_size;
             let max_eis = self
                 .config
@@ -306,20 +316,11 @@ impl Model {
                 })
                 .max()
                 .unwrap_or(0);
-            let all_devices: Vec<_> = (0..num_gpus)
-                .map(|i| braidinfer_core::types::DeviceId(i as u32))
-                .collect();
-            let dispatch = PersistentDispatch::init_multi_gpu(
-                self.device,
-                &all_devices,
-                shared_mem,
-                hs,
-                max_eis,
-            )
-            .map_err(ModelError::Hip)?;
-            self.persistent_workers = Some(dispatch);
 
-            // Init GPU-native P2P MoE dispatch (moe_worker_kernel on GPUs 1-3)
+            // Init GPU-native P2P MoE dispatch (moe_worker_kernel on GPUs 1-3) BEFORE
+            // launching the persistent cooperative worker on GPU 0. hipMalloc on GPU 0
+            // deadlocks if the cooperative kernel is already running (ROCm synchronizes
+            // all GPU work before allocating). Launch persistent_worker LAST.
             let has_moe = self
                 .config
                 .layers
@@ -339,17 +340,11 @@ impl Model {
                     max_eis,
                     num_total_layers,
                     &dist_refs,
-                    shared_mem,
+                    moe_worker_shared_mem,
                 )
                 .map_err(ModelError::Hip)?;
                 let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
                     .map_err(ModelError::Hip)?;
-                eprintln!(
-                    "  P2P debug: act.normed={:#x} act.normed_stage={:#x} p2p.output_slots={:#x}",
-                    self.activations.normed.as_ptr() as u64,
-                    self.activations.normed_stage.as_ptr() as u64,
-                    p2p.output_slots.as_ptr() as u64,
-                );
                 self.moe_p2p = Some(p2p);
                 self.megakernel_multi_gpu_p2p = Some(mk_p2p);
                 eprintln!(
@@ -357,6 +352,21 @@ impl Model {
                     num_gpus - 1
                 );
             }
+
+            // Launch persistent cooperative worker on GPU 0 LAST — after all GPU memory
+            // operations are complete (hipMalloc deadlocks on running cooperative kernels).
+            let all_devices: Vec<_> = (0..num_gpus)
+                .map(|i| braidinfer_core::types::DeviceId(i as u32))
+                .collect();
+            let dispatch = PersistentDispatch::init_multi_gpu(
+                self.device,
+                &all_devices,
+                shared_mem,
+                hs,
+                max_eis,
+            )
+            .map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
         }
 
         // Use P2P megakernel if available (GPU-native MoE dispatch, no OP_BARRIER)
@@ -921,8 +931,20 @@ impl Model {
 
         if !segment.is_empty() {
             let dispatch = self.persistent_workers.as_mut().unwrap();
+            let debug_hidden = std::env::var("DEBUG_P2P_HIDDEN").is_ok();
+            let mut batch_idx = 0usize;
             for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
                 dispatch.dispatch_batch(0, chunk);
+                if debug_hidden {
+                    // Sync + read hidden[0:2] after each batch
+                    let src = self.activations.hidden.as_ptr() as *const u8;
+                    let mut buf = [0u8; 8];
+                    braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
+                    let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
+                    let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
+                    eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
+                    batch_idx += 1;
+                }
             }
         }
 
@@ -933,6 +955,14 @@ impl Model {
             )
         }
         .to_vec();
+        // DBG: print top token and logit distribution
+        {
+            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+            let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            top5.truncate(5);
+            eprintln!("DBG p2p logits: nan={nan_count} top5={top5:?} logits[11]={:.4}", logits[11]);
+        }
         self.seq_len = position + 1;
         Ok(logits)
     }
@@ -1001,7 +1031,11 @@ impl Model {
             .is_empty();
 
         // GPU 0 base pointers (P2P-accessible)
-        let normed_base = self.activations.normed.as_ptr() as u64;
+        // Use normed_stage (GART/MappedHostBuffer) for broadcast source, NOT normed (device VRAM).
+        // On RDNA3 PCIe, P2P reads bypass GPU 0's L2 and hit VRAM — which may be stale since
+        // op_rmsnorm_wx writes go through L2. normed_stage is write-through to system RAM,
+        // so GPU 1-3's peer_copy_kernel reads the correct value.
+        let normed_base = self.activations.normed_stage.device_ptr() as u64;
         let k_attn_base = self.activations.k_attn.as_ptr() as u64;
         let v_attn_base = self.activations.v_attn.as_ptr() as u64;
         let q_attn_base = self.activations.q_attn.as_ptr() as u64;
@@ -1068,7 +1102,9 @@ impl Model {
                         let q_gate = w.attn_q_gate.as_ref().unwrap().as_write_ptr() as u64;
                         let k = w.attn_k.as_ref().unwrap().as_write_ptr() as u64;
                         let v = w.attn_v.as_ref().unwrap().as_write_ptr() as u64;
-                        let gate = w.attn_gate.as_ref().unwrap().as_write_ptr() as u64;
+                        let gate = w.attn_gate.as_ref()
+                            .map(|b| b.as_write_ptr() as u64)
+                            .unwrap_or(0);
                         (normed, q_gate, k, v, gate)
                     }
                 };
@@ -1175,20 +1211,18 @@ impl Model {
                     batch.push(inst);
                 }
 
-                // 5. QK-norm on local k (uses q_norm/k_norm weights from GPU 0 via P2P)
-                // Note: QK-norm weights are DeviceBuffer<u16> on GPU 0, P2P-accessible
-                let (q_norm_ptr, k_norm_ptr, qk_norm_eps) = {
-                    match &self.layers[layer_idx_for_attn] {
-                        LayerWeights::Attention(w) => (
-                            w.q_norm.as_ptr(),
-                            w.k_norm.as_ptr(),
-                            self.config.rms_norm_eps,
-                        ),
-                        _ => panic!("expected attention layer"),
-                    }
-                };
-                // QK-norm: combined Q+K instruction (matches megakernel_ops.hip interface)
-                {
+                // 5. QK-norm on local k (only for models with QK-norm weights — e.g. Qwen3, not Nemotron-H)
+                if self.config.has_qk_norm {
+                    let (q_norm_ptr, k_norm_ptr, qk_norm_eps) = {
+                        match &self.layers[layer_idx_for_attn] {
+                            LayerWeights::Attention(w) => (
+                                w.q_norm.as_ptr(),
+                                w.k_norm.as_ptr(),
+                                self.config.rms_norm_eps,
+                            ),
+                            _ => panic!("expected attention layer"),
+                        }
+                    };
                     let mut inst = Instruction::new(OP_QK_NORM, (local_nqh + local_nkh) as u32);
                     inst.set_output_ptr(1, q_ptr as *mut f32);
                     inst.set_output_ptr(2, k_local_ptr as *mut f32);
@@ -1223,9 +1257,8 @@ impl Model {
                     batch.push(inst);
                 }
 
-                // 7. mRoPE on local Q (position is the argument to dispatch_head_parallel_attention)
-                // mRoPE on local Q+K (GPU 0's inv_freq and position_ids are P2P-accessible)
-                {
+                // 7. mRoPE on local Q+K — only for models that use RoPE
+                if self.config.use_rope {
                     let rd = self.config.rope_dim;
                     let ms = &self.config.mrope_section;
                     let mut inst = Instruction::new(OP_MROPE, (local_nqh + local_nkh) as u32);
@@ -1251,11 +1284,12 @@ impl Model {
                     inst.set_ptr(2, q_ptr as *const f32);
                     inst.set_ptr(3, kv_k_base as *const f32);
                     inst.set_ptr(4, kv_v_base as *const f32);
-                    inst.set_int(5, local_nqh as i32);
-                    inst.set_int(6, local_nkh as i32);
+                    inst.set_int(5, nqh as i32);          // global nqh for gqa_group
+                    inst.set_int(6, nkh as i32);          // global nkh
                     inst.set_int(7, hd as i32);
                     inst.set_int(8, seq_len);
                     inst.set_int(9, max_sl as i32);
+                    inst.set_int(10, (gpu_i * local_nqh) as i32); // q_head_start
                     batch.push(inst);
                 }
             } else {
@@ -1303,11 +1337,12 @@ impl Model {
                     inst.set_ptr(2, q_src as *const f32);
                     inst.set_ptr(3, kv_k_base as *const f32);
                     inst.set_ptr(4, kv_v_base as *const f32);
-                    inst.set_int(5, local_nqh as i32);
-                    inst.set_int(6, local_nkh as i32);
+                    inst.set_int(5, nqh as i32);          // global nqh for gqa_group
+                    inst.set_int(6, nkh as i32);          // global nkh
                     inst.set_int(7, hd as i32);
                     inst.set_int(8, seq_len);
                     inst.set_int(9, max_sl as i32);
+                    inst.set_int(10, (gpu_i * local_nqh) as i32); // q_head_start
                     batch.push(inst);
                 }
             }
@@ -1523,9 +1558,11 @@ impl Model {
                     let hd = inst.words[7] as u32;
                     let sl = inst.words[8] as u32;
                     let msl = inst.words[9] as u32;
+                    let q_head_start = inst.words[10] as u32;
+                    let local_nqh = (inst.words[0] >> 32) as u32; // gupd = block count
                     self.multi_gpu.as_ref().unwrap().workers[gpu_i]
                         .gqa_kernel
-                        .forward_ptr(out, q, k_cache, v_cache, nqh, nkh, hd, sl, msl, stream)?;
+                        .forward_ptr(out, q, k_cache, v_cache, nqh, nkh, hd, sl, msl, local_nqh, q_head_start, stream)?;
                 }
                 _ => {}
             }
@@ -1605,6 +1642,15 @@ impl Model {
                 LayerType::Attention => {
                     self.attention_forward(layer_i, kv_idx, position)?;
                     sync_check_moe!(format!("L{layer_i}.attn"));
+                    if layer_i >= 5 && layer_i <= 10 {
+                        self.stream.synchronize()?;
+                        let src = self.activations.hidden.as_ptr() as *const u8;
+                        let mut buf = [0u8; 8];
+                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
+                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
+                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
+                        eprintln!("DBG ref attn L{layer_i}: h[0]={v0:.6} h[1]={v1:.6}");
+                    }
                     kv_idx += 1;
                 }
                 LayerType::Gdn => {
@@ -1615,6 +1661,16 @@ impl Model {
                 LayerType::Mamba2 => {
                     self.mamba2_forward(layer_i, mamba2_idx)?;
                     sync_check_moe!(format!("L{layer_i}.mamba2"));
+                    // DEBUG: print hidden[0:2] after Mamba2 layers near divergence point
+                    if layer_i >= 5 && layer_i <= 8 {
+                        self.stream.synchronize()?;
+                        let src = self.activations.hidden.as_ptr() as *const u8;
+                        let mut buf = [0u8; 8];
+                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
+                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
+                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
+                        eprintln!("DBG ref mamba L{layer_i}: h[0]={v0:.6} h[1]={v1:.6}");
+                    }
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -1809,6 +1865,15 @@ impl Model {
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
+
+        // DBG: print top5 logits from reference moe path
+        {
+            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+            let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            top5.truncate(5);
+            eprintln!("DBG moe logits pos={position}: nan={nan_count} top5={top5:?} logits[11]={:.4}", logits[11]);
+        }
 
         if self.trace.is_some() {
             let mut hid_buf = vec![0.0f32; self.config.hidden_size];

@@ -48,7 +48,8 @@ pub struct WorkerQueueLayout {
     pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE], // instruction batch buffer
     pub ack: u32,
     pub done: u32, // kernel writes 1 when exiting after shutdown (for Drop polling)
-    pub _pad2: [u32; 2],
+    pub progress_pc: u32, // kernel writes pc before each instruction (for timeout diagnosis)
+    pub _pad2: u32,
 }
 
 /// Per-GPU worker state.
@@ -163,6 +164,7 @@ impl PersistentDispatch {
                 "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared)",
                 device.0
             );
+            braidinfer_hip::set_persistent_worker_active(true);
             workers.push(std::mem::ManuallyDrop::new(GpuWorker {
                 device,
                 queue,
@@ -233,10 +235,22 @@ impl PersistentDispatch {
             if ack == seq {
                 break;
             }
-            if start.elapsed().as_secs() > 2 {
+            if start.elapsed().as_secs() > 30 {
                 let opcode0 = instructions[0].words[0] & 0x7FFFFFFF;
+                let progress_pc = unsafe {
+                    std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc))
+                };
+                let stuck_op = instructions
+                    .get(progress_pc as usize)
+                    .map(|i| i.words[0] & 0x7FFFFFFF)
+                    .unwrap_or(0);
+                let stuck_grid_x = instructions
+                    .get(progress_pc as usize)
+                    .map(|i| (i.words[0] >> 32) as u32)
+                    .unwrap_or(0);
                 panic!(
-                    "dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} opcode0={opcode0}",
+                    "dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} opcode0={opcode0} \
+                     stuck_pc={progress_pc} stuck_op={stuck_op} stuck_grid_x={stuck_grid_x}",
                     instructions.len()
                 );
             }
@@ -323,6 +337,7 @@ impl PersistentDispatch {
             "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B); GPUs 1+ use kbk",
             gpu0.0
         );
+        braidinfer_hip::set_persistent_worker_active(true);
         let moe_output_slot = MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?;
         Ok(PersistentDispatch {
             workers: vec![std::mem::ManuallyDrop::new(GpuWorker {
@@ -361,6 +376,11 @@ impl Drop for PersistentDispatch {
     /// write_volatile on host_ptr). The kernel writes `done=1` before returning so we can
     /// poll without any HIP API.
     fn drop(&mut self) {
+        // If we're already panicking (e.g. dispatch_batch timeout), the kernel is stuck
+        // inside grid.sync() and will never see shutdown. Exit immediately.
+        if std::thread::panicking() {
+            std::process::exit(1);
+        }
         self.request_shutdown();
         // Poll kernel-written `done` flag. Kernel writes done=1 before returning on shutdown.
         let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);

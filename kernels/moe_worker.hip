@@ -18,11 +18,24 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     float* local_output       // [hidden_size] local VRAM — accumulated then P2P written
 ) {
     namespace cg = cooperative_groups;
+
+    // Signal CPU that kernel started before cg::this_grid() (to detect early crash).
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *done_flag = 0xAA01u;
+        __threadfence_system();
+    }
+
     cg::grid_group grid = cg::this_grid();
+
+    // Signal CPU that kernel is past cg::this_grid() (CPU waits for this before proceeding).
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        *done_flag = 0xAA02u;
+        __threadfence_system();
+    }
 
     // my_gpu_id comes from the first non-null config (same for all MoE layers on this worker)
     uint32_t my_gpu = 0;
-    for (int _li = 0; ; _li++) {
+    for (int _li = 0; _li < 256; _li++) {
         if (layer_configs[_li] != nullptr) { my_gpu = layer_configs[_li]->my_gpu_id; break; }
     }
     uint32_t last_seq = 0;
@@ -42,6 +55,10 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         }
         grid.sync();
 
+        // Acquire fence: ensures all wq field writes from GPU 0 (done before seq_num RELEASE)
+        // are visible to this GPU before we read activation_ptr, output_slots_ptr, etc.
+        __threadfence_system();
+
         uint32_t seq = work_queue->seq_num;
         if (seq == 0xFFFFFFFFu) {
             // Signal CPU that kernel has exited
@@ -59,12 +76,20 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         uint32_t eis = work_queue->expert_intermediate_size;
         uint32_t k = work_queue->num_active;
         uint32_t has_gate = work_queue->has_gate_proj;
-        const float* activation_src = (const float*)work_queue->activation_ptr;
+        // gate_up_in_dim: expert input dimension (= hidden_size for standard MoE,
+        // = moe_latent_size for Nemotron-H). Default to hs for backward compat.
+        uint32_t gupd = (work_queue->gate_up_in_dim > 0) ? work_queue->gate_up_in_dim : hs;
+        // activation_cache: GPU 0 wrote activation here (GART, bypassing L2) before writing seq_num.
+        // Workers read from GART → always see fresh data (no L2-stale issue from GPU 0's VRAM).
+        const float* activation_src = (const float*)work_queue->activation_cache;
         float* output_slots = (float*)work_queue->output_slots_ptr;
+        // Output slot stride is always hidden_size so GPU 0's sum loop uses consistent offsets.
         float* my_output_slot = output_slots + my_gpu * hs;
 
-        // 1. P2P copy activation from GPU 0 VRAM to local buffer
-        coop_copy(local_activation, activation_src, hs, grid);
+        // 1. Copy activation from work queue GART cache to local VRAM (gupd elements)
+        coop_copy(local_activation, activation_src, gupd, grid);
+
+        grid.sync();
 
         // 2. Zero local output
         coop_zero(local_output, hs, grid);
@@ -83,28 +108,29 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
 
             if (has_gate) {
                 coop_gemv_pcg32(scratch_gate, gate_up_data,
-                                local_activation, eis, hs, grid);
+                                local_activation, eis, gupd, grid);
                 const unsigned char* up_data = gate_up_data +
                     (long long)eis * config->gate_up_row_stride;
                 coop_gemv_pcg32(scratch_up, up_data,
-                                local_activation, eis, hs, grid);
+                                local_activation, eis, gupd, grid);
                 coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
             } else {
                 coop_gemv_pcg32(scratch_up, gate_up_data,
-                                local_activation, eis, hs, grid);
+                                local_activation, eis, gupd, grid);
                 coop_relu_squared(scratch_act, scratch_up, eis, grid);
             }
 
+            // down: eis → gupd (= gate_up_in_dim, not necessarily hidden_size)
             coop_gemv_pcg32(scratch_gate, down_data,
-                            scratch_act, hs, eis, grid);
-            coop_weighted_acc(local_output, scratch_gate, ew, hs, grid);
+                            scratch_act, gupd, eis, grid);
+            coop_weighted_acc(local_output, scratch_gate, ew, gupd, grid);
         }
 
-        // 4. P2P write local_output to GPU 0's output_slots
+        // 4. P2P write local_output to GPU 0's output_slots (gupd elements)
         // __threadfence_system() ensures the write is visible to GPU 0 after
         // it polls ack_flags (which polls MTYPE_UC host-mapped memory).
         __threadfence_system();
-        coop_copy(my_output_slot, local_output, hs, grid);
+        coop_copy(my_output_slot, local_output, gupd, grid);
 
         // 5. Ack via host-mapped flag
         // __threadfence_system() after coop_copy ensures P2P writes to output_slots

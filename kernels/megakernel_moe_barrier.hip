@@ -49,6 +49,24 @@ __device__ void op_barrier(const u64* inst, u32 vb) {
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
 
+// OP_MOE_DISPATCH instruction layout (17 u64 words):
+//   inst[1]  = work_queue_ptr       (MoeWorkItem*, host-mapped)
+//   inst[2]  = output_slots_ptr     (float*, GPU 0 VRAM, [total_gpus * hidden_size])
+//   inst[3]  = final_output_ptr     (float*, GPU 0 VRAM, [gate_up_in_dim] accumulated result)
+//   inst[4]  = expert_ids_ptr       (int32_t*, host-mapped — OP_MOE_GATE output)
+//   inst[5]  = expert_weights_ptr   (float*, host-mapped — OP_MOE_GATE output)
+//   inst[6]  = seq_counter_ptr      (volatile uint32_t*, host-mapped)
+//   inst[7]  = (num_workers << 32) | hidden_size   [hidden_size for output slot stride]
+//   inst[8]  = (layer_idx << 32) | num_active (k)
+//   inst[9]  = (expert_intermediate_size << 32) | has_gate_proj
+//   inst[10] = activation_ptr       (float*, GPU 0 VRAM — [gate_up_in_dim] expert activation)
+//   inst[11] = gpu0_config_ptr      (MoeWorkerConfig**, GPU 0 VRAM array indexed by layer_idx)
+//   inst[12] = scratch_gate_ptr     (float*, GPU 0 VRAM [eis])
+//   inst[13] = scratch_up_ptr       (float*, GPU 0 VRAM [eis])
+//   inst[14] = scratch_act_ptr      (float*, GPU 0 VRAM [eis])
+//   inst[15] = total_gpus           (num_workers + 1, for output_slots indexing)
+//   inst[16] = gate_up_in_dim       (expert input dim; = hidden_size for standard MoE,
+//                                    = moe_latent_size for Nemotron-H)
 __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid) {
     volatile MoeWorkItem* wq = (volatile MoeWorkItem*)(uintptr_t)inst[1];
     float* output_slots = (float*)(uintptr_t)inst[2];
@@ -57,7 +75,7 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
     const float* src_expert_weights = (const float*)(uintptr_t)inst[5];
     volatile uint32_t* seq_counter = (volatile uint32_t*)(uintptr_t)inst[6];
     int num_workers = (int)(inst[7] >> 32);
-    int hs = (int)(inst[7] & 0xFFFFFFFF);
+    int hs = (int)(inst[7] & 0xFFFFFFFF);  // hidden_size (output slot stride)
     int layer_idx = (int)(inst[8] >> 32);
     int k = (int)(inst[8] & 0xFFFFFFFF);
     int eis = (int)(inst[9] >> 32);
@@ -69,14 +87,31 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
     float* scratch_up = (float*)(uintptr_t)inst[13];
     float* scratch_act = (float*)(uintptr_t)inst[14];
     int total_gpus = (int)inst[15];
+    // gate_up_in_dim: expert input dimension (= hs for standard MoE, moe_latent_size for Nemotron-H)
+    int gupd = (int)inst[16];
+    if (gupd == 0) gupd = hs;  // backward compat: default to hidden_size
 
-    // GPU 0's output slot is at index 0 in output_slots
-    float* gpu0_output = output_slots; // [0..hs)
+    // GPU 0's output slot is at index 0 in output_slots (stride = hs for consistent slot layout)
+    float* gpu0_output = output_slots; // [0..gupd)
 
-    // 1. Zero final_output and GPU 0's output slot (all blocks cooperate).
+    // 1. Zero GPU 0's output slot and copy activation to work queue (GART).
+    // Do NOT zero final_output — the sum loop overwrites it completely.
     // Do NOT zero worker output slots — GPU 0 would cache those in L2.
-    coop_zero(final_output, hs, grid);
-    coop_zero(gpu0_output, hs, grid);
+    //
+    // CRITICAL: activation (moe_latent) lives in GPU 0's L2 cache after fc1.
+    // Workers cannot P2P-read GPU 0 L2 directly — they see stale HBM (zeros).
+    // Solution: copy activation to wq->activation_cache (GART/host-mapped).
+    // GPU 0 GART writes (MTYPE_UC) bypass L2 → go directly to system memory →
+    // immediately visible to workers via their GART device pointers.
+    coop_zero(gpu0_output, gupd, grid);
+
+    // Copy activation from GPU 0 VRAM to GART cache (all threads cooperate).
+    // GART writes are uncached (bypass GPU 0's L2), so workers see them immediately.
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < gupd;
+         i += gridDim.x * blockDim.x) {
+        wq->activation_cache[i] = activation[i];
+    }
+    grid.sync();
 
     // 2. Block 0 thread 0: populate work queue and trigger workers
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -89,15 +124,18 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
         wq->hidden_size = hs;
         wq->expert_intermediate_size = eis;
         wq->has_gate_proj = has_gate;
-        wq->activation_ptr = (uint64_t)activation;
+        wq->gate_up_in_dim = gupd;
+        wq->activation_ptr = (uint64_t)activation;  // kept for reference
         wq->output_slots_ptr = (uint64_t)output_slots;
         wq->num_workers = num_workers;
 
-        for (int w = 0; w < num_workers; w++)
+        // ack_flags are indexed by GPU ID; workers are GPUs 1..num_workers
+        for (int w = 1; w <= num_workers; w++)
             wq->ack_flags[w] = 0;
 
-        // Ensure GPU 0 VRAM zeros are committed before workers read output_slots
-        __threadfence();
+        // GART writes above (activation_cache) are uncached — no extra fence needed.
+        // wq field writes (GART) also bypass L2 → visible before seq_num write.
+        __threadfence_system();
 
         uint32_t seq = *seq_counter + 1;
         *seq_counter = seq;
@@ -113,7 +151,7 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
     for (int j = 0; j < k; j++) {
         int32_t eid = src_expert_ids[j];
         float ew = src_expert_weights[j];
-        if (eid < 0 || eid >= 256) continue;
+        if (eid < 0 || eid >= 512) continue;
 
         MoeExpertEntry& entry = gpu0_config->entries[eid];
         if (entry.gate_up_ptr == 0) continue; // not on GPU 0
@@ -122,27 +160,29 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
         const unsigned char* down_data = (const unsigned char*)entry.down_ptr;
 
         if (has_gate) {
-            coop_gemv_pcg32(scratch_gate, gate_up_data, activation, eis, hs, grid);
+            coop_gemv_pcg32(scratch_gate, gate_up_data, activation, eis, gupd, grid);
             const unsigned char* up_data = gate_up_data +
                 (long long)eis * gpu0_config->gate_up_row_stride;
-            coop_gemv_pcg32(scratch_up, up_data, activation, eis, hs, grid);
+            coop_gemv_pcg32(scratch_up, up_data, activation, eis, gupd, grid);
             coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
         } else {
-            coop_gemv_pcg32(scratch_up, gate_up_data, activation, eis, hs, grid);
+            coop_gemv_pcg32(scratch_up, gate_up_data, activation, eis, gupd, grid);
             coop_relu_squared(scratch_act, scratch_up, eis, grid);
         }
 
-        coop_gemv_pcg32(scratch_gate, down_data, scratch_act, hs, eis, grid);
-        coop_weighted_acc(gpu0_output, scratch_gate, ew, hs, grid);
+        // down: eis → gupd (= gate_up_in_dim, not necessarily hidden_size)
+        coop_gemv_pcg32(scratch_gate, down_data, scratch_act, gupd, eis, grid);
+        coop_weighted_acc(gpu0_output, scratch_gate, ew, gupd, grid);
     }
 
     // 4. Block 0 thread 0: poll worker acks (GPU 0's experts are done by now)
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (int w = 0; w < num_workers; w++) {
-            while (wq->ack_flags[w] != seq) {
+            while (wq->ack_flags[w + 1] != seq) {
                 __builtin_amdgcn_s_sleep(0);
             }
         }
+        // (acks debug removed)
     }
     grid.sync();
 
@@ -151,10 +191,10 @@ __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group&
     // GPU 0 side ensures the HIP memory model guarantees ordering (not just empirical RDNA3 behavior).
     __threadfence_system();
 
-    // 5. Sum all output_slots into final_output (all blocks cooperate).
+    // 5. Sum all output_slots into final_output (gupd elements per slot, slot stride = hs).
     // GPU 0 slot (index 0) is in local VRAM — no stale L2 issue.
     // Worker slots (indices 1..num_workers) were P2P-written — GPU 0 reads fresh VRAM (L2 miss).
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hs;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < gupd;
          i += gridDim.x * blockDim.x) {
         float sum = 0.0f;
         for (int g = 0; g < total_gpus; g++) {

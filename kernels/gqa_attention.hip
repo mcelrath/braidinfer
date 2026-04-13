@@ -13,21 +13,22 @@
 // One block per Q head. Threads collaborate on dot products and reduction.
 
 extern "C" __global__ void gqa_attention_decode_f32(
-    float* __restrict__ output,        // [num_q_heads, head_dim]
-    const float* __restrict__ q,       // [num_q_heads, head_dim]
+    float* __restrict__ output,        // [local_num_q_heads, head_dim]
+    const float* __restrict__ q,       // [local_num_q_heads, head_dim]
     const float* __restrict__ k_cache, // [num_kv_heads, max_seq_len, head_dim]
     const float* __restrict__ v_cache, // [num_kv_heads, max_seq_len, head_dim]
-    const int num_q_heads,
-    const int num_kv_heads,
+    const int num_q_heads,   // global nqh (for gqa_group computation)
+    const int num_kv_heads,  // global nkh
     const int head_dim,
     const int seq_len,
-    const int max_seq_len
+    const int max_seq_len,
+    const int q_head_start   // gpu_i * local_nqh (offset for kv_head mapping)
 ) {
-    const int q_head = blockIdx.x;
+    const int q_head = blockIdx.x;     // local Q head index
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
     const int gqa_group = num_q_heads / num_kv_heads;
-    const int kv_head = q_head / gqa_group;
+    const int kv_head = (q_head + q_head_start) / gqa_group;
 
     const float scale = 1.0f / sqrtf((float)head_dim);
     const float* q_ptr = q + q_head * head_dim;

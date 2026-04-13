@@ -70,6 +70,40 @@ Use `Bash run_in_background=true` and `timeout=600000`. The launch script waits 
 
 **If you need in-process measurements** (e.g., VRAM after model load): Add reporting to the binary itself (e.g., print VRAM usage from within Rust), don't try to race external tools against the process.
 
+## What Causes Hangs in Persistent Mode
+
+**Root cause**: The persistent cooperative worker (`persistent_worker.hip`) is a cooperative kernel that holds ALL GPU CUs for its entire lifetime. Any HIP operation that requires launching a kernel or DMA transfer on the SAME GPU will deadlock waiting for free CUs.
+
+### Causes hang (NEVER do while persistent worker is running):
+
+| Operation | Why |
+|---|---|
+| `hipMemcpy` / `memcpy_d2h` / `memcpy_h2d` | DMA requires CUs to be free |
+| Any `hipLaunchKernel` on GPU 0 | Needs CUs — all held by persistent worker |
+| `hipMemset` on GPU 0 | Same |
+| `hipDeviceSynchronize()` after non-persistent launch on GPU 0 | Deadlocks |
+| `peer_copy_async` (GPU-to-GPU copy via kernel on GPU 0) | Needs GPU 0 CUs |
+
+These operations are safe ONLY:
+- During model initialization, BEFORE `persistent_worker` is launched
+- AFTER the persistent worker has been shut down (never in practice during inference)
+- On GPU 1-3 (they run kbk workers, not persistent cooperative kernels)
+
+### Safe while persistent worker is running:
+
+| Operation | Why safe |
+|---|---|
+| GPU-side `printf()` in kernel code | Runs within existing CUs |
+| `grid.sync()` inside the cooperative kernel | Same kernel |
+| Reading/writing to host-mapped buffers (`MappedHostBuffer`) | CPU MMIO, no GPU CUs needed |
+| `write_volatile` / `read_volatile` on queue memory | CPU-side volatile memory access |
+| `dispatch_batch` / `dispatch_batch_fire` (work queue writes) | CPU writes to host-mapped memory |
+| P2P DMA from GPU 0 to GPU 1-3 (`peer_copy_async` on GPU 1-3) | Uses GPU 1-3 CUs, not GPU 0 |
+
+### Debugging rule:
+
+**GPU-side `printf()` only.** Add debug prints directly in `.hip` kernel files. Never add `memcpy_d2h`, `hipMemcpy`, or any HIP API call in code that runs during active inference (after worker launch).
+
 ## Build
 
 ```bash
