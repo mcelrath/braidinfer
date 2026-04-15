@@ -29,6 +29,11 @@ pub struct Model {
     pub(crate) lm_head_weight: DeviceBuffer<u16>, // separate from embed when tie_word_embeddings=false
     pub(crate) final_norm_weight: DeviceBuffer<u16>,
     pub(crate) layers: Vec<LayerWeights>,
+    // SAFETY: distributed_moe MUST be declared before moe_weights so it drops first.
+    // DistributedMoeWeights::gpu0_gate_up_base may point into moe_weights[i].expert_gate_up
+    // (the non-bqnt path in distribute_moe_weights_from_ref). If moe_weights dropped first,
+    // gpu0_gate_up_base would dangle. Drop order = declaration order in Rust structs.
+    pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,
     pub(crate) moe_weights: Vec<Option<MoeWeights>>, // per-layer MoE FFN (None for dense FFN layers)
     pub(crate) activations: ActivationBuffers,
     pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
@@ -51,7 +56,6 @@ pub struct Model {
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
     // Multi-GPU expert parallel (None for single-GPU)
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
-    pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
     // Multi-GPU megakernel programs
     pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
