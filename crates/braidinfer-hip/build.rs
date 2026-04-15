@@ -72,6 +72,17 @@ fn main() {
         println!("cargo:rerun-if-changed={}", src.display());
     }
 
+    // Track all .hip include files so changes trigger recompile
+    for entry in std::fs::read_dir(&kernel_dir).expect("read kernel dir") {
+        let entry = entry.expect("dir entry");
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("hip")
+            || path.extension().and_then(|e| e.to_str()) == Some("h")
+        {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+
     // Write kernel directory to a file that other crates can include
     let kernel_dir_file = out_dir.join("kernel_dir.txt");
     std::fs::write(&kernel_dir_file, out_dir.to_str().unwrap()).unwrap();
