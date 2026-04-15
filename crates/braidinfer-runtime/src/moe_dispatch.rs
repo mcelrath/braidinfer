@@ -235,9 +235,9 @@ pub fn dispatch_moe_layer_kbk(
     Ok(active_mask)
 }
 
-/// P2P dispatch: broadcasts activation directly from GPU 0 VRAM to worker GPU VRAM via
-/// hipMemcpyPeerAsync, eliminating stream.synchronize() + D2D-to-GART + H2D round-trip.
-/// Caller must record ctx.fc1_done on the GPU 0 compute stream before calling this.
+/// GART dispatch: caller copies activation to normed_stage (GART/write-through) via async D2D,
+/// records fc1_done event. Workers H2D from normed_stage host pointer — always PCIe-coherent.
+/// Avoids RDNA3 L2 coherency issue where P2P reads bypass GPU 0's L2 and see stale VRAM.
 /// Populates ffn_down_stage; caller copies to ffn_down if needed.
 pub fn dispatch_moe_layer_p2p(
     ctx: &mut MultiGpuContext,
@@ -269,8 +269,10 @@ pub fn dispatch_moe_layer_p2p(
         std::ptr::write_bytes(ffn_down_stage.host_ptr(), 0, src_size);
     }
 
-    // Broadcast activation GPU0→workerN via P2P, gated on fc1_done event.
-    // No stream.synchronize() needed — transfer_stream waits for the event.
+    // Broadcast activation to each worker via H2D from GART (normed_stage).
+    // fc1_done fires after async D2D to normed_stage completes, so src_host is valid.
+    // H2D from GART is always PCIe-coherent — no L2 stale data issue.
+    let act_host: *const std::ffi::c_void = src_host as *const std::ffi::c_void;
     for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() {
             continue;
@@ -285,13 +287,12 @@ pub fn dispatch_moe_layer_p2p(
                 worker.compute_stream.raw(),
             );
         }
-        // Wait for D2D→normed_stage (GART) to complete, then H2D to worker.
-        // Using GART instead of P2P VRAM avoids RDNA3 L2 coherency staleness.
+        // Wait for fc1_done (fired after async D2D to GART), then H2D from GART host pointer.
         MultiGpuContext::stream_wait_event(&worker.transfer_stream, &ctx.fc1_done)?;
         unsafe {
             let rc = ffi::hipMemcpyAsync(
                 worker.activation_in.as_ptr() as *mut std::ffi::c_void,
-                src_host as *const std::ffi::c_void,
+                act_host,
                 src_size * 4,
                 ffi::hipMemcpyHostToDevice,
                 worker.transfer_stream.raw(),

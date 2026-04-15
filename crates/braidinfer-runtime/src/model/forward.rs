@@ -489,10 +489,11 @@ impl Model {
                         &self.stream,
                     )?;
                 }
-                // RDNA3 L2 coherency: moe_latent/normed are coarse-grained VRAM.
-                // P2P reads from worker GPUs bypass GPU 0's L2 and see stale VRAM.
-                // Fix: D2D copy to normed_stage (GART/write-through, PCIe-coherent),
-                // then record fc1_done. Workers H2D from normed_stage host pointer.
+                // RDNA3 L2 coherency: P2P reads from worker GPUs bypass GPU 0's L2 and
+                // see stale VRAM. Fix: synchronous D2D copy to normed_stage (GART/write-through)
+                // — hipMemcpy(D2D) uses a blit kernel that reads from L2, writes to GART
+                // (PCIe-coherent). Workers H2D from normed_stage host pointer.
+                // Note: sync D2D blocks CPU until GPU 0's L2 is flushed to GART.
                 let act_size = if fc1_ptr.is_some() { latent_size } else { hs };
                 let act_src = if fc1_ptr.is_some() {
                     self.activations.moe_latent.as_ptr() as *const u8

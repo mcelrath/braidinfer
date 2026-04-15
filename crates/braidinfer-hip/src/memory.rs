@@ -137,6 +137,7 @@ pub fn memcpy_d2d(dst: *mut u8, src: *const u8, len: usize) -> HipResult<()> {
     })
 }
 
+
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
