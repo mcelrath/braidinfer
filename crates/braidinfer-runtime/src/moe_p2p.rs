@@ -138,15 +138,17 @@ impl MoeP2pContext {
         let num_gpus = num_workers + 1;
 
         // Allocate shared GART resources (GPU 0 context).
-        // Use alloc_portable so device pointers are valid in ALL GPUs' GPUVM page tables —
-        // worker GPUs (1-3) access work_queue and seq_counter via XGMI P2P.
+        // Use alloc (NOT alloc_portable): MTYPE_UC (write-through) ensures GPU→CPU signaling
+        // for ack_flags, seq_num, and done_flag is immediately visible without L2 caching.
+        // alloc_portable uses MTYPE_NC which may cache GPU writes — unsafe for polling.
+        // Workers access work_queue and seq_counter via hipHostGetDevicePointer per GPU
+        // (called below in the worker launch loop), which works even without portable flag
+        // because P2P is enabled between all GPUs at init time.
         // Work queue includes flexible activation_cache[] at the end, sized to gate_up_in_dim.
-        // Each GPU uses its own per-GPU device VA (from hipHostGetDevicePointer), so
-        // all offset arithmetic is correct regardless of address space differences.
         Device::set_current(gpu0)?;
         let wq_size = MOE_WORK_QUEUE_FIXED + gate_up_in_dim * std::mem::size_of::<f32>();
-        let work_queue = MappedHostBuffer::<u8>::alloc_portable(wq_size)?;
-        let seq_counter = MappedHostBuffer::<u32>::alloc_portable(1)?;
+        let work_queue = MappedHostBuffer::<u8>::alloc(wq_size)?;
+        let seq_counter = MappedHostBuffer::<u32>::alloc(1)?;
         let output_slots = DeviceBuffer::<f32>::alloc(gpu0, num_gpus * hidden_size)?;
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
