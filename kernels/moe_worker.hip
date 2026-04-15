@@ -1,6 +1,11 @@
 // Persistent cooperative worker kernel for GPU-initiated MoE expert dispatch.
 // Launched once per worker GPU (GPUs 1..N-1), polls host-mapped work queue.
 // Uses shared coop_* GEMV/activation primitives from moe_expert_ops.h.
+//
+// Design note: all blocks (1 per CU × 48 CUs = 12288 threads) spin at grid.sync()
+// between work items. This is required for cooperative kernel correctness: all blocks
+// must reach grid.sync() together, so they must all be running. This consumes the full
+// GPU while idle — an intentional tradeoff for low dispatch latency.
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "moe_work_queue.h"
