@@ -1648,15 +1648,6 @@ impl Model {
                 LayerType::Attention => {
                     self.attention_forward(layer_i, kv_idx, position)?;
                     sync_check_moe!(format!("L{layer_i}.attn"));
-                    if layer_i >= 5 && layer_i <= 10 {
-                        self.stream.synchronize()?;
-                        let src = self.activations.hidden.as_ptr() as *const u8;
-                        let mut buf = [0u8; 8];
-                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
-                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
-                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
-                        eprintln!("DBG ref attn L{layer_i}: h[0]={v0:.6} h[1]={v1:.6}");
-                    }
                     kv_idx += 1;
                 }
                 LayerType::Gdn => {
@@ -1667,16 +1658,6 @@ impl Model {
                 LayerType::Mamba2 => {
                     self.mamba2_forward(layer_i, mamba2_idx)?;
                     sync_check_moe!(format!("L{layer_i}.mamba2"));
-                    // DEBUG: print hidden[0:2] after Mamba2 layers near divergence point
-                    if layer_i >= 5 && layer_i <= 8 {
-                        self.stream.synchronize()?;
-                        let src = self.activations.hidden.as_ptr() as *const u8;
-                        let mut buf = [0u8; 8];
-                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
-                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
-                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
-                        eprintln!("DBG ref mamba L{layer_i}: h[0]={v0:.6} h[1]={v1:.6}");
-                    }
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -1871,15 +1852,6 @@ impl Model {
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
-
-        // DBG: print top5 logits from reference moe path
-        {
-            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
-            let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            top5.truncate(5);
-            eprintln!("DBG moe logits pos={position}: nan={nan_count} top5={top5:?} logits[11]={:.4}", logits[11]);
-        }
 
         if self.trace.is_some() {
             let mut hid_buf = vec![0.0f32; self.config.hidden_size];

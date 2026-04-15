@@ -489,13 +489,22 @@ impl Model {
                         &self.stream,
                     )?;
                 }
-                // Record fc1_done event (or compute_stream checkpoint if no fc1)
-                // so P2P broadcast can start without stream.synchronize().
-                let (act_ptr, act_size) = if fc1_ptr.is_some() {
-                    (self.activations.moe_latent.as_ptr(), latent_size)
+                // RDNA3 L2 coherency: moe_latent/normed are coarse-grained VRAM.
+                // P2P reads from worker GPUs bypass GPU 0's L2 and see stale VRAM.
+                // Fix: D2D copy to normed_stage (GART/write-through, PCIe-coherent),
+                // then record fc1_done. Workers H2D from normed_stage host pointer.
+                let act_size = if fc1_ptr.is_some() { latent_size } else { hs };
+                let act_src = if fc1_ptr.is_some() {
+                    self.activations.moe_latent.as_ptr() as *const u8
                 } else {
-                    (self.activations.normed.as_ptr(), hs)
+                    self.activations.normed.as_ptr() as *const u8
                 };
+                braidinfer_hip::memory::memcpy_d2d(
+                    self.activations.normed_stage.as_write_ptr() as *mut u8,
+                    act_src,
+                    act_size * 4,
+                )?;
+                let act_host = self.activations.normed_stage.host_ptr();
                 {
                     let mgpu = self.multi_gpu.as_mut().unwrap();
                     mgpu.fc1_done.record(&self.stream)?;
@@ -507,8 +516,7 @@ impl Model {
                     mgpu,
                     &self.worker_kernels,
                     dist_moe,
-                    act_ptr,
-                    braidinfer_core::types::DeviceId(0),
+                    act_host,
                     &mut self.activations.ffn_down_stage,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_expert_weights,

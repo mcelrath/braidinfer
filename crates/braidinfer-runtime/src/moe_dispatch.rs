@@ -243,8 +243,7 @@ pub fn dispatch_moe_layer_p2p(
     ctx: &mut MultiGpuContext,
     worker_kernels: &[WorkerKernels],
     moe: &DistributedMoeWeights,
-    src_ptr: *const f32,   // activation in GPU 0 VRAM (moe_latent or normed)
-    src_device: DeviceId,  // DeviceId(0)
+    src_host: *const f32,  // activation in GART host-mapped memory (normed_stage), PCIe-coherent
     ffn_down_stage: &mut MappedHostBuffer<f32>,
     moe_expert_ids: &MappedHostBuffer<i32>,
     moe_expert_weights: &MappedHostBuffer<f32>,
@@ -286,15 +285,15 @@ pub fn dispatch_moe_layer_p2p(
                 worker.compute_stream.raw(),
             );
         }
-        // Wait for fc1 to finish before starting P2P copy
+        // Wait for D2D→normed_stage (GART) to complete, then H2D to worker.
+        // Using GART instead of P2P VRAM avoids RDNA3 L2 coherency staleness.
         MultiGpuContext::stream_wait_event(&worker.transfer_stream, &ctx.fc1_done)?;
         unsafe {
-            let rc = ffi::hipMemcpyPeerAsync(
+            let rc = ffi::hipMemcpyAsync(
                 worker.activation_in.as_ptr() as *mut std::ffi::c_void,
-                worker.device.0 as i32,
-                src_ptr as *const std::ffi::c_void,
-                src_device.0 as i32,
+                src_host as *const std::ffi::c_void,
                 src_size * 4,
+                ffi::hipMemcpyHostToDevice,
                 worker.transfer_stream.raw(),
             );
             if rc != 0 {
