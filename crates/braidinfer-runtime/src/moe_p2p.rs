@@ -114,7 +114,8 @@ pub struct MoeP2pContext {
 /// activation_ptr(8) + output_slots_ptr(8) = 16
 /// ack_flags[8]*4 = 32
 /// Total = 336; round to 512 for alignment safety.
-pub const MOE_WORK_QUEUE_SIZE: usize = 512;
+// MoeWorkItem: ~360 bytes of fields + 4096 floats activation_cache = ~16760 bytes. Use 20KB.
+pub const MOE_WORK_QUEUE_SIZE: usize = 20480;
 
 impl MoeP2pContext {
     /// Initialize GPU-native P2P MoE dispatch.
@@ -136,10 +137,12 @@ impl MoeP2pContext {
         let num_workers = worker_devices.len();
         let num_gpus = num_workers + 1;
 
-        // Allocate shared GART resources (GPU 0 context)
+        // Allocate shared GART resources (GPU 0 context).
+        // Use alloc_portable so device pointers are valid in ALL GPUs' GPUVM page tables —
+        // worker GPUs (1-3) access work_queue and seq_counter via XGMI P2P.
         Device::set_current(gpu0)?;
-        let work_queue = MappedHostBuffer::<u8>::alloc(MOE_WORK_QUEUE_SIZE)?;
-        let seq_counter = MappedHostBuffer::<u32>::alloc(1)?;
+        let work_queue = MappedHostBuffer::<u8>::alloc_portable(MOE_WORK_QUEUE_SIZE)?;
+        let seq_counter = MappedHostBuffer::<u32>::alloc_portable(1)?;
         let output_slots = DeviceBuffer::<f32>::alloc(gpu0, num_gpus * hidden_size)?;
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
@@ -206,7 +209,18 @@ impl MoeP2pContext {
 
             // Args: work_queue, shutdown, layer_configs, done_flag,
             //       local_activation, scratch_gate, scratch_up, scratch_act, local_output
-            let mut wq_ptr = work_queue.device_ptr() as *mut std::ffi::c_void;
+            // Re-query device pointer for work_queue and seq_counter from CURRENT GPU context.
+            // hipHostGetDevicePointer returns the VA for the current GPU's GPUVM page tables.
+            // Even with hipHostMallocPortable, VA may differ per GPU on AMD discrete GPUs.
+            let mut wq_dp: *mut std::ffi::c_void = std::ptr::null_mut();
+            braidinfer_hip::error::check(unsafe {
+                ffi::hipHostGetDevicePointer(
+                    &mut wq_dp,
+                    work_queue.host_ptr() as *mut std::ffi::c_void,
+                    0,
+                )
+            })?;
+            let mut wq_ptr = wq_dp;
             let mut sd_ptr = shutdown.device_ptr() as *mut std::ffi::c_void;
             let mut lc_ptr = layer_config_ptrs.as_ptr() as *mut std::ffi::c_void;
             let mut df_ptr = done.device_ptr() as *mut std::ffi::c_void;
@@ -215,7 +229,6 @@ impl MoeP2pContext {
             let mut su_ptr = scratch_up.as_ptr() as *mut std::ffi::c_void;
             let mut sa_ptr = scratch_act.as_ptr() as *mut std::ffi::c_void;
             let mut lo_ptr = local_output.as_ptr() as *mut std::ffi::c_void;
-
             let mut args: [*mut std::ffi::c_void; 9] = [
                 std::ptr::addr_of_mut!(wq_ptr).cast(),
                 std::ptr::addr_of_mut!(sd_ptr).cast(),
@@ -228,9 +241,11 @@ impl MoeP2pContext {
                 std::ptr::addr_of_mut!(lo_ptr).cast(),
             ];
 
-            let bpsm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
             let num_cus = multiprocessor_count(device)?;
-            let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
+            // Use exactly num_cus blocks (1 per CU): safest cooperative launch count.
+            // Each block polls independently; more blocks = more parallelism but risks
+            // cooperative constraint violations if bpsm * num_cus exceeds hardware capacity.
+            let num_blocks = num_cus;
             func.launch_cooperative(
                 (num_blocks, 1, 1),
                 (256, 1, 1),
@@ -238,10 +253,17 @@ impl MoeP2pContext {
                 &stream,
                 &mut args,
             )?;
-            eprintln!(
-                "  MoE worker GPU {}: launched ({num_blocks} blocks, {shared_mem}B shared)",
-                device.0
-            );
+            // Wait until kernel reaches past cg::this_grid() (done_flag >= 0xAA02).
+            let t0 = std::time::Instant::now();
+            loop {
+                let v = unsafe { std::ptr::read_volatile(done.host_ptr()) };
+                if v >= 0xAA02 { break; }
+                if t0.elapsed().as_millis() > 5000 {
+                    panic!("GPU {} moe_worker_kernel failed to start (done_flag={v:#x})", gpu_id);
+                }
+                std::hint::spin_loop();
+            }
+            eprintln!("  moe_worker_kernel GPU {}: started (done_flag=0xAA02)", gpu_id);
 
             workers.push(ManuallyDrop::new(MoeWorkerGpu {
                 device,
@@ -277,6 +299,11 @@ impl MoeP2pContext {
 
 impl Drop for MoeP2pContext {
     fn drop(&mut self) {
+        // If already panicking (e.g. dispatch timeout), kernel is stuck in grid.sync()
+        // and will never respond to shutdown. Exit immediately.
+        if std::thread::panicking() {
+            std::process::exit(1);
+        }
         for worker in &self.workers {
             unsafe {
                 std::ptr::write_volatile(worker.shutdown.host_ptr(), 1u32);
@@ -328,11 +355,10 @@ fn build_layer_configs(
         }
         let Some(dist) = maybe_dist else { continue };
 
-        // Row strides for Q4 PcG32: num_groups * 20 bytes/group.
-        // gate_up rows: output=eis, input=hs → num_groups = (hs+31)/32
-        // down rows: output=hs, input=eis → num_groups = (eis+31)/32
-        let gate_up_row_stride = ((hidden_size + 31) / 32 * 20) as u32;
-        let down_row_stride = ((expert_intermediate_size + 31) / 32 * 20) as u32;
+        // Row strides from DistributedMoeWeights (authoritative: uses actual gate_up_in_dim,
+        // which may be moe_latent_size < hidden_size for Nemotron-H).
+        let gate_up_row_stride = dist.gate_up_row_stride as u32;
+        let down_row_stride = ((dist.expert_intermediate_size + 31) / 32 * 20) as u32;
 
         // Build config for this layer
         let mut cfg = MoeWorkerConfig {
@@ -359,7 +385,7 @@ fn build_layer_configs(
         }
         cfg.num_experts_local = local_count;
 
-        // Upload to device
+        // Upload to device (synchronous — called before any kernel is launched on this device)
         let config_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(&cfg as *const MoeWorkerConfig as *const u8, CONFIG_SIZE)
         };

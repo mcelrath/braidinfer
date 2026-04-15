@@ -16,15 +16,21 @@ struct MoeWorkItem {
     uint32_t expert_intermediate_size;
     uint32_t has_gate_proj;       // 1 = gate+up (SiLU*up), 0 = up only (ReLU²)
     uint32_t num_workers;
-    uint32_t _pad0;
+    // Expert input dimension: hidden_size for standard MoE, moe_latent_size for Nemotron-H.
+    // Used by workers for gate_up/down projection in_dim and activation copy count.
+    uint32_t gate_up_in_dim;
 
     int32_t  expert_ids[MOE_MAX_ACTIVE_EXPERTS];
     float    expert_weights[MOE_MAX_ACTIVE_EXPERTS];
 
-    // GPU 0 VRAM pointer to normed activation [hidden_size]
+    // GPU 0 VRAM pointer to expert activation [gate_up_in_dim] (for reference; workers use activation_cache)
     uint64_t activation_ptr;
     // GPU 0 VRAM pointer to per-worker output slots [num_workers * hidden_size]
     uint64_t output_slots_ptr;
+    // Activation cache: GPU 0 writes gate_up_in_dim floats here (GART, bypasses L2)
+    // so workers can read without P2P VRAM read (which sees stale L2-cached data).
+    // Max size = 4096 (max gate_up_in_dim for any supported model).
+    float activation_cache[4096];
 
     // Per-worker ack flags. Worker writes seq_num here when done.
     volatile uint32_t ack_flags[MOE_MAX_GPUS];
