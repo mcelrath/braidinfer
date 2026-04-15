@@ -489,34 +489,31 @@ impl Model {
                         &self.stream,
                     )?;
                 }
-                self.stream.synchronize()?;
-                // Copy latent input (moe_latent if fc1 exists, else normed) to normed_stage.
-                let (src_ptr, src_size) = if fc1_ptr.is_some() {
-                    (self.activations.moe_latent.as_ptr() as *const u8, latent_size)
+                // Record fc1_done event (or compute_stream checkpoint if no fc1)
+                // so P2P broadcast can start without stream.synchronize().
+                let (act_ptr, act_size) = if fc1_ptr.is_some() {
+                    (self.activations.moe_latent.as_ptr(), latent_size)
                 } else {
-                    (self.activations.normed.as_ptr() as *const u8, hs)
+                    (self.activations.normed.as_ptr(), hs)
                 };
-                braidinfer_hip::memory::memcpy_d2d(
-                    self.activations.normed_stage.as_write_ptr() as *mut u8,
-                    src_ptr,
-                    src_size * 4,
-                )?;
-                let dispatch_input: &[f32] = unsafe {
-                    std::slice::from_raw_parts(self.activations.normed_stage.host_ptr(), src_size)
-                };
+                {
+                    let mgpu = self.multi_gpu.as_mut().unwrap();
+                    mgpu.fc1_done.record(&self.stream)?;
+                }
                 let mgpu = self.multi_gpu.as_mut().unwrap();
                 let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
                 if sync_debug { eprintln!("SYNC_DEBUG: L{layer_idx}.moe_dispatch_start eis={eis}"); }
-                crate::moe_dispatch::dispatch_moe_layer_sync(
+                crate::moe_dispatch::dispatch_moe_layer_p2p(
                     mgpu,
                     &self.worker_kernels,
                     dist_moe,
-                    dispatch_input,
+                    act_ptr,
+                    braidinfer_core::types::DeviceId(0),
                     &mut self.activations.ffn_down_stage,
                     &self.activations.moe_expert_ids,
                     &self.activations.moe_expert_weights,
                     k,
-                    src_size,  // latent_size for Nemotron-H, hs for standard
+                    act_size,  // latent_size for Nemotron-H, hs for standard
                     eis,
                     &self.stream,
                 )?;

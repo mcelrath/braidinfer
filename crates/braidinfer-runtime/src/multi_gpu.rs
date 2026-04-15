@@ -87,6 +87,7 @@ pub struct MultiGpuContext {
     pub workers: Vec<GpuWorker>,
     pub gather_stream: Stream, // on GPU 0, used to gather results from workers
     pub gather_done: HipEvent, // signaled after all results gathered
+    pub fc1_done: HipEvent,   // signaled after fc1_latent_proj completes on GPU 0 compute stream
 }
 
 impl MultiGpuContext {
@@ -177,11 +178,14 @@ impl MultiGpuContext {
 
         eprintln!("Multi-GPU: {num_devices} devices, P2P enabled");
 
+        let fc1_done = HipEvent::new()?;
+
         Ok(Some(MultiGpuContext {
             num_devices,
             workers,
             gather_stream,
             gather_done,
+            fc1_done,
         }))
     }
 

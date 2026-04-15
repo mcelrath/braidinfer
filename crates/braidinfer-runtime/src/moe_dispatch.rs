@@ -235,29 +235,24 @@ pub fn dispatch_moe_layer_kbk(
     Ok(active_mask)
 }
 
-/// Kernel-by-kernel multi-GPU dispatch (called from decode_step_moe / moe_ffn_forward).
-/// No cooperative kernel running — GPU 0 is free to run experts alongside GPUs 1..N-1.
+/// P2P dispatch: broadcasts activation directly from GPU 0 VRAM to worker GPU VRAM via
+/// hipMemcpyPeerAsync, eliminating stream.synchronize() + D2D-to-GART + H2D round-trip.
+/// Caller must record ctx.fc1_done on the GPU 0 compute stream before calling this.
 /// Populates ffn_down_stage; caller copies to ffn_down if needed.
-pub fn dispatch_moe_layer_sync(
+pub fn dispatch_moe_layer_p2p(
     ctx: &mut MultiGpuContext,
     worker_kernels: &[WorkerKernels],
     moe: &DistributedMoeWeights,
-    normed_host: &[f32],
+    src_ptr: *const f32,   // activation in GPU 0 VRAM (moe_latent or normed)
+    src_device: DeviceId,  // DeviceId(0)
     ffn_down_stage: &mut MappedHostBuffer<f32>,
     moe_expert_ids: &MappedHostBuffer<i32>,
     moe_expert_weights: &MappedHostBuffer<f32>,
     k: usize,
-    hs: usize,
+    src_size: usize, // latent_size for Nemotron-H, hs for standard
     eis: usize,
-    stream0: &Stream,
+    _stream0: &Stream,
 ) -> HipResult<()> {
-    // In non-megakernel mode, GPU 0 is idle; just call the barrier-safe version
-    // after copying normed to normed_stage manually.
-    let _ = stream0; // unused — included for call-site clarity
-    // Re-use a temporary MappedHostBuffer or just write directly
-    // We can't easily reuse normed_stage here without it, so just inline the logic.
-    // Actually: just use same logic, normed_host is already available.
-
     let expert_ids: &[i32] =
         unsafe { std::slice::from_raw_parts(moe_expert_ids.host_ptr() as *const i32, k) };
     let expert_weights: &[f32] =
@@ -272,9 +267,11 @@ pub fn dispatch_moe_layer_sync(
     }
 
     unsafe {
-        std::ptr::write_bytes(ffn_down_stage.host_ptr(), 0, hs);
+        std::ptr::write_bytes(ffn_down_stage.host_ptr(), 0, src_size);
     }
 
+    // Broadcast activation GPU0→workerN via P2P, gated on fc1_done event.
+    // No stream.synchronize() needed — transfer_stream waits for the event.
     for gpu in 0..num_devices {
         if per_gpu[gpu].is_empty() {
             continue;
@@ -285,14 +282,19 @@ pub fn dispatch_moe_layer_sync(
             ffi::hipMemsetAsync(
                 worker.expert_out.as_ptr() as *mut std::ffi::c_void,
                 0,
-                hs * 4,
+                src_size * 4,
                 worker.compute_stream.raw(),
             );
-            let rc = ffi::hipMemcpyAsync(
+        }
+        // Wait for fc1 to finish before starting P2P copy
+        MultiGpuContext::stream_wait_event(&worker.transfer_stream, &ctx.fc1_done)?;
+        unsafe {
+            let rc = ffi::hipMemcpyPeerAsync(
                 worker.activation_in.as_ptr() as *mut std::ffi::c_void,
-                normed_host.as_ptr() as *const std::ffi::c_void,
-                hs * 4,
-                ffi::hipMemcpyHostToDevice,
+                worker.device.0 as i32,
+                src_ptr as *const std::ffi::c_void,
+                src_device.0 as i32,
+                src_size * 4,
                 worker.transfer_stream.raw(),
             );
             if rc != 0 {
@@ -313,27 +315,19 @@ pub fn dispatch_moe_layer_sync(
         MultiGpuContext::stream_wait_event(&worker.compute_stream, &worker.broadcast_done)?;
         Device::set_current(worker.device)?;
         if sync_debug {
-            eprintln!("SYNC_DEBUG: dispatch GPU{gpu} {} experts gate_up_base={:#x} down_base={:#x} gate_up_stride={} down_stride={} gate_up_row_stride={}",
-                per_gpu[gpu].len(),
-                buf.gate_up.as_ptr() as usize,
-                buf.down.as_ptr() as usize,
-                moe.gate_up_expert_stride,
-                moe.down_expert_stride,
-                moe.gate_up_row_stride,
-            );
+            eprintln!("SYNC_DEBUG: p2p dispatch GPU{gpu} {} experts", per_gpu[gpu].len());
         }
         let input_ptr = worker.activation_in.as_ptr();
         let gate_up_base = buf.gate_up.as_ptr();
         let down_base = buf.down.as_ptr();
         let fmt = moe.weight_format;
+        let expert_in_dim = moe.gate_up_in_dim as u32;
 
         for &(expert_id, weight) in &per_gpu[gpu] {
             let local_slot = buf.slot_map[expert_id].expect("expert not on expected GPU");
             let gate_up_offset = local_slot * moe.gate_up_expert_stride;
             let down_offset = local_slot * moe.down_expert_stride;
 
-            // Use actual expert in_dim (moe_latent_size for Nemotron, hs for standard models).
-            let expert_in_dim = moe.gate_up_in_dim as u32;
             if moe.has_gate_proj {
                 let up_byte_offset = gate_up_offset + eis * moe.gate_up_row_stride;
                 dispatch_proj(
@@ -419,7 +413,7 @@ pub fn dispatch_moe_layer_sync(
             let rc = ffi::hipMemcpyAsync(
                 worker.gather_host.as_ptr() as *mut std::ffi::c_void,
                 worker.expert_out.as_ptr() as *const std::ffi::c_void,
-                hs * 4,
+                src_size * 4,
                 ffi::hipMemcpyDeviceToHost,
                 worker.transfer_stream.raw(),
             );
@@ -435,10 +429,10 @@ pub fn dispatch_moe_layer_sync(
         }
         ctx.workers[gpu].transfer_done.synchronize()?;
         let src: &[f32] =
-            unsafe { std::slice::from_raw_parts(ctx.workers[gpu].gather_host.as_ptr(), hs) };
+            unsafe { std::slice::from_raw_parts(ctx.workers[gpu].gather_host.as_ptr(), src_size) };
         let out: &mut [f32] =
-            unsafe { std::slice::from_raw_parts_mut(ffn_down_stage.host_ptr(), hs) };
-        for i in 0..hs {
+            unsafe { std::slice::from_raw_parts_mut(ffn_down_stage.host_ptr(), src_size) };
+        for i in 0..src_size {
             out[i] += src[i];
         }
     }
