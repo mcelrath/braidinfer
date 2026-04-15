@@ -479,7 +479,6 @@ impl Model {
         let used_multi_gpu = if self.multi_gpu.is_some() && !self.distributed_moe.is_empty() {
             if let Some(ref dist_moe) = self.distributed_moe[layer_idx] {
                 // Apply fc1_latent_proj if present: normed(hs) → moe_latent(latent_size).
-                // Otherwise copy normed to moe_latent (or just use normed directly).
                 if let Some(fc1) = fc1_ptr {
                     unsafe { &*fc1 }.forward(
                         &self.kernels.linear_proj,

@@ -57,6 +57,7 @@ impl<T> DeviceBuffer<T> {
     }
 
     pub fn copy_from_host(&mut self, data: &[T]) -> HipResult<()> {
+        crate::assert_no_persistent_worker("DeviceBuffer::copy_from_host");
         assert!(data.len() <= self.len, "source larger than buffer");
         let size = data.len() * std::mem::size_of::<T>();
         error::check(unsafe {
@@ -87,6 +88,7 @@ impl<T> DeviceBuffer<T> {
     }
 
     pub fn copy_to_host(&self, data: &mut [T]) -> HipResult<()> {
+        crate::assert_no_persistent_worker("DeviceBuffer::copy_to_host");
         assert!(data.len() >= self.len, "destination smaller than buffer");
         let size = self.len * std::mem::size_of::<T>();
         error::check(unsafe {

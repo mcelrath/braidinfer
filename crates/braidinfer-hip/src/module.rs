@@ -28,6 +28,15 @@ impl Module {
         self.device
     }
 
+    /// Pre-warm the function cache. Call once at module load time with all known kernel names
+    /// so the first dispatch doesn't pay the ~100μs hipModuleGetFunction cost.
+    pub fn preload_functions(&self, names: &[&str]) -> HipResult<()> {
+        for &name in names {
+            self.get_function(name)?;
+        }
+        Ok(())
+    }
+
     pub fn get_function(&self, name: &str) -> HipResult<Function<'_>> {
         {
             let cache = self.cache.borrow();

@@ -142,18 +142,11 @@ impl Model {
             if nan_count > 0 {
                 eprintln!("WARN: {nan_count}/{} NaN in logits", logits.len());
             }
-            let (idx, best_val) = logits
+            let (idx, _) = logits
                 .iter()
                 .enumerate()
                 .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
                 .unwrap();
-            // DBG: print top token and surrounding logits
-            let mut top5: Vec<(usize, f32)> = logits.iter().enumerate()
-                .map(|(i, &v)| (i, v))
-                .collect::<Vec<_>>();
-            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            top5.truncate(5);
-            eprintln!("DBG argmax: token={idx} val={best_val:.4} top5={top5:?} logits[0]={:.4} logits[11]={:.4}", logits[0], logits[11]);
             Ok(idx as u32)
         } else {
             let result = self.kernels.argmax.forward(
