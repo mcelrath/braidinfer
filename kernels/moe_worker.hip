@@ -15,7 +15,8 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     float* scratch_gate,      // [expert_intermediate_size] local VRAM
     float* scratch_up,        // [expert_intermediate_size] local VRAM
     float* scratch_act,       // [expert_intermediate_size] local VRAM
-    float* local_output       // [hidden_size] local VRAM — accumulated then P2P written
+    float* local_output,      // [hidden_size] local VRAM — accumulated then P2P written
+    uint32_t gpu_id           // this worker's GPU index (explicit, avoids scanning layer_configs)
 ) {
     namespace cg = cooperative_groups;
 
@@ -33,11 +34,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         __threadfence_system();
     }
 
-    // my_gpu_id comes from the first non-null config (same for all MoE layers on this worker)
-    uint32_t my_gpu = 0;
-    for (int _li = 0; _li < 256; _li++) {
-        if (layer_configs[_li] != nullptr) { my_gpu = layer_configs[_li]->my_gpu_id; break; }
-    }
+    uint32_t my_gpu = gpu_id;
     uint32_t last_seq = 0;
 
     while (true) {

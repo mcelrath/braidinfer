@@ -52,10 +52,9 @@ struct MoeWorkerConfig {
     uint32_t my_gpu_id;
     uint32_t num_experts_local;
     uint32_t gate_up_row_stride;  // bytes per row in Q4 packed format
-    uint32_t down_row_stride;
     uint32_t hidden_size;
     uint32_t expert_intermediate_size;
-    uint32_t _pad[2];
+    uint32_t _pad[3];
     // Map: global_expert_id → local entry (or NULL if not on this GPU).
     // Indexed by global expert ID. Only populated entries have valid pointers.
     MoeExpertEntry entries[512];

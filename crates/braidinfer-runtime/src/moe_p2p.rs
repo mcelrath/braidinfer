@@ -48,10 +48,9 @@ struct MoeWorkerConfig {
     my_gpu_id: u32,
     num_experts_local: u32,
     gate_up_row_stride: u32,
-    down_row_stride: u32,
     hidden_size: u32,
     expert_intermediate_size: u32,
-    _pad: [u32; 2],
+    _pad: [u32; 3],
     entries: [MoeExpertEntry; 512],
 }
 
@@ -213,8 +212,8 @@ impl MoeP2pContext {
             let func = module.get_function("moe_worker_kernel")?;
 
             // Args: work_queue, shutdown, layer_configs, done_flag,
-            //       local_activation, scratch_gate, scratch_up, scratch_act, local_output
-            // Re-query device pointer for work_queue and seq_counter from CURRENT GPU context.
+            //       local_activation, scratch_gate, scratch_up, scratch_act, local_output, gpu_id
+            // Re-query device pointer for work_queue from CURRENT GPU context.
             // hipHostGetDevicePointer returns the VA for the current GPU's GPUVM page tables.
             // Even with hipHostMallocPortable, VA may differ per GPU on AMD discrete GPUs.
             let mut wq_dp: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -234,7 +233,8 @@ impl MoeP2pContext {
             let mut su_ptr = scratch_up.as_ptr() as *mut std::ffi::c_void;
             let mut sa_ptr = scratch_act.as_ptr() as *mut std::ffi::c_void;
             let mut lo_ptr = local_output.as_ptr() as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 9] = [
+            let mut gid = gpu_id;
+            let mut args: [*mut std::ffi::c_void; 10] = [
                 std::ptr::addr_of_mut!(wq_ptr).cast(),
                 std::ptr::addr_of_mut!(sd_ptr).cast(),
                 std::ptr::addr_of_mut!(lc_ptr).cast(),
@@ -244,6 +244,7 @@ impl MoeP2pContext {
                 std::ptr::addr_of_mut!(su_ptr).cast(),
                 std::ptr::addr_of_mut!(sa_ptr).cast(),
                 std::ptr::addr_of_mut!(lo_ptr).cast(),
+                std::ptr::addr_of_mut!(gid).cast(),
             ];
 
             let num_cus = multiprocessor_count(device)?;
@@ -360,24 +361,28 @@ fn build_layer_configs(
         }
         let Some(dist) = maybe_dist else { continue };
 
-        // Row strides from DistributedMoeWeights (authoritative: uses actual gate_up_in_dim,
+        // Row stride from DistributedMoeWeights (authoritative: uses actual gate_up_in_dim,
         // which may be moe_latent_size < hidden_size for Nemotron-H).
         let gate_up_row_stride = dist.gate_up_row_stride as u32;
-        let down_row_stride = ((dist.expert_intermediate_size + 31) / 32 * 20) as u32;
 
         // Build config for this layer
         let mut cfg = MoeWorkerConfig {
             my_gpu_id: gpu_id,
             num_experts_local: 0, // filled below
             gate_up_row_stride,
-            down_row_stride,
             hidden_size: hidden_size as u32,
             expert_intermediate_size: expert_intermediate_size as u32,
-            _pad: [0; 2],
+            _pad: [0; 3],
             entries: unsafe { std::mem::zeroed() },
         };
+        assert!(
+            dist.num_experts <= 512,
+            "MoeWorkerConfig::entries[512] too small for model with {} experts (layer {})",
+            dist.num_experts,
+            layer_idx
+        );
         let mut local_count = 0u32;
-        for eid in 0..dist.num_experts.min(512) {
+        for eid in 0..dist.num_experts {
             if let Some((gu_ptr, dn_ptr, cnt)) = get_expert_ptrs(dist, eid) {
                 cfg.entries[eid] = MoeExpertEntry {
                     global_expert_id: eid as u32,
