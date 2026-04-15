@@ -37,7 +37,7 @@ include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 
 pub(crate) const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
-pub(crate) const INST_SIZE: usize = 17; // 17 u64s per instruction = 136 bytes
+pub(crate) const INST_SIZE: usize = 18; // 18 u64s per instruction = 144 bytes
 // RDNA3 7900XTX: 96 CUs grouped into 48 WGPs. hipDeviceAttributeMultiprocessorCount=48 (WGPs).
 // Cooperative kernel max blocks = blocks_per_sm * WGPs = blocks_per_sm * 48.
 pub(crate) const NUM_CUS: u32 = 48;

@@ -15,7 +15,7 @@
 // Main megakernel entry point
 // ============================================================
 
-#define INST_SIZE 17  // 17 u64s per instruction = 136 bytes (expanded for QK-norm k_norm_weight ptr at slot 16)
+#define INST_SIZE 18  // 18 u64s per instruction = 144 bytes
 
 // Dump mode: per-instruction activation capture
 // dump_base: GPU buffer for storing instruction outputs (NULL = disabled)
@@ -216,6 +216,9 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
                 case OP_SCALE_ADD:   op_scale_add(inst, vb); break;
                 case OP_RELU_SQ:     op_relu_sq(inst, vb); break;
+                case OP_MAMBA2_CONV1D:    op_mamba2_conv1d(inst, vb); break;
+                case OP_SSM_UPDATE:       op_ssm_update(inst, vb); break;
+                case OP_MAMBA2_NORM_GATED: op_mamba2_norm_gated(inst, vb); break;
                 default:
                     if (threadIdx.x == 0 && blockIdx.x == 0)
                         printf("MEGAKERNEL: unknown opcode %u at pc %d\n", opcode, pc);

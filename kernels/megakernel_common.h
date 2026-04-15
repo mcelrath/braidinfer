@@ -6,7 +6,7 @@
 #include "quant_consts.h"
 
 #define FLAG_NO_SYNC   0x80000000u  // bit 31: skip grid.sync() after this instruction
-#define INST_SIZE_WORDS 17          // 17 u64s per instruction = 136 bytes
+#define INST_SIZE_WORDS 18          // 18 u64s per instruction = 144 bytes
 
 typedef unsigned long long u64;
 typedef unsigned int u32;

@@ -40,3 +40,5 @@
 #define OP_EXPERT_FFN   35  // Compound: gate+up+silu+down (Q4 PcG32) with internal grid.sync()
 #define OP_SCALE_ADD    36  // output[i] += scale * src[i]; args: [1]=output, [2]=src, [3]=scale(f32 bits), [4]=size
 #define OP_RELU_SQ      37  // output[i] = relu(input[i])^2; args: [1]=output, [2]=input, [3]=size
+#define OP_MAMBA2_CONV1D    38  // causal conv1d with f32 bias + SiLU; args: [1]=state(w), [2]=input, [3]=weight(u16), [4]=bias(f32), [5]=output(w), [6]=conv_dim, [7]=kernel_size
+#define OP_MAMBA2_NORM_GATED 39 // rms_norm(x*silu(z))*weight; args: [1]=output(w), [2]=x, [3]=z, [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
