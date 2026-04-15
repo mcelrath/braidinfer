@@ -2258,12 +2258,12 @@ impl MegakernelProgram {
                 inst.set_int(5, hs as i32);
                 instructions.push(inst);
 
-                // relu² — use OP_SILU_MUL with same input for gate+up (relu² handled by kernel)
-                // Actually, we need a relu² op... for now emit as two ops: silu_mul won't work.
-                // TODO: add OP_RELU_SQ or handle in shared expert path
-                // Workaround: emit the relu² computation via the standalone kernel path
-                // For now, skip shared expert in megakernel for relu² models (Nemotron)
-                // This is acceptable since Nemotron uses Mamba2 layers which aren't in megakernel yet
+                // relu²: relu(x)² → moe_expert_act
+                let mut inst = Instruction::new(OP_RELU_SQ, div_ceil(se_is as u32, 256));
+                inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
+                inst.set_ptr(2, act.moe_expert_up.as_ptr());
+                inst.set_int(3, se_is as i32);
+                instructions.push(inst);
             }
 
             // down_proj → expert_out scratch
@@ -2467,9 +2467,7 @@ impl MegakernelProgram {
                 inst.set_int(4, se_is as i32);
                 instructions.push(inst);
             } else {
-                // relu² shared expert — not yet supported in megakernel multi-GPU path.
-                // Only affects models without gate_proj (e.g. Nemotron), which use Mamba2
-                // and are handled by a different path. Skip down_proj for now.
+                // relu² shared expert
                 let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
                 emit_linear_proj(&mut inst, &se.up_proj, 2);
                 inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
@@ -2477,8 +2475,13 @@ impl MegakernelProgram {
                 inst.set_int(4, se_is as i32);
                 inst.set_int(5, hs as i32);
                 instructions.push(inst);
-                // TODO(braidinfer-xsz): add OP_RELU_SQ opcode; for now skip shared expert down_proj on relu² models
-                return barrier_inst_idx;
+
+                // relu²: relu(x)² → moe_expert_act
+                let mut inst = Instruction::new(OP_RELU_SQ, div_ceil(se_is as u32, 256));
+                inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
+                inst.set_ptr(2, act.moe_expert_up.as_ptr());
+                inst.set_int(3, se_is as i32);
+                instructions.push(inst);
             }
 
             let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);

@@ -69,7 +69,7 @@ fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
 pub struct MoeWorkerGpu {
     pub device: DeviceId,
     /// Per-layer config pointer array on this GPU's VRAM: `MoeWorkerConfig*[num_layers]`.
-    layer_config_ptrs: DeviceBuffer<u64>,
+    _layer_config_ptrs: DeviceBuffer<u64>,
     /// Per-layer config blobs on this GPU's VRAM (kept alive for kernel lifetime).
     _config_storage: Vec<DeviceBuffer<u8>>,
     pub local_activation: DeviceBuffer<f32>,
@@ -87,7 +87,7 @@ pub struct MoeWorkerGpu {
 
 /// GPU-native P2P MoE dispatch context.
 pub struct MoeP2pContext {
-    /// Shared work queue in GART memory (MoeWorkItem layout, host-mapped).
+    /// Shared work queue in GART memory (MoeWorkItem fixed fields + activation_cache[gate_up_in_dim]).
     pub work_queue: MappedHostBuffer<u8>,
     /// Monotonic dispatch sequence counter (GART, host-mapped u32).
     pub seq_counter: MappedHostBuffer<u32>,
@@ -107,15 +107,15 @@ pub struct MoeP2pContext {
     pub hidden_size: usize,
 }
 
-/// Size of MoeWorkItem in bytes (must fit the struct in moe_work_queue.h).
-/// seq_num(4)+layer_idx(4)+num_active(4)+hidden_size(4)+expert_intermediate_size(4)+
-/// has_gate_proj(4)+num_workers(4)+_pad0(4) = 32
-/// expert_ids[32]*4 = 128, expert_weights[32]*4 = 128
-/// activation_ptr(8) + output_slots_ptr(8) = 16
-/// ack_flags[8]*4 = 32
-/// Total = 336; round to 512 for alignment safety.
-// MoeWorkItem: ~360 bytes of fields + 4096 floats activation_cache = ~16760 bytes. Use 20KB.
-pub const MOE_WORK_QUEUE_SIZE: usize = 20480;
+/// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache array.
+/// seq_num(4)+layer_idx(4)+num_active(4)+hidden_size(4)+eis(4)+
+/// has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 32
+/// expert_ids[32]*4=128, expert_weights[32]*4=128
+/// activation_ptr(8)+output_slots_ptr(8)=16
+/// ack_flags[8]*4=32
+/// Total fixed = 336 bytes.
+/// Full work_queue size = MOE_WORK_QUEUE_FIXED + gate_up_in_dim * 4 (flexible activation_cache[]).
+pub const MOE_WORK_QUEUE_FIXED: usize = 336;
 
 impl MoeP2pContext {
     /// Initialize GPU-native P2P MoE dispatch.
@@ -128,6 +128,7 @@ impl MoeP2pContext {
         gpu0: DeviceId,
         worker_devices: &[DeviceId],
         hidden_size: usize,
+        gate_up_in_dim: usize,
         expert_intermediate_size: usize,
         num_total_layers: usize,
         dist_moe_by_layer: &[Option<&DistributedMoeWeights>],
@@ -140,8 +141,12 @@ impl MoeP2pContext {
         // Allocate shared GART resources (GPU 0 context).
         // Use alloc_portable so device pointers are valid in ALL GPUs' GPUVM page tables —
         // worker GPUs (1-3) access work_queue and seq_counter via XGMI P2P.
+        // Work queue includes flexible activation_cache[] at the end, sized to gate_up_in_dim.
+        // Each GPU uses its own per-GPU device VA (from hipHostGetDevicePointer), so
+        // all offset arithmetic is correct regardless of address space differences.
         Device::set_current(gpu0)?;
-        let work_queue = MappedHostBuffer::<u8>::alloc_portable(MOE_WORK_QUEUE_SIZE)?;
+        let wq_size = MOE_WORK_QUEUE_FIXED + gate_up_in_dim * std::mem::size_of::<f32>();
+        let work_queue = MappedHostBuffer::<u8>::alloc_portable(wq_size)?;
         let seq_counter = MappedHostBuffer::<u32>::alloc_portable(1)?;
         let output_slots = DeviceBuffer::<f32>::alloc(gpu0, num_gpus * hidden_size)?;
 
@@ -196,7 +201,7 @@ impl MoeP2pContext {
                 },
             )?;
 
-            let local_activation = DeviceBuffer::<f32>::alloc(device, hidden_size)?;
+            let local_activation = DeviceBuffer::<f32>::alloc(device, gate_up_in_dim)?;
             let scratch_gate = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let scratch_up = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let scratch_act = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
@@ -267,7 +272,7 @@ impl MoeP2pContext {
 
             workers.push(ManuallyDrop::new(MoeWorkerGpu {
                 device,
-                layer_config_ptrs,
+                _layer_config_ptrs: layer_config_ptrs,
                 _config_storage: config_storage,
                 local_activation,
                 scratch_gate,

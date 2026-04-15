@@ -172,7 +172,18 @@ impl Model {
             return self.decode_step_moe(token_id, position);
         }
         if std::env::var("PERSISTENT").as_deref() == Ok("1") {
-            return self.decode_step_persistent(token_id, position);
+            // Single-GPU persistent path cannot handle MoE: compile() emits OP_MOE_FFN,
+            // but persistent_worker.hip has an intentional empty first branch for OP_MOE_FFN
+            // (VGPR optimization trick) so expert FFN is silently skipped → garbled output.
+            // MoE models need multi-GPU path or paged decode.
+            let has_moe = self
+                .config
+                .layers
+                .iter()
+                .any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
+            if !has_moe {
+                return self.decode_step_persistent(token_id, position);
+            }
         }
         self.decode_step_paged(token_id, position)
     }
@@ -326,10 +337,12 @@ impl Model {
                 let num_total_layers = self.config.layers.len();
                 let dist_refs: Vec<Option<&crate::weights::DistributedMoeWeights>> =
                     self.distributed_moe.iter().map(|d| d.as_ref()).collect();
+                let gate_up_in_dim = self.config.moe_latent_size.unwrap_or(hs);
                 let p2p = crate::moe_p2p::MoeP2pContext::init(
                     self.device,
                     &worker_devices,
                     hs,
+                    gate_up_in_dim,
                     max_eis,
                     num_total_layers,
                     &dist_refs,

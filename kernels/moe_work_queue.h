@@ -23,17 +23,20 @@ struct MoeWorkItem {
     int32_t  expert_ids[MOE_MAX_ACTIVE_EXPERTS];
     float    expert_weights[MOE_MAX_ACTIVE_EXPERTS];
 
-    // GPU 0 VRAM pointer to expert activation [gate_up_in_dim] (for reference; workers use activation_cache)
+    // GPU 0 VRAM pointer to expert activation [gate_up_in_dim] (for reference)
     uint64_t activation_ptr;
     // GPU 0 VRAM pointer to per-worker output slots [num_workers * hidden_size]
     uint64_t output_slots_ptr;
-    // Activation cache: GPU 0 writes gate_up_in_dim floats here (GART, bypasses L2)
-    // so workers can read without P2P VRAM read (which sees stale L2-cached data).
-    // Max size = 4096 (max gate_up_in_dim for any supported model).
-    float activation_cache[4096];
 
     // Per-worker ack flags. Worker writes seq_num here when done.
     volatile uint32_t ack_flags[MOE_MAX_GPUS];
+
+    // Activation cache: GPU 0 writes gate_up_in_dim floats here (GART, bypasses L2)
+    // so workers can read without P2P VRAM staleness. Flexible array — allocation is
+    // sizeof(MoeWorkItem) + gate_up_in_dim * sizeof(float) bytes.
+    // Each GPU accesses this via its own per-GPU device VA (from hipHostGetDevicePointer),
+    // so offsetof arithmetic is always correct regardless of address space.
+    float activation_cache[];
 };
 
 // Per-expert entry in worker config (device memory on each worker GPU).
