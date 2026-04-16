@@ -5,10 +5,10 @@ use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 
-use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
+use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, OP_BARRIER, PrefillBuffers};
 #[allow(unused_imports)]
 use super::{
-    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
+    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_CONV1D, OP_D2D_COPY,
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP,
     OP_FFN_GATE_UP_RNF4, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT, OP_KV_QUANTIZE,
     OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_LM_HEAD, OP_MAMBA2_CONV1D,
@@ -977,7 +977,7 @@ impl MegakernelProgram {
                         as u64;
                 paged_layer_v_offset = paged_layer_k_offset
                     + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
-                let chunk_head_stride = chunk_tokens * hd;
+                let _chunk_head_stride = chunk_tokens * hd;
                 let mut head_indices = Vec::new();
                 for h in 0..nkh {
                     let k_copy_idx = instructions.len();
@@ -2632,7 +2632,6 @@ impl MegakernelProgram {
             inst.words[14] = p2p.gpu0_scratch_act.as_ptr() as u64;
             inst.words[15] = num_gpus as u64;
             inst.words[16] = gupd as u64; // gate_up_in_dim (0 → kernel defaults to hs)
-            inst.words[17] = act.hidden.as_ptr() as u64; // DEBUG: hidden_ptr for GPU-side print
 
             prog.instructions[barrier_idx] = inst;
         }
@@ -2668,7 +2667,6 @@ impl MegakernelProgram {
                     .unwrap_or(false)
             });
 
-        eprintln!("DBG compile_inner_p2p: has_fc2_layers={has_fc2_layers} stale_positions={stale_positions:?} barrier_map.len()={}", barrier_map.len());
         if has_fc2_layers {
             let mut new_instructions =
                 Vec::with_capacity(prog.instructions.len() + 2 * barrier_map.len());
@@ -2687,7 +2685,6 @@ impl MegakernelProgram {
                     let dist = model.distributed_moe[layer_idx].as_ref();
                     let gupd = dist.map(|d| d.gate_up_in_dim).unwrap_or(hs);
                     let cfg = &model.config;
-                    eprintln!("DBG Pass2: inserting fc2 after OP_MOE_DISPATCH at i={i} layer_idx={layer_idx} gupd={gupd} fc2={}", moe.fc2_latent_proj.is_some());
                     if let Some(ref fc2) = moe.fc2_latent_proj {
                         // fc2: moe_latent(gupd) → ffn_down_stage(hs)
                         let mut fc2_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
@@ -2784,9 +2781,6 @@ impl MegakernelProgram {
                 let nf = new_flush as usize;
                 let nr = new_resume as usize;
                 // Verify: flush instruction should be OP_RMSNORM
-                let flush_op = prog.instructions.get(nf).map(|i| i.words[0] & 0x7FFFFFFF).unwrap_or(0xDEAD);
-                let resume_op = prog.instructions.get(nr).map(|i| i.words[0] & 0x7FFFFFFF).unwrap_or(0xDEAD);
-                eprintln!("DBG attn_boundary[{attn_i}]: old=({flush},{resume}) → new=({nf},{nr}) flush_op={flush_op:#x} resume_op={resume_op:#x}");
                 (nf, nr)
             }).collect();
         }

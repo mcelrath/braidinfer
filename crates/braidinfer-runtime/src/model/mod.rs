@@ -58,7 +58,6 @@ pub struct Model {
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
     // Multi-GPU megakernel programs
-    pub(crate) megakernel_multi_gpu: Option<MegakernelProgram>,
     pub(crate) megakernel_multi_gpu_p2p: Option<MegakernelProgram>,
 }
 
@@ -167,13 +166,21 @@ impl Model {
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let is_multi_gpu = self.multi_gpu.is_some();
         if self.trace.is_some() {
-            return self.decode_step_moe(token_id, position);
+            if is_multi_gpu {
+                // Multi-GPU trace: use P2P path. Only top10_logits checkpoint is available;
+                // hidden/normed are in GPU VRAM and inaccessible while persistent worker runs.
+                return self.decode_step_persistent_multi_gpu(token_id, position);
+            }
+            // Single-GPU trace: use per-layer path with full per-layer checkpoints.
+            return self.decode_step_trace(token_id, position);
         }
         if is_multi_gpu {
             if std::env::var("PERSISTENT").as_deref() == Ok("1") {
                 return self.decode_step_persistent_multi_gpu(token_id, position);
             }
-            return self.decode_step_moe(token_id, position);
+            return Err(ModelError::InvalidConfig(
+                "Multi-GPU inference requires PERSISTENT=1".to_string(),
+            ));
         }
         if std::env::var("PERSISTENT").as_deref() == Ok("1") {
             // Single-GPU persistent path cannot handle MoE: compile() emits OP_MOE_FFN,
@@ -288,22 +295,16 @@ impl Model {
     }
 
     /// Multi-GPU persistent worker decode for MoE models.
-    /// Persistent worker on GPU 0 handles dense layers (60% faster than kbk).
-    /// At MoE layers: worker paused, kbk dispatch across all GPUs, worker resumed.
+    /// Initializes P2P workers on first call, then delegates to decode_step_p2p.
     fn decode_step_persistent_multi_gpu(
         &mut self,
         token_id: u32,
         position: u32,
     ) -> Result<Vec<f32>, ModelError> {
-        use crate::megakernel::Instruction;
         use crate::persistent_dispatch::PersistentDispatch;
 
-        // Lazy-init: compile multi-GPU megakernel + launch workers on ALL GPUs
+        // Lazy-init: compile P2P megakernel + launch workers on ALL GPUs
         if self.persistent_workers.is_none() {
-            if self.megakernel_multi_gpu.is_none() {
-                let mk = MegakernelProgram::compile_multi_gpu(self)?;
-                self.megakernel_multi_gpu = Some(mk);
-            }
             let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
             // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS needs (8+7680+256)*4 = 31776 bytes per block.
             // moe_worker_kernel (GPUs 1-3) only needs 4352B; persistent_worker (GPU 0) needs 31776B.
@@ -324,7 +325,6 @@ impl Model {
                 })
                 .max()
                 .unwrap_or(0);
-
             // Init GPU-native P2P MoE dispatch (moe_worker_kernel on GPUs 1-3) BEFORE
             // launching the persistent cooperative worker on GPU 0. hipMalloc on GPU 0
             // deadlocks if the cooperative kernel is already running (ROCm synchronizes
@@ -379,471 +379,12 @@ impl Model {
             self.persistent_workers = Some(dispatch);
         }
 
-        // Use P2P megakernel if available (GPU-native MoE dispatch, no OP_BARRIER)
+        // P2P megakernel is always initialized above when has_moe && num_gpus > 1.
+        // For non-MoE multi-GPU models, fall through to decode_step_paged.
         if self.megakernel_multi_gpu_p2p.is_some() {
             return self.decode_step_p2p(token_id, position);
         }
-
-        // Update host-side instructions
-        let pos_data = [position as i32, position as i32, position as i32];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                pos_data.as_ptr(),
-                self.activations.position_ids.host_ptr(),
-                3,
-            );
-        }
-        let mk = self.megakernel_multi_gpu.as_mut().unwrap();
-        mk.update_step_host_only(token_id, position)?;
-
-        // Patch LM head to write to logits_mapped
-        let n_inst = mk.instructions.len();
-        mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
-
-        let hs = self.config.hidden_size;
-        // Precompute head-parallel attention boundaries.
-        // For each attn layer: (mrope_idx, gqa_idx) — we flush at mrope, skip up to gqa.
-        let has_head_parallel = self
-            .multi_gpu
-            .as_ref()
-            .map(|m| !m.workers[0].attn_kv_caches.is_empty())
-            .unwrap_or(false);
-        // Use distributed QKV boundaries if available (multi_gpu path with split projections),
-        // otherwise fall back to mRoPE/GQA boundaries (legacy head-parallel path).
-        let use_distributed_qkv = has_head_parallel && {
-            let mk_ref = self.megakernel_multi_gpu.as_ref().unwrap();
-            !mk_ref.multi_gpu_attn_boundaries.is_empty()
-        };
-        let attn_boundaries: Vec<(usize, usize)> = if has_head_parallel {
-            let mk_ref = self.megakernel_multi_gpu.as_ref().unwrap();
-            if use_distributed_qkv {
-                mk_ref.multi_gpu_attn_boundaries.clone()
-            } else {
-                mk_ref
-                    ._mrope_inst_indices
-                    .iter()
-                    .zip(mk_ref.gqa_attn_inst_indices.iter())
-                    .map(|(&mrope_idx, &gqa_idx)| (mrope_idx, gqa_idx))
-                    .collect()
-            }
-        } else {
-            Vec::new()
-        };
-        let n_inst = self
-            .megakernel_multi_gpu
-            .as_ref()
-            .unwrap()
-            .instructions
-            .len();
-
-        // Split instruction stream at OP_BARRIER markers into segments.
-        // Dense segments batched to GPU 0. At OP_BARRIER: build per-GPU expert
-        // FFN batches, dispatch to all GPUs in parallel via persistent workers.
-        // At attention mRoPE boundary: flush and dispatch head-parallel attention.
-        let mut segment: Vec<Instruction> = Vec::new();
-        let mut attn_i = 0usize;
-        let mut i = 0usize;
-        let layer_timing = std::env::var("LAYER_TIMING").is_ok();
-        let step_start = std::time::Instant::now();
-        let mut layer_t = std::time::Instant::now();
-        let mut moe_total_us = 0u64;
-        let mut attn_total_us = 0u64;
-        let mut dense_total_us = 0u64;
-        let mut n_moe = 0u32;
-        let mut n_attn = 0u32;
-        // Pending reduce instructions: prepended to next dense segment dispatch to
-        // merge two dispatch_batch round-trips into one per MoE layer.
-        let mut pending_reduce: Vec<Instruction> = Vec::new();
-
-        while i < n_inst {
-            let inst = self.megakernel_multi_gpu.as_ref().unwrap().instructions[i].clone();
-            i += 1;
-            let opcode = inst.words[0] & 0x7FFFFFFF;
-            if opcode == 16 {
-                break;
-            }
-
-            if opcode == 33 {
-                // OP_BARRIER — MoE dispatch point
-                let layer_idx = inst.words[3] as usize;
-                let (k, eis) = match &self.config.layers[layer_idx].ffn_type {
-                    crate::model::FfnType::MoE {
-                        num_active,
-                        expert_intermediate_size,
-                        ..
-                    } => (*num_active, *expert_intermediate_size),
-                    _ => panic!("OP_BARRIER on non-MoE layer"),
-                };
-
-                let dist_moe = self.distributed_moe[layer_idx]
-                    .as_ref()
-                    .expect("missing distributed MoE weights");
-
-                // Append normed→normed_stage copy to the tail of the dense segment so it
-                // executes in the same dispatch_batch, saving one round-trip per MoE layer.
-                // (H2D broadcast to GPUs 1-3 happens via parallel hipMemcpyAsync in dispatch_moe_layer_kbk.)
-                {
-                    let mut copy_inst = Instruction::new(17, (hs as u32 + 255) / 256);
-                    copy_inst.words[1] = self.activations.normed_stage.as_write_ptr() as u64;
-                    copy_inst.words[2] = self.activations.normed.as_ptr() as u64;
-                    copy_inst.words[3] = hs as u64;
-                    segment.push(copy_inst);
-                }
-
-                // Flush dense segment (now includes the normed→normed_stage copy).
-                // Prepend any pending reduce instructions from the previous MoE layer so they
-                // execute in the same dispatch_batch, saving one round-trip per MoE layer.
-                if !segment.is_empty() || !pending_reduce.is_empty() {
-                    if layer_timing {
-                        dense_total_us += layer_t.elapsed().as_micros() as u64;
-                        layer_t = std::time::Instant::now();
-                    }
-                    let mut combined: Vec<Instruction> = std::mem::take(&mut pending_reduce);
-                    combined.extend_from_slice(&segment);
-                    segment.clear();
-                    let dispatch = self.persistent_workers.as_mut().unwrap();
-                    for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS)
-                    {
-                        dispatch.dispatch_batch(0, chunk);
-                    }
-                }
-
-                // Build OP_EXPERT_FFN batch for GPU 0 (persistent worker handles its experts).
-                // GPUs 1+ run via kbk in parallel with GPU 0.
-                let expert_ids_snap: Vec<i32> = unsafe {
-                    std::slice::from_raw_parts(
-                        self.activations.moe_expert_ids.host_ptr() as *const i32,
-                        k,
-                    )
-                    .to_vec()
-                };
-                let expert_wts_snap: Vec<f32> = unsafe {
-                    std::slice::from_raw_parts(
-                        self.activations.moe_expert_weights.host_ptr() as *const f32,
-                        k,
-                    )
-                    .to_vec()
-                };
-                let mut gpu0_batch: Vec<Instruction> = Vec::new();
-                {
-                    let mgpu = self.multi_gpu.as_ref().unwrap();
-                    let buf = &dist_moe.expert_buffers[0];
-                    let sg_ptr = mgpu.workers[0].scratch_gate.as_ptr() as u64;
-                    let su_ptr = mgpu.workers[0].scratch_up.as_ptr() as u64;
-                    let sa_ptr = mgpu.workers[0].scratch_act.as_ptr() as u64;
-                    let sd_ptr = mgpu.workers[0].scratch_down.as_ptr() as u64;
-                    let act_ptr = self.activations.normed_stage.device_ptr() as u64;
-                    let out_ptr = self
-                        .persistent_workers
-                        .as_ref()
-                        .unwrap()
-                        .moe_output_slot
-                        .device_ptr() as u64;
-                    let gu_row_stride = dist_moe.gate_up_row_stride as u64;
-                    for j in 0..k {
-                        let eid = expert_ids_snap[j] as usize;
-                        if dist_moe.expert_device[eid] != 0 {
-                            continue;
-                        }
-                        let local_slot = buf.slot_map[eid].expect("GPU 0 expert missing slot");
-                        let gu_ptr = unsafe {
-                            dist_moe
-                                .gpu0_gate_up_base
-                                .add(local_slot * dist_moe.gate_up_expert_stride)
-                        } as u64;
-                        let dn_ptr = unsafe {
-                            dist_moe
-                                .gpu0_down_base
-                                .add(local_slot * dist_moe.down_expert_stride)
-                        } as u64;
-                        let ew_bits = expert_wts_snap[j].to_bits() as u64;
-
-                        if dist_moe.has_gate_proj {
-                            // Gate proj → scratch_gate
-                            let mut g = Instruction::new(
-                                crate::megakernel::OP_LINEAR_PROJ_PCG32,
-                                eis as u32,
-                            );
-                            g.words[1] = sg_ptr;
-                            g.words[2] = gu_ptr;
-                            g.words[3] = act_ptr;
-                            g.words[4] = eis as u64;
-                            g.words[5] = hs as u64;
-                            g.words[6] = 1;
-                            gpu0_batch.push(g);
-                            // Up proj → scratch_up (rows offset by eis * row_stride)
-                            let gu_up = gu_ptr + (eis as u64) * gu_row_stride;
-                            let mut u = Instruction::new(
-                                crate::megakernel::OP_LINEAR_PROJ_PCG32,
-                                eis as u32,
-                            );
-                            u.words[1] = su_ptr;
-                            u.words[2] = gu_up;
-                            u.words[3] = act_ptr;
-                            u.words[4] = eis as u64;
-                            u.words[5] = hs as u64;
-                            u.words[6] = 1;
-                            gpu0_batch.push(u);
-                            // SiLU: silu(scratch_gate) * scratch_up → scratch_act
-                            let mut silu = Instruction::new(
-                                crate::megakernel::OP_SILU_MUL,
-                                (eis as u32 + 255) / 256,
-                            );
-                            silu.words[1] = sa_ptr;
-                            silu.words[2] = sg_ptr;
-                            silu.words[3] = su_ptr;
-                            silu.words[4] = eis as u64;
-                            gpu0_batch.push(silu);
-                        } else {
-                            // Up-only proj → scratch_up
-                            let mut u = Instruction::new(
-                                crate::megakernel::OP_LINEAR_PROJ_PCG32,
-                                eis as u32,
-                            );
-                            u.words[1] = su_ptr;
-                            u.words[2] = gu_ptr;
-                            u.words[3] = act_ptr;
-                            u.words[4] = eis as u64;
-                            u.words[5] = hs as u64;
-                            u.words[6] = 1;
-                            gpu0_batch.push(u);
-                            // ReLU²: relu(scratch_up)² → scratch_act
-                            let mut rsq = Instruction::new(
-                                crate::megakernel::OP_RELU_SQ,
-                                (eis as u32 + 255) / 256,
-                            );
-                            rsq.words[1] = sa_ptr;
-                            rsq.words[2] = su_ptr;
-                            rsq.words[3] = eis as u64;
-                            gpu0_batch.push(rsq);
-                        }
-                        // Down proj: scratch_act → scratch_down
-                        let mut d =
-                            Instruction::new(crate::megakernel::OP_LINEAR_PROJ_PCG32, hs as u32);
-                        d.words[1] = sd_ptr;
-                        d.words[2] = dn_ptr;
-                        d.words[3] = sa_ptr;
-                        d.words[4] = hs as u64;
-                        d.words[5] = eis as u64;
-                        d.words[6] = 1;
-                        gpu0_batch.push(d);
-                        // Scale add: moe_output_slot += ew * scratch_down
-                        let mut sa_inst = Instruction::new(
-                            crate::megakernel::OP_SCALE_ADD,
-                            (hs as u32 + 255) / 256,
-                        );
-                        sa_inst.words[1] = out_ptr;
-                        sa_inst.words[2] = sd_ptr;
-                        sa_inst.words[3] = ew_bits;
-                        sa_inst.words[4] = hs as u64;
-                        gpu0_batch.push(sa_inst);
-                    }
-                }
-
-                // Zero moe_output_slot so GPU 0 experts accumulate into a clean buffer.
-                // Always zeroed: when no GPU 0 experts run, the D2D_COPY init will write zeros.
-                unsafe {
-                    std::ptr::write_bytes(
-                        self.persistent_workers
-                            .as_ref()
-                            .unwrap()
-                            .moe_output_slot
-                            .host_ptr(),
-                        0,
-                        hs,
-                    );
-                }
-
-                // Fire GPU 0 expert batch non-blocking (fat worker computes while CPU dispatches GPUs 1+).
-                let seq0 = if !gpu0_batch.is_empty() {
-                    Some(
-                        self.persistent_workers
-                            .as_mut()
-                            .unwrap()
-                            .dispatch_batch_fire(0, &gpu0_batch),
-                    )
-                } else {
-                    None
-                };
-
-                // Dispatch GPUs 1+ via kbk — runs in parallel with GPU 0's fat worker.
-                // dispatch_moe_layer_kbk dispatches compute only; no D2H/CPU gather.
-                let active_mask = {
-                    let mgpu =
-                        self.multi_gpu.as_mut().unwrap() as *mut crate::multi_gpu::MultiGpuContext;
-                    let wk = self.worker_kernels.as_slice()
-                        as *const [crate::moe_dispatch::WorkerKernels];
-                    let dm = dist_moe as *const crate::weights::DistributedMoeWeights;
-                    let ns = &self.activations.normed_stage
-                        as *const braidinfer_hip::memory::MappedHostBuffer<f32>;
-                    let ids = &self.activations.moe_expert_ids
-                        as *const braidinfer_hip::memory::MappedHostBuffer<i32>;
-                    let wts = &self.activations.moe_expert_weights
-                        as *const braidinfer_hip::memory::MappedHostBuffer<f32>;
-                    unsafe {
-                        crate::moe_dispatch::dispatch_moe_layer_kbk(
-                            &mut *mgpu, &*wk, &*dm, &*ns, &*ids, &*wts, k, hs, eis,
-                        )
-                        .map_err(ModelError::Hip)?
-                    }
-                };
-
-                // Sync GPUs 1+ first (CPU-side stream sync, overlaps with GPU 0 persistent worker).
-                // Then wait_ack GPU 0. Both may already be done by the time we check.
-                let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-                for gpu_i in 1..num_gpus {
-                    if active_mask & (1 << gpu_i) == 0 {
-                        continue;
-                    }
-                    let worker = &self.multi_gpu.as_ref().unwrap().workers[gpu_i];
-                    braidinfer_hip::Device::set_current(worker.device).map_err(ModelError::Hip)?;
-                    worker
-                        .compute_stream
-                        .synchronize()
-                        .map_err(ModelError::Hip)?;
-                }
-                braidinfer_hip::Device::set_current(braidinfer_core::types::DeviceId(0))
-                    .map_err(ModelError::Hip)?;
-                if let Some(seq) = seq0 {
-                    self.persistent_workers.as_ref().unwrap().wait_ack(0, seq);
-                }
-
-                // On-GPU reduction: build a persistent worker batch that:
-                // 1. Copies GPU 0's moe_output_slot → ffn_down (init with GPU 0 result, or zero if no GPU 0 experts)
-                // 2. For each GPU 1-3 with experts: D2D_COPY expert_out → scratch_down, SCALE_ADD into ffn_down
-                {
-                    let ffn_down_ptr = self.activations.ffn_down.as_write_ptr() as u64;
-                    let moe_slot_ptr = self
-                        .persistent_workers
-                        .as_ref()
-                        .unwrap()
-                        .moe_output_slot
-                        .device_ptr() as u64;
-                    let scratch_down_ptr = self.multi_gpu.as_ref().unwrap().workers[0]
-                        .scratch_down
-                        .as_ptr() as u64;
-                    let grid_hs = (hs as u32 + 255) / 256;
-                    let mut reduce_batch: Vec<Instruction> = Vec::new();
-
-                    // Step 1: copy GPU 0 result (or zeros) into ffn_down
-                    let mut init = Instruction::new(17, grid_hs); // OP_D2D_COPY
-                    init.words[1] = ffn_down_ptr;
-                    init.words[2] = moe_slot_ptr;
-                    init.words[3] = hs as u64;
-                    reduce_batch.push(init);
-
-                    // Step 2: accumulate each GPU 1+ expert_out
-                    for gpu_i in 1..num_gpus {
-                        if active_mask & (1 << gpu_i) == 0 {
-                            continue;
-                        }
-                        let expert_out_ptr = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                            .expert_out
-                            .as_ptr() as u64;
-                        // D2D_COPY: GPU i expert_out → GPU 0 scratch_down (P2P)
-                        let mut copy = Instruction::new(17, grid_hs);
-                        copy.words[1] = scratch_down_ptr;
-                        copy.words[2] = expert_out_ptr;
-                        copy.words[3] = hs as u64;
-                        reduce_batch.push(copy);
-                        // SCALE_ADD: ffn_down += 1.0 * scratch_down
-                        let mut add = Instruction::new(crate::megakernel::OP_SCALE_ADD, grid_hs);
-                        add.words[1] = ffn_down_ptr;
-                        add.words[2] = scratch_down_ptr;
-                        add.words[3] = 1.0f32.to_bits() as u64;
-                        add.words[4] = hs as u64;
-                        reduce_batch.push(add);
-                    }
-
-                    // Don't dispatch yet — defer to next dense segment flush to merge into one batch.
-                    pending_reduce = reduce_batch;
-                }
-
-                if layer_timing {
-                    let us = layer_t.elapsed().as_micros() as u64;
-                    moe_total_us += us;
-                    n_moe += 1;
-                    layer_t = std::time::Instant::now();
-                }
-                continue;
-            }
-
-            // Head-parallel attention: at boundary, flush segment, dispatch parallel QKV+GQA
-            if has_head_parallel && attn_i < attn_boundaries.len() {
-                let (flush_idx, resume_idx) = attn_boundaries[attn_i];
-                if i - 1 == flush_idx {
-                    // Include boundary instruction (RMSNorm or mRoPE) in segment, flush to GPU 0.
-                    // Prepend any pending reduce from previous MoE layer.
-                    segment.push(inst);
-                    {
-                        let mut combined: Vec<Instruction> = std::mem::take(&mut pending_reduce);
-                        combined.extend_from_slice(&segment);
-                        segment.clear();
-                        let dispatch = self.persistent_workers.as_mut().unwrap();
-                        for chunk in
-                            combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS)
-                        {
-                            dispatch.dispatch_batch(0, chunk);
-                        }
-                    }
-                    if layer_timing {
-                        layer_t = std::time::Instant::now();
-                    }
-                    self.dispatch_head_parallel_attention(attn_i, position)?;
-                    if layer_timing {
-                        let us = layer_t.elapsed().as_micros() as u64;
-                        attn_total_us += us;
-                        n_attn += 1;
-                        layer_t = std::time::Instant::now();
-                    }
-                    attn_i += 1;
-                    // For distributed QKV (new): resume_idx = output_gate_idx (don't skip it)
-                    // For legacy mRoPE boundary: resume_idx = gqa_idx (skip the GQA itself: +1)
-                    i = if use_distributed_qkv {
-                        resume_idx
-                    } else {
-                        resume_idx + 1
-                    };
-                    continue;
-                }
-            }
-
-            segment.push(inst);
-        }
-
-        // Flush final segment (with any pending reduce prefix)
-        if !segment.is_empty() || !pending_reduce.is_empty() {
-            let mut combined: Vec<Instruction> = std::mem::take(&mut pending_reduce);
-            combined.extend_from_slice(&segment);
-            let dispatch = self.persistent_workers.as_mut().unwrap();
-            for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-                dispatch.dispatch_batch(0, chunk);
-            }
-        }
-
-        if layer_timing && position > 0 {
-            let total = moe_total_us + attn_total_us + dense_total_us;
-            let wall_us = step_start.elapsed().as_micros() as u64;
-            eprintln!(
-                "LAYER_TIMING pos={position}: moe={:.1}ms×{n_moe}  attn={:.1}ms×{n_attn}  dense={:.1}ms  tracked={:.1}ms  wall={:.1}ms",
-                moe_total_us as f64 / 1000.,
-                attn_total_us as f64 / 1000.,
-                dense_total_us as f64 / 1000.,
-                total as f64 / 1000.,
-                wall_us as f64 / 1000.
-            );
-        }
-
-        let logits = unsafe {
-            std::slice::from_raw_parts(
-                self.activations.logits_mapped.host_ptr(),
-                self.config.vocab_size,
-            )
-        }
-        .to_vec();
-
-        self.seq_len = position + 1;
-        Ok(logits)
+        self.decode_step_paged(token_id, position)
     }
 
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
@@ -965,14 +506,21 @@ impl Model {
             )
         }
         .to_vec();
-        // DBG: print top token and logit distribution
-        {
-            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
-            let mut top5: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-            top5.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            top5.truncate(5);
-            eprintln!("DBG p2p logits: nan={nan_count} top5={top5:?} logits[11]={:.4}", logits[11]);
+
+        if self.trace.is_some() {
+            // Multi-GPU trace: only top10_logits available. hidden/normed are in GPU VRAM
+            // and inaccessible while the persistent cooperative worker holds all CUs.
+            let mut indexed: Vec<(usize, f32)> =
+                logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top10: Vec<f32> = indexed
+                .iter()
+                .take(10)
+                .flat_map(|&(id, val)| [id as f32, val])
+                .collect();
+            self.trace.as_mut().unwrap().write_checkpoint("top10_logits", &top10);
         }
+
         self.seq_len = position + 1;
         Ok(logits)
     }
@@ -1034,7 +582,7 @@ impl Model {
         let q_mult = if self.config.has_output_gate { 2 } else { 1 };
         let has_gate = self.config.has_output_gate;
         let use_distributed_qkv = !self
-            .megakernel_multi_gpu
+            .megakernel_multi_gpu_p2p
             .as_ref()
             .unwrap()
             .multi_gpu_attn_boundaries
@@ -1580,7 +1128,9 @@ impl Model {
         Ok(())
     }
 
-    fn decode_step_moe(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+    /// Single-GPU per-layer decode with activation trace checkpoints.
+    /// Only reachable when trace.is_some() && multi_gpu.is_none().
+    fn decode_step_trace(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let hs = self.config.hidden_size as u32;
         let eps = self.config.rms_norm_eps;
         let sync_debug = std::env::var("SYNC_DEBUG").is_ok();

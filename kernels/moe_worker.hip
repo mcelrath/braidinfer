@@ -87,7 +87,6 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         float* output_slots = (float*)work_queue->output_slots_ptr;
         // Output slot stride is always hidden_size so GPU 0's sum loop uses consistent offsets.
         float* my_output_slot = output_slots + my_gpu * hs;
-
         // 1. Copy activation from work queue GART cache to local VRAM (gupd elements)
         coop_copy(local_activation, activation_src, gupd, grid);
 

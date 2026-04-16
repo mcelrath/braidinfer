@@ -172,7 +172,10 @@ impl MoeP2pContext {
             },
         )?;
 
-        let gpu0_scratch_gate = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
+        // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
+        // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim).
+        let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
+        let gpu0_scratch_gate = DeviceBuffer::<f32>::alloc(gpu0, scratch_gate_size)?;
         let gpu0_scratch_up = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
         let gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
 
@@ -203,7 +206,8 @@ impl MoeP2pContext {
             )?;
 
             let local_activation = DeviceBuffer::<f32>::alloc(device, gate_up_in_dim)?;
-            let scratch_gate = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
+            // scratch_gate reused for gate output (eis) and down output (gupd): allocate max.
+            let scratch_gate = DeviceBuffer::<f32>::alloc(device, scratch_gate_size)?;
             let scratch_up = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let scratch_act = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let local_output = DeviceBuffer::<f32>::alloc(device, hidden_size)?;
