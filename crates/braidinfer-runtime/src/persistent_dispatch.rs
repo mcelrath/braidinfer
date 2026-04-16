@@ -61,44 +61,6 @@ pub struct GpuWorker {
     pub seq_counter: u32,
 }
 
-impl GpuWorker {
-    /// Dispatch a single instruction and wait for completion.
-    pub(crate) fn dispatch_and_wait(&mut self, inst: &Instruction) {
-        let q_ptr = self.queue.host_ptr() as *mut WorkerQueueLayout;
-
-        // Copy instruction words to work queue
-        for i in 0..INST_SIZE {
-            unsafe {
-                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).inst[i]), inst.words[i]);
-            }
-        }
-
-        // Increment and write seq_num (triggers worker)
-        self.seq_counter += 1;
-        let seq = self.seq_counter;
-        unsafe {
-            std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
-        }
-
-        // Poll ack with timeout
-        let start = std::time::Instant::now();
-        loop {
-            let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-            if ack == seq {
-                break;
-            }
-            if start.elapsed().as_secs() > 10 {
-                let opcode = inst.words[0] & 0x7FFFFFFF;
-                let grid_x = (inst.words[0] >> 32) as u32;
-                panic!(
-                    "PERSISTENT: dispatch timeout seq={seq} opcode={opcode} grid_x={grid_x} ack={ack}"
-                );
-            }
-            std::hint::spin_loop();
-        }
-    }
-}
-
 /// Persistent dispatch context: manages the fat cooperative worker on GPU 0.
 ///
 /// `workers` is wrapped in `ManuallyDrop` so HIP resources (DeviceBuffer → hipFree,

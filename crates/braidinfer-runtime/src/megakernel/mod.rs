@@ -1,6 +1,6 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
+use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use std::ffi::c_void;
@@ -11,29 +11,13 @@ use crate::trace::TraceWriter;
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
 pub const CHUNK_TOKENS: usize = 64;
 
-/// Mapped host memory flags for CPU↔megakernel synchronization at MoE barriers.
-/// Both pointers are in hipHostMallocMapped memory (GPU-accessible via GART, MTYPE_UC).
-pub struct MoeBarrierState {
-    /// GPU writes `layer_idx + 1` here when ready for dispatch; CPU resets to 0 after reading.
-    pub barrier: MappedHostBuffer<u32>,
-    /// CPU writes 1 here after dispatch; GPU resets to 0 before continuing.
-    pub resume: MappedHostBuffer<u32>,
-}
-
-impl MoeBarrierState {
-    pub fn new() -> HipResult<Self> {
-        let barrier = MappedHostBuffer::<u32>::alloc(1)?;
-        let resume = MappedHostBuffer::<u32>::alloc(1)?;
-        unsafe {
-            *barrier.host_ptr() = 0;
-            *resume.host_ptr() = 0;
-        }
-        Ok(MoeBarrierState { barrier, resume })
-    }
-}
-
 // Opcode constants — auto-generated from kernels/opcodes.h (single source of truth)
 include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
+
+// OP_BARRIER is an internal IR value used by compile_moe_ffn_multi_gpu and patched to
+// OP_MOE_DISPATCH by compile_inner_p2p. It is NOT dispatched in any GPU kernel.
+// Removed from opcodes.h (C side) since no kernel handler exists for it.
+pub(crate) const OP_BARRIER: u32 = 33;
 
 pub(crate) const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
 
@@ -119,8 +103,6 @@ pub struct MegakernelProgram {
     pub(crate) dump_buffer: Option<DeviceBuffer<u8>>, // slot data
     pub(crate) dump_counter: Option<DeviceBuffer<i32>>, // atomic slot counter
     pub(crate) dump_capacity: i32,
-    // Multi-GPU MoE barrier: OP_BARRIER instructions park here; CPU dispatches, resumes
-    pub(crate) moe_barrier: Option<MoeBarrierState>,
     /// (instruction_idx, layer_idx) for each OP_BARRIER in the program.
     /// CPU dispatch loop uses layer_idx to look up DistributedMoeWeights.
     pub(crate) barrier_layer_map: Vec<(usize, usize)>,
@@ -323,11 +305,6 @@ impl MegakernelProgram {
             path
         );
         Ok(())
-    }
-
-    /// Reference to the MoE barrier state (for the CPU dispatch loop in decode_step_megakernel_moe).
-    pub fn moe_barrier(&self) -> Option<&MoeBarrierState> {
-        self.moe_barrier.as_ref()
     }
 
     /// Execute the megakernel program.

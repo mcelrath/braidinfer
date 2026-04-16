@@ -110,22 +110,6 @@ impl MegakernelProgram {
         Self::compile_inner_p2p(model, p2p)
     }
 
-    /// Compile for multi-GPU MoE models. MoE layers emit OP_BARRIER instead of OP_MOE_FFN.
-    /// The CPU dispatch loop (decode_step_megakernel_moe) handles expert dispatch per barrier.
-    pub fn compile_multi_gpu(model: &Model) -> HipResult<Self> {
-        let mut prog = Self::compile_inner(model, false, true)?;
-        let barrier_state = super::MoeBarrierState::new()?;
-        // Patch barrier flag pointers into all OP_BARRIER instructions
-        let bflag_dev = barrier_state.barrier.device_ptr() as u64;
-        let rflag_dev = barrier_state.resume.device_ptr() as u64;
-        for &(inst_idx, _layer_idx) in &prog.barrier_layer_map {
-            prog.instructions[inst_idx].words[1] = bflag_dev;
-            prog.instructions[inst_idx].words[2] = rflag_dev;
-        }
-        prog.moe_barrier = Some(barrier_state);
-        Ok(prog)
-    }
-
     fn compile_inner(model: &Model, paged: bool, multi_gpu: bool) -> HipResult<Self> {
         let cfg = &model.config;
         let device = model.device;
@@ -392,7 +376,6 @@ impl MegakernelProgram {
             dump_capacity: 0,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
-            moe_barrier: None,
             barrier_layer_map,
             multi_gpu_attn_boundaries,
             _not_send: std::marker::PhantomData,
@@ -801,7 +784,6 @@ impl MegakernelProgram {
             dump_capacity: 0,
             num_kv_heads_attn: cfg.num_kv_heads,
             head_dim_attn: cfg.head_dim,
-            moe_barrier: None,
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             _not_send: std::marker::PhantomData,
@@ -2773,7 +2755,7 @@ impl MegakernelProgram {
 
             // Remap multi_gpu_attn_boundaries to new instruction indices.
             // old_to_new maps old index → new index (-1 if skipped).
-            prog.multi_gpu_attn_boundaries = prog.multi_gpu_attn_boundaries.iter().enumerate().map(|(attn_i, &(flush, resume))| {
+            prog.multi_gpu_attn_boundaries = prog.multi_gpu_attn_boundaries.iter().enumerate().map(|(_attn_i, &(flush, resume))| {
                 let new_flush = old_to_new[flush];
                 let new_resume = old_to_new[resume];
                 assert!(new_flush >= 0, "attn flush_idx {flush} was in stale_positions — logic error");
@@ -2785,10 +2767,8 @@ impl MegakernelProgram {
             }).collect();
         }
 
-        // Clear barrier_layer_map so decode loop doesn't try to handle OP_BARRIER
+        // Clear barrier_layer_map so it's not misinterpreted after OP_BARRIER→OP_MOE_DISPATCH patch
         prog.barrier_layer_map.clear();
-        // Clear moe_barrier (not needed for P2P path)
-        prog.moe_barrier = None;
 
         Ok(prog)
     }
