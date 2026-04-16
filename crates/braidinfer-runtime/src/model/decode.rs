@@ -138,12 +138,7 @@ impl Model {
             // launching the persistent cooperative worker on GPU 0. hipMalloc on GPU 0
             // deadlocks if the cooperative kernel is already running (ROCm synchronizes
             // all GPU work before allocating). Launch persistent_worker LAST.
-            let has_moe = self
-                .config
-                .layers
-                .iter()
-                .any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-            if has_moe && num_gpus > 1 {
+            if self.has_moe && num_gpus > 1 {
                 let worker_devices: Vec<_> = (1..num_gpus)
                     .map(|i| braidinfer_core::types::DeviceId(i as u32))
                     .collect();

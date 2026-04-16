@@ -1015,6 +1015,7 @@ impl Model {
             argmax_result: DeviceBuffer::<i32>::alloc(device, 1)?,
         };
 
+        let has_moe = config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
         Ok(Model {
             config,
             device,
@@ -1044,6 +1045,7 @@ impl Model {
                 .ok()
                 .and_then(|path| crate::trace::TraceWriter::open(&path).ok()),
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
+            has_moe,
             persistent: std::env::var("PERSISTENT").as_deref() == Ok("1"),
             sync_debug: std::env::var("SYNC_DEBUG").is_ok(),
             weight_prefix: prefix.clone(),
@@ -1060,12 +1062,7 @@ impl Model {
     /// Distributes MoE expert weights across available GPUs (round-robin).
     /// Must be called after load, before first decode_step.
     pub fn enable_multi_gpu(&mut self) -> Result<(), ModelError> {
-        let has_moe = self
-            .config
-            .layers
-            .iter()
-            .any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
-        if !has_moe {
+        if !self.has_moe {
             eprintln!("Multi-GPU: model has no MoE layers, skipping");
             return Ok(());
         }

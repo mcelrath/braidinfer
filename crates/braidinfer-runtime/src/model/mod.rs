@@ -58,6 +58,7 @@ pub struct Model {
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) trace: Option<crate::trace::TraceWriter>,
     pub(crate) debug_nan: bool,
+    pub(crate) has_moe: bool,     // cached at load time: any layer has FfnType::MoE
     pub(crate) persistent: bool, // cached from PERSISTENT env var at load time
     pub(crate) sync_debug: bool, // cached from SYNC_DEBUG env var at load time
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
