@@ -1,6 +1,7 @@
 //! GDN, Mamba2, and FFN layer compilation.
 
 use super::compile_common::{div_ceil, emit_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
+use crate::quant::WeightFormat;
 use super::instructions::*;
 use super::{FLAG_NO_SYNC, Instruction, MegakernelProgram, PrefillBuffers};
 use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4, OP_LINEAR_PROJ};
@@ -230,9 +231,12 @@ impl MegakernelProgram {
         let all_bf16 = matches!(w_gate, LinearWeight::Bf16(_))
             && matches!(w_up, LinearWeight::Bf16(_))
             && matches!(w_down, LinearWeight::Bf16(_));
+        let all_rnf4 = matches!(w_gate, LinearWeight::Packed(pw) if pw.format == WeightFormat::Rnf4G128)
+            && matches!(w_up, LinearWeight::Packed(pw) if pw.format == WeightFormat::Rnf4G128)
+            && matches!(w_down, LinearWeight::Packed(pw) if pw.format == WeightFormat::Rnf4G128);
 
         if all_bf16 {
-            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only, processes all N tokens)
+            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16, processes all N tokens)
             instructions.push(FfnGateUpInst::new(
                 OP_FFN_GATE_UP, (is * n) as u32,
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
@@ -247,6 +251,27 @@ impl MegakernelProgram {
                 OP_FFN_DOWN_RES, (hs * n) as u32,
                 bufs.hidden.as_write_ptr(), bufs.residual.as_ptr(),
                 w_down.as_bf16_ptr() as *const u8, bufs.ffn_act.as_ptr(),
+                hs as i32, is as i32, n as i32,
+            ).into_inst());
+        } else if all_rnf4 {
+            // Fused path: OP_FFN_GATE_UP_RNF4 + OP_FFN_DOWN_RES_RNF4 (rnf4, processes all N tokens)
+            let wg_ptr = match w_gate { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let wu_ptr = match w_up   { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let wd_ptr = match w_down { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            instructions.push(FfnGateUpInst::new(
+                OP_FFN_GATE_UP_RNF4, (is * n) as u32,
+                bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
+                wg_ptr, wu_ptr,
+                hs as i32, is as i32, eps, n as i32,
+            ).into_inst());
+            instructions.push(D2dCopyInst::new(
+                div_ceil((n * hs) as u32, 256),
+                bufs.residual.as_write_ptr(), bufs.hidden.as_ptr(), (n * hs) as i32,
+            ).into_inst());
+            instructions.push(FfnDownResInst::new(
+                OP_FFN_DOWN_RES_RNF4, (hs * n) as u32,
+                bufs.hidden.as_write_ptr(), bufs.residual.as_ptr(),
+                wd_ptr, bufs.ffn_act.as_ptr(),
                 hs as i32, is as i32, n as i32,
             ).into_inst());
         } else {

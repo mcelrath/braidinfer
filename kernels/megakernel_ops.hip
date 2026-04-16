@@ -1141,23 +1141,30 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
     if (tid == 0) output[row] = shared[0] + residual[row];
 }
 
-// OP_FFN_GATE_UP_RNF4: fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights, decode n=1)
+// OP_FFN_GATE_UP_RNF4: fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights)
 // args: [1]=scratch, [2]=input, [3]=rms_weight, [4]=w_gate (rnf4), [5]=w_up (rnf4),
-//       [6]=hidden_size, [7]=intermediate_size, [8]=eps
-// vblock = output row index in [0, intermediate_size)
+//       [6]=hidden_size, [7]=intermediate_size, [8]=eps, [9]=batch_size (0/1=single)
+// When batch > 1: input is [batch × hidden_size], scratch is [batch × intermediate_size].
+// vblock = batch_idx * intermediate_size + row.
 __device__ void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
     const FfnGateUpInst* i = (const FfnGateUpInst*)inst;
-    float* scratch = i->output;
-    const float* input = i->hidden;
+    float* scratch_base = i->output;
+    const float* input_base = i->hidden;
     const uint16_t* rms_weight = i->norm_weight;
     const unsigned char* w_gate = i->w_gate;
     const unsigned char* w_up = i->w_up;
     int hidden_size = (int)i->hs;
     int intermediate_size = (int)i->intermediate;
     float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
+    int batch = (int)i->batch;
+    if (batch <= 1) batch = 1;
 
-    int row = vblock;
-    if (row >= intermediate_size) return;
+    int row = vblock % intermediate_size;
+    int batch_idx = vblock / intermediate_size;
+    if (batch_idx >= batch) return;
+
+    const float* input = input_base + (long long)batch_idx * hidden_size;
+    float* scratch = scratch_base + (long long)batch_idx * intermediate_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
@@ -1239,20 +1246,28 @@ __device__ void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
     }
 }
 
-// OP_FFN_DOWN_RES_RNF4: down_proj(scratch) + residual (rnf4 weights, decode n=1)
-// args: [1]=output, [2]=residual, [3]=w_down (rnf4), [4]=scratch, [5]=hidden_size, [6]=intermediate_size
-// vblock = output row index in [0, hidden_size)
+// OP_FFN_DOWN_RES_RNF4: down_proj(scratch) + residual (rnf4 weights)
+// args: [1]=output, [2]=residual, [3]=w_down (rnf4), [4]=scratch, [5]=hidden_size, [6]=intermediate_size, [7]=batch_size
+// When batch > 1: output/residual are [batch × hidden_size], scratch is [batch × intermediate_size].
+// vblock = batch_idx * hidden_size + row.
 __device__ void op_ffn_down_res_rnf4(const u64* inst, u32 vblock) {
     const FfnDownResInst* i = (const FfnDownResInst*)inst;
-    float* output = i->output;
-    const float* residual = i->residual;
+    float* output_base = i->output;
+    const float* residual_base = i->residual;
     const unsigned char* w_down = i->w_down;
-    const float* scratch = i->ffn_act;
+    const float* scratch_base = i->ffn_act;
     int hidden_size = (int)i->hs;
     int intermediate_size = (int)i->intermediate;
+    int batch = (int)i->batch;
+    if (batch <= 1) batch = 1;
 
-    int row = vblock;
-    if (row >= hidden_size) return;
+    int row = vblock % hidden_size;
+    int batch_idx = vblock / hidden_size;
+    if (batch_idx >= batch) return;
+
+    float* output = output_base + (long long)batch_idx * hidden_size;
+    const float* residual = residual_base + (long long)batch_idx * hidden_size;
+    const float* scratch = scratch_base + (long long)batch_idx * intermediate_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
