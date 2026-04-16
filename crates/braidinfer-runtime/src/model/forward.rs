@@ -361,38 +361,18 @@ impl Model {
         // Input is mamba2_in_proj[intermediate..intermediate+cd], output to mamba2_conv_out
         {
             let state = &mut self.mamba2_states[mamba2_idx];
-            let func = self
-                .kernels
-                .causal_conv1d
-                .module
-                .get_function("causal_conv1d_update_bias_f32")?;
-            let mut state_ptr: *mut std::ffi::c_void = state.conv.as_mut_ptr().cast();
-            let mut in_ptr: *const std::ffi::c_void =
-                unsafe { self.activations.mamba2_in_proj.as_ptr().add(nh * hd).cast() };
-            let mut w_ptr: *const std::ffi::c_void = unsafe { (*w).conv1d_weight.as_ptr().cast() };
-            let mut bias_ptr: *const std::ffi::c_void = unsafe { (*w).conv1d_bias.as_ptr().cast() };
-            let mut out_ptr: *mut std::ffi::c_void =
-                self.activations.mamba2_conv_out.as_mut_ptr().cast();
-            let mut i_cd = cd as i32;
-            let mut i_ck = _ck as i32;
-            let mut args: [*mut std::ffi::c_void; 7] = [
-                std::ptr::addr_of_mut!(state_ptr).cast(),
-                std::ptr::addr_of_mut!(in_ptr).cast(),
-                std::ptr::addr_of_mut!(w_ptr).cast(),
-                std::ptr::addr_of_mut!(bias_ptr).cast(),
-                std::ptr::addr_of_mut!(out_ptr).cast(),
-                std::ptr::addr_of_mut!(i_cd).cast(),
-                std::ptr::addr_of_mut!(i_ck).cast(),
-            ];
-            let block_size = 256u32;
-            let grid_size = (cd as u32 + block_size - 1) / block_size;
-            func.launch(
-                (grid_size, 1, 1),
-                (block_size, 1, 1),
-                0,
-                &self.stream,
-                &mut args,
-            )?;
+            unsafe {
+                self.kernels.causal_conv1d.forward_with_bias_ptr(
+                    state.conv.as_mut_ptr(),
+                    self.activations.mamba2_in_proj.as_ptr().add(nh * hd),
+                    (*w).conv1d_weight.as_ptr(),
+                    (*w).conv1d_bias.as_ptr(),
+                    self.activations.mamba2_conv_out.as_mut_ptr(),
+                    cd as u32,
+                    _ck as u32,
+                    &self.stream,
+                )?;
+            }
         }
 
         if dbg {
@@ -422,54 +402,22 @@ impl Model {
         // 5. selective_state_update
         let state = &mut self.mamba2_states[mamba2_idx];
         unsafe {
-            let x_ptr = self.activations.mamba2_conv_out.as_ptr();
-            let b_ptr = self.activations.mamba2_conv_out.as_ptr().add(nh * hd);
-            let c_ptr = self
-                .activations
-                .mamba2_conv_out
-                .as_ptr()
-                .add(nh * hd + ng * sd);
-            let dt_ptr = self.activations.mamba2_in_proj.as_ptr().add(nh * hd + cd);
-
-            // Create temporary DeviceBuffer wrappers pointing to sub-regions
-            // We need to call the kernel with raw pointers
-            let func = self
-                .kernels
-                .ssm_update
-                .module
-                .get_function("selective_state_update_f32")?;
-            let mut state_ptr: *mut std::ffi::c_void = state.ssm.as_mut_ptr().cast();
-            let mut x_p: *const std::ffi::c_void = x_ptr.cast();
-            let mut dt_p: *const std::ffi::c_void = dt_ptr.cast();
-            let mut dt_bias_p: *const std::ffi::c_void = (*w).dt_bias.as_ptr().cast();
-            let mut a_log_p: *const std::ffi::c_void = (*w).a_log.as_ptr().cast();
-            let mut b_p: *const std::ffi::c_void = b_ptr.cast();
-            let mut c_p: *const std::ffi::c_void = c_ptr.cast();
-            let mut d_p: *const std::ffi::c_void = (*w).d.as_ptr().cast();
-            let mut out_p: *mut std::ffi::c_void =
-                self.activations.mamba2_ssm_out.as_mut_ptr().cast();
-            let mut i_nh = nh as i32;
-            let mut i_hd = hd as i32;
-            let mut i_sd = sd as i32;
-            let mut i_ng = ng as i32;
-
-            let mut args: [*mut std::ffi::c_void; 13] = [
-                std::ptr::addr_of_mut!(state_ptr).cast(),
-                std::ptr::addr_of_mut!(x_p).cast(),
-                std::ptr::addr_of_mut!(dt_p).cast(),
-                std::ptr::addr_of_mut!(dt_bias_p).cast(),
-                std::ptr::addr_of_mut!(a_log_p).cast(),
-                std::ptr::addr_of_mut!(b_p).cast(),
-                std::ptr::addr_of_mut!(c_p).cast(),
-                std::ptr::addr_of_mut!(d_p).cast(),
-                std::ptr::addr_of_mut!(out_p).cast(),
-                std::ptr::addr_of_mut!(i_nh).cast(),
-                std::ptr::addr_of_mut!(i_hd).cast(),
-                std::ptr::addr_of_mut!(i_sd).cast(),
-                std::ptr::addr_of_mut!(i_ng).cast(),
-            ];
-
-            func.launch((nh as u32, 1, 1), (256, 1, 1), 0, &self.stream, &mut args)?;
+            self.kernels.ssm_update.forward_ptr(
+                state.ssm.as_mut_ptr(),
+                self.activations.mamba2_conv_out.as_ptr(),
+                self.activations.mamba2_in_proj.as_ptr().add(nh * hd + cd),
+                (*w).dt_bias.as_ptr(),
+                (*w).a_log.as_ptr(),
+                self.activations.mamba2_conv_out.as_ptr().add(nh * hd),
+                self.activations.mamba2_conv_out.as_ptr().add(nh * hd + ng * sd),
+                (*w).d.as_ptr(),
+                self.activations.mamba2_ssm_out.as_mut_ptr(),
+                nh as u32,
+                hd as u32,
+                sd as u32,
+                ng as u32,
+                &self.stream,
+            )?;
         }
 
         if dbg {
@@ -496,40 +444,19 @@ impl Model {
         // Mamba2/Nemotron uses norm_before_gate=False: norm the gated product.
         // Per-group norm (group_size = intermediate / n_groups).
         let group_size = (nh * hd / ng) as u32;
-        {
-            let func = self
-                .kernels
-                .rmsnorm_gated
-                .module
-                .get_function("rmsnorm_gated_post_f32")?;
-            for g in 0..ng {
-                let off = g * group_size as usize;
-                let mut out_p: *mut std::ffi::c_void = unsafe {
-                    self.activations
-                        .mamba2_conv_out
-                        .as_mut_ptr()
-                        .add(off)
-                        .cast()
-                };
-                let mut x_p: *const std::ffi::c_void =
-                    unsafe { self.activations.mamba2_ssm_out.as_ptr().add(off).cast() };
-                let mut z_p: *const std::ffi::c_void =
-                    unsafe { self.activations.mamba2_in_proj.as_ptr().add(off).cast() };
-                let mut w_p: *const std::ffi::c_void =
-                    unsafe { (*w).norm_weight.as_ptr().add(off).cast() };
-                let mut i_nh = 1i32;
-                let mut i_vd = group_size as i32;
-                let mut f_eps = eps;
-                let mut args: [*mut std::ffi::c_void; 7] = [
-                    std::ptr::addr_of_mut!(out_p).cast(),
-                    std::ptr::addr_of_mut!(x_p).cast(),
-                    std::ptr::addr_of_mut!(z_p).cast(),
-                    std::ptr::addr_of_mut!(w_p).cast(),
-                    std::ptr::addr_of_mut!(i_nh).cast(),
-                    std::ptr::addr_of_mut!(i_vd).cast(),
-                    std::ptr::addr_of_mut!(f_eps).cast(),
-                ];
-                func.launch((1, 1, 1), (256, 1, 1), 256 * 4, &self.stream, &mut args)?;
+        for g in 0..ng {
+            let off = g * group_size as usize;
+            unsafe {
+                self.kernels.rmsnorm_gated.forward_post_ptr(
+                    self.activations.mamba2_conv_out.as_mut_ptr().add(off),
+                    self.activations.mamba2_ssm_out.as_ptr().add(off),
+                    self.activations.mamba2_in_proj.as_ptr().add(off),
+                    (*w).norm_weight.as_ptr().add(off),
+                    1,
+                    group_size,
+                    eps,
+                    &self.stream,
+                )?;
             }
         }
 

@@ -605,6 +605,41 @@ impl CausalConv1dUpdateKernel {
         let grid_size = (conv_dim + block_size - 1) / block_size;
         func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
     }
+
+    /// Raw-pointer variant for Mamba2: input/output may be sub-regions of packed buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_bias_ptr(
+        &self,
+        state_ptr: *mut f32,
+        input_ptr: *const f32,
+        weight_ptr: *const u16,
+        bias_ptr: *const f32,
+        output_ptr: *mut f32,
+        conv_dim: u32,
+        kernel_size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("causal_conv1d_update_bias_f32")?;
+        let mut sp = state_ptr as *mut c_void;
+        let mut ip = input_ptr as *const c_void;
+        let mut wp = weight_ptr as *const c_void;
+        let mut bp = bias_ptr as *const c_void;
+        let mut op = output_ptr as *mut c_void;
+        let mut cd = conv_dim as i32;
+        let mut ks = kernel_size as i32;
+        let mut args: [*mut c_void; 7] = [
+            std::ptr::addr_of_mut!(sp).cast(),
+            std::ptr::addr_of_mut!(ip).cast(),
+            std::ptr::addr_of_mut!(wp).cast(),
+            std::ptr::addr_of_mut!(bp).cast(),
+            std::ptr::addr_of_mut!(op).cast(),
+            std::ptr::addr_of_mut!(cd).cast(),
+            std::ptr::addr_of_mut!(ks).cast(),
+        ];
+        let block_size = 256u32;
+        let grid_size = (conv_dim + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
 }
 
 pub struct GdnGateKernel {
@@ -1059,6 +1094,57 @@ impl SelectiveStateUpdateKernel {
             std::ptr::addr_of_mut!(ng).cast(),
         ];
 
+        func.launch((num_heads, 1, 1), (256, 1, 1), 0, stream, &mut args)
+    }
+
+    /// Raw-pointer variant: x/dt/b/c may be sub-regions of packed activation buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_ptr(
+        &self,
+        ssm_state: *mut f32,
+        x: *const f32,
+        dt: *const f32,
+        dt_bias: *const f32,
+        a_log: *const f32,
+        b: *const f32,
+        c: *const f32,
+        d_param: *const f32,
+        output: *mut f32,
+        num_heads: u32,
+        head_dim: u32,
+        state_size: u32,
+        n_groups: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("selective_state_update_f32")?;
+        let mut state_p = ssm_state as *mut c_void;
+        let mut x_p = x as *const c_void;
+        let mut dt_p = dt as *const c_void;
+        let mut dt_bias_p = dt_bias as *const c_void;
+        let mut a_log_p = a_log as *const c_void;
+        let mut b_p = b as *const c_void;
+        let mut c_p = c as *const c_void;
+        let mut d_p = d_param as *const c_void;
+        let mut out_p = output as *mut c_void;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ss = state_size as i32;
+        let mut ng = n_groups as i32;
+        let mut args: [*mut c_void; 13] = [
+            std::ptr::addr_of_mut!(state_p).cast(),
+            std::ptr::addr_of_mut!(x_p).cast(),
+            std::ptr::addr_of_mut!(dt_p).cast(),
+            std::ptr::addr_of_mut!(dt_bias_p).cast(),
+            std::ptr::addr_of_mut!(a_log_p).cast(),
+            std::ptr::addr_of_mut!(b_p).cast(),
+            std::ptr::addr_of_mut!(c_p).cast(),
+            std::ptr::addr_of_mut!(d_p).cast(),
+            std::ptr::addr_of_mut!(out_p).cast(),
+            std::ptr::addr_of_mut!(nh).cast(),
+            std::ptr::addr_of_mut!(hd).cast(),
+            std::ptr::addr_of_mut!(ss).cast(),
+            std::ptr::addr_of_mut!(ng).cast(),
+        ];
         func.launch((num_heads, 1, 1), (256, 1, 1), 0, stream, &mut args)
     }
 }

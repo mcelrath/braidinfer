@@ -215,4 +215,45 @@ impl RmsNormGatedKernel {
             &mut args,
         )
     }
+
+    /// Post-norm gated variant (norm_before_gate=False): output = rms_norm(x * silu(z)) * weight.
+    /// Used by Mamba2 per-group norm. Raw-pointer API for sub-region access.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_post_ptr(
+        &self,
+        output: *mut f32,
+        x: *const f32,
+        z: *const f32,
+        weight: *const f32,
+        num_heads: u32,
+        value_dim: u32,
+        eps: f32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("rmsnorm_gated_post_f32")?;
+        let mut out_p = output as *mut c_void;
+        let mut x_p = x as *const c_void;
+        let mut z_p = z as *const c_void;
+        let mut w_p = weight as *const c_void;
+        let mut nh = num_heads as i32;
+        let mut vd = value_dim as i32;
+        let mut ep = eps;
+        let mut args: [*mut c_void; 7] = [
+            std::ptr::addr_of_mut!(out_p).cast(),
+            std::ptr::addr_of_mut!(x_p).cast(),
+            std::ptr::addr_of_mut!(z_p).cast(),
+            std::ptr::addr_of_mut!(w_p).cast(),
+            std::ptr::addr_of_mut!(nh).cast(),
+            std::ptr::addr_of_mut!(vd).cast(),
+            std::ptr::addr_of_mut!(ep).cast(),
+        ];
+        let block_size = 256u32.min(value_dim);
+        func.launch(
+            (num_heads, 1, 1),
+            (block_size, 1, 1),
+            block_size * 4,
+            stream,
+            &mut args,
+        )
+    }
 }
