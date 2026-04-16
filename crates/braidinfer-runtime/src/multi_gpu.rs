@@ -3,7 +3,7 @@
 use crate::kernel::{DeinterleaveKernel, GqaAttentionKernel, MRoPEKernel, QkNormKernel};
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::Device;
-use braidinfer_hip::memory::{DeviceBuffer, PinnedBuffer};
+use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{HipResult, ffi};
@@ -45,21 +45,8 @@ impl Drop for HipEvent {
 pub struct GpuWorker {
     pub device: DeviceId,
     pub compute_stream: Stream,
-    pub transfer_stream: Stream,
-    pub broadcast_done: HipEvent, // signaled after activation arrives
-    pub compute_done: HipEvent,   // signaled after expert FFN completes
-    // Per-worker activation and scratch buffers
-    pub activation_in: DeviceBuffer<f32>, // [hidden_size] — receives broadcast
-    pub expert_out: DeviceBuffer<f32>,    // [hidden_size] — accumulated output
-    pub scratch_gate: DeviceBuffer<f32>,  // [max_expert_intermediate_size]
-    pub scratch_up: DeviceBuffer<f32>,    // [max_expert_intermediate_size]
-    pub scratch_act: DeviceBuffer<f32>,   // [max_expert_intermediate_size]
-    pub scratch_down: DeviceBuffer<f32>,  // [hidden_size] — down proj output before scale_add
-    pub transfer_done: HipEvent,          // signaled after D2H gather completes
     // Compute-path P2P copy kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe)
     pub peer_copy_module: Module,
-    // Pre-allocated pinned host buffer for async gather (hipHostMalloc for true async DMA)
-    pub gather_host: PinnedBuffer<f32>,
     // Head-parallel attention buffers (allocated by init_attn_buffers after construction)
     pub attn_kv_caches: Vec<crate::weights::KvCache>, // [num_attn_layers], each [local_nkh, max_seq_len, hd]
     pub attn_q: Option<DeviceBuffer<f32>>,            // [local_nqh * head_dim]
@@ -85,9 +72,6 @@ pub struct GpuWorker {
 pub struct MultiGpuContext {
     pub num_devices: usize,
     pub workers: Vec<GpuWorker>,
-    pub gather_stream: Stream, // on GPU 0, used to gather results from workers
-    pub gather_done: HipEvent, // signaled after all results gathered
-    pub fc1_done: HipEvent,   // signaled after fc1_latent_proj completes on GPU 0 compute stream
 }
 
 impl MultiGpuContext {
@@ -138,21 +122,10 @@ impl MultiGpuContext {
             workers.push(GpuWorker {
                 device,
                 compute_stream: Stream::new(device)?,
-                transfer_stream: Stream::new(device)?,
-                broadcast_done: HipEvent::new()?,
-                compute_done: HipEvent::new()?,
-                activation_in: DeviceBuffer::<f32>::alloc(device, hidden_size)?,
-                expert_out: DeviceBuffer::<f32>::alloc(device, hidden_size)?,
-                scratch_gate: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
-                scratch_up: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
-                scratch_act: DeviceBuffer::<f32>::alloc(device, max_expert_is)?,
-                scratch_down: DeviceBuffer::<f32>::alloc(device, hidden_size)?,
-                transfer_done: HipEvent::new()?,
                 peer_copy_module: Module::load(
                     device,
                     &crate::kernel::kernel_dir().join("peer_copy.hsaco"),
                 )?,
-                gather_host: PinnedBuffer::<f32>::alloc(hidden_size)?,
                 attn_kv_caches: Vec::new(),
                 attn_q: None,
                 attn_out: None,
@@ -171,21 +144,12 @@ impl MultiGpuContext {
             });
         }
 
-        // Gather stream + event on GPU 0
         Device::set_current(DeviceId(0))?;
-        let gather_stream = Stream::new(DeviceId(0))?;
-        let gather_done = HipEvent::new()?;
-
         eprintln!("Multi-GPU: {num_devices} devices, P2P enabled");
-
-        let fc1_done = HipEvent::new()?;
 
         Ok(Some(MultiGpuContext {
             num_devices,
             workers,
-            gather_stream,
-            gather_done,
-            fc1_done,
         }))
     }
 
