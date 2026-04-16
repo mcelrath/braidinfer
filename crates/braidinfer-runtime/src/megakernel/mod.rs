@@ -170,6 +170,10 @@ impl PrefillBuffers {
 pub(crate) mod instructions;
 pub(crate) use instructions::*;
 
+mod compile_common;
+mod compile_attention;
+mod compile_layers;
+mod compile_moe;
 mod megakernel_compile;
 mod megakernel_run;
 
