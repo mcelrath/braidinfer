@@ -112,7 +112,11 @@ impl PersistentDispatch {
             let func = module.get_function("persistent_worker")?;
             let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
             let mut args: [*mut std::ffi::c_void; 1] = [std::ptr::addr_of_mut!(queue_ptr).cast()];
-            let bpsm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+            // Cap at 2 blocks/SM to match __launch_bounds__(256, 2) intent.
+            // Higher occupancy (e.g. 3 blocks/SM when shared_mem is small) causes
+            // grid.sync() hangs because the virtual-block loop assumes exactly
+            // num_cus * 2 blocks are coordinating on each instruction.
+            let bpsm = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
             let num_cus = multiprocessor_count(device)?;
             let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
             func.launch_cooperative(
@@ -283,7 +287,7 @@ impl PersistentDispatch {
         let stream = Stream::new(gpu0)?;
         let module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
         let func = module.get_function("persistent_worker")?;
-        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
         let num_cus = multiprocessor_count(gpu0)?;
         let num_blocks = (blocks_per_sm as u32 * num_cus).max(num_cus);
         let mut q = queue.device_ptr() as *mut std::ffi::c_void;

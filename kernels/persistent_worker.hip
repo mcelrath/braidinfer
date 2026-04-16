@@ -78,10 +78,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
 
-        // Note: empty branch before else-if is intentional — compiler optimization
-        // artifact that reduces VGPR allocation from 252 to 182 (2 blocks/CU vs 1).
         if (opcode == OP_MOE_FFN) {
-        } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
         } else if (opcode == OP_MOE_DISPATCH) {
             op_moe_dispatch(inst, grid);

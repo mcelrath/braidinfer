@@ -186,22 +186,11 @@ impl Model {
                 return self.decode_step_persistent_multi_gpu(token_id, position);
             }
             return Err(ModelError::InvalidConfig(
-                "Multi-GPU inference requires PERSISTENT=1".to_string(),
+                "Multi-GPU inference requires persistent mode (set PERSISTENT=1)".to_string(),
             ));
         }
         if self.persistent {
-            // Single-GPU persistent path cannot handle MoE: compile() emits OP_MOE_FFN,
-            // but persistent_worker.hip has an intentional empty first branch for OP_MOE_FFN
-            // (VGPR optimization trick) so expert FFN is silently skipped → garbled output.
-            // MoE models need multi-GPU path or paged decode.
-            let has_moe = self
-                .config
-                .layers
-                .iter()
-                .any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
-            if !has_moe {
-                return self.decode_step_persistent(token_id, position);
-            }
+            return self.decode_step_persistent(token_id, position);
         }
         self.decode_step_paged(token_id, position)
     }

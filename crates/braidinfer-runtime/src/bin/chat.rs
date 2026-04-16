@@ -5,10 +5,25 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
+use braidinfer_runtime::config::FfnType;
 use braidinfer_runtime::generate::{
     ChatMessage, TokenConfig, apply_chat_template_thinking, load_tokenizer,
 };
 use braidinfer_runtime::model::Model;
+
+fn vram_free_per_gpu() -> Vec<usize> {
+    let mut count: i32 = 0;
+    unsafe { braidinfer_hip::ffi::hipGetDeviceCount(&mut count) };
+    (0..count)
+        .map(|i| {
+            unsafe { braidinfer_hip::ffi::hipSetDevice(i) };
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            unsafe { braidinfer_hip::ffi::hipMemGetInfo(&mut free, &mut total) };
+            free
+        })
+        .collect()
+}
 
 const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
@@ -76,10 +91,56 @@ async fn main() {
     let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN")
         .ok()
         .and_then(|v| v.parse().ok());
+
+    // Parse model config to detect MoE (needed for PERSISTENT auto-detection).
+    let config_path = model_dir.join("config.json");
+    let has_moe = config_path
+        .exists()
+        .then(|| braidinfer_runtime::config::ModelConfig::from_config_json(&config_path).ok())
+        .flatten()
+        .map_or(false, |c| c.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. })));
+
+    let bqnt_size_bytes: u64 = std::env::var("BQNT_PATH")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            model_dir.file_name().map(|n| {
+                model_dir
+                    .parent()
+                    .unwrap_or(model_dir)
+                    .join(format!("{}.q4.bqnt", n.to_string_lossy()))
+            })
+        })
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let free_per_gpu = vram_free_per_gpu();
+    let single_gpu_vram = free_per_gpu.first().copied().unwrap_or(0);
+    let multi_gpu = std::env::var("MULTI_GPU").is_ok()
+        || (bqnt_size_bytes > 0 && bqnt_size_bytes as usize > single_gpu_vram * 85 / 100);
+    if multi_gpu && std::env::var("MULTI_GPU").is_err() {
+        eprintln!(
+            "Auto: MULTI_GPU enabled (model {:.1}GB > single-GPU {:.1}GB free)",
+            bqnt_size_bytes as f64 / 1e9,
+            single_gpu_vram as f64 / 1e9,
+        );
+        unsafe { std::env::set_var("MULTI_GPU", "1") };
+    }
+
+    let persistent = std::env::var("PERSISTENT").as_deref() == Ok("1")
+        || multi_gpu
+        || !has_moe;
+    if persistent && std::env::var("PERSISTENT").is_err() {
+        let reason = if multi_gpu { "required for multi-GPU" } else { "non-MoE model" };
+        eprintln!("Auto: PERSISTENT enabled ({reason})");
+        unsafe { std::env::set_var("PERSISTENT", "1") };
+    }
+
     let mut model =
         Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
-    if std::env::var("MULTI_GPU").is_ok() {
+    if multi_gpu {
         model.enable_multi_gpu().expect("enable multi-GPU");
     }
 
