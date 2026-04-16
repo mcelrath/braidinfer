@@ -8,13 +8,6 @@ use crate::weights::*;
 impl Model {
     /// Uses individual kernel launches (no megakernel).
     pub(crate) fn moe_ffn_forward(&mut self, layer_idx: usize) -> HipResult<()> {
-        let sync_debug_entry = std::env::var("SYNC_DEBUG").is_ok();
-        if sync_debug_entry {
-            let has_mgpu = self.multi_gpu.is_some();
-            let dist_len = self.distributed_moe.len();
-            let has_dist = self.distributed_moe.get(layer_idx).and_then(|x| x.as_ref()).is_some();
-            eprintln!("SYNC_DEBUG: moe_ffn_forward L{layer_idx} multi_gpu={has_mgpu} dist_len={dist_len} has_dist={has_dist}");
-        }
         let moe = self.moe_weights[layer_idx]
             .as_ref()
             .expect("moe_ffn_forward called on non-MoE layer");

@@ -634,7 +634,7 @@ impl Model {
                 // 7. mRoPE on local Q+K — only for models that use RoPE
                 if self.config.use_rope {
                     let rd = self.config.rope_dim;
-                    let ms = &self.config.mrope_section;
+                    let ms = self.config.mrope_sections();
                     let mut inst = Instruction::new(OP_MROPE, (local_nqh + local_nkh) as u32);
                     inst.set_output_ptr(1, q_ptr as *mut f32);
                     inst.set_output_ptr(2, k_local_ptr as *mut f32);

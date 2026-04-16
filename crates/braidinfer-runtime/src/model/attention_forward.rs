@@ -18,23 +18,11 @@ impl Model {
         let nkh = cfg.num_kv_heads as u32;
         let hd = cfg.head_dim as u32;
         let rd = cfg.rope_dim as u32;
-        let s0 = cfg.mrope_section[0] as u32;
-        let s1 = cfg.mrope_section[1] as u32;
-        let s2 = cfg.mrope_section[2] as u32;
+        let [ms0, ms1, ms2] = cfg.mrope_sections();
+        let s0 = ms0 as u32;
+        let s1 = ms1 as u32;
+        let s2 = ms2 as u32;
         let eps = cfg.rms_norm_eps;
-        let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
-
-        macro_rules! sync_check {
-            ($label:expr) => {
-                if sync_debug {
-                    if let Err(e) = self.stream.synchronize() {
-                        eprintln!("SYNC_DEBUG: crash at L{}.{}", layer_idx, $label);
-                        return Err(e);
-                    }
-                    eprintln!("SYNC_DEBUG: L{}.{} OK", layer_idx, $label);
-                }
-            };
-        }
 
         // 1. RMSNorm
         // SAFETY: Raw pointer breaks borrow on self.layers for mutable self.activations access.
@@ -55,7 +43,6 @@ impl Model {
                 &self.stream,
             )?;
         }
-        sync_check!("rmsnorm");
 
         // 2. Project Q+gate, K, V
         // Use raw pointers to LinearWeight to work around borrow checker
@@ -82,7 +69,6 @@ impl Model {
                 hs,
                 &self.stream,
             )?;
-            sync_check!("q_proj");
             (*w_k_p).forward(
                 &self.kernels.linear_proj,
                 &mut self.activations.k_attn,
@@ -91,7 +77,6 @@ impl Model {
                 hs,
                 &self.stream,
             )?;
-            sync_check!("k_proj");
             (*w_v_p).forward(
                 &self.kernels.linear_proj,
                 &mut self.activations.v_attn,
@@ -100,7 +85,6 @@ impl Model {
                 hs,
                 &self.stream,
             )?;
-            sync_check!("v_proj");
         }
 
         // 3. Split q_gate_attn → q, gate (gated) or just copy (non-gated)
@@ -143,7 +127,6 @@ impl Model {
                 )?;
             }
         }
-        sync_check!("q_copy");
 
         // 4a. Write K,V to paged KV BEFORE QK-norm so stored K preserves full dynamic range.
         {
@@ -277,7 +260,6 @@ impl Model {
                 s2,
                 &self.stream,
             )?;
-            sync_check!("mrope");
         } // end if cfg.use_rope
 
         // 6. KV write already done at step 4a (before QK-norm) for quantization quality.
@@ -338,7 +320,6 @@ impl Model {
             k_norm_weight,
             &self.stream,
         )?;
-        sync_check!("paged_attention");
 
         // 8. Output gate (Qwen3.5 only) or pass-through
         let final_attn = if cfg.has_output_gate {

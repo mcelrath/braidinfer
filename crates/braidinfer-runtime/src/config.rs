@@ -83,8 +83,6 @@ pub struct ModelConfig {
     pub rope_dim: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
-    // mrope sections (pairs)
-    pub mrope_section: [usize; 3], // TODO(kvn.1): redundant with rope_type.sections, unify during split
     // GDN config
     pub linear_num_heads: usize,       // num_key_heads for GDN
     pub linear_num_value_heads: usize, // may differ from linear_num_heads (e.g. 4B: 32 vs 16)
@@ -117,6 +115,13 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
+    pub fn mrope_sections(&self) -> [usize; 3] {
+        match &self.rope_type {
+            RopeType::MRope { sections } => *sections,
+            _ => [0, 0, 0],
+        }
+    }
+
     pub fn qwen35_0_8b() -> Self {
         let attention_layer_indices: Vec<usize> = vec![3, 7, 11, 15, 19, 23];
         let ffn = FfnType::Dense;
@@ -141,7 +146,6 @@ impl ModelConfig {
             rope_dim: 64,
             rope_theta: 10_000_000.0,
             rms_norm_eps: 1e-6,
-            mrope_section: [11, 11, 10],
             linear_num_heads: 16,
             linear_num_value_heads: 16,
             linear_key_head_dim: 128,
@@ -523,7 +527,6 @@ impl ModelConfig {
             rope_dim,
             rope_theta,
             rms_norm_eps,
-            mrope_section,
             linear_num_heads,
             linear_num_value_heads,
             linear_key_head_dim,

@@ -1023,9 +1023,9 @@ impl MegakernelProgram {
                     inst.set_int(6, nkh as i32);
                     inst.set_int(7, hd as i32);
                     inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_section[0] as i32);
-                    inst.set_int(10, cfg.mrope_section[1] as i32);
-                    inst.set_int(11, cfg.mrope_section[2] as i32);
+                    inst.set_int(9, cfg.mrope_sections()[0] as i32);
+                    inst.set_int(10, cfg.mrope_sections()[1] as i32);
+                    inst.set_int(11, cfg.mrope_sections()[2] as i32);
                     inst.set_int(12, n as i32);
                     instructions.push(inst);
                 }
@@ -1096,9 +1096,9 @@ impl MegakernelProgram {
                     inst.set_int(6, nkh as i32);
                     inst.set_int(7, hd as i32);
                     inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_section[0] as i32);
-                    inst.set_int(10, cfg.mrope_section[1] as i32);
-                    inst.set_int(11, cfg.mrope_section[2] as i32);
+                    inst.set_int(9, cfg.mrope_sections()[0] as i32);
+                    inst.set_int(10, cfg.mrope_sections()[1] as i32);
+                    inst.set_int(11, cfg.mrope_sections()[2] as i32);
                     inst.set_int(12, 1); // batch=1 for decode
                     instructions.push(inst);
                 }
@@ -1189,9 +1189,9 @@ impl MegakernelProgram {
                     inst.set_int(6, nkh as i32);
                     inst.set_int(7, hd as i32);
                     inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_section[0] as i32);
-                    inst.set_int(10, cfg.mrope_section[1] as i32);
-                    inst.set_int(11, cfg.mrope_section[2] as i32);
+                    inst.set_int(9, cfg.mrope_sections()[0] as i32);
+                    inst.set_int(10, cfg.mrope_sections()[1] as i32);
+                    inst.set_int(11, cfg.mrope_sections()[2] as i32);
                     inst.set_int(12, n as i32);
                     instructions.push(inst);
                 }

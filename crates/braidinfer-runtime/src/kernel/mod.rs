@@ -345,45 +345,10 @@ impl MRoPEKernel {
         assert_eq!(k.device(), self.device);
         assert_eq!(inv_freq.device(), self.device);
         assert_eq!(stream.device(), self.device);
-
-        let func = self.module.get_function("mrope_f32")?;
-
-        let mut q_ptr: *mut c_void = q.as_mut_ptr().cast();
-        let mut k_ptr: *mut c_void = k.as_mut_ptr().cast();
-        let mut inv_ptr: *const c_void = inv_freq.as_ptr().cast();
-        let mut pos_ptr: *const c_void = position_ids_ptr.cast();
-        let mut nqh = num_q_heads as i32;
-        let mut nkh = num_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut rd = rope_dim as i32;
-        let mut s0 = section0_pairs as i32;
-        let mut s1 = section1_pairs as i32;
-        let mut s2 = section2_pairs as i32;
-
-        let mut args: [*mut c_void; 11] = [
-            std::ptr::addr_of_mut!(q_ptr).cast(),
-            std::ptr::addr_of_mut!(k_ptr).cast(),
-            std::ptr::addr_of_mut!(inv_ptr).cast(),
-            std::ptr::addr_of_mut!(pos_ptr).cast(),
-            std::ptr::addr_of_mut!(nqh).cast(),
-            std::ptr::addr_of_mut!(nkh).cast(),
-            std::ptr::addr_of_mut!(hd).cast(),
-            std::ptr::addr_of_mut!(rd).cast(),
-            std::ptr::addr_of_mut!(s0).cast(),
-            std::ptr::addr_of_mut!(s1).cast(),
-            std::ptr::addr_of_mut!(s2).cast(),
-        ];
-
-        let total_heads = num_q_heads + num_kv_heads;
-        let total_pairs = rope_dim / 2;
-        let block_size = 32u32.max(total_pairs).next_power_of_two().min(256);
-
-        func.launch(
-            (total_heads, 1, 1),
-            (block_size, 1, 1),
-            0,
-            stream,
-            &mut args,
+        self.forward_ptr(
+            q.as_mut_ptr(), k.as_mut_ptr(), inv_freq.as_ptr(), position_ids_ptr,
+            num_q_heads, num_kv_heads, head_dim, rope_dim,
+            section0_pairs, section1_pairs, section2_pairs, stream,
         )
     }
 

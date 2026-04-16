@@ -100,37 +100,10 @@ impl QkNormKernel {
         assert_eq!(q_weight.device(), self.device);
         assert_eq!(k_weight.device(), self.device);
         assert_eq!(stream.device(), self.device);
-
-        let func = self.module.get_function("qk_norm_f32")?;
-
-        let mut q_ptr: *mut c_void = q.as_mut_ptr().cast();
-        let mut k_ptr: *mut c_void = k.as_mut_ptr().cast();
-        let mut qw_ptr: *const c_void = q_weight.as_ptr().cast();
-        let mut kw_ptr: *const c_void = k_weight.as_ptr().cast();
-        let mut nqh = num_q_heads as i32;
-        let mut nkh = num_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut ep = eps;
-
-        let mut args: [*mut c_void; 8] = [
-            std::ptr::addr_of_mut!(q_ptr).cast(),
-            std::ptr::addr_of_mut!(k_ptr).cast(),
-            std::ptr::addr_of_mut!(qw_ptr).cast(),
-            std::ptr::addr_of_mut!(kw_ptr).cast(),
-            std::ptr::addr_of_mut!(nqh).cast(),
-            std::ptr::addr_of_mut!(nkh).cast(),
-            std::ptr::addr_of_mut!(hd).cast(),
-            std::ptr::addr_of_mut!(ep).cast(),
-        ];
-
-        let total_heads = num_q_heads + num_kv_heads;
-        let block_size = 256u32.min(head_dim);
-        func.launch(
-            (total_heads, 1, 1),
-            (block_size, 1, 1),
-            block_size * 4,
-            stream,
-            &mut args,
+        self.forward_ptr(
+            q.as_mut_ptr(), k.as_mut_ptr(),
+            q_weight.as_ptr(), k_weight.as_ptr(),
+            num_q_heads, num_kv_heads, head_dim, eps, stream,
         )
     }
 
