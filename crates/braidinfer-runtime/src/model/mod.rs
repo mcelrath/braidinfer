@@ -47,6 +47,7 @@ pub struct Model {
     pub(crate) mamba2_states: Vec<Mamba2State>,
     pub(crate) seq_len: u32,
     pub(crate) megakernel: Option<MegakernelProgram>,
+    pub(crate) prefill_bufs: Option<crate::megakernel::PrefillBuffers>,
     // Paged KV path (lazy-init)
     pub(crate) megakernel_paged: Option<MegakernelProgram>,
     pub(crate) page_allocator: Option<PageAllocator>,

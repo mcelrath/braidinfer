@@ -30,15 +30,58 @@ impl Model {
     }
 
     /// Process a sequence of tokens (prefill). Returns logits for the last token.
-    /// Saves GDN checkpoints at each 64-token chunk boundary.
+    /// In persistent mode (before worker starts): uses batched megakernel compile_prefill.
+    /// Otherwise: sequential decode_step fallback.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
         if tokens.is_empty() {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
+        // Batched path: persistent mode, worker not yet started (can still do hipMemcpy).
+        if self.persistent && self.persistent_workers.is_none() && !self.has_moe {
+            return self.prefill_batched(tokens);
+        }
+        // Sequential fallback.
         let mut logits = vec![];
         for (i, &tok) in tokens.iter().enumerate() {
-            logits = self.decode_step(tok, i as u32)?;
+            logits = self.decode_step(tok, self.seq_len + i as u32)?;
         }
+        Ok(logits)
+    }
+
+    fn prefill_batched(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, PrefillBuffers};
+
+        // Lazy-alloc prefill buffers.
+        if self.prefill_bufs.is_none() {
+            self.prefill_bufs = Some(
+                PrefillBuffers::alloc(self.device, &self.config, CHUNK_TOKENS)
+                    .map_err(ModelError::Hip)?,
+            );
+        }
+
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        let total = tokens.len();
+        let mut offset = 0;
+
+        while offset < total {
+            let end = (offset + CHUNK_TOKENS).min(total);
+            let chunk = &tokens[offset..end];
+            let start_pos = self.seq_len + offset as u32;
+
+            // take() avoids split-borrow: compile_prefill takes &Model + &mut PrefillBuffers
+            let mut bufs = self.prefill_bufs.take().unwrap();
+            let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
+                .map_err(ModelError::Hip)?;
+            self.prefill_bufs = Some(bufs);
+
+            mk.execute(&self.stream).map_err(ModelError::Hip)?;
+            self.stream.synchronize().map_err(ModelError::Hip)?;
+
+            offset = end;
+        }
+
+        self.seq_len += total as u32;
+        self.activations.logits.copy_to_host(&mut logits)?;
         Ok(logits)
     }
 

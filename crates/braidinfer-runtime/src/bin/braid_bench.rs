@@ -60,93 +60,91 @@ fn load_model(model_dir: &Path, multi_gpu: bool) -> Model {
     model
 }
 
-fn bench_decode(model: &mut Model, warmup: usize, runs: usize, positions: &[u32]) {
+fn bench_decode(model: &mut Model, warmup: usize, runs: usize) {
     println!("=== Decode benchmark ===");
     let token_id = 9906u32; // "Hello"
 
-    for &pos in positions {
-        // Warmup
-        for _ in 0..warmup {
-            model.reset_state().expect("reset");
-            // prefill up to pos
-            for p in 0..pos {
-                model.decode_step_token(token_id, p).expect("decode");
-            }
-        }
-
-        // Timed runs
-        let mut total_ns = 0u128;
-        for _ in 0..runs {
-            let t0 = Instant::now();
-            model.decode_step_token(token_id, pos).expect("decode");
-            total_ns += t0.elapsed().as_nanos();
-        }
-
-        let avg_ms = total_ns as f64 / runs as f64 / 1_000_000.0;
-        let toks_per_sec = 1000.0 / avg_ms;
-        println!("  pos={pos:4}  avg={avg_ms:7.2}ms  {toks_per_sec:6.1} tok/s");
+    // Warmup: advance position to warmup, let the model run without timing
+    for p in 0..warmup as u32 {
+        model.decode_step_token(token_id, p).expect("decode");
     }
+
+    // Timed: run `runs` consecutive decode steps and time each
+    let mut pos = warmup as u32;
+    let mut times_ns = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let t0 = Instant::now();
+        model.decode_step_token(token_id, pos).expect("decode");
+        times_ns.push(t0.elapsed().as_nanos());
+        pos += 1;
+    }
+
+    let avg_ms = times_ns.iter().sum::<u128>() as f64 / runs as f64 / 1_000_000.0;
+    let min_ms = times_ns.iter().min().unwrap().clone() as f64 / 1_000_000.0;
+    let max_ms = times_ns.iter().max().unwrap().clone() as f64 / 1_000_000.0;
+    println!(
+        "  positions {}-{}  avg={avg_ms:.2}ms  min={min_ms:.2}ms  max={max_ms:.2}ms  {:.1} tok/s",
+        warmup, warmup + runs - 1, 1000.0 / avg_ms,
+    );
 }
 
 fn bench_prefill(model: &mut Model, token_counts: &[usize]) {
-    println!("=== Prefill benchmark ===");
+    // MUST be called before bench_decode (before persistent worker starts) so reset_state works.
+    // Calls model.prefill() which uses batched megakernel compile_prefill path.
+    println!("=== Prefill benchmark (batched megakernel) ===");
     let token_id = 9906u32;
+
+    // Warmup
+    let warmup_tokens: Vec<u32> = vec![token_id; 8];
+    model.reset_state().expect("reset");
+    model.prefill(&warmup_tokens).expect("prefill warmup");
 
     for &n in token_counts {
         let tokens: Vec<u32> = vec![token_id; n];
-
-        // Warmup
-        model.reset_state().expect("reset");
-        model.prefill(&tokens).expect("prefill");
-
-        // Timed
         model.reset_state().expect("reset");
         let t0 = Instant::now();
         model.prefill(&tokens).expect("prefill");
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let toks_per_sec = n as f64 / (elapsed_ms / 1000.0);
-        println!("  n={n:4}  {elapsed_ms:7.2}ms  {toks_per_sec:7.1} tok/s");
+        println!("  n={n:4}  {elapsed_ms:7.1}ms  {toks_per_sec:6.1} tok/s");
     }
+    model.reset_state().expect("reset");
 }
 
-fn bench_coherence(model: &mut Model, prompt_len: usize, gen_len: usize) {
-    println!("=== Coherence test (determinism) ===");
+fn bench_coherence(model: &mut Model, prompt_len: usize) {
+    // MUST be called before bench_decode (before persistent worker starts) so reset_state works.
+    // Validates batched prefill logits == sequential decode logits at the last token position.
+    println!("=== Coherence test (batched prefill vs sequential decode) ===");
     let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 9906 + (i % 100)).collect();
 
-    let generate = |m: &mut Model| -> Vec<u32> {
-        m.reset_state().expect("reset");
-        m.prefill(&prompt).expect("prefill");
-        let mut tokens = Vec::with_capacity(gen_len);
-        let mut tok = prompt[prompt_len - 1];
-        for p in prompt_len..(prompt_len + gen_len) {
-            tok = m.decode_step_token(tok, p as u32).expect("decode");
-            tokens.push(tok);
-        }
-        tokens
+    let top10 = |logits: &[f32]| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.truncate(10);
+        idx
     };
 
-    let run1 = generate(model);
-    let run2 = generate(model);
+    // Sequential reference: use paged path directly so persistent worker is NOT launched,
+    // allowing reset_state() afterward without deadlock.
+    model.reset_state().expect("reset");
+    let mut seq_logits = vec![];
+    for (i, &tok) in prompt.iter().enumerate() {
+        seq_logits = model.decode_step_paged(tok, i as u32).expect("seq decode");
+    }
+    let seq_top = top10(&seq_logits);
 
-    let matches = run1.iter().zip(run2.iter()).filter(|(a, b)| a == b).count();
-    let pass = matches == gen_len;
-    println!("  runs match: {matches}/{gen_len}  [{}]", if pass { "PASS" } else { "FAIL" });
-    print!("  tokens: ");
-    for (i, &t) in run1.iter().take(20).enumerate() {
-        if i > 0 { print!(", "); }
-        print!("{t}");
-    }
-    if run1.len() > 20 { print!(", ..."); }
-    println!();
-    if !pass {
-        print!("  run2:   ");
-        for (i, &t) in run2.iter().take(20).enumerate() {
-            if i > 0 { print!(", "); }
-            print!("{t}");
-        }
-        if run2.len() > 20 { print!(", ..."); }
-        println!();
-    }
+    // Batched prefill
+    model.reset_state().expect("reset");
+    let prefill_logits = model.prefill(&prompt).expect("batched prefill");
+    let prefill_top = top10(&prefill_logits);
+
+    let matches = seq_top.iter().zip(prefill_top.iter()).filter(|(a, b)| a == b).count();
+    let pass = matches >= 8; // allow ≥8/10 match (floating-point ordering may differ slightly)
+    println!("  top-10 match: {matches}/10  [{}]", if pass { "PASS" } else { "FAIL" });
+    println!("  seq top-5:     {:?}", &seq_top[..5.min(seq_top.len())]);
+    println!("  prefill top-5: {:?}", &prefill_top[..5.min(prefill_top.len())]);
+
+    model.reset_state().expect("reset");
 }
 
 fn main() {
@@ -225,7 +223,8 @@ fn main() {
     let warmup: usize = std::env::var("BENCH_WARMUP").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let runs: usize = std::env::var("BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
 
-    bench_decode(&mut model, warmup, runs, &[0, 64, 256, 512]);
+    // Coherence and prefill FIRST: must run before persistent worker starts.
+    bench_coherence(&mut model, 8);
     bench_prefill(&mut model, &[8, 32, 128, 512]);
-    bench_coherence(&mut model, 8, 32);
+    bench_decode(&mut model, warmup, runs);
 }
