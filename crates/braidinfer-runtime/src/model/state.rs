@@ -283,10 +283,11 @@ impl Model {
         let mut conv_w_k = DeviceBuffer::<u16>::alloc(self.device, conv_k_len * ck_usize)?;
         let mut conv_w_v = DeviceBuffer::<u16>::alloc(self.device, conv_v_len * ck_usize)?;
         unsafe {
+            let conv1d = w.conv1d_weight.as_ref().expect("conv1d_weight required for trace (set TRACE env var)");
             d2d_copy_u16(
                 &mut conv_w_q,
                 0,
-                &w.conv1d_weight,
+                conv1d,
                 0,
                 conv_q_len * ck_usize,
                 &self.stream,
@@ -294,7 +295,7 @@ impl Model {
             d2d_copy_u16(
                 &mut conv_w_k,
                 0,
-                &w.conv1d_weight,
+                conv1d,
                 conv_q_len * ck_usize,
                 conv_k_len * ck_usize,
                 &self.stream,
@@ -302,7 +303,7 @@ impl Model {
             d2d_copy_u16(
                 &mut conv_w_v,
                 0,
-                &w.conv1d_weight,
+                conv1d,
                 (conv_q_len + conv_k_len) * ck_usize,
                 conv_v_len * ck_usize,
                 &self.stream,

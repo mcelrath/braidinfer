@@ -9,13 +9,6 @@ use braidinfer_hip::{HipResult, ffi};
 use safetensors::Dtype;
 
 use crate::config::*;
-use crate::kernel::{
-    ArgmaxKernel, CausalConv1dUpdateKernel, DotSigmoidScaleAddKernel, EmbeddingKernel,
-    FfnFusedKernel, GdnGateKernel, GdnRecurrentStepV2Kernel, GqaAttentionKernel,
-    LinearProjKernel, LmHeadKernel, MRoPEKernel, MoeGateKernel, OutputGateKernel,
-    PagedAttentionKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel, RmsNormKernel,
-    SelectiveStateUpdateKernel, SiluMulKernel,
-};
 pub use crate::quant::{
     LinearWeight, PackedWeights, WeightFormat, WeightQuantMode, quantize_pc_g32_q4,
     quantize_rnf4_g128,
@@ -29,7 +22,7 @@ pub struct GdnLayerWeights {
     pub w_a: LinearWeight,             // [16, 1024]
     pub w_b: LinearWeight,             // [16, 1024]
     pub w_z: LinearWeight,             // [2048, 1024]
-    pub conv1d_weight: DeviceBuffer<u16>, // bf16 [6144, 4] (kept for traced path)
+    pub conv1d_weight: Option<DeviceBuffer<u16>>, // bf16 [6144, 4] — trace path only
     pub conv1d_weight_q: DeviceBuffer<u16>, // bf16 [nh*kd, ck] pre-split Q slice
     pub conv1d_weight_k: DeviceBuffer<u16>, // bf16 [nh*kd, ck] pre-split K slice
     pub conv1d_weight_v: DeviceBuffer<u16>, // bf16 [nh*vd, ck] pre-split V slice
@@ -195,12 +188,6 @@ pub struct ActivationBuffers {
     pub position_ids: braidinfer_hip::MappedHostBuffer<i32>, // [3] — host-mapped for persistent worker path
     // conv states per GDN layer (allocated separately)
     // Pre-allocated GDN conv state temp buffers (reused each gdn_forward call)
-    pub gdn_cs_q: DeviceBuffer<f32>,       // [nh*kd*(ck-1)]
-    pub gdn_cs_k: DeviceBuffer<f32>,       // [nh*kd*(ck-1)]
-    pub gdn_cs_v: DeviceBuffer<f32>,       // [nh*vd*(ck-1)]
-    pub gdn_conv_out_q: DeviceBuffer<f32>, // [nh*kd]
-    pub gdn_conv_out_k: DeviceBuffer<f32>, // [nh*kd]
-    pub gdn_conv_out_v: DeviceBuffer<f32>, // [nh*vd]
     // Multi-GPU barrier staging: written by megakernel before OP_BARRIER, read by CPU dispatch.
     // MappedHostBuffer = GPU-writable (GART/uncached) + CPU-readable without hipMemcpy.
     pub normed_stage: MappedHostBuffer<f32>, // [hidden_size] — copy of normed for CPU broadcast
@@ -220,58 +207,6 @@ pub struct ActivationBuffers {
     pub mamba2_ssm_out: DeviceBuffer<f32>, // [intermediate] (SSM output y)
     // GPU-resident argmax
     pub argmax_result: DeviceBuffer<i32>, // [1] — single token ID
-}
-
-// ---- All kernels ----
-
-pub struct AllKernels {
-    pub rmsnorm: RmsNormKernel,
-    pub linear_proj: LinearProjKernel,
-    pub silu_mul: SiluMulKernel,
-    pub residual_add: ResidualAddKernel,
-    pub embedding: EmbeddingKernel,
-    pub lm_head: LmHeadKernel,
-    pub mrope: MRoPEKernel,
-    pub gqa_attention: GqaAttentionKernel,
-    pub paged_attention: PagedAttentionKernel,
-    pub gdn_recurrent_v2: GdnRecurrentStepV2Kernel,
-    pub causal_conv1d: CausalConv1dUpdateKernel,
-    pub qk_norm: QkNormKernel,
-    pub rmsnorm_gated: RmsNormGatedKernel,
-    pub output_gate: OutputGateKernel,
-    pub gdn_gate: GdnGateKernel,
-    pub ffn_fused: FfnFusedKernel,
-    pub ssm_update: SelectiveStateUpdateKernel,
-    pub argmax: ArgmaxKernel,
-    pub moe_gate: MoeGateKernel,
-    pub dot_sigmoid_scale_add: DotSigmoidScaleAddKernel,
-}
-
-impl AllKernels {
-    pub fn load(device: DeviceId) -> HipResult<Self> {
-        Ok(AllKernels {
-            rmsnorm: RmsNormKernel::load(device)?,
-            linear_proj: LinearProjKernel::load(device)?,
-            silu_mul: SiluMulKernel::load(device)?,
-            residual_add: ResidualAddKernel::load(device)?,
-            embedding: EmbeddingKernel::load(device)?,
-            lm_head: LmHeadKernel::load(device)?,
-            mrope: MRoPEKernel::load(device)?,
-            gqa_attention: GqaAttentionKernel::load(device)?,
-            paged_attention: PagedAttentionKernel::load(device)?,
-            gdn_recurrent_v2: GdnRecurrentStepV2Kernel::load(device)?,
-            causal_conv1d: CausalConv1dUpdateKernel::load(device)?,
-            qk_norm: QkNormKernel::load(device)?,
-            rmsnorm_gated: RmsNormGatedKernel::load(device)?,
-            output_gate: OutputGateKernel::load(device)?,
-            gdn_gate: GdnGateKernel::load(device)?,
-            ffn_fused: FfnFusedKernel::load(device)?,
-            ssm_update: SelectiveStateUpdateKernel::load(device)?,
-            argmax: ArgmaxKernel::load(device)?,
-            moe_gate: MoeGateKernel::load(device)?,
-            dot_sigmoid_scale_add: DotSigmoidScaleAddKernel::load(device)?,
-        })
-    }
 }
 
 // ---- Error type ----

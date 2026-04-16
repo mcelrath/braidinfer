@@ -492,3 +492,53 @@ impl DeinterleaveKernel {
         func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
     }
 }
+
+pub struct AllKernels {
+    pub rmsnorm: RmsNormKernel,
+    pub linear_proj: LinearProjKernel,
+    pub silu_mul: SiluMulKernel,
+    pub residual_add: ResidualAddKernel,
+    pub embedding: EmbeddingKernel,
+    pub lm_head: LmHeadKernel,
+    pub mrope: MRoPEKernel,
+    pub gqa_attention: GqaAttentionKernel,
+    pub paged_attention: PagedAttentionKernel,
+    pub gdn_recurrent_v2: GdnRecurrentStepV2Kernel,
+    pub causal_conv1d: CausalConv1dUpdateKernel,
+    pub qk_norm: QkNormKernel,
+    pub rmsnorm_gated: RmsNormGatedKernel,
+    pub output_gate: OutputGateKernel,
+    pub gdn_gate: GdnGateKernel,
+    pub ffn_fused: FfnFusedKernel,
+    pub ssm_update: SelectiveStateUpdateKernel,
+    pub argmax: ArgmaxKernel,
+    pub moe_gate: MoeGateKernel,
+    pub dot_sigmoid_scale_add: DotSigmoidScaleAddKernel,
+}
+
+impl AllKernels {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        Ok(AllKernels {
+            rmsnorm: RmsNormKernel::load(device)?,
+            linear_proj: LinearProjKernel::load(device)?,
+            silu_mul: SiluMulKernel::load(device)?,
+            residual_add: ResidualAddKernel::load(device)?,
+            embedding: EmbeddingKernel::load(device)?,
+            lm_head: LmHeadKernel::load(device)?,
+            mrope: MRoPEKernel::load(device)?,
+            gqa_attention: GqaAttentionKernel::load(device)?,
+            paged_attention: PagedAttentionKernel::load(device)?,
+            gdn_recurrent_v2: GdnRecurrentStepV2Kernel::load(device)?,
+            causal_conv1d: CausalConv1dUpdateKernel::load(device)?,
+            qk_norm: QkNormKernel::load(device)?,
+            rmsnorm_gated: RmsNormGatedKernel::load(device)?,
+            output_gate: OutputGateKernel::load(device)?,
+            gdn_gate: GdnGateKernel::load(device)?,
+            ffn_fused: FfnFusedKernel::load(device)?,
+            ssm_update: SelectiveStateUpdateKernel::load(device)?,
+            argmax: ArgmaxKernel::load(device)?,
+            moe_gate: MoeGateKernel::load(device)?,
+            dot_sigmoid_scale_add: DotSigmoidScaleAddKernel::load(device)?,
+        })
+    }
+}

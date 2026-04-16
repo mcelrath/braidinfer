@@ -8,7 +8,7 @@
 // Include all megakernel op implementations (same as megakernel.hip)
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
-#include "megakernel_moe_barrier.hip"
+#include "megakernel_moe_dispatch.hip"
 
 // Work queue for CPU → GPU communication (host-mapped memory).
 // CPU writes an instruction + increments seq_num. Worker polls seq_num.

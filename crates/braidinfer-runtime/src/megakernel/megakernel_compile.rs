@@ -5,7 +5,8 @@ use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 
-use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, OP_BARRIER, PrefillBuffers};
+use super::instructions::*;
+use super::{CHUNK_TOKENS, INST_OPCODE_MASK, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
 use super::{
     OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_CONV1D, OP_D2D_COPY,
@@ -25,7 +26,7 @@ fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight,
     use crate::model::{LinearWeight, WeightFormat};
     match weight {
         LinearWeight::Bf16(buf) => {
-            inst.set_ptr(ptr_slot, buf.as_ptr());
+            inst.words[ptr_slot] = buf.as_ptr() as u64;
         }
         LinearWeight::Packed(pw) => {
             let op = match pw.format {
@@ -35,7 +36,7 @@ fn emit_linear_proj(inst: &mut Instruction, weight: &crate::model::LinearWeight,
             };
             // Replace opcode (low 32 bits), preserve grid_x (high 32 bits)
             inst.words[0] = (inst.words[0] & 0xFFFF_FFFF_0000_0000u64) | op as u64;
-            inst.set_ptr(ptr_slot, pw.data.as_ptr());
+            inst.words[ptr_slot] = pw.data.as_ptr() as u64;
         }
     }
 }
@@ -52,18 +53,26 @@ fn emit_batched_linear_proj(
     no_sync: bool,
     instructions: &mut Vec<Instruction>,
 ) {
-    // All weight formats support batched projection via slot 6
-    let mut inst = Instruction::new(OP_LINEAR_PROJ, out_dim as u32);
-    inst.set_output_ptr(1, output);
-    emit_linear_proj(&mut inst, weight, 2);
-    inst.set_ptr(3, input);
-    inst.set_int(4, out_dim as i32);
-    inst.set_int(5, in_dim as i32);
-    inst.set_int(6, n as i32);
-    if no_sync {
-        inst.set_no_sync();
+    let (opcode, w_ptr) = linear_proj_opcode_ptr(weight);
+    let inst = LinearProjInst::new(opcode, out_dim as u32, output, w_ptr, input, out_dim as i32, in_dim as i32, n as i32);
+    let inst = if no_sync { inst.no_sync() } else { inst };
+    instructions.push(inst.into_inst());
+}
+
+/// Return (opcode, weight_data_ptr) for a LinearWeight.
+fn linear_proj_opcode_ptr(weight: &crate::model::LinearWeight) -> (u32, *const u8) {
+    use crate::model::{LinearWeight, WeightFormat};
+    match weight {
+        LinearWeight::Bf16(buf) => (OP_LINEAR_PROJ, buf.as_ptr() as *const u8),
+        LinearWeight::Packed(pw) => {
+            let op = match pw.format {
+                WeightFormat::Rnf4G128 => OP_LINEAR_PROJ_RNF4,
+                WeightFormat::PcG32Q4 => OP_LINEAR_PROJ_PCG32,
+                WeightFormat::Bf16 => OP_LINEAR_PROJ,
+            };
+            (op, pw.data.as_ptr())
+        }
     }
-    instructions.push(inst);
 }
 
 /// Choose RMSNorm opcode based on model config.
@@ -168,14 +177,13 @@ impl MegakernelProgram {
 
         // Embedding (token_id placeholder = 0, updated per step)
         let embedding_inst_idx = instructions.len();
-        {
-            let mut inst = Instruction::new(OP_EMBEDDING, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, model.embed_weight.as_ptr());
-            inst.set_int(3, 0); // token_id — updated per step
-            inst.set_int(4, hs as i32);
-            instructions.push(inst);
-        }
+        instructions.push(EmbeddingInst::new(
+            div_ceil(hs as u32, 256),
+            act.hidden.as_write_ptr(),
+            model.embed_weight.as_ptr(),
+            0, // token_id — updated per step
+            hs as i32,
+        ).into_inst());
 
         // Layers
         let mut attn_paged_inst_indices = Vec::new();
@@ -299,43 +307,25 @@ impl MegakernelProgram {
         }
 
         // Final RMSNorm: copy hidden→normed, then norm normed→hidden
-        {
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.normed.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-        }
-        {
-            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, act.normed.as_ptr());
-            inst.set_ptr(3, model.final_norm_weight.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_float(5, eps);
-            instructions.push(inst);
-        }
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.normed.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+        instructions.push(RmsNormInst::new(
+            rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+            act.hidden.as_write_ptr(), act.normed.as_ptr(),
+            model.final_norm_weight.as_ptr(), hs as i32, eps,
+        ).into_inst());
 
-        // LM head (= linear_proj with vocab_size output rows)
+        // LM head
         {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, vs as u32);
-            inst.set_output_ptr(1, act.logits.as_write_ptr());
-            inst.set_ptr(
-                2,
-                if model.config.tie_word_embeddings {
-                    model.embed_weight.as_ptr()
-                } else {
-                    model.lm_head_weight.as_ptr()
-                },
-            );
-            inst.set_ptr(3, act.hidden.as_ptr());
-            inst.set_int(4, vs as i32);
-            inst.set_int(5, hs as i32);
-            instructions.push(inst);
+            let lm_weight = if model.config.tie_word_embeddings {
+                model.embed_weight.as_ptr() as *const u8
+            } else {
+                model.lm_head_weight.as_ptr() as *const u8
+            };
+            instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, vs as u32, act.logits.as_write_ptr(), lm_weight, act.hidden.as_ptr(), vs as i32, hs as i32, 0).into_inst());
         }
 
         // HALT
-        instructions.push(Instruction::new(OP_HALT, 0));
+        instructions.push(HaltInst::new().into_inst());
 
         // Upload program to device
         let total_words = instructions.len() * INST_SIZE;
@@ -431,15 +421,15 @@ impl MegakernelProgram {
         // === Embedding: N lookups into prefill_bufs.hidden ===
         let embedding_inst_idx = instructions.len();
         for t in 0..n {
-            let mut inst = Instruction::new(OP_EMBEDDING, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) });
-            inst.set_ptr(2, model.embed_weight.as_ptr());
-            inst.set_int(3, tokens[t] as i32);
-            inst.set_int(4, hs as i32);
-            if t + 1 < n {
-                inst.set_no_sync();
-            }
-            instructions.push(inst);
+            let inst = EmbeddingInst::new(
+                div_ceil(hs as u32, 256),
+                unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) },
+                model.embed_weight.as_ptr(),
+                tokens[t] as i32,
+                hs as i32,
+            );
+            let inst = if t + 1 < n { inst.no_sync() } else { inst };
+            instructions.push(inst.into_inst());
         }
 
         // Upload positions into prefill_bufs.position_ids: [N × 3] i32
@@ -513,14 +503,15 @@ impl MegakernelProgram {
                 // --- Batched projections ---
                 // RMSNorm (grid_x=N, one block per token)
                 {
-                    let mut inst =
-                        Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), n as u32);
-                    inst.set_output_ptr(1, prefill_bufs.normed.as_write_ptr());
-                    inst.set_ptr(2, prefill_bufs.hidden.as_ptr());
-                    inst.set_ptr(3, w.input_norm.as_ptr());
-                    inst.set_int(4, hs as i32);
-                    inst.set_float(5, eps);
-                    instructions.push(inst);
+                    instructions.push(RmsNormInst::new(
+                        rmsnorm_opcode(cfg.rms_norm_one_plus_w),
+                        n as u32,
+                        prefill_bufs.normed.as_write_ptr(),
+                        prefill_bufs.hidden.as_ptr(),
+                        w.input_norm.as_ptr(),
+                        hs as i32,
+                        eps,
+                    ).into_inst());
                 }
 
                 // QKV projection (batch=N)
@@ -578,112 +569,99 @@ impl MegakernelProgram {
 
                 for t in 0..n {
                     // Conv1d on Q (from batched qkv[t])
-                    {
-                        let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
-                        inst.set_output_ptr(1, conv_state.as_write_ptr());
-                        inst.set_ptr(2, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim) });
-                        inst.set_ptr(3, w.conv1d_weight_q.as_ptr());
-                        inst.set_output_ptr(4, act.q_gdn.as_write_ptr());
-                        inst.set_int(5, q_dim as i32);
-                        inst.set_int(6, ck as i32);
-                        inst.set_no_sync();
-                        instructions.push(inst);
-                    }
+                    instructions.push(Conv1dInst::new(
+                        div_ceil(q_dim as u32, 256),
+                        conv_state.as_write_ptr(),
+                        unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim) },
+                        w.conv1d_weight_q.as_ptr(),
+                        act.q_gdn.as_write_ptr(),
+                        q_dim as i32,
+                        ck as i32,
+                    ).no_sync().into_inst());
+
                     // Conv1d on K
-                    {
-                        let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
-                        inst.set_output_ptr(1, unsafe {
-                            conv_state.as_write_ptr().add(q_dim * (ck - 1))
-                        });
-                        inst.set_ptr(2, unsafe {
-                            prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim)
-                        });
-                        inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
-                        inst.set_output_ptr(4, act.k_gdn.as_write_ptr());
-                        inst.set_int(5, k_dim as i32);
-                        inst.set_int(6, ck as i32);
-                        inst.set_no_sync();
-                        instructions.push(inst);
-                    }
+                    instructions.push(Conv1dInst::new(
+                        div_ceil(k_dim as u32, 256),
+                        unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) },
+                        unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim) },
+                        w.conv1d_weight_k.as_ptr(),
+                        act.k_gdn.as_write_ptr(),
+                        k_dim as i32,
+                        ck as i32,
+                    ).no_sync().into_inst());
+
                     // Conv1d on V
-                    {
-                        let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
-                        inst.set_output_ptr(1, unsafe {
-                            conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1))
-                        });
-                        inst.set_ptr(2, unsafe {
-                            prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim)
-                        });
-                        inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
-                        inst.set_output_ptr(4, act.v_gdn.as_write_ptr());
-                        inst.set_int(5, v_dim as i32);
-                        inst.set_int(6, ck as i32);
-                        instructions.push(inst);
-                    }
+                    instructions.push(Conv1dInst::new(
+                        div_ceil(v_dim as u32, 256),
+                        unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) },
+                        unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim) },
+                        w.conv1d_weight_v.as_ptr(),
+                        act.v_gdn.as_write_ptr(),
+                        v_dim as i32,
+                        ck as i32,
+                    ).into_inst());
 
                     // GDN gate (from batched a_proj[t])
-                    {
-                        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nvh_gdn as u32, 256));
-                        inst.set_output_ptr(1, act.gate_gdn.as_write_ptr());
-                        inst.set_ptr(2, unsafe { prefill_bufs.a_proj.as_ptr().add(t * nvh_gdn) });
-                        inst.set_ptr(3, w.a_log.as_ptr());
-                        inst.set_ptr(4, w.dt_bias.as_ptr());
-                        inst.set_int(5, nvh_gdn as i32);
-                        instructions.push(inst);
-                    }
+                    instructions.push(GdnGateInst::new(
+                        div_ceil(nvh_gdn as u32, 256),
+                        act.gate_gdn.as_write_ptr(),
+                        unsafe { prefill_bufs.a_proj.as_ptr().add(t * nvh_gdn) },
+                        w.a_log.as_ptr(),
+                        w.dt_bias.as_ptr(),
+                        nvh_gdn as i32,
+                    ).into_inst());
 
                     // GDN recurrence (nvh heads with GQA key sharing)
                     {
                         let gqa_group = nvh_gdn / nh_gdn;
-                        let mut inst = Instruction::new(OP_GDN_RECUR, nvh_gdn as u32);
-                        inst.set_ptr(1, act.q_gdn.as_ptr());
-                        inst.set_ptr(2, act.k_gdn.as_ptr());
-                        inst.set_ptr(3, act.v_gdn.as_ptr());
-                        inst.set_ptr(4, act.gate_gdn.as_ptr());
-                        inst.set_ptr(5, unsafe { prefill_bufs.b_proj.as_ptr().add(t * nvh_gdn) });
-                        inst.set_output_ptr(6, gdn_state.recurrent.as_write_ptr());
-                        inst.set_output_ptr(7, act.recurrent_out.as_write_ptr());
-                        inst.set_int(8, kd as i32);
-                        inst.set_int(9, vd as i32);
-                        inst.set_int(10, gqa_group as i32);
-                        instructions.push(inst);
+                        instructions.push(GdnRecurInst::new(
+                            nvh_gdn as u32,
+                            act.q_gdn.as_ptr(),
+                            act.k_gdn.as_ptr(),
+                            act.v_gdn.as_ptr(),
+                            act.gate_gdn.as_ptr(),
+                            unsafe { prefill_bufs.b_proj.as_ptr().add(t * nvh_gdn) },
+                            gdn_state.recurrent.as_write_ptr(),
+                            act.recurrent_out.as_write_ptr(),
+                            kd as i32,
+                            vd as i32,
+                            gqa_group as i32,
+                        ).into_inst());
                     }
 
                     // RMSNorm gated (z from batched z_proj[t])
-                    {
-                        let mut inst = Instruction::new(OP_RMSNORM_GATE, nvh_gdn as u32);
-                        inst.set_output_ptr(1, act.normed_gated.as_write_ptr());
-                        inst.set_ptr(2, act.recurrent_out.as_ptr());
-                        inst.set_ptr(3, unsafe {
-                            prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd)
-                        });
-                        inst.set_ptr(4, w.output_norm.as_ptr());
-                        inst.set_int(5, nvh_gdn as i32);
-                        inst.set_int(6, vd as i32);
-                        inst.set_float(7, eps);
-                        instructions.push(inst);
-                    }
+                    instructions.push(RmsNormGateInst::new(
+                        nvh_gdn as u32,
+                        act.normed_gated.as_write_ptr(),
+                        act.recurrent_out.as_ptr(),
+                        unsafe { prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd) },
+                        w.output_norm.as_ptr(),
+                        nvh_gdn as i32,
+                        vd as i32,
+                        eps,
+                    ).into_inst());
 
                     // Output projection
                     {
                         let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                        inst.set_output_ptr(1, act.out_proj.as_write_ptr());
+                        inst.words[1] = act.out_proj.as_write_ptr() as u64;
                         emit_linear_proj(&mut inst, &w.w_out, 2);
-                        inst.set_ptr(3, act.normed_gated.as_ptr());
-                        inst.set_int(4, hs as i32);
-                        inst.set_int(5, (nvh_gdn * vd) as i32);
+                        inst.words[3] = act.normed_gated.as_ptr() as u64;
+                        inst.words[4] = hs as u64;
+                        inst.words[5] = (nvh_gdn * vd) as u64;
                         instructions.push(inst);
                     }
 
                     // Residual: hidden[t] = out_proj + hidden[t]
                     {
                         let hidden_t = unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) };
-                        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                        inst.set_output_ptr(1, hidden_t);
-                        inst.set_ptr(2, act.out_proj.as_ptr());
-                        inst.set_ptr(3, hidden_t);
-                        inst.set_int(4, hs as i32);
-                        instructions.push(inst);
+                        instructions.push(ResidualAddInst::new(
+                            div_ceil(hs as u32, 256),
+                            hidden_t,
+                            act.out_proj.as_ptr(),
+                            hidden_t,
+                            hs as i32,
+                        ).into_inst());
                     }
                 }
 
@@ -702,46 +680,46 @@ impl MegakernelProgram {
 
         // === Final norm + LM head (last token only) ===
         // Copy last token's hidden to act.hidden
-        {
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, unsafe { prefill_bufs.hidden.as_ptr().add((n - 1) * hs) });
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-        }
-        // RMSNorm
-        {
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.normed.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-        }
-        {
-            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, act.normed.as_ptr());
-            inst.set_ptr(3, model.final_norm_weight.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_float(5, eps);
-            instructions.push(inst);
-        }
+        instructions.push(D2dCopyInst::new(
+            div_ceil(hs as u32, 256),
+            act.hidden.as_write_ptr(),
+            unsafe { prefill_bufs.hidden.as_ptr().add((n - 1) * hs) },
+            hs as i32,
+        ).into_inst());
+        // D2D copy normed ← hidden (buffer copy before final RMSNorm)
+        instructions.push(D2dCopyInst::new(
+            div_ceil(hs as u32, 256),
+            act.normed.as_write_ptr(),
+            act.hidden.as_ptr(),
+            hs as i32,
+        ).into_inst());
+        // Final RMSNorm: hidden ← rmsnorm(normed, final_norm_weight)
+        instructions.push(RmsNormInst::new(
+            rmsnorm_opcode(cfg.rms_norm_one_plus_w),
+            1,
+            act.hidden.as_write_ptr(),
+            act.normed.as_ptr(),
+            model.final_norm_weight.as_ptr(),
+            hs as i32,
+            eps,
+        ).into_inst());
         // LM head
         {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, cfg.vocab_size as u32);
-            inst.set_output_ptr(1, act.logits.as_write_ptr());
-            inst.set_ptr(
-                2,
-                if cfg.tie_word_embeddings {
-                    model.embed_weight.as_ptr()
-                } else {
-                    model.lm_head_weight.as_ptr()
-                },
-            );
-            inst.set_ptr(3, act.hidden.as_ptr());
-            inst.set_int(4, cfg.vocab_size as i32);
-            inst.set_int(5, hs as i32);
-            instructions.push(inst);
+            let lm_w_ptr = if cfg.tie_word_embeddings {
+                model.embed_weight.as_ptr()
+            } else {
+                model.lm_head_weight.as_ptr()
+            };
+            instructions.push(LinearProjInst::new(
+                OP_LINEAR_PROJ,
+                cfg.vocab_size as u32,
+                act.logits.as_write_ptr(),
+                lm_w_ptr as *const u8,
+                act.hidden.as_ptr(),
+                cfg.vocab_size as i32,
+                hs as i32,
+                0,
+            ).into_inst());
         }
         instructions.push(Instruction::new(OP_HALT, 0));
 
@@ -868,79 +846,21 @@ impl MegakernelProgram {
         };
 
         // 1. RMSNorm
-        {
-            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), n as u32);
-            inst.set_output_ptr(1, normed_ptr);
-            inst.set_ptr(2, hidden_ptr);
-            inst.set_ptr(3, w.input_norm.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_float(5, eps);
-            instructions.push(inst);
-        }
+        instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), n as u32, normed_ptr, hidden_ptr, w.input_norm.as_ptr(), hs as i32, eps).into_inst());
 
         // 2. Q(+gate), K, V projections
         let q_mult = if cfg.has_output_gate { 2 } else { 1 };
-        emit_batched_linear_proj(
-            &w.w_q_gate,
-            q_gate_attn_ptr,
-            normed_ptr,
-            nqh * hd * q_mult,
-            hs,
-            n,
-            true,
-            instructions,
-        );
-        emit_batched_linear_proj(
-            &w.w_k,
-            k_attn_ptr,
-            normed_ptr,
-            nkh * hd,
-            hs,
-            n,
-            true,
-            instructions,
-        );
-        emit_batched_linear_proj(
-            &w.w_v,
-            v_attn_ptr,
-            normed_ptr,
-            nkh * hd,
-            hs,
-            n,
-            false,
-            instructions,
-        );
+        emit_batched_linear_proj(&w.w_q_gate, q_gate_attn_ptr, normed_ptr, nqh * hd * q_mult, hs, n, true, instructions);
+        emit_batched_linear_proj(&w.w_k, k_attn_ptr, normed_ptr, nkh * hd, hs, n, true, instructions);
+        emit_batched_linear_proj(&w.w_v, v_attn_ptr, normed_ptr, nkh * hd, hs, n, false, instructions);
 
-        // 3. Deinterleave Q+gate → Q, gate (only for gated Q models like Qwen3.5)
+        // 3. Deinterleave Q+gate → Q, gate
         if !cfg.has_output_gate {
-            // No gate: Q projection writes directly to q_gate_attn which IS q_attn
-            // Just copy q_gate_attn → q_attn (they may be different buffers)
-            if n > 1 {
-                let total = n * nqh * hd;
-                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(total as u32, 256));
-                inst.set_output_ptr(1, q_attn_ptr);
-                inst.set_ptr(2, q_gate_attn_ptr);
-                inst.set_int(3, total as i32);
-                instructions.push(inst);
-            } else {
-                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((nqh * hd) as u32, 256));
-                inst.set_output_ptr(1, q_attn_ptr);
-                inst.set_ptr(2, q_gate_attn_ptr);
-                inst.set_int(3, (nqh * hd) as i32);
-                instructions.push(inst);
-            }
+            let total = n * nqh * hd;
+            instructions.push(D2dCopyInst::new(div_ceil(total as u32, 256), q_attn_ptr, q_gate_attn_ptr as *const f32, total as i32).into_inst());
         } else {
-            // Use OP_DEINTERLEAVE for both batched and single-token (batch=1 handled by kernel).
-            // Replaces per-head D2D_COPY loop (48 instrs for nqh=24) with a single instruction.
             let total_elems = n * nqh * hd;
-            let mut inst = Instruction::new(OP_DEINTERLEAVE, div_ceil(total_elems as u32, 256));
-            inst.set_output_ptr(1, q_attn_ptr);
-            inst.set_output_ptr(2, gate_attn_ptr);
-            inst.set_ptr(3, q_gate_attn_ptr);
-            inst.set_int(4, nqh as i32);
-            inst.set_int(5, hd as i32);
-            inst.set_int(6, n as i32);
-            instructions.push(inst);
+            instructions.push(DeinterleaveInst::new(div_ceil(total_elems as u32, 256), q_attn_ptr, gate_attn_ptr, q_gate_attn_ptr as *const f32, nqh as i32, hd as i32, n as i32).into_inst());
         }
 
         // 4a. KV write for PagedKv — BEFORE QK-norm so cache stores pre-norm K/V.
@@ -963,25 +883,12 @@ impl MegakernelProgram {
                 let mut head_indices = Vec::new();
                 for h in 0..nkh {
                     let k_copy_idx = instructions.len();
-                    {
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, std::ptr::null_mut::<f32>());
-                        inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
-                        inst.set_int(3, hd as i32);
-                        inst.set_no_sync();
-                        instructions.push(inst);
-                    }
+                    let ki = D2dCopyInst::new(div_ceil(hd as u32, 256), std::ptr::null_mut::<f32>(), unsafe { k_attn_ptr.add(h * hd) as *const f32 }, hd as i32).no_sync();
+                    instructions.push(ki.into_inst());
                     let v_copy_idx = instructions.len();
-                    {
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, std::ptr::null_mut::<f32>());
-                        inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
-                        inst.set_int(3, hd as i32);
-                        if h < nkh - 1 {
-                            inst.set_no_sync();
-                        }
-                        instructions.push(inst);
-                    }
+                    let vi = D2dCopyInst::new(div_ceil(hd as u32, 256), std::ptr::null_mut::<f32>(), unsafe { v_attn_ptr.add(h * hd) as *const f32 }, hd as i32);
+                    let vi = if h < nkh - 1 { vi.no_sync() } else { vi };
+                    instructions.push(vi.into_inst());
                     head_indices.push((k_copy_idx, v_copy_idx));
                 }
                 kv_write_indices.push(head_indices);
@@ -990,19 +897,18 @@ impl MegakernelProgram {
 
         // 4b. QK norm (only for models that have qk_norm weights — e.g. Qwen3.5, not Mistral)
         if cfg.has_qk_norm {
-            let mut inst = Instruction::new(OP_QK_NORM, (n * (nqh + nkh)) as u32);
-            inst.set_output_ptr(1, q_attn_ptr);
-            inst.set_output_ptr(2, k_attn_ptr);
-            inst.set_ptr(3, w.q_norm.as_ptr());
-            inst.set_ptr(4, w.k_norm.as_ptr());
-            inst.set_int(5, nqh as i32);
-            inst.set_int(6, nkh as i32);
-            inst.set_int(7, hd as i32);
-            inst.set_float(8, eps);
-            if n > 1 {
-                inst.set_int(9, n as i32);
-            }
-            instructions.push(inst);
+            instructions.push(QkNormInst::new(
+                (n * (nqh + nkh)) as u32,
+                q_attn_ptr,
+                k_attn_ptr,
+                w.q_norm.as_ptr(),
+                w.k_norm.as_ptr(),
+                nqh as i32,
+                nkh as i32,
+                hd as i32,
+                eps,
+                if n > 1 { n as i32 } else { 0 },
+            ).into_inst());
         }
 
         // Steps 5/6: variant-specific attention ops. PagedKv KV write already done above.
@@ -1013,22 +919,16 @@ impl MegakernelProgram {
                 // mRoPE first (step 5), then KV write (step 6), then GQA (step 7)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
-                {
-                    let mut inst = Instruction::new(OP_MROPE, (n * (nqh + nkh)) as u32);
-                    inst.set_output_ptr(1, q_attn_ptr);
-                    inst.set_output_ptr(2, k_attn_ptr);
-                    inst.set_ptr(3, act.inv_freq.as_ptr());
-                    inst.set_ptr(4, position_ids_ptr);
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_sections()[0] as i32);
-                    inst.set_int(10, cfg.mrope_sections()[1] as i32);
-                    inst.set_int(11, cfg.mrope_sections()[2] as i32);
-                    inst.set_int(12, n as i32);
-                    instructions.push(inst);
-                }
+                instructions.push(MropeInst::new(
+                    (n * (nqh + nkh)) as u32,
+                    q_attn_ptr, k_attn_ptr,
+                    act.inv_freq.as_ptr(), position_ids_ptr,
+                    nqh as i32, nkh as i32, hd as i32, rd as i32,
+                    cfg.mrope_sections()[0] as i32,
+                    cfg.mrope_sections()[1] as i32,
+                    cfg.mrope_sections()[2] as i32,
+                    n as i32,
+                ).into_inst());
 
                 // Per-head D2D_COPY for [H,T,D] layout: each head's cache slot
                 // is at base + h * max_seq_len * hd, updated at runtime with position offset.
@@ -1038,25 +938,22 @@ impl MegakernelProgram {
                     let mut head_indices = Vec::new();
                     for h in 0..nkh {
                         let k_copy_idx = instructions.len();
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe {
-                            kv_cache.k.as_write_ptr().add(h * head_stride)
-                        });
-                        inst.set_ptr(2, unsafe { k_attn_ptr.add(h * hd) });
-                        inst.set_int(3, hd as i32);
-                        inst.set_no_sync();
-                        instructions.push(inst);
+                        let ki = D2dCopyInst::new(
+                            div_ceil(hd as u32, 256),
+                            unsafe { kv_cache.k.as_write_ptr().add(h * head_stride) },
+                            unsafe { k_attn_ptr.add(h * hd) as *const f32 },
+                            hd as i32,
+                        ).no_sync();
+                        instructions.push(ki.into_inst());
                         let v_copy_idx = instructions.len();
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, unsafe {
-                            kv_cache.v.as_write_ptr().add(h * head_stride)
-                        });
-                        inst.set_ptr(2, unsafe { v_attn_ptr.add(h * hd) });
-                        inst.set_int(3, hd as i32);
-                        if h < nkh - 1 {
-                            inst.set_no_sync();
-                        }
-                        instructions.push(inst);
+                        let vi = D2dCopyInst::new(
+                            div_ceil(hd as u32, 256),
+                            unsafe { kv_cache.v.as_write_ptr().add(h * head_stride) },
+                            unsafe { v_attn_ptr.add(h * hd) as *const f32 },
+                            hd as i32,
+                        );
+                        let vi = if h < nkh - 1 { vi.no_sync() } else { vi };
+                        instructions.push(vi.into_inst());
                         head_indices.push((k_copy_idx, v_copy_idx));
                     }
                     kv_write_indices.push(head_indices);
@@ -1066,17 +963,16 @@ impl MegakernelProgram {
                 // GQA attention
                 let gqa_idx = instructions.len();
                 gqa_attn_inst_indices.push(gqa_idx);
-                let mut inst = Instruction::new(OP_GQA_ATTN, nqh as u32);
-                inst.set_output_ptr(1, attn_out_ptr);
-                inst.set_ptr(2, q_attn_ptr);
-                inst.set_ptr(3, kv_cache.k.as_ptr());
-                inst.set_ptr(4, kv_cache.v.as_ptr());
-                inst.set_int(5, nqh as i32);
-                inst.set_int(6, nkh as i32);
-                inst.set_int(7, hd as i32);
-                inst.set_int(8, 1); // seq_len — updated per step
-                inst.set_int(9, cfg.max_seq_len as i32);
-                instructions.push(inst);
+                instructions.push(GqaAttnInst::new(
+                    nqh as u32,
+                    attn_out_ptr,
+                    q_attn_ptr as *const f32,
+                    kv_cache.k.as_ptr(),
+                    kv_cache.v.as_ptr(),
+                    nqh as i32, nkh as i32, hd as i32,
+                    1, // seq_len — updated per step
+                    cfg.max_seq_len as i32,
+                ).into_inst());
             }
 
             AttentionVariant::PagedKv { attn_layer_index } => {
@@ -1086,22 +982,16 @@ impl MegakernelProgram {
                 // mRoPE after KV write (applied to working Q/K buffers, not cache)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
-                {
-                    let mut inst = Instruction::new(OP_MROPE, (nqh + nkh) as u32);
-                    inst.set_output_ptr(1, q_attn_ptr);
-                    inst.set_output_ptr(2, k_attn_ptr);
-                    inst.set_ptr(3, act.inv_freq.as_ptr());
-                    inst.set_ptr(4, position_ids_ptr);
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_sections()[0] as i32);
-                    inst.set_int(10, cfg.mrope_sections()[1] as i32);
-                    inst.set_int(11, cfg.mrope_sections()[2] as i32);
-                    inst.set_int(12, 1); // batch=1 for decode
-                    instructions.push(inst);
-                }
+                instructions.push(MropeInst::new(
+                    (nqh + nkh) as u32,
+                    q_attn_ptr, k_attn_ptr,
+                    act.inv_freq.as_ptr(), position_ids_ptr,
+                    nqh as i32, nkh as i32, hd as i32, rd as i32,
+                    cfg.mrope_sections()[0] as i32,
+                    cfg.mrope_sections()[1] as i32,
+                    cfg.mrope_sections()[2] as i32,
+                    1, // batch=1 for decode
+                ).into_inst());
 
                 // OP_ATTN_PAGED_Q: quantized attention (grid_x=0 initially, patched when chunks seal)
                 let quant_idx = instructions.len();
@@ -1111,64 +1001,36 @@ impl MegakernelProgram {
                     let chunk_tokens: usize = CHUNK_TOKENS;
                     let (q1d, q1s, rd_off, rs) =
                         quantized_kv_offsets(cfg, chunk_tokens, *attn_layer_index, false);
-                    let mut inst = Instruction::new(OP_ATTN_PAGED_Q, 0); // grid_x=0: skip until chunks are quantized
-                    inst.set_int(1, 0); // scratch ptr — patched when quantized KV is enabled
-                    inst.set_ptr(2, q_attn_ptr);
-                    inst.set_int(3, 0); // quant page_table — patched per step
-                    inst.set_int(4, 0); // position_table — patched per step
-                    inst.set_ptr(5, act.inv_freq.as_ptr());
-                    inst.set_int(6, nqh as i32);
-                    inst.set_int(7, nkh as i32);
-                    inst.set_int(8, hd as i32);
-                    inst.set_int(9, 0); // quant_seq_len — patched per step
-                    inst.set_int(10, chunk_tokens as i32);
-                    inst.set_int(11, rd as i32);
-                    inst.words[12] = q1d as u64;
-                    inst.words[13] = q1s as u64;
-                    inst.words[14] = rd_off as u64;
-                    inst.words[15] = rs as u64;
-                    // Pass k_norm weight for QK-norm after dequant (null = no QK-norm)
-                    inst.set_ptr(
-                        16,
-                        if cfg.has_qk_norm {
-                            w.k_norm.as_ptr()
-                        } else {
-                            std::ptr::null()
-                        },
-                    );
-                    inst.set_no_sync(); // no sync between quant and f32 attention
-                    instructions.push(inst);
+                    let k_norm_ptr = if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() };
+                    instructions.push(AttnPagedQInst::new(
+                        q_attn_ptr as *const f32,
+                        act.inv_freq.as_ptr(),
+                        nqh as i32, nkh as i32, hd as i32,
+                        chunk_tokens as i32,
+                        rd as i32,
+                        q1d as u64, q1s as u64, rd_off as u64, rs as u64,
+                        k_norm_ptr,
+                    ).no_sync().into_inst()); // no sync between quant and f32 attention
                 }
 
                 // OP_ATTN_PAGED: f32 attention on active chunk + merge from scratch
                 let paged_idx = instructions.len();
                 attn_paged_indices.push(paged_idx);
                 {
-                    let mut inst = Instruction::new(OP_ATTN_PAGED, nqh as u32);
-                    inst.set_output_ptr(1, attn_out_ptr);
-                    inst.set_ptr(2, q_attn_ptr);
-                    inst.set_int(3, 0); // page_table_ptr — patched per step
-                    inst.set_int(4, 0); // position_table_ptr — patched per step
-                    inst.set_ptr(5, act.inv_freq.as_ptr());
-                    inst.set_int(6, nqh as i32);
-                    inst.set_int(7, nkh as i32);
-                    inst.set_int(8, hd as i32);
-                    inst.set_int(9, 1); // seq_len — patched per step
-                    inst.set_int(10, CHUNK_TOKENS as i32);
-                    inst.set_int(11, rd as i32);
-                    inst.words[12] = paged_layer_k_offset;
-                    inst.words[13] = paged_layer_v_offset;
-                    inst.words[14] = 0; // partial_state — patched when quantized KV enabled
-                    // Pass k_norm weight for QK-norm after loading from cache (slot 16)
-                    inst.set_ptr(
-                        16,
-                        if cfg.has_qk_norm {
-                            w.k_norm.as_ptr()
-                        } else {
-                            std::ptr::null()
-                        },
-                    );
-                    instructions.push(inst);
+                    let k_norm_ptr = if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() };
+                    instructions.push(AttnPagedInst::new(
+                        nqh as u32,
+                        attn_out_ptr,
+                        q_attn_ptr as *const f32,
+                        act.inv_freq.as_ptr(),
+                        nqh as i32, nkh as i32, hd as i32,
+                        1, // seq_len — patched per step
+                        CHUNK_TOKENS as i32,
+                        rd as i32,
+                        paged_layer_k_offset,
+                        paged_layer_v_offset,
+                        k_norm_ptr,
+                    ).into_inst());
                 }
             }
 
@@ -1179,22 +1041,16 @@ impl MegakernelProgram {
                 // mRoPE first (batched)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
-                {
-                    let mut inst = Instruction::new(OP_MROPE, (n * (nqh + nkh)) as u32);
-                    inst.set_output_ptr(1, q_attn_ptr);
-                    inst.set_output_ptr(2, k_attn_ptr);
-                    inst.set_ptr(3, act.inv_freq.as_ptr());
-                    inst.set_ptr(4, position_ids_ptr);
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, rd as i32);
-                    inst.set_int(9, cfg.mrope_sections()[0] as i32);
-                    inst.set_int(10, cfg.mrope_sections()[1] as i32);
-                    inst.set_int(11, cfg.mrope_sections()[2] as i32);
-                    inst.set_int(12, n as i32);
-                    instructions.push(inst);
-                }
+                instructions.push(MropeInst::new(
+                    (n * (nqh + nkh)) as u32,
+                    q_attn_ptr, k_attn_ptr,
+                    act.inv_freq.as_ptr(), position_ids_ptr,
+                    nqh as i32, nkh as i32, hd as i32, rd as i32,
+                    cfg.mrope_sections()[0] as i32,
+                    cfg.mrope_sections()[1] as i32,
+                    cfg.mrope_sections()[2] as i32,
+                    n as i32,
+                ).into_inst());
 
                 // Per-head KV write for N tokens ([H,T,D] layout)
                 // Source k_attn is [N, nkh, hd], dest is [nkh, max_seq_len, hd]
@@ -1209,55 +1065,46 @@ impl MegakernelProgram {
                         let dst_off = h * max_sl * hd + (*start_pos as usize + t) * hd;
                         let k_dst = unsafe { kv_cache.k.as_write_ptr().add(dst_off) };
                         let k_src = unsafe { k_attn_ptr.add(src_off) };
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, k_dst);
-                        inst.set_ptr(2, k_src);
-                        inst.set_int(3, hd as i32);
-                        inst.set_no_sync();
-                        instructions.push(inst);
+                        let ki = D2dCopyInst::new(
+                            div_ceil(hd as u32, 256), k_dst, k_src as *const f32, hd as i32,
+                        ).no_sync();
+                        instructions.push(ki.into_inst());
 
                         let v_dst = unsafe { kv_cache.v.as_write_ptr().add(dst_off) };
                         let v_src = unsafe { v_attn_ptr.add(src_off) };
-                        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hd as u32, 256));
-                        inst.set_output_ptr(1, v_dst);
-                        inst.set_ptr(2, v_src);
-                        inst.set_int(3, hd as i32);
-                        if t == n - 1 && h == nkh - 1 {
-                            // last copy syncs
-                        } else {
-                            inst.set_no_sync();
-                        }
-                        instructions.push(inst);
+                        let vi = D2dCopyInst::new(
+                            div_ceil(hd as u32, 256), v_dst, v_src as *const f32, hd as i32,
+                        );
+                        let vi = if t == n - 1 && h == nkh - 1 { vi } else { vi.no_sync() };
+                        instructions.push(vi.into_inst());
                     }
                 }
 
                 // OP_ATTN_PREFILL
-                {
-                    let mut inst = Instruction::new(OP_ATTN_PREFILL, (n * nqh) as u32);
-                    inst.set_output_ptr(1, attn_out_ptr);
-                    inst.set_ptr(2, q_attn_ptr);
-                    inst.set_ptr(3, kv_cache.k.as_ptr());
-                    inst.set_ptr(4, kv_cache.v.as_ptr());
-                    inst.set_int(5, nqh as i32);
-                    inst.set_int(6, nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, *start_pos as i32);
-                    inst.set_int(9, n as i32);
-                    inst.set_int(10, cfg.max_seq_len as i32);
-                    instructions.push(inst);
-                }
+                instructions.push(AttnPrefillInst::new(
+                    (n * nqh) as u32,
+                    attn_out_ptr,
+                    q_attn_ptr as *const f32,
+                    kv_cache.k.as_ptr(),
+                    kv_cache.v.as_ptr(),
+                    nqh as i32, nkh as i32, hd as i32,
+                    *start_pos as i32,
+                    n as i32,
+                    cfg.max_seq_len as i32,
+                ).into_inst());
             }
         }
 
         // 10. Output gate (Qwen3.5 only) or pass-through
         let final_attn_ptr = if cfg.has_output_gate {
             let gate_size = n * nqh * hd;
-            let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-            inst.set_output_ptr(1, gated_out_ptr);
-            inst.set_ptr(2, attn_out_ptr);
-            inst.set_ptr(3, gate_attn_ptr);
-            inst.set_int(4, gate_size as i32);
-            instructions.push(inst);
+            instructions.push(OutputGateInst::new(
+                div_ceil(gate_size as u32, 256),
+                gated_out_ptr,
+                attn_out_ptr as *const f32,
+                gate_attn_ptr as *const f32,
+                gate_size as i32,
+            ).into_inst());
             gated_out_ptr
         } else {
             attn_out_ptr // skip output gate, use attention output directly
@@ -1277,38 +1124,37 @@ impl MegakernelProgram {
         if n > 1 {
             // Batched residual: hidden = hidden + out_proj (N tokens)
             let total = n * hs;
-            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
-            inst.set_output_ptr(1, ffn_hidden_ptr);
-            inst.set_ptr(2, out_proj_ptr);
-            inst.set_ptr(3, ffn_hidden_ptr);
-            inst.set_int(4, total as i32);
-            instructions.push(inst);
+            instructions.push(ResidualAddInst::new(
+                div_ceil(total as u32, 256),
+                ffn_hidden_ptr,
+                out_proj_ptr as *const f32,
+                ffn_hidden_ptr as *const f32,
+                total as i32,
+            ).into_inst());
         } else if prefill.is_some() {
             // Single-token prefill: residual uses prefill buffer (hidden_ptr = pb.hidden)
-            let total = hs;
-            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(total as u32, 256));
-            inst.set_output_ptr(1, hidden_ptr);
-            inst.set_ptr(2, out_proj_ptr);
-            inst.set_ptr(3, hidden_ptr);
-            inst.set_int(4, total as i32);
-            instructions.push(inst);
+            instructions.push(ResidualAddInst::new(
+                div_ceil(hs as u32, 256),
+                hidden_ptr,
+                out_proj_ptr as *const f32,
+                hidden_ptr as *const f32,
+                hs as i32,
+            ).into_inst());
         } else {
             // Single-token decode: two-step residual via act.residual scratch
-            {
-                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, act.residual.as_write_ptr());
-                inst.set_ptr(2, hidden_ptr);
-                inst.set_int(3, hs as i32);
-                instructions.push(inst);
-            }
-            {
-                let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, act.hidden.as_write_ptr());
-                inst.set_ptr(2, out_proj_ptr);
-                inst.set_ptr(3, act.residual.as_ptr());
-                inst.set_int(4, hs as i32);
-                instructions.push(inst);
-            }
+            instructions.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                act.residual.as_write_ptr(),
+                hidden_ptr as *const f32,
+                hs as i32,
+            ).into_inst());
+            instructions.push(ResidualAddInst::new(
+                div_ceil(hs as u32, 256),
+                act.hidden.as_write_ptr(),
+                out_proj_ptr as *const f32,
+                act.residual.as_ptr(),
+                hs as i32,
+            ).into_inst());
         }
     }
 
@@ -1334,151 +1180,93 @@ impl MegakernelProgram {
         let eps = cfg.rms_norm_eps;
 
         // 1. RMSNorm
-        let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-        inst.set_output_ptr(1, act.normed.as_write_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_ptr(3, w.input_norm.as_ptr());
-        inst.set_int(4, hs as i32);
-        inst.set_float(5, eps);
-        instructions.push(inst);
+        instructions.push(RmsNormInst::new(
+            rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+            act.normed.as_write_ptr(), act.hidden.as_ptr(), w.input_norm.as_ptr(), hs as i32, eps,
+        ).into_inst());
 
-        // 2. QKV projection [6144, 1024] @ [1024] → [6144]
-        // NO_SYNC: next 3 instructions (a/b/z proj) read normed, not qkv
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, qkv_dim as u32);
-        inst.set_output_ptr(1, act.qkv.as_write_ptr());
-        emit_linear_proj(&mut inst, &w.w_qkv, 2);
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, qkv_dim as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
+        // 2. QKV projection — NO_SYNC: next 3 instructions (a/b/z proj) read normed, not qkv
+        {
+            let (op, wp) = linear_proj_opcode_ptr(&w.w_qkv);
+            instructions.push(LinearProjInst::new(op, qkv_dim as u32, act.qkv.as_write_ptr(), wp, act.normed.as_ptr(), qkv_dim as i32, hs as i32, 0).no_sync().into_inst());
+        }
 
-        // 3. Project a [nvh], b [nvh], z [nvh*vd]
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh as u32);
-        inst.set_output_ptr(1, act.a_proj.as_write_ptr());
-        emit_linear_proj(&mut inst, &w.w_a, 2);
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, nvh as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, nvh as u32);
-        inst.set_output_ptr(1, act.b_proj.as_write_ptr());
-        emit_linear_proj(&mut inst, &w.w_b, 2);
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, nvh as i32);
-        inst.set_int(5, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        // z proj: SYNC here ensures QKV+a+b+z all complete before conv1d reads qkv
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, (nvh * vd) as u32);
-        inst.set_output_ptr(1, act.z_proj.as_write_ptr());
-        emit_linear_proj(&mut inst, &w.w_z, 2);
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, (nvh * vd) as i32);
-        inst.set_int(5, hs as i32);
-        instructions.push(inst);
+        // 3. Project a, b, z
+        {
+            let (op, wp) = linear_proj_opcode_ptr(&w.w_a);
+            instructions.push(LinearProjInst::new(op, nvh as u32, act.a_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).no_sync().into_inst());
+        }
+        {
+            let (op, wp) = linear_proj_opcode_ptr(&w.w_b);
+            instructions.push(LinearProjInst::new(op, nvh as u32, act.b_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).no_sync().into_inst());
+        }
+        // z proj: SYNC ensures QKV+a+b+z all complete before conv1d reads qkv
+        {
+            let (op, wp) = linear_proj_opcode_ptr(&w.w_z);
+            instructions.push(LinearProjInst::new(op, (nvh * vd) as u32, act.z_proj.as_write_ptr(), wp, act.normed.as_ptr(), (nvh * vd) as i32, hs as i32, 0).into_inst());
+        }
 
         // 4. Causal conv1d on QKV (3 separate calls for q, k, v slices)
-        let q_dim = nh * kd; // 2048
-        let k_dim = nh * kd; // 2048
-        let v_dim = nvh * vd; // 2048
+        let q_dim = nh * kd;
+        let k_dim = nh * kd;
+        let v_dim = nvh * vd;
 
-        // Conv on Q portion — NO_SYNC: conv_k reads different qkv slice, writes different state/output
-        let mut inst = Instruction::new(OP_CONV1D, div_ceil(q_dim as u32, 256));
-        inst.set_output_ptr(1, conv_state.as_write_ptr());
-        inst.set_ptr(2, act.qkv.as_ptr());
-        inst.set_ptr(3, w.conv1d_weight_q.as_ptr());
-        inst.set_output_ptr(4, act.q_gdn.as_write_ptr());
-        inst.set_int(5, q_dim as i32);
-        inst.set_int(6, ck as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
+        // Conv on Q — NO_SYNC
+        instructions.push(Conv1dInst::new(
+            div_ceil(q_dim as u32, 256),
+            conv_state.as_write_ptr(), act.qkv.as_ptr(), w.conv1d_weight_q.as_ptr(), act.q_gdn.as_write_ptr(),
+            q_dim as i32, ck as i32,
+        ).no_sync().into_inst());
 
-        // Conv on K portion — NO_SYNC: conv_v reads different slice
-        let mut inst = Instruction::new(OP_CONV1D, div_ceil(k_dim as u32, 256));
-        inst.set_output_ptr(1, unsafe {
-            conv_state.as_write_ptr().add(q_dim * (ck - 1))
-        });
-        inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim) });
-        inst.set_ptr(3, w.conv1d_weight_k.as_ptr());
-        inst.set_output_ptr(4, act.k_gdn.as_write_ptr());
-        inst.set_int(5, k_dim as i32);
-        inst.set_int(6, ck as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
+        // Conv on K — NO_SYNC
+        instructions.push(Conv1dInst::new(
+            div_ceil(k_dim as u32, 256),
+            unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) },
+            unsafe { act.qkv.as_ptr().add(q_dim) },
+            w.conv1d_weight_k.as_ptr(), act.k_gdn.as_write_ptr(),
+            k_dim as i32, ck as i32,
+        ).no_sync().into_inst());
 
-        // Conv on V portion
-        let mut inst = Instruction::new(OP_CONV1D, div_ceil(v_dim as u32, 256));
-        inst.set_output_ptr(1, unsafe {
-            conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1))
-        });
-        inst.set_ptr(2, unsafe { act.qkv.as_ptr().add(q_dim + k_dim) });
-        inst.set_ptr(3, w.conv1d_weight_v.as_ptr());
-        inst.set_output_ptr(4, act.v_gdn.as_write_ptr());
-        inst.set_int(5, v_dim as i32);
-        inst.set_int(6, ck as i32);
-        instructions.push(inst);
+        // Conv on V
+        instructions.push(Conv1dInst::new(
+            div_ceil(v_dim as u32, 256),
+            unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) },
+            unsafe { act.qkv.as_ptr().add(q_dim + k_dim) },
+            w.conv1d_weight_v.as_ptr(), act.v_gdn.as_write_ptr(),
+            v_dim as i32, ck as i32,
+        ).into_inst());
 
-        // 5. GDN gate (nvh heads — per value head)
-        let mut inst = Instruction::new(OP_GDN_GATE, div_ceil(nvh as u32, 256));
-        inst.set_output_ptr(1, act.gate_gdn.as_write_ptr());
-        inst.set_ptr(2, act.a_proj.as_ptr());
-        inst.set_ptr(3, w.a_log.as_ptr());
-        inst.set_ptr(4, w.dt_bias.as_ptr());
-        inst.set_int(5, nvh as i32);
-        instructions.push(inst);
-
-        // 6. GDN recurrent (nvh heads, GQA key sharing)
+        // 5. GDN gate
         let gqa_group = nvh / nh;
-        let mut inst = Instruction::new(OP_GDN_RECUR, nvh as u32);
-        inst.set_ptr(1, act.q_gdn.as_ptr());
-        inst.set_ptr(2, act.k_gdn.as_ptr());
-        inst.set_ptr(3, act.v_gdn.as_ptr());
-        inst.set_ptr(4, act.gate_gdn.as_ptr());
-        inst.set_ptr(5, act.b_proj.as_ptr());
-        inst.set_output_ptr(6, gdn_state.recurrent.as_write_ptr());
-        inst.set_output_ptr(7, act.recurrent_out.as_write_ptr());
-        inst.set_int(8, kd as i32);
-        inst.set_int(9, vd as i32);
-        inst.set_int(10, gqa_group as i32);
-        instructions.push(inst);
+        instructions.push(GdnGateInst::new(
+            div_ceil(nvh as u32, 256),
+            act.gate_gdn.as_write_ptr(), act.a_proj.as_ptr(), w.a_log.as_ptr(), w.dt_bias.as_ptr(), nvh as i32,
+        ).into_inst());
+
+        // 6. GDN recurrent
+        instructions.push(GdnRecurInst::new(
+            nvh as u32,
+            act.q_gdn.as_ptr(), act.k_gdn.as_ptr(), act.v_gdn.as_ptr(), act.gate_gdn.as_ptr(), act.b_proj.as_ptr(),
+            gdn_state.recurrent.as_write_ptr(), act.recurrent_out.as_write_ptr(),
+            kd as i32, vd as i32, gqa_group as i32,
+        ).into_inst());
 
         // 7. RMSNorm gated
-        let mut inst = Instruction::new(OP_RMSNORM_GATE, nvh as u32);
-        inst.set_output_ptr(1, act.normed_gated.as_write_ptr());
-        inst.set_ptr(2, act.recurrent_out.as_ptr());
-        inst.set_ptr(3, act.z_proj.as_ptr());
-        inst.set_ptr(4, w.output_norm.as_ptr());
-        inst.set_int(5, nvh as i32);
-        inst.set_int(6, vd as i32);
-        inst.set_float(7, eps);
-        instructions.push(inst);
+        instructions.push(RmsNormGateInst::new(
+            nvh as u32,
+            act.normed_gated.as_write_ptr(), act.recurrent_out.as_ptr(), act.z_proj.as_ptr(), w.output_norm.as_ptr(),
+            nvh as i32, vd as i32, eps,
+        ).into_inst());
 
-        // 8. Output projection [1024, 2048]
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-        inst.set_output_ptr(1, act.out_proj.as_write_ptr());
-        emit_linear_proj(&mut inst, &w.w_out, 2);
-        inst.set_ptr(3, act.normed_gated.as_ptr());
-        inst.set_int(4, hs as i32);
-        inst.set_int(5, (nvh * vd) as i32);
-        instructions.push(inst);
+        // 8. Output projection
+        {
+            let (op, wp) = linear_proj_opcode_ptr(&w.w_out);
+            instructions.push(LinearProjInst::new(op, hs as u32, act.out_proj.as_write_ptr(), wp, act.normed_gated.as_ptr(), hs as i32, (nvh * vd) as i32, 0).into_inst());
+        }
 
-        // 9. Residual: copy hidden→residual, then add
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.residual.as_write_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_int(3, hs as i32);
-        instructions.push(inst);
-
-        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.hidden.as_write_ptr());
-        inst.set_ptr(2, act.out_proj.as_ptr());
-        inst.set_ptr(3, act.residual.as_ptr());
-        inst.set_int(4, hs as i32);
-        instructions.push(inst);
+        // 9. Residual
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.out_proj.as_ptr(), act.residual.as_ptr(), hs as i32).into_inst());
     }
 
     fn compile_mamba2_layer(
@@ -1510,106 +1298,63 @@ impl MegakernelProgram {
         let eps = cfg.rms_norm_eps;
         let group_size = intermediate / ng; // value_dim per norm group
 
-        // 1. RMSNorm: hidden → normed
+        // 1. RMSNorm
+        instructions.push(RmsNormInst::new(
+            rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+            act.normed.as_write_ptr(), act.hidden.as_ptr(), w.input_norm.as_ptr(), hs as i32, eps,
+        ).into_inst());
+
+        // 2. in_proj
         {
-            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-            inst.set_output_ptr(1, act.normed.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_ptr(3, w.input_norm.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_float(5, eps);
-            instructions.push(inst);
+            let (op, wp) = linear_proj_opcode_ptr(&w.in_proj);
+            instructions.push(LinearProjInst::new(op, in_proj_size as u32, act.mamba2_in_proj.as_write_ptr(), wp, act.normed.as_ptr(), in_proj_size as i32, hs as i32, 0).into_inst());
         }
 
-        // 2. in_proj: normed → mamba2_in_proj [gate(intermediate) | xBC(conv_dim) | dt(num_heads)]
+        // 3. conv1d
+        instructions.push(Mamba2Conv1dInst::new(
+            div_ceil(cd as u32, 256),
+            state.conv.as_write_ptr(),
+            unsafe { act.mamba2_in_proj.as_ptr().add(intermediate) },
+            w.conv1d_weight.as_ptr(),
+            w.conv1d_bias.as_ptr(),
+            act.mamba2_conv_out.as_write_ptr(),
+            cd as i32, ck as i32,
+        ).into_inst());
+
+        // 4. SSM update
+        instructions.push(SsmUpdateInst::new(
+            nh as u32,
+            state.ssm.as_write_ptr(),
+            act.mamba2_conv_out.as_ptr(),
+            unsafe { act.mamba2_in_proj.as_ptr().add(intermediate + cd) },
+            w.dt_bias.as_ptr(),
+            w.a_log.as_ptr(),
+            unsafe { act.mamba2_conv_out.as_ptr().add(intermediate) },
+            unsafe { act.mamba2_conv_out.as_ptr().add(intermediate + ng * sd) },
+            w.d.as_ptr(),
+            act.mamba2_ssm_out.as_write_ptr(),
+            nh as i32, hd as i32, sd as i32, ng as i32,
+        ).into_inst());
+
+        // 5. mamba2_norm_gated
+        instructions.push(Mamba2NormGatedInst::new(
+            ng as u32,
+            act.mamba2_conv_out.as_write_ptr(),
+            act.mamba2_ssm_out.as_ptr(),
+            act.mamba2_in_proj.as_ptr(),
+            w.norm_weight.as_ptr(),
+            ng as i32, group_size as i32, eps,
+        ).into_inst());
+
+        // 6. out_proj
         {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, in_proj_size as u32);
-            inst.set_output_ptr(1, act.mamba2_in_proj.as_write_ptr());
-            emit_linear_proj(&mut inst, &w.in_proj, 2);
-            inst.set_ptr(3, act.normed.as_ptr());
-            inst.set_int(4, in_proj_size as i32);
-            inst.set_int(5, hs as i32);
-            instructions.push(inst);
+            let (op, wp) = linear_proj_opcode_ptr(&w.out_proj);
+            instructions.push(LinearProjInst::new(op, hs as u32, act.out_proj.as_write_ptr(), wp, act.mamba2_conv_out.as_ptr(), hs as i32, intermediate as i32, 0).into_inst());
         }
 
-        // 3. conv1d: mamba2_in_proj[intermediate..intermediate+cd] → mamba2_conv_out[cd]
-        //    grid_x = ceil(cd / 256)
-        {
-            let mut inst = Instruction::new(OP_MAMBA2_CONV1D, div_ceil(cd as u32, 256));
-            inst.set_output_ptr(1, state.conv.as_write_ptr());
-            inst.set_ptr(2, unsafe { act.mamba2_in_proj.as_ptr().add(intermediate) });
-            inst.set_ptr(3, w.conv1d_weight.as_ptr());
-            inst.set_ptr(4, w.conv1d_bias.as_ptr());
-            inst.set_output_ptr(5, act.mamba2_conv_out.as_write_ptr());
-            inst.set_int(6, cd as i32);
-            inst.set_int(7, ck as i32);
-            instructions.push(inst);
-        }
-
-        // 4. SSM update: conv_out[x,B,C] + dt + state → mamba2_ssm_out
-        //    x = conv_out[0..intermediate], B = conv_out[intermediate..intermediate+ng*sd],
-        //    C = conv_out[intermediate+ng*sd..]
-        //    dt = mamba2_in_proj[intermediate+cd..] (num_heads elements)
-        //    grid_x = num_heads (one block per head)
-        {
-            let mut inst = Instruction::new(OP_SSM_UPDATE, nh as u32);
-            inst.set_output_ptr(1, state.ssm.as_write_ptr());
-            inst.set_ptr(2, act.mamba2_conv_out.as_ptr()); // x = conv_out[0..intermediate]
-            inst.set_ptr(3, unsafe { act.mamba2_in_proj.as_ptr().add(intermediate + cd) }); // dt
-            inst.set_ptr(4, w.dt_bias.as_ptr());
-            inst.set_ptr(5, w.a_log.as_ptr());
-            inst.set_ptr(6, unsafe { act.mamba2_conv_out.as_ptr().add(intermediate) }); // B
-            inst.set_ptr(7, unsafe { act.mamba2_conv_out.as_ptr().add(intermediate + ng * sd) }); // C
-            inst.set_ptr(8, w.d.as_ptr());
-            inst.set_output_ptr(9, act.mamba2_ssm_out.as_write_ptr());
-            inst.set_int(10, nh as i32);
-            inst.set_int(11, hd as i32);
-            inst.set_int(12, sd as i32);
-            inst.set_int(13, ng as i32);
-            instructions.push(inst);
-        }
-
-        // 5. mamba2_norm_gated: rms_norm(ssm_out * silu(gate)) * weight → mamba2_conv_out (reused)
-        //    ng groups, each group_size elements: treat as ng "heads" each of value_dim=group_size
-        {
-            let mut inst = Instruction::new(OP_MAMBA2_NORM_GATED, ng as u32);
-            inst.set_output_ptr(1, act.mamba2_conv_out.as_write_ptr()); // reuse as output
-            inst.set_ptr(2, act.mamba2_ssm_out.as_ptr()); // x = ssm_out
-            inst.set_ptr(3, act.mamba2_in_proj.as_ptr()); // z = gate (first intermediate floats)
-            inst.set_ptr(4, w.norm_weight.as_ptr());
-            inst.set_int(5, ng as i32);
-            inst.set_int(6, group_size as i32);
-            inst.set_float(7, eps);
-            instructions.push(inst);
-        }
-
-        // 6. out_proj: mamba2_conv_out[intermediate] → out_proj[hs]
-        {
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-            inst.set_output_ptr(1, act.out_proj.as_write_ptr());
-            emit_linear_proj(&mut inst, &w.out_proj, 2);
-            inst.set_ptr(3, act.mamba2_conv_out.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_int(5, intermediate as i32);
-            instructions.push(inst);
-        }
-
-        // 7. Residual: hidden = out_proj + hidden
-        {
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.residual.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-        }
-        {
-            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, act.out_proj.as_ptr());
-            inst.set_ptr(3, act.residual.as_ptr());
-            inst.set_int(4, hs as i32);
-            instructions.push(inst);
-        }
+        // 7. Residual
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.out_proj.as_ptr(), act.residual.as_ptr(), hs as i32).into_inst());
     }
 
     fn compile_attention_layer(
@@ -1675,27 +1420,21 @@ impl MegakernelProgram {
         let out_proj_ptr = act.out_proj.as_write_ptr();
 
         // 1. RMSNorm
-        {
-            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-            inst.set_output_ptr(1, normed_ptr);
-            inst.set_ptr(2, hidden_ptr);
-            inst.set_ptr(3, w.input_norm.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_float(5, eps);
-            instructions.push(inst);
-        }
+        instructions.push(RmsNormInst::new(
+            rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+            normed_ptr, hidden_ptr, w.input_norm.as_ptr(), hs as i32, eps,
+        ).into_inst());
         // 1b. Copy normed → normed_stage (GART/MappedHostBuffer, write-through to system RAM).
         // This is the flush boundary for P2P dispatch: after GPU 0 acks this instruction,
         // normed_stage is coherently visible to GPUs 1-3 without L2 cache coherence issues.
         // (Regular device VRAM is NOT coherent for PCIe P2P on RDNA3; GART is.)
         let normed_stage_copy_idx = instructions.len();
-        {
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.normed_stage.as_write_ptr());
-            inst.set_ptr(2, normed_ptr);
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-        }
+        instructions.push(D2dCopyInst::new(
+            div_ceil(hs as u32, 256),
+            act.normed_stage.as_write_ptr(),
+            normed_ptr,
+            hs as i32,
+        ).into_inst());
         // Steps 2–9 (QKV proj, deinterleave, QK-norm, KV write, mRoPE, GQA) handled by dispatcher.
         // output_gate_idx points to the first instruction AFTER the dispatched block.
         let output_gate_idx = instructions.len(); // == normed_stage_copy_idx + 1
@@ -1703,12 +1442,10 @@ impl MegakernelProgram {
         // 10. Output gate (Qwen3.5) or pass-through
         let final_attn_ptr = if cfg.has_output_gate {
             let gate_size = nqh * hd;
-            let mut inst = Instruction::new(OP_OUTPUT_GATE, div_ceil(gate_size as u32, 256));
-            inst.set_output_ptr(1, gated_out_ptr);
-            inst.set_ptr(2, attn_out_ptr);
-            inst.set_ptr(3, gate_attn_ptr);
-            inst.set_int(4, gate_size as i32);
-            instructions.push(inst);
+            instructions.push(OutputGateInst::new(
+                div_ceil(gate_size as u32, 256),
+                gated_out_ptr, attn_out_ptr, gate_attn_ptr, gate_size as i32,
+            ).into_inst());
             gated_out_ptr
         } else {
             attn_out_ptr
@@ -1726,21 +1463,14 @@ impl MegakernelProgram {
             instructions,
         );
         // Two-step residual (single-token decode): copy hidden → residual, then add
-        {
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.residual.as_write_ptr());
-            inst.set_ptr(2, hidden_ptr);
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-        }
-        {
-            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, out_proj_ptr);
-            inst.set_ptr(3, act.residual.as_ptr());
-            inst.set_int(4, hs as i32);
-            instructions.push(inst);
-        }
+        instructions.push(D2dCopyInst::new(
+            div_ceil(hs as u32, 256),
+            act.residual.as_write_ptr(), hidden_ptr, hs as i32,
+        ).into_inst());
+        instructions.push(ResidualAddInst::new(
+            div_ceil(hs as u32, 256),
+            act.hidden.as_write_ptr(), out_proj_ptr, act.residual.as_ptr(), hs as i32,
+        ).into_inst());
 
         multi_gpu_boundaries.push((normed_stage_copy_idx, output_gate_idx));
     }
@@ -1802,33 +1532,22 @@ impl MegakernelProgram {
 
         if all_bf16 {
             // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only, processes all N tokens)
-            let mut inst = Instruction::new(OP_FFN_GATE_UP, (is * n) as u32);
-            inst.set_output_ptr(1, bufs.ffn_act.as_write_ptr());
-            inst.set_ptr(2, bufs.hidden.as_ptr());
-            inst.set_ptr(3, post_norm.as_ptr());
-            inst.set_ptr(4, w_gate.as_bf16_ptr());
-            inst.set_ptr(5, w_up.as_bf16_ptr());
-            inst.set_int(6, hs as i32);
-            inst.set_int(7, is as i32);
-            inst.set_float(8, eps);
-            inst.set_int(9, n as i32);
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil((n * hs) as u32, 256));
-            inst.set_output_ptr(1, bufs.residual.as_write_ptr());
-            inst.set_ptr(2, bufs.hidden.as_ptr());
-            inst.set_int(3, (n * hs) as i32);
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_FFN_DOWN_RES, (hs * n) as u32);
-            inst.set_output_ptr(1, bufs.hidden.as_write_ptr());
-            inst.set_ptr(2, bufs.residual.as_ptr());
-            inst.set_ptr(3, w_down.as_bf16_ptr());
-            inst.set_ptr(4, bufs.ffn_act.as_ptr());
-            inst.set_int(5, hs as i32);
-            inst.set_int(6, is as i32);
-            inst.set_int(7, n as i32);
-            instructions.push(inst);
+            instructions.push(FfnGateUpInst::new(
+                OP_FFN_GATE_UP, (is * n) as u32,
+                bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
+                w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
+                hs as i32, is as i32, eps, n as i32,
+            ).into_inst());
+            instructions.push(D2dCopyInst::new(
+                div_ceil((n * hs) as u32, 256),
+                bufs.residual.as_write_ptr(), bufs.hidden.as_ptr(), (n * hs) as i32,
+            ).into_inst());
+            instructions.push(FfnDownResInst::new(
+                OP_FFN_DOWN_RES, (hs * n) as u32,
+                bufs.hidden.as_write_ptr(), bufs.residual.as_ptr(),
+                w_down.as_bf16_ptr() as *const u8, bufs.ffn_act.as_ptr(),
+                hs as i32, is as i32, n as i32,
+            ).into_inst());
         } else {
             // Unfused path for quantized weights: process one token at a time.
             // Uses ffn_gate_scratch/ffn_up_scratch/ffn_down_scratch as single-token intermediates.
@@ -1838,66 +1557,62 @@ impl MegakernelProgram {
                 let residual_t = unsafe { bufs.residual.as_write_ptr().add(t * hs) };
 
                 // D2D_COPY: hidden[t] → residual[t]  (no_sync: RMSNorm reads hidden, not residual)
-                let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, residual_t);
-                inst.set_ptr(2, hidden_t);
-                inst.set_int(3, hs as i32);
-                inst.set_no_sync();
-                instructions.push(inst);
+                instructions.push(D2dCopyInst::new(
+                    div_ceil(hs as u32, 256), residual_t, hidden_t, hs as i32,
+                ).no_sync().into_inst());
 
                 // RMSNorm: hidden[t] → normed[t]
-                let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-                inst.set_output_ptr(1, normed_t);
-                inst.set_ptr(2, hidden_t);
-                inst.set_ptr(3, post_norm.as_ptr());
-                inst.set_int(4, hs as i32);
-                inst.set_float(5, eps);
-                instructions.push(inst);
+                instructions.push(RmsNormInst::new(
+                    rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+                    normed_t, hidden_t, post_norm.as_ptr(), hs as i32, eps,
+                ).into_inst());
 
                 // Gate: normed[t] → ffn_gate_scratch  (no_sync: up reads same normed)
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
-                emit_linear_proj(&mut inst, w_gate, 2);
-                inst.set_output_ptr(1, bufs.ffn_gate_scratch.as_write_ptr());
-                inst.set_ptr(3, normed_t);
-                inst.set_int(4, is as i32);
-                inst.set_int(5, hs as i32);
-                inst.set_no_sync();
-                instructions.push(inst);
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
+                    emit_linear_proj(&mut inst, w_gate, 2);
+                    inst.words[1] = bufs.ffn_gate_scratch.as_write_ptr() as u64;
+                    inst.words[3] = normed_t as u64;
+                    inst.words[4] = is as u64;
+                    inst.words[5] = hs as u64;
+                    inst.words[0] |= super::FLAG_NO_SYNC as u64;
+                    instructions.push(inst);
+                }
 
                 // Up: normed[t] → ffn_up_scratch
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
-                emit_linear_proj(&mut inst, w_up, 2);
-                inst.set_output_ptr(1, bufs.ffn_up_scratch.as_write_ptr());
-                inst.set_ptr(3, normed_t);
-                inst.set_int(4, is as i32);
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
+                    emit_linear_proj(&mut inst, w_up, 2);
+                    inst.words[1] = bufs.ffn_up_scratch.as_write_ptr() as u64;
+                    inst.words[3] = normed_t as u64;
+                    inst.words[4] = is as u64;
+                    inst.words[5] = hs as u64;
+                    instructions.push(inst);
+                }
 
-                // SiLU(gate) * up → ffn_act[t..t+is] (reuse ffn_act as scratch per token)
+                // SiLU(gate) * up → ffn_act[t..t+is]
                 let ffn_act_t = unsafe { bufs.ffn_act.as_write_ptr().add(t * is) };
-                let mut inst = Instruction::new(OP_SILU_MUL, div_ceil(is as u32, 256));
-                inst.set_output_ptr(1, ffn_act_t);
-                inst.set_ptr(2, bufs.ffn_gate_scratch.as_ptr());
-                inst.set_ptr(3, bufs.ffn_up_scratch.as_ptr());
-                inst.set_int(4, is as i32);
-                instructions.push(inst);
+                instructions.push(SiluMulInst::new(
+                    div_ceil(is as u32, 256),
+                    ffn_act_t, bufs.ffn_gate_scratch.as_ptr(), bufs.ffn_up_scratch.as_ptr(), is as i32,
+                ).into_inst());
 
                 // Down: ffn_act[t] → ffn_down_scratch
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                emit_linear_proj(&mut inst, w_down, 2);
-                inst.set_output_ptr(1, bufs.ffn_down_scratch.as_write_ptr());
-                inst.set_ptr(3, ffn_act_t);
-                inst.set_int(4, hs as i32);
-                inst.set_int(5, is as i32);
-                instructions.push(inst);
+                {
+                    let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                    emit_linear_proj(&mut inst, w_down, 2);
+                    inst.words[1] = bufs.ffn_down_scratch.as_write_ptr() as u64;
+                    inst.words[3] = ffn_act_t as u64;
+                    inst.words[4] = hs as u64;
+                    inst.words[5] = is as u64;
+                    instructions.push(inst);
+                }
 
                 // Residual: ffn_down_scratch + residual[t] → hidden[t]
-                let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, hidden_t);
-                inst.set_ptr(2, bufs.ffn_down_scratch.as_ptr());
-                inst.set_ptr(3, residual_t);
-                inst.set_int(4, hs as i32);
-                instructions.push(inst);
+                instructions.push(ResidualAddInst::new(
+                    div_ceil(hs as u32, 256),
+                    hidden_t, bufs.ffn_down_scratch.as_ptr(), residual_t, hs as i32,
+                ).into_inst());
             }
         }
     }
@@ -1928,134 +1643,115 @@ impl MegakernelProgram {
             && matches!(w_down, LinearWeight::Packed(pw) if pw.format == crate::quant::WeightFormat::Rnf4G128);
 
         if all_bf16 {
-            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only)
-            let mut inst = Instruction::new(OP_FFN_GATE_UP, is as u32);
-            inst.set_output_ptr(1, act.ffn_act.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_ptr(3, post_norm.as_ptr());
-            inst.set_ptr(4, w_gate.as_bf16_ptr());
-            inst.set_ptr(5, w_up.as_bf16_ptr());
-            inst.set_int(6, hs as i32);
-            inst.set_int(7, is as i32);
-            inst.set_float(8, eps);
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.residual.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_FFN_DOWN_RES, hs as u32);
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, act.residual.as_ptr());
-            inst.set_ptr(3, w_down.as_bf16_ptr());
-            inst.set_ptr(4, act.ffn_act.as_ptr());
-            inst.set_int(5, hs as i32);
-            inst.set_int(6, is as i32);
-            instructions.push(inst);
+            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only, batch=0=single token)
+            instructions.push(FfnGateUpInst::new(
+                OP_FFN_GATE_UP, is as u32,
+                act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
+                w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
+                hs as i32, is as i32, eps, 0,
+            ).into_inst());
+            instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+            instructions.push(FfnDownResInst::new(
+                OP_FFN_DOWN_RES, hs as u32,
+                act.hidden.as_write_ptr(), act.residual.as_ptr(), w_down.as_bf16_ptr() as *const u8, act.ffn_act.as_ptr(),
+                hs as i32, is as i32, 0,
+            ).into_inst());
         } else if all_rnf4 {
-            // Fused path: OP_FFN_GATE_UP_RNF4 + OP_FFN_DOWN_RES_RNF4 (rnf4 decode n=1 only)
-            let w_gate_ptr = match w_gate {
-                LinearWeight::Packed(pw) => pw.data.as_ptr(),
-                _ => unreachable!(),
-            };
-            let w_up_ptr = match w_up {
-                LinearWeight::Packed(pw) => pw.data.as_ptr(),
-                _ => unreachable!(),
-            };
-            let w_down_ptr = match w_down {
-                LinearWeight::Packed(pw) => pw.data.as_ptr(),
-                _ => unreachable!(),
-            };
-
-            let mut inst = Instruction::new(OP_FFN_GATE_UP_RNF4, is as u32);
-            inst.set_output_ptr(1, act.ffn_act.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_ptr(3, post_norm.as_ptr());
-            inst.set_ptr(4, w_gate_ptr);
-            inst.set_ptr(5, w_up_ptr);
-            inst.set_int(6, hs as i32);
-            inst.set_int(7, is as i32);
-            inst.set_float(8, eps);
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.residual.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_int(3, hs as i32);
-            instructions.push(inst);
-
-            let mut inst = Instruction::new(OP_FFN_DOWN_RES_RNF4, hs as u32);
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, act.residual.as_ptr());
-            inst.set_ptr(3, w_down_ptr);
-            inst.set_ptr(4, act.ffn_act.as_ptr());
-            inst.set_int(5, hs as i32);
-            inst.set_int(6, is as i32);
-            instructions.push(inst);
+            let w_gate_ptr = match w_gate { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let w_up_ptr   = match w_up   { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            let w_down_ptr = match w_down { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
+            instructions.push(FfnGateUpInst::new(
+                OP_FFN_GATE_UP_RNF4, is as u32,
+                act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
+                w_gate_ptr, w_up_ptr,
+                hs as i32, is as i32, eps, 0,
+            ).into_inst());
+            instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+            instructions.push(FfnDownResInst::new(
+                OP_FFN_DOWN_RES_RNF4, hs as u32,
+                act.hidden.as_write_ptr(), act.residual.as_ptr(), w_down_ptr, act.ffn_act.as_ptr(),
+                hs as i32, is as i32, 0,
+            ).into_inst());
         } else {
             // Unfused path for quantized weights (decode n=1 only)
-            // D2D_COPY: hidden → residual (NO_SYNC: RMSNorm reads hidden, not residual)
-            let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.residual.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_int(3, hs as i32);
-            inst.set_no_sync();
-            instructions.push(inst);
+            instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).no_sync().into_inst());
+            instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.normed.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(), hs as i32, eps).into_inst());
+            {
+                let (op, wp) = linear_proj_opcode_ptr(w_gate);
+                instructions.push(LinearProjInst::new(op, is as u32, act.ffn_gate.as_write_ptr(), wp, act.normed.as_ptr(), is as i32, hs as i32, 0).no_sync().into_inst());
+            }
+            {
+                let (op, wp) = linear_proj_opcode_ptr(w_up);
+                instructions.push(LinearProjInst::new(op, is as u32, act.ffn_up.as_write_ptr(), wp, act.normed.as_ptr(), is as i32, hs as i32, 0).into_inst());
+            }
+            instructions.push(SiluMulInst::new(div_ceil(is as u32, 256), act.ffn_act.as_write_ptr(), act.ffn_gate.as_ptr(), act.ffn_up.as_ptr(), is as i32).into_inst());
+            {
+                let (op, wp) = linear_proj_opcode_ptr(w_down);
+                instructions.push(LinearProjInst::new(op, hs as u32, act.ffn_down.as_write_ptr(), wp, act.ffn_act.as_ptr(), hs as i32, is as i32, 0).into_inst());
+            }
+            instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.ffn_down.as_ptr(), act.residual.as_ptr(), hs as i32).into_inst());
+        }
+    }
 
-            // RMSNorm: hidden → normed
-            let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-            inst.set_output_ptr(1, act.normed.as_write_ptr());
-            inst.set_ptr(2, act.hidden.as_ptr());
-            inst.set_ptr(3, post_norm.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_float(5, eps);
-            instructions.push(inst);
+    /// Emit shared expert instructions into `instructions`.
+    fn emit_shared_expert(
+        se: &crate::weights::DenseFfnWeights,
+        moe: &crate::model::MoeWeights,
+        act: &ActivationBuffers,
+        hs: usize,
+        se_is: usize,
+        instructions: &mut Vec<Instruction>,
+    ) {
+        if moe.has_gate_proj {
+            let (op, wp) = linear_proj_opcode_ptr(&se.gate_proj);
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_gate.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).no_sync().into_inst());
+            let (op, wp) = linear_proj_opcode_ptr(&se.up_proj);
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_up.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
+            instructions.push(SiluMulInst::new(div_ceil(se_is as u32, 256), act.moe_expert_act.as_write_ptr(), act.moe_expert_gate.as_ptr(), act.moe_expert_up.as_ptr(), se_is as i32).into_inst());
+        } else {
+            let (op, wp) = linear_proj_opcode_ptr(&se.up_proj);
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_up.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
+            instructions.push(ReluSqInst::new(div_ceil(se_is as u32, 256), act.moe_expert_act.as_write_ptr(), act.moe_expert_up.as_ptr(), se_is as i32).into_inst());
+        }
+        let (op, wp) = linear_proj_opcode_ptr(&se.down_proj);
+        instructions.push(LinearProjInst::new(op, hs as u32, act.moe_expert_out.as_write_ptr(), wp, act.moe_expert_act.as_ptr(), hs as i32, se_is as i32, 0).into_inst());
 
-            // Gate: normed → ffn_gate (NO_SYNC: up_proj reads same normed, writes different buf)
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
-            emit_linear_proj(&mut inst, w_gate, 2);
-            inst.set_output_ptr(1, act.ffn_gate.as_write_ptr());
-            inst.set_ptr(3, act.normed.as_ptr());
-            inst.set_int(4, is as i32);
-            inst.set_int(5, hs as i32);
-            inst.set_no_sync();
-            instructions.push(inst);
+        if let Some(ref gate_buf) = moe.shared_expert_gate {
+            instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, 1, act.moe_scores.as_write_ptr(), gate_buf.as_ptr() as *const u8, act.normed.as_ptr(), 1, hs as i32, 0).into_inst());
+            instructions.push(SigmoidWeightedAddInst::new(div_ceil(hs as u32, 256), act.ffn_down.as_write_ptr(), act.moe_scores.as_ptr(), act.moe_expert_out.as_ptr(), hs as i32).into_inst());
+        } else {
+            instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.ffn_down.as_write_ptr(), act.ffn_down.as_ptr(), act.moe_expert_out.as_ptr(), hs as i32).into_inst());
+        }
+    }
 
-            // Up: normed → ffn_up
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
-            emit_linear_proj(&mut inst, w_up, 2);
-            inst.set_output_ptr(1, act.ffn_up.as_write_ptr());
-            inst.set_ptr(3, act.normed.as_ptr());
-            inst.set_int(4, is as i32);
-            inst.set_int(5, hs as i32);
-            instructions.push(inst);
+    // Overload for ffn_down_stage output (multi-GPU path)
+    fn emit_shared_expert_stage(
+        se: &crate::weights::DenseFfnWeights,
+        moe: &crate::model::MoeWeights,
+        act: &ActivationBuffers,
+        hs: usize,
+        se_is: usize,
+        instructions: &mut Vec<Instruction>,
+    ) {
+        if moe.has_gate_proj {
+            let (op, wp) = linear_proj_opcode_ptr(&se.gate_proj);
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_gate.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).no_sync().into_inst());
+            let (op, wp) = linear_proj_opcode_ptr(&se.up_proj);
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_up.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
+            instructions.push(SiluMulInst::new(div_ceil(se_is as u32, 256), act.moe_expert_act.as_write_ptr(), act.moe_expert_gate.as_ptr(), act.moe_expert_up.as_ptr(), se_is as i32).into_inst());
+        } else {
+            let (op, wp) = linear_proj_opcode_ptr(&se.up_proj);
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_up.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
+            instructions.push(ReluSqInst::new(div_ceil(se_is as u32, 256), act.moe_expert_act.as_write_ptr(), act.moe_expert_up.as_ptr(), se_is as i32).into_inst());
+        }
+        let (op, wp) = linear_proj_opcode_ptr(&se.down_proj);
+        instructions.push(LinearProjInst::new(op, hs as u32, act.moe_expert_out.as_write_ptr(), wp, act.moe_expert_act.as_ptr(), hs as i32, se_is as i32, 0).into_inst());
 
-            // SiLU(gate) * up → ffn_act
-            let mut inst = Instruction::new(OP_SILU_MUL, div_ceil(is as u32, 256));
-            inst.set_output_ptr(1, act.ffn_act.as_write_ptr());
-            inst.set_ptr(2, act.ffn_gate.as_ptr());
-            inst.set_ptr(3, act.ffn_up.as_ptr());
-            inst.set_int(4, is as i32);
-            instructions.push(inst);
-
-            // Down: ffn_act → ffn_down
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-            emit_linear_proj(&mut inst, w_down, 2);
-            inst.set_output_ptr(1, act.ffn_down.as_write_ptr());
-            inst.set_ptr(3, act.ffn_act.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_int(5, is as i32);
-            instructions.push(inst);
-
-            // Residual: ffn_down + residual → hidden
-            let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-            inst.set_output_ptr(1, act.hidden.as_write_ptr());
-            inst.set_ptr(2, act.ffn_down.as_ptr());
-            inst.set_ptr(3, act.residual.as_ptr());
-            inst.set_int(4, hs as i32);
-            instructions.push(inst);
+        if let Some(ref gate_buf) = moe.shared_expert_gate {
+            instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, 1, act.moe_scores.as_write_ptr(), gate_buf.as_ptr() as *const u8, act.normed.as_ptr(), 1, hs as i32, 0).into_inst());
+            instructions.push(SigmoidWeightedAddInst::new(div_ceil(hs as u32, 256), act.ffn_down_stage.as_write_ptr(), act.moe_scores.as_ptr(), act.moe_expert_out.as_ptr(), hs as i32).into_inst());
+        } else {
+            instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.ffn_down_stage.as_write_ptr(), act.ffn_down_stage.as_ptr() as *const f32, act.moe_expert_out.as_ptr(), hs as i32).into_inst());
         }
     }
 
@@ -2092,57 +1788,22 @@ impl MegakernelProgram {
         };
 
         // D2D_COPY: hidden → residual (NO_SYNC: norm reads hidden)
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.residual.as_write_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_int(3, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).no_sync().into_inst());
 
         // RMSNorm: hidden → normed
-        let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-        inst.set_output_ptr(1, act.normed.as_write_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_ptr(3, norm_ptr);
-        inst.set_int(4, hs as i32);
-        inst.set_float(5, eps);
-        instructions.push(inst);
+        instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.normed.as_write_ptr(), act.hidden.as_ptr(), norm_ptr, hs as i32, eps).into_inst());
 
         // Gate projection: normed → moe_scores[num_experts]
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, ne as u32);
-        inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
-        inst.set_ptr(2, moe.gate.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, ne as i32);
-        inst.set_int(5, hs as i32);
-        instructions.push(inst);
+        instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, ne as u32, act.moe_scores.as_write_ptr(), moe.gate.as_ptr() as *const u8, act.normed.as_ptr(), ne as i32, hs as i32, 0).into_inst());
 
         // OP_MOE_GATE: top-k selection on GPU
         let (gate_mode, rsf) = match &gate_type {
             GateType::Softmax => (0u32, 1.0f32),
-            GateType::NormTopK {
-                routed_scaling_factor,
-            } => (1, *routed_scaling_factor),
-            GateType::Sigmoid {
-                routed_scaling_factor,
-            } => (2, *routed_scaling_factor),
+            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
+            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
         };
-        let bias_ptr = moe
-            .score_correction_bias_gpu
-            .as_ref()
-            .map(|b| b.as_ptr() as *const u8)
-            .unwrap_or(std::ptr::null());
-
-        let mut inst = Instruction::new(OP_MOE_GATE, 1);
-        inst.set_ptr(1, act.moe_scores.as_ptr());
-        inst.set_ptr(2, act.moe_expert_ids.as_ptr());
-        inst.set_ptr(3, act.moe_expert_weights.as_ptr());
-        inst.set_int(4, ne as i32);
-        inst.set_int(5, k as i32);
-        inst.set_int(6, gate_mode as i32);
-        inst.set_float(7, rsf);
-        inst.set_ptr(8, bias_ptr);
-        instructions.push(inst);
+        let bias_ptr = moe.score_correction_bias_gpu.as_ref().map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
+        instructions.push(MoeGateInst::new(act.moe_scores.as_ptr(), act.moe_expert_ids.as_write_ptr(), act.moe_expert_weights.as_write_ptr(), ne as i32, k as i32, gate_mode, rsf, bias_ptr).into_inst());
 
         // OP_MOE_FFN: fused expert loop (internal grid.sync())
         // Currently only supports PcG32Q4 weights in the GPU kernel
@@ -2167,132 +1828,44 @@ impl MegakernelProgram {
 
         let grid_x = std::cmp::max(eis, hs) as u32;
 
-        let mut inst = Instruction::new(OP_MOE_FFN, grid_x);
-        inst.set_ptr(1, act.moe_expert_ids.as_ptr());
-        inst.set_ptr(2, act.moe_expert_weights.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_output_ptr(4, act.ffn_down.as_write_ptr());
-        inst.set_ptr(5, moe.expert_gate_up.raw_data_ptr());
-        inst.words[6] = gate_up_expert_stride as u64;
-        inst.set_ptr(7, moe.expert_down.raw_data_ptr());
-        inst.words[8] = down_expert_stride as u64;
-        inst.set_int(9, k as i32);
-        inst.set_int(10, (hs | (eis << 16)) as i32);
-        inst.set_int(11, flags as i32);
-        inst.set_ptr(12, act.moe_expert_gate.as_ptr());
-        inst.set_ptr(13, act.moe_expert_up.as_ptr());
-        inst.set_ptr(14, act.moe_expert_act.as_ptr());
-        inst.set_ptr(15, act.moe_expert_out.as_ptr());
-        inst.words[16] = gate_up_row_stride as u64;
-        instructions.push(inst);
+        instructions.push(Instruction {
+            words: {
+                let mut w = [0u64; INST_SIZE];
+                w[0] = make_opcode_gridx(OP_MOE_FFN, grid_x);
+                w[1] = act.moe_expert_ids.as_ptr() as u64;
+                w[2] = act.moe_expert_weights.as_ptr() as u64;
+                w[3] = act.normed.as_ptr() as u64;
+                w[4] = act.ffn_down.as_write_ptr() as u64;
+                w[5] = moe.expert_gate_up.raw_data_ptr() as u64;
+                w[6] = gate_up_expert_stride as u64;
+                w[7] = moe.expert_down.raw_data_ptr() as u64;
+                w[8] = down_expert_stride as u64;
+                w[9] = k as u64;
+                w[10] = (hs | (eis << 16)) as u64;
+                w[11] = flags as u64;
+                w[12] = act.moe_expert_gate.as_ptr() as u64;
+                w[13] = act.moe_expert_up.as_ptr() as u64;
+                w[14] = act.moe_expert_act.as_ptr() as u64;
+                w[15] = act.moe_expert_out.as_ptr() as u64;
+                w[16] = gate_up_row_stride as u64;
+                w
+            }
+        });
 
         // Shared expert (if present)
         if let Some(ref se) = moe.shared_expert {
             let se_is = match &cfg.layers[layer_idx].ffn_type {
-                FfnType::MoE {
-                    shared_intermediate_size,
-                    expert_intermediate_size,
-                    ..
-                } => {
-                    if *shared_intermediate_size > 0 {
-                        *shared_intermediate_size
-                    } else {
-                        *expert_intermediate_size
-                    }
+                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
                 }
                 _ => eis,
             };
 
-            if moe.has_gate_proj {
-                // gate_proj → gate scratch
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                emit_linear_proj(&mut inst, &se.gate_proj, 2);
-                inst.set_output_ptr(1, act.moe_expert_gate.as_write_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, se_is as i32);
-                inst.set_int(5, hs as i32);
-                inst.set_no_sync();
-                instructions.push(inst);
-
-                // up_proj → up scratch
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                emit_linear_proj(&mut inst, &se.up_proj, 2);
-                inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, se_is as i32);
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
-
-                // silu_mul
-                let mut inst = Instruction::new(OP_SILU_MUL, div_ceil(se_is as u32, 256));
-                inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
-                inst.set_ptr(2, act.moe_expert_gate.as_ptr());
-                inst.set_ptr(3, act.moe_expert_up.as_ptr());
-                inst.set_int(4, se_is as i32);
-                instructions.push(inst);
-            } else {
-                // up_proj → up scratch
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                emit_linear_proj(&mut inst, &se.up_proj, 2);
-                inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, se_is as i32);
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
-
-                // relu²: relu(x)² → moe_expert_act
-                let mut inst = Instruction::new(OP_RELU_SQ, div_ceil(se_is as u32, 256));
-                inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
-                inst.set_ptr(2, act.moe_expert_up.as_ptr());
-                inst.set_int(3, se_is as i32);
-                instructions.push(inst);
-            }
-
-            // down_proj → expert_out scratch
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-            emit_linear_proj(&mut inst, &se.down_proj, 2);
-            inst.set_output_ptr(1, act.moe_expert_out.as_write_ptr());
-            inst.set_ptr(3, act.moe_expert_act.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_int(5, se_is as i32);
-            instructions.push(inst);
-
-            // Shared expert gating: ffn_down += sigmoid(gate @ normed) * expert_out
-            if let Some(ref gate_buf) = moe.shared_expert_gate {
-                // Compute dot product: gate_weight @ normed → scalar (reuse moe_scores[0])
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, 1);
-                inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
-                inst.set_ptr(2, gate_buf.as_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, 1i32); // out_dim = 1
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
-
-                // ffn_down += sigmoid(scalar) * expert_out
-                let mut inst = Instruction::new(OP_SIGMOID_WEIGHTED_ADD, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, act.ffn_down.as_write_ptr());
-                inst.set_ptr(2, act.moe_scores.as_ptr());
-                inst.set_ptr(3, act.moe_expert_out.as_ptr());
-                inst.set_int(4, hs as i32);
-                instructions.push(inst);
-            } else {
-                // No gate: ffn_down += expert_out
-                let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, act.ffn_down.as_write_ptr());
-                inst.set_ptr(2, act.ffn_down.as_ptr());
-                inst.set_ptr(3, act.moe_expert_out.as_ptr());
-                inst.set_int(4, hs as i32);
-                instructions.push(inst);
-            }
+            Self::emit_shared_expert(se, moe, act, hs, se_is, instructions);
         }
 
         // Residual: hidden = residual + ffn_down
-        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.hidden.as_write_ptr());
-        inst.set_ptr(2, act.residual.as_ptr());
-        inst.set_ptr(3, act.ffn_down.as_ptr());
-        inst.set_int(4, hs as i32);
-        instructions.push(inst);
+        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.residual.as_ptr(), act.ffn_down.as_ptr(), hs as i32).into_inst());
     }
 
     /// Multi-GPU variant: emit norm + gate proj + OP_MOE_GATE + OP_BARRIER.
@@ -2336,179 +1909,36 @@ impl MegakernelProgram {
             _ => panic!("no norm weight for MoE FFN layer"),
         };
 
-        // D2D_COPY: hidden → residual
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.residual.as_write_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_int(3, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).no_sync().into_inst());
+        instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.normed.as_write_ptr(), act.hidden.as_ptr(), norm_ptr, hs as i32, eps).into_inst());
+        instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, ne as u32, act.moe_scores.as_write_ptr(), moe.gate.as_ptr() as *const u8, act.normed.as_ptr(), ne as i32, hs as i32, 0).into_inst());
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.normed_stage.as_write_ptr(), act.normed.as_ptr(), hs as i32).no_sync().into_inst());
 
-        // RMSNorm: hidden → normed
-        let mut inst = Instruction::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1);
-        inst.set_output_ptr(1, act.normed.as_write_ptr());
-        inst.set_ptr(2, act.hidden.as_ptr());
-        inst.set_ptr(3, norm_ptr);
-        inst.set_int(4, hs as i32);
-        inst.set_float(5, eps);
-        instructions.push(inst);
-
-        // Gate projection: normed → moe_scores[num_experts]
-        let mut inst = Instruction::new(OP_LINEAR_PROJ, ne as u32);
-        inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
-        inst.set_ptr(2, moe.gate.as_ptr());
-        inst.set_ptr(3, act.normed.as_ptr());
-        inst.set_int(4, ne as i32);
-        inst.set_int(5, hs as i32);
-        instructions.push(inst);
-
-        // D2D_COPY: normed → normed_stage (GART/pinned memory, CPU-readable without hipMemcpy)
-        // Must happen before OP_BARRIER so CPU can read activation for worker broadcast.
-        let mut inst = Instruction::new(OP_D2D_COPY, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.normed_stage.as_write_ptr());
-        inst.set_ptr(2, act.normed.as_ptr());
-        inst.set_int(3, hs as i32);
-        inst.set_no_sync();
-        instructions.push(inst);
-
-        // OP_MOE_GATE: top-k selection; writes to moe_expert_ids/weights (GART memory, CPU-readable)
         let (gate_mode, rsf) = match &gate_type {
             GateType::Softmax => (0u32, 1.0f32),
-            GateType::NormTopK {
-                routed_scaling_factor,
-            } => (1, *routed_scaling_factor),
-            GateType::Sigmoid {
-                routed_scaling_factor,
-            } => (2, *routed_scaling_factor),
+            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
+            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
         };
-        let bias_ptr = moe
-            .score_correction_bias_gpu
-            .as_ref()
-            .map(|b| b.as_ptr() as *const u8)
-            .unwrap_or(std::ptr::null());
-        let mut inst = Instruction::new(OP_MOE_GATE, 1);
-        inst.set_ptr(1, act.moe_scores.as_ptr());
-        inst.set_ptr(2, act.moe_expert_ids.as_ptr());
-        inst.set_ptr(3, act.moe_expert_weights.as_ptr());
-        inst.set_int(4, ne as i32);
-        inst.set_int(5, k as i32);
-        inst.set_int(6, gate_mode as i32);
-        inst.set_float(7, rsf);
-        inst.set_ptr(8, bias_ptr);
-        instructions.push(inst);
+        let bias_ptr = moe.score_correction_bias_gpu.as_ref().map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
+        instructions.push(MoeGateInst::new(act.moe_scores.as_ptr(), act.moe_expert_ids.as_write_ptr(), act.moe_expert_weights.as_write_ptr(), ne as i32, k as i32, gate_mode, rsf, bias_ptr).into_inst());
 
-        // OP_BARRIER: park megakernel, CPU dispatches expert FFN into act.ffn_down_stage, then resumes.
-        // barrier_flag_ptr and resume_flag_ptr are null here; patched in execute_multi_gpu().
+        // OP_BARRIER: grid_x=1: only block 0 runs op_barrier
         let barrier_inst_idx = instructions.len();
-        let mut inst = Instruction::new(OP_BARRIER, 1); // grid_x=1: only block 0 runs op_barrier
-        inst.set_ptr(1, std::ptr::null::<u32>()); // barrier_flag — patched per-execute
-        inst.set_ptr(2, std::ptr::null::<u32>()); // resume_flag — patched per-execute
-        inst.set_int(3, layer_idx as i32);
-        instructions.push(inst);
+        instructions.push(BarrierInst::new(layer_idx as i32).into_inst());
 
         // After barrier: compute shared expert (if present) and add to ffn_down_stage.
-        // GPU 0 has all SMs available again after resume.
         if let Some(ref se) = moe.shared_expert {
             let se_is = match &cfg.layers[layer_idx].ffn_type {
-                FfnType::MoE {
-                    shared_intermediate_size,
-                    expert_intermediate_size,
-                    ..
-                } => {
-                    if *shared_intermediate_size > 0 {
-                        *shared_intermediate_size
-                    } else {
-                        *expert_intermediate_size
-                    }
+                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
                 }
                 _ => eis,
             };
-
-            if moe.has_gate_proj {
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                emit_linear_proj(&mut inst, &se.gate_proj, 2);
-                inst.set_output_ptr(1, act.moe_expert_gate.as_write_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, se_is as i32);
-                inst.set_int(5, hs as i32);
-                inst.set_no_sync();
-                instructions.push(inst);
-
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                emit_linear_proj(&mut inst, &se.up_proj, 2);
-                inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, se_is as i32);
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
-
-                let mut inst = Instruction::new(OP_SILU_MUL, div_ceil(se_is as u32, 256));
-                inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
-                inst.set_ptr(2, act.moe_expert_gate.as_ptr());
-                inst.set_ptr(3, act.moe_expert_up.as_ptr());
-                inst.set_int(4, se_is as i32);
-                instructions.push(inst);
-            } else {
-                // relu² shared expert
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                emit_linear_proj(&mut inst, &se.up_proj, 2);
-                inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, se_is as i32);
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
-
-                // relu²: relu(x)² → moe_expert_act
-                let mut inst = Instruction::new(OP_RELU_SQ, div_ceil(se_is as u32, 256));
-                inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
-                inst.set_ptr(2, act.moe_expert_up.as_ptr());
-                inst.set_int(3, se_is as i32);
-                instructions.push(inst);
-            }
-
-            let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-            emit_linear_proj(&mut inst, &se.down_proj, 2);
-            inst.set_output_ptr(1, act.moe_expert_out.as_write_ptr());
-            inst.set_ptr(3, act.moe_expert_act.as_ptr());
-            inst.set_int(4, hs as i32);
-            inst.set_int(5, se_is as i32);
-            instructions.push(inst);
-
-            // Add shared expert output into ffn_down_stage
-            if let Some(ref gate_buf) = moe.shared_expert_gate {
-                let mut inst = Instruction::new(OP_LINEAR_PROJ, 1);
-                inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
-                inst.set_ptr(2, gate_buf.as_ptr());
-                inst.set_ptr(3, act.normed.as_ptr());
-                inst.set_int(4, 1i32);
-                inst.set_int(5, hs as i32);
-                instructions.push(inst);
-
-                let mut inst = Instruction::new(OP_SIGMOID_WEIGHTED_ADD, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
-                inst.set_ptr(2, act.moe_scores.as_ptr());
-                inst.set_ptr(3, act.moe_expert_out.as_ptr());
-                inst.set_int(4, hs as i32);
-                instructions.push(inst);
-            } else {
-                // No gate: ffn_down_stage += shared_expert_out
-                let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
-                inst.set_ptr(2, act.ffn_down_stage.as_ptr() as *const f32);
-                inst.set_ptr(3, act.moe_expert_out.as_ptr());
-                inst.set_int(4, hs as i32);
-                instructions.push(inst);
-            }
+            Self::emit_shared_expert_stage(se, moe, act, hs, se_is, instructions);
         }
 
         // Final residual: hidden = residual + ffn_down_stage
-        // ffn_down_stage contains: gathered worker expert outputs (CPU-written) + shared expert
-        let mut inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-        inst.set_output_ptr(1, act.hidden.as_write_ptr());
-        inst.set_ptr(2, act.residual.as_ptr());
-        inst.set_ptr(3, act.ffn_down_stage.as_ptr() as *const f32);
-        inst.set_int(4, hs as i32);
-        instructions.push(inst);
+        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.residual.as_ptr(), act.ffn_down_stage.as_ptr() as *const f32, hs as i32).into_inst());
 
         barrier_inst_idx
     }
@@ -2562,17 +1992,17 @@ impl MegakernelProgram {
             // compile_moe_ffn_multi_gpu order: ..., D2D_COPY(normed→normed_stage), OP_MOE_GATE, OP_BARRIER
             if barrier_idx >= 2 {
                 let prev2 = &prog.instructions[barrier_idx - 2];
-                let prev2_opcode = (prev2.words[0] & 0x7FFFFFFF) as u32;
+                let prev2_opcode = (prev2.words[0] & INST_OPCODE_MASK) as u32;
                 let normed_stage_ptr = act.normed_stage.as_ptr() as u64;
                 if prev2_opcode == OP_D2D_COPY && prev2.words[1] == normed_stage_ptr {
                     if let Some(ref fc1) = moe.fc1_latent_proj {
                         // Emit fc1: normed(hs) → moe_latent(gupd)
                         let mut fc1_inst = Instruction::new(OP_LINEAR_PROJ, gupd as u32);
-                        fc1_inst.set_output_ptr(1, act.moe_latent.as_write_ptr());
+                        fc1_inst.words[1] = act.moe_latent.as_write_ptr() as u64;
                         emit_linear_proj(&mut fc1_inst, fc1, 2);
-                        fc1_inst.set_ptr(3, act.normed.as_ptr());
-                        fc1_inst.set_int(4, gupd as i32);
-                        fc1_inst.set_int(5, hs as i32);
+                        fc1_inst.words[3] = act.normed.as_ptr() as u64;
+                        fc1_inst.words[4] = gupd as u64;
+                        fc1_inst.words[5] = hs as u64;
                         prog.instructions[barrier_idx - 2] = fc1_inst;
                     } else {
                         // NOP: no normed_stage copy needed in P2P path
@@ -2669,13 +2099,15 @@ impl MegakernelProgram {
                     let cfg = &model.config;
                     if let Some(ref fc2) = moe.fc2_latent_proj {
                         // fc2: moe_latent(gupd) → ffn_down_stage(hs)
-                        let mut fc2_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                        fc2_inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
-                        emit_linear_proj(&mut fc2_inst, fc2, 2);
-                        fc2_inst.set_ptr(3, act.moe_latent.as_ptr());
-                        fc2_inst.set_int(4, hs as i32);
-                        fc2_inst.set_int(5, gupd as i32);
-                        new_instructions.push(fc2_inst);
+                        {
+                            let mut fc2_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                            fc2_inst.words[1] = act.ffn_down_stage.as_write_ptr() as u64;
+                            emit_linear_proj(&mut fc2_inst, fc2, 2);
+                            fc2_inst.words[3] = act.moe_latent.as_ptr() as u64;
+                            fc2_inst.words[4] = hs as u64;
+                            fc2_inst.words[5] = gupd as u64;
+                            new_instructions.push(fc2_inst);
+                        }
 
                         // Shared expert (relu² + down_proj, missing in compile_moe_ffn_multi_gpu early return)
                         if let Some(ref se) = moe.shared_expert {
@@ -2687,53 +2119,58 @@ impl MegakernelProgram {
                             };
                             if !moe.has_gate_proj {
                                 // relu² path (Nemotron-H): up_proj → relu² → down_proj
-                                let mut up_inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                                up_inst.set_output_ptr(1, act.moe_expert_up.as_write_ptr());
-                                emit_linear_proj(&mut up_inst, &se.up_proj, 2);
-                                up_inst.set_ptr(3, act.normed.as_ptr());
-                                up_inst.set_int(4, se_is as i32);
-                                up_inst.set_int(5, hs as i32);
-                                new_instructions.push(up_inst);
-
-                                let mut relu_inst = Instruction::new(OP_RELU_SQ, div_ceil(se_is as u32, 256));
-                                relu_inst.set_output_ptr(1, act.moe_expert_act.as_write_ptr());
-                                relu_inst.set_ptr(2, act.moe_expert_up.as_ptr());
-                                relu_inst.set_int(3, se_is as i32);
-                                new_instructions.push(relu_inst);
-
-                                let mut dn_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                                dn_inst.set_output_ptr(1, act.moe_expert_out.as_write_ptr());
-                                emit_linear_proj(&mut dn_inst, &se.down_proj, 2);
-                                dn_inst.set_ptr(3, act.moe_expert_act.as_ptr());
-                                dn_inst.set_int(4, hs as i32);
-                                dn_inst.set_int(5, se_is as i32);
-                                new_instructions.push(dn_inst);
+                                {
+                                    let mut up_inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
+                                    up_inst.words[1] = act.moe_expert_up.as_write_ptr() as u64;
+                                    emit_linear_proj(&mut up_inst, &se.up_proj, 2);
+                                    up_inst.words[3] = act.normed.as_ptr() as u64;
+                                    up_inst.words[4] = se_is as u64;
+                                    up_inst.words[5] = hs as u64;
+                                    new_instructions.push(up_inst);
+                                }
+                                new_instructions.push(ReluSqInst::new(
+                                    div_ceil(se_is as u32, 256),
+                                    act.moe_expert_act.as_write_ptr(),
+                                    act.moe_expert_up.as_ptr(),
+                                    se_is as i32,
+                                ).into_inst());
+                                {
+                                    let mut dn_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
+                                    dn_inst.words[1] = act.moe_expert_out.as_write_ptr() as u64;
+                                    emit_linear_proj(&mut dn_inst, &se.down_proj, 2);
+                                    dn_inst.words[3] = act.moe_expert_act.as_ptr() as u64;
+                                    dn_inst.words[4] = hs as u64;
+                                    dn_inst.words[5] = se_is as u64;
+                                    new_instructions.push(dn_inst);
+                                }
 
                                 if let Some(ref gate_buf) = moe.shared_expert_gate {
                                     // gate @ normed → moe_scores (1 scalar)
-                                    let mut g_inst = Instruction::new(OP_LINEAR_PROJ, 1);
-                                    g_inst.set_output_ptr(1, act.moe_scores.as_write_ptr());
-                                    g_inst.set_ptr(2, gate_buf.as_ptr());
-                                    g_inst.set_ptr(3, act.normed.as_ptr());
-                                    g_inst.set_int(4, 1i32);
-                                    g_inst.set_int(5, hs as i32);
-                                    new_instructions.push(g_inst);
+                                    new_instructions.push(LinearProjInst::new(
+                                        OP_LINEAR_PROJ, 1,
+                                        act.moe_scores.as_write_ptr(),
+                                        gate_buf.as_ptr() as *const u8,
+                                        act.normed.as_ptr(),
+                                        1i32, hs as i32, 0,
+                                    ).into_inst());
 
                                     // ffn_down_stage += sigmoid(moe_scores[0]) * moe_expert_out
-                                    let mut sw_inst = Instruction::new(OP_SIGMOID_WEIGHTED_ADD, div_ceil(hs as u32, 256));
-                                    sw_inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
-                                    sw_inst.set_ptr(2, act.moe_scores.as_ptr());
-                                    sw_inst.set_ptr(3, act.moe_expert_out.as_ptr());
-                                    sw_inst.set_int(4, hs as i32);
-                                    new_instructions.push(sw_inst);
+                                    new_instructions.push(SigmoidWeightedAddInst::new(
+                                        div_ceil(hs as u32, 256),
+                                        act.ffn_down_stage.as_write_ptr(),
+                                        act.moe_scores.as_ptr(),
+                                        act.moe_expert_out.as_ptr(),
+                                        hs as i32,
+                                    ).into_inst());
                                 } else {
                                     // ffn_down_stage += moe_expert_out
-                                    let mut add_inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                                    add_inst.set_output_ptr(1, act.ffn_down_stage.as_write_ptr());
-                                    add_inst.set_ptr(2, act.ffn_down_stage.as_ptr() as *const f32);
-                                    add_inst.set_ptr(3, act.moe_expert_out.as_ptr());
-                                    add_inst.set_int(4, hs as i32);
-                                    new_instructions.push(add_inst);
+                                    new_instructions.push(ResidualAddInst::new(
+                                        div_ceil(hs as u32, 256),
+                                        act.ffn_down_stage.as_write_ptr(),
+                                        act.ffn_down_stage.as_ptr() as *const f32,
+                                        act.moe_expert_out.as_ptr(),
+                                        hs as i32,
+                                    ).into_inst());
                                 }
                             }
                             // Note: has_gate_proj shared expert already handled correctly by
@@ -2742,12 +2179,13 @@ impl MegakernelProgram {
 
                         // residual_add: hidden = residual + ffn_down_stage
                         // (missing for Nemotron-H because compile_moe_ffn_multi_gpu returns early)
-                        let mut res_inst = Instruction::new(OP_RESIDUAL_ADD, div_ceil(hs as u32, 256));
-                        res_inst.set_output_ptr(1, act.hidden.as_write_ptr());
-                        res_inst.set_ptr(2, act.residual.as_ptr());
-                        res_inst.set_ptr(3, act.ffn_down_stage.as_ptr() as *const f32);
-                        res_inst.set_int(4, hs as i32);
-                        new_instructions.push(res_inst);
+                        new_instructions.push(ResidualAddInst::new(
+                            div_ceil(hs as u32, 256),
+                            act.hidden.as_write_ptr(),
+                            act.residual.as_ptr(),
+                            act.ffn_down_stage.as_ptr() as *const f32,
+                            hs as i32,
+                        ).into_inst());
                     }
                 }
             }

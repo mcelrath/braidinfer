@@ -9,7 +9,7 @@
 
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
-#include "megakernel_moe_barrier.hip"
+#include "megakernel_moe_dispatch.hip"
 
 // ============================================================
 // Main megakernel entry point
@@ -32,52 +32,60 @@ __device__ void dump_instruction_output(
     if (dump_base == nullptr) return;
     if (blockIdx.x != 0) return;  // Only block 0 dumps
 
-    // Get output pointer and size from instruction (inst[1] is output for all compute ops)
-    float* output = inst_fptr(inst, 1);
+    // Get output pointer and size from instruction (all structs have output/result at word[1])
+    float* output = (float*)(inst[1]);
     int size = 0;
 
-    // Determine output size from opcode + instruction args
+    // Determine output size from opcode + typed struct fields
     switch (opcode) {
         case OP_RMSNORM: case OP_RMSNORM_WX:
-            size = inst_int(inst, 4); // hidden_size
+            size = (int)((const RmsNormInst*)inst)->dim;
             break;
         case OP_LINEAR_PROJ: case OP_LINEAR_PROJ_RNF4: case OP_LINEAR_PROJ_PCG32:
-            size = inst_int(inst, 4); // out_dim (total for batch=1)
+            size = (int)((const LinearProjInst*)inst)->out_dim;
             break;
-        case OP_RMSNORM_GATE:
-            size = inst_int(inst, 4) * inst_int(inst, 5); // num_heads * value_dim
+        case OP_RMSNORM_GATE: {
+            const RmsNormGateInst* g = (const RmsNormGateInst*)inst;
+            size = (int)g->num_heads * (int)g->vd;
             break;
+        }
         case OP_RESIDUAL_ADD:
-            size = inst_int(inst, 4); // size
+            size = (int)((const ResidualAddInst*)inst)->n;
             break;
         case OP_SILU_MUL:
-            size = inst_int(inst, 4); // size
+            size = (int)((const SiluMulInst*)inst)->size;
             break;
         case OP_EMBEDDING:
-            size = inst_int(inst, 4); // hidden_size
+            size = (int)((const EmbeddingInst*)inst)->hs;
             break;
         case OP_FFN_GATE_UP:
         case OP_FFN_GATE_UP_RNF4:
-            size = inst_int(inst, 7); // intermediate_size
+            size = (int)((const FfnGateUpInst*)inst)->intermediate;
             break;
         case OP_FFN_DOWN_RES:
         case OP_FFN_DOWN_RES_RNF4:
-            size = inst_int(inst, 5); // hidden_size
+            size = (int)((const FfnDownResInst*)inst)->hs;
             break;
-        case OP_GQA_ATTN:
-            size = inst_int(inst, 4) * inst_int(inst, 6); // nqh * hd
+        case OP_GQA_ATTN: {
+            const GqaAttnInst* g = (const GqaAttnInst*)inst;
+            size = (int)g->nqh * (int)g->hd;
             break;
+        }
         case OP_OUTPUT_GATE:
-            size = inst_int(inst, 4); // size
+            size = (int)((const OutputGateInst*)inst)->size;
             break;
-        case OP_MOE_GATE:
-            output = inst_fptr(inst, 3); // expert_weights
-            size = inst_int(inst, 5);    // k
+        case OP_MOE_GATE: {
+            const MoeGateInst* g = (const MoeGateInst*)inst;
+            output = g->expert_weights;
+            size = (int)g->k;
             break;
-        case OP_MOE_FFN:
-            output = inst_fptr(inst, 4); // ffn_down (accumulated output)
-            size = inst_int(inst, 10) & 0xFFFF; // hs
+        }
+        case OP_MOE_FFN: {
+            const MoeFfnInst* g = (const MoeFfnInst*)inst;
+            output = g->ffn_down;
+            size = (int)g->hs_eis & 0xFFFF;
             break;
+        }
         default:
             return;  // Skip non-compute ops
     }
@@ -126,10 +134,11 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     char* dump_base = nullptr;
     int dump_capacity = 0;
     int* dump_count = nullptr;
-    if (num_instructions > 0 && inst_opcode(program) == OP_NOP && inst_ptr(program, 1) != nullptr) {
-        dump_base = (char*)inst_ptr(program, 1);
-        dump_capacity = inst_int(program, 2);
-        dump_count = (int*)inst_ptr(program, 3);
+    if (num_instructions > 0 && inst_opcode(program) == OP_NOP && ((const NopInst*)program)->dump_buf != nullptr) {
+        const NopInst* nop = (const NopInst*)program;
+        dump_base = (char*)nop->dump_buf;
+        dump_capacity = (int)nop->max_slots;
+        dump_count = (int*)nop->dump_counter;
     }
 
     for (int pc = 0; pc < num_instructions; pc++) {
@@ -163,15 +172,6 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             op_linear_proj_rnf4_full(inst, grid_x);
             grid.sync();
             if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); grid.sync(); }
-            continue;
-        }
-
-        // OP_BARRIER: block 0 thread 0 signals CPU and spins; all other blocks wait at grid.sync().
-        // Must be outside the virtual block loop so blocks 1..N-1 can reach grid.sync() immediately
-        // while block 0 spins. After CPU resumes block 0, block 0 also calls grid.sync() to reunite.
-        if (opcode == OP_BARRIER) {
-            op_barrier(inst, blockIdx.x);
-            grid.sync();
             continue;
         }
 

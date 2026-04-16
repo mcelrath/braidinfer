@@ -33,7 +33,7 @@ use braidinfer_hip::memory::MappedHostBuffer;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 
-use crate::megakernel::{INST_SIZE, Instruction};
+use crate::megakernel::{INST_OPCODE_MASK, INST_SIZE, Instruction};
 
 /// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 64;
@@ -198,13 +198,13 @@ impl PersistentDispatch {
                 break;
             }
             if start.elapsed().as_secs() > 30 {
-                let opcode0 = instructions[0].words[0] & 0x7FFFFFFF;
+                let opcode0 = instructions[0].words[0] & INST_OPCODE_MASK;
                 let progress_pc = unsafe {
                     std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc))
                 };
                 let stuck_op = instructions
                     .get(progress_pc as usize)
-                    .map(|i| i.words[0] & 0x7FFFFFFF)
+                    .map(|i| i.words[0] & INST_OPCODE_MASK)
                     .unwrap_or(0);
                 let stuck_grid_x = instructions
                     .get(progress_pc as usize)
@@ -220,7 +220,7 @@ impl PersistentDispatch {
         }
         if std::env::var("DISPATCH_RTT").is_ok() {
             let us = start.elapsed().as_micros();
-            let op0 = instructions[0].words[0] & 0x7FFFFFFF;
+            let op0 = instructions[0].words[0] & INST_OPCODE_MASK;
             eprintln!(
                 "dispatch_batch gpu={gpu_idx} n={} op0={op0:#x} rtt={us}us",
                 instructions.len()

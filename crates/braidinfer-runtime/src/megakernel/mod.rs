@@ -20,6 +20,10 @@ include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 pub(crate) const OP_BARRIER: u32 = 33;
 
 pub(crate) const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
+pub(crate) const INST_OPCODE_MASK: u64 = 0x7FFFFFFF; // mask out FLAG_NO_SYNC to get opcode
+/// Shared memory bytes per block for tiled-LDS linear_proj ops: (8 + 7680 + 256) * 4.
+/// Must match SHARED_LPROJ_TOTAL in kernels/megakernel_ops.hip.
+pub(crate) const SHARED_LPROJ_TOTAL: u32 = 31776;
 
 pub(crate) const INST_SIZE: usize = 18; // 18 u64s per instruction = 144 bytes
 // RDNA3 7900XTX: 96 CUs grouped into 48 WGPs. hipDeviceAttributeMultiprocessorCount=48 (WGPs).
@@ -39,27 +43,6 @@ impl Instruction {
         Instruction { words }
     }
 
-    pub(crate) fn set_ptr<T>(&mut self, idx: usize, ptr: *const T) {
-        self.words[idx] = ptr as u64;
-    }
-
-    /// Set a slot to a GPU output pointer (GPU writes through this pointer).
-    /// Callers should use DeviceBuffer::as_write_ptr() to get *mut T from &self.
-    pub(crate) fn set_output_ptr<T>(&mut self, idx: usize, ptr: *mut T) {
-        self.words[idx] = ptr as u64;
-    }
-
-    pub(crate) fn set_int(&mut self, idx: usize, val: i32) {
-        self.words[idx] = val as u64;
-    }
-
-    pub(crate) fn set_float(&mut self, idx: usize, val: f32) {
-        self.words[idx] = val.to_bits() as u64;
-    }
-
-    pub(crate) fn set_no_sync(&mut self) {
-        self.words[0] |= FLAG_NO_SYNC as u64;
-    }
 }
 
 /// Set opcode + weight pointer for a linear projection instruction.
@@ -184,6 +167,9 @@ impl PrefillBuffers {
     }
 }
 
+pub(crate) mod instructions;
+pub(crate) use instructions::*;
+
 mod megakernel_compile;
 mod megakernel_run;
 
@@ -209,10 +195,13 @@ impl MegakernelProgram {
         self.dump_capacity = max_slots;
 
         // Prepend OP_NOP header with dump pointers, re-upload program
-        let mut header = Instruction::new(OP_NOP, 0);
-        header.set_ptr(1, self.dump_buffer.as_ref().unwrap().as_ptr());
-        header.set_int(2, max_slots);
-        header.set_ptr(3, self.dump_counter.as_ref().unwrap().as_ptr());
+        let header = NopInst {
+            opcode_gridx: make_opcode_gridx(OP_NOP, 0),
+            dump_buf: self.dump_buffer.as_ref().unwrap().as_ptr(),
+            max_slots: max_slots as u64,
+            dump_counter: self.dump_counter.as_ref().unwrap().as_ptr(),
+            _pad: [0; 14],
+        }.into_inst();
 
         let total_words = (1 + self.instructions.len()) * INST_SIZE;
         let mut flat: Vec<u64> = Vec::with_capacity(total_words);

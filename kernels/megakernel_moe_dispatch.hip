@@ -25,27 +25,28 @@
 #include "moe_expert_ops.h"
 
 __device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid) {
-    volatile MoeWorkItem* wq = (volatile MoeWorkItem*)(uintptr_t)inst[1];
-    float* output_slots = (float*)(uintptr_t)inst[2];
-    float* final_output = (float*)(uintptr_t)inst[3];
-    const int32_t* src_expert_ids = (const int32_t*)(uintptr_t)inst[4];
-    const float* src_expert_weights = (const float*)(uintptr_t)inst[5];
-    volatile uint32_t* seq_counter = (volatile uint32_t*)(uintptr_t)inst[6];
-    int num_workers = (int)(inst[7] >> 32);
-    int hs = (int)(inst[7] & 0xFFFFFFFF);  // hidden_size (output slot stride)
-    int layer_idx = (int)(inst[8] >> 32);
-    int k = (int)(inst[8] & 0xFFFFFFFF);
-    int eis = (int)(inst[9] >> 32);
-    int has_gate = (int)(inst[9] & 0xFFFFFFFF);
-    const float* activation = (const float*)(uintptr_t)inst[10];
-    // inst[11] is MoeWorkerConfig**: array of per-layer config ptrs indexed by layer_idx
-    MoeWorkerConfig* gpu0_config = ((MoeWorkerConfig**)(uintptr_t)inst[11])[layer_idx];
-    float* scratch_gate = (float*)(uintptr_t)inst[12];
-    float* scratch_up = (float*)(uintptr_t)inst[13];
-    float* scratch_act = (float*)(uintptr_t)inst[14];
-    int total_gpus = (int)inst[15];
+    const MoeDispatchInst* i = (const MoeDispatchInst*)inst;
+    volatile MoeWorkItem* wq = (volatile MoeWorkItem*)(uintptr_t)i->work_queue;
+    float* output_slots = (float*)(uintptr_t)i->output_slots;
+    float* final_output = (float*)(uintptr_t)i->final_output;
+    const int32_t* src_expert_ids = (const int32_t*)(uintptr_t)i->expert_ids;
+    const float* src_expert_weights = (const float*)(uintptr_t)i->expert_weights;
+    volatile uint32_t* seq_counter = (volatile uint32_t*)(uintptr_t)i->seq_counter;
+    int num_workers = (int)(i->num_workers_hs >> 32);
+    int hs = (int)(i->num_workers_hs & 0xFFFFFFFF);  // hidden_size (output slot stride)
+    int layer_idx = (int)(i->layer_k >> 32);
+    int k = (int)(i->layer_k & 0xFFFFFFFF);
+    int eis = (int)(i->eis_gate >> 32);
+    int has_gate = (int)(i->eis_gate & 0xFFFFFFFF);
+    const float* activation = (const float*)(uintptr_t)i->activation;
+    // layer_config_ptrs is MoeWorkerConfig**: array of per-layer config ptrs indexed by layer_idx
+    MoeWorkerConfig* gpu0_config = ((MoeWorkerConfig**)(uintptr_t)i->layer_config_ptrs)[layer_idx];
+    float* scratch_gate = (float*)(uintptr_t)i->scratch_gate;
+    float* scratch_up = (float*)(uintptr_t)i->scratch_up;
+    float* scratch_act = (float*)(uintptr_t)i->scratch_act;
+    int total_gpus = (int)i->num_gpus;
     // gate_up_in_dim: expert input dimension (= hs for standard MoE, moe_latent_size for Nemotron-H)
-    int gupd = (int)inst[16];
+    int gupd = (int)i->gate_up_in_dim;
     if (gupd == 0) gupd = hs;  // backward compat: default to hidden_size
 
     // GPU 0's output slot is at index 0 in output_slots (stride = hs for consistent slot layout)

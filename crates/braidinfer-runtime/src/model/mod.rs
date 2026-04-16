@@ -8,6 +8,7 @@ use crate::paged_kv::{PageAllocator, RecurrentCheckpointPool, SequenceState};
 
 // Re-export weight types and config for backward compatibility
 pub use crate::config::*;
+pub use crate::kernel::AllKernels;
 pub use crate::weights::*;
 
 mod attention_forward; // attention_forward

@@ -1,6 +1,7 @@
 use braidinfer_hip::memory::DeviceBuffer;
 
-use crate::megakernel::MegakernelProgram;
+use crate::megakernel::{MegakernelProgram, INST_OPCODE_MASK, OP_HALT, SHARED_LPROJ_TOTAL};
+use crate::megakernel::instructions::{EmbeddingInst, GqaAttnInst};
 
 use super::Model;
 use super::ModelError;
@@ -51,7 +52,10 @@ impl Model {
         }
 
         let mk = self.megakernel.as_mut().unwrap();
-        mk.instructions[mk.embedding_inst_idx].set_int(3, token_id as i32);
+        unsafe {
+            let inst = mk.instructions[mk.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
+            (*inst).token_id = token_id as u64;
+        }
         let hd = mk.head_dim_attn;
         let max_sl = mk.max_seq_len as usize;
         let head_stride = max_sl * hd;
@@ -66,7 +70,10 @@ impl Model {
         }
         let seq_len = position + 1;
         for &idx in &mk.gqa_attn_inst_indices {
-            mk.instructions[idx].set_int(8, seq_len as i32);
+            unsafe {
+                let inst = mk.instructions[idx].words.as_mut_ptr() as *mut GqaAttnInst;
+                (*inst).seq_len = seq_len as u64;
+            }
         }
         // dispatch instructions via persistent worker
 
@@ -82,7 +89,7 @@ impl Model {
         let batch: Vec<_> = mk
             .instructions
             .iter()
-            .take_while(|inst| (inst.words[0] & 0x7FFFFFFF) != 16)
+            .take_while(|inst| (inst.words[0] & INST_OPCODE_MASK) != OP_HALT as u64)
             .cloned()
             .collect();
         let dispatch = self.persistent_workers.as_mut().unwrap();
@@ -115,11 +122,11 @@ impl Model {
         // Lazy-init: compile P2P megakernel + launch workers on ALL GPUs
         if self.persistent_workers.is_none() {
             let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-            // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS needs (8+7680+256)*4 = 31776 bytes per block.
-            // moe_worker_kernel (GPUs 1-3) only needs 4352B; persistent_worker (GPU 0) needs 31776B.
+            // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS needs SHARED_LPROJ_TOTAL bytes per block.
+            // moe_worker_kernel (GPUs 1-3) only needs 4352B; persistent_worker (GPU 0) needs SHARED_LPROJ_TOTAL.
             // Pass the larger value; moe_worker has its own calculation in moe_p2p.rs.
             let moe_worker_shared_mem = 1024u32 * 4 + 256; // 4352B for moe_worker_kernel
-            let shared_mem = moe_worker_shared_mem.max(31776u32); // 31776B for persistent_worker
+            let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
             let hs = self.config.hidden_size;
             let max_eis = self
                 .config
@@ -259,10 +266,10 @@ impl Model {
         while i < n_inst {
             let inst = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].clone();
             i += 1;
-            let opcode = inst.words[0] & 0x7FFFFFFF;
-            if opcode == 16 {
+            let opcode = inst.words[0] & INST_OPCODE_MASK;
+            if opcode == OP_HALT as u64 {
                 break;
-            } // OP_HALT
+            }
 
             // Head-parallel attention boundary: flush segment, dispatch parallel QKV+GQA
             if has_head_parallel && attn_i < attn_boundaries.len() {
@@ -357,9 +364,12 @@ impl Model {
         attn_i: usize,
         position: u32,
     ) -> Result<(), ModelError> {
+        use crate::megakernel::instructions::{
+            D2dCopyInst, DeinterleaveInst, GqaAttnInst as GqaAttnInstLocal, LinearProjInst,
+            MropeInst, QkNormInst,
+        };
         use crate::megakernel::{
-            Instruction, OP_D2D_COPY, OP_DEINTERLEAVE, OP_GQA_ATTN, OP_LINEAR_PROJ,
-            OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_MROPE, OP_QK_NORM,
+            Instruction, OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4,
         };
         use crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS;
         use crate::quant::{LinearWeight, WeightFormat};
@@ -377,13 +387,7 @@ impl Model {
                 WeightFormat::Rnf4G128 => (OP_LINEAR_PROJ_RNF4, w.raw_data_ptr()),
                 WeightFormat::Bf16 => (OP_LINEAR_PROJ, w.raw_data_ptr()),
             };
-            let mut inst = Instruction::new(opcode, out_dim as u32);
-            inst.set_output_ptr(1, out_ptr);
-            inst.set_ptr(2, w_ptr);
-            inst.set_ptr(3, in_ptr);
-            inst.set_int(4, out_dim as i32);
-            inst.set_int(5, in_dim as i32);
-            batch.push(inst);
+            batch.push(LinearProjInst::new(opcode, out_dim as u32, out_ptr, w_ptr, in_ptr, out_dim as i32, in_dim as i32, 0).into_inst());
         }
 
         let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
@@ -485,12 +489,7 @@ impl Model {
 
                 // 0. Broadcast normed to GPUs 1..n
                 if gpu_i > 0 {
-                    let mut inst = Instruction::new(OP_D2D_COPY, (hs as u32 + 255) / 256);
-                    inst.set_output_ptr(1, normed_local as *mut f32);
-                    inst.set_ptr(2, normed_base as *const f32);
-                    inst.set_int(3, hs as i32);
-                    inst.set_no_sync();
-                    batch.push(inst);
+                    batch.push(D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32).no_sync().into_inst());
                 }
 
                 // 1-3. QKV projections.
@@ -567,22 +566,10 @@ impl Model {
                 // 4. Deinterleave Q+gate → q_attn, gate_attn (only for gated Q)
                 if has_gate {
                     let total = local_nqh * hd;
-                    let mut inst = Instruction::new(OP_DEINTERLEAVE, (total as u32 + 255) / 256);
-                    inst.set_output_ptr(1, q_ptr as *mut f32);
-                    inst.set_output_ptr(2, gate_ptr as *mut f32);
-                    inst.set_ptr(3, q_gate_ptr as *const f32);
-                    inst.set_int(4, local_nqh as i32);
-                    inst.set_int(5, hd as i32);
-                    inst.set_int(6, 1); // batch=1
-                    batch.push(inst);
+                    batch.push(DeinterleaveInst::new((total as u32 + 255) / 256, q_ptr as *mut f32, gate_ptr as *mut f32, q_gate_ptr as *const f32, local_nqh as i32, hd as i32, 1).into_inst());
                 } else {
                     // Non-gated: q_gate IS q, just copy
-                    let mut inst =
-                        Instruction::new(OP_D2D_COPY, ((local_nqh * hd) as u32 + 255) / 256);
-                    inst.set_output_ptr(1, q_ptr as *mut f32);
-                    inst.set_ptr(2, q_gate_ptr as *const f32);
-                    inst.set_int(3, (local_nqh * hd) as i32);
-                    batch.push(inst);
+                    batch.push(D2dCopyInst::new(((local_nqh * hd) as u32 + 255) / 256, q_ptr as *mut f32, q_gate_ptr as *const f32, (local_nqh * hd) as i32).into_inst());
                 }
 
                 // 5. QK-norm on local k (only for models with QK-norm weights — e.g. Qwen3, not Nemotron-H)
@@ -597,16 +584,7 @@ impl Model {
                             _ => panic!("expected attention layer"),
                         }
                     };
-                    let mut inst = Instruction::new(OP_QK_NORM, (local_nqh + local_nkh) as u32);
-                    inst.set_output_ptr(1, q_ptr as *mut f32);
-                    inst.set_output_ptr(2, k_local_ptr as *mut f32);
-                    inst.set_ptr(3, q_norm_ptr);
-                    inst.set_ptr(4, k_norm_ptr);
-                    inst.set_int(5, local_nqh as i32);
-                    inst.set_int(6, local_nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_float(8, qk_norm_eps);
-                    batch.push(inst);
+                    batch.push(QkNormInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, q_norm_ptr, k_norm_ptr, local_nqh as i32, local_nkh as i32, hd as i32, qk_norm_eps, 0).into_inst());
                 }
 
                 // 6. KV write (local — from local k/v to local KV cache)
@@ -617,54 +595,23 @@ impl Model {
                         kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
                     let dst_v =
                         kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    let mut inst = Instruction::new(OP_D2D_COPY, ((hd as u32) + 255) / 256);
-                    inst.set_output_ptr(1, dst_k as *mut f32);
-                    inst.set_ptr(2, src_k as *const f32);
-                    inst.set_int(3, hd as i32);
-                    inst.set_no_sync();
-                    batch.push(inst);
-                    let mut inst = Instruction::new(OP_D2D_COPY, ((hd as u32) + 255) / 256);
-                    inst.set_output_ptr(1, dst_v as *mut f32);
-                    inst.set_ptr(2, src_v as *const f32);
-                    inst.set_int(3, hd as i32);
-                    inst.set_no_sync();
-                    batch.push(inst);
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).no_sync().into_inst());
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).no_sync().into_inst());
                 }
 
                 // 7. mRoPE on local Q+K — only for models that use RoPE
                 if self.config.use_rope {
                     let rd = self.config.rope_dim;
                     let ms = self.config.mrope_sections();
-                    let mut inst = Instruction::new(OP_MROPE, (local_nqh + local_nkh) as u32);
-                    inst.set_output_ptr(1, q_ptr as *mut f32);
-                    inst.set_output_ptr(2, k_local_ptr as *mut f32);
-                    inst.set_ptr(3, self.activations.inv_freq.as_ptr());
-                    inst.set_ptr(4, self.activations.position_ids.as_ptr());
-                    inst.set_int(5, local_nqh as i32);
-                    inst.set_int(6, local_nkh as i32);
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, rd as i32);
-                    inst.set_int(9, ms[0] as i32);
-                    inst.set_int(10, ms[1] as i32);
-                    inst.set_int(11, ms[2] as i32);
-                    batch.push(inst);
+                    batch.push(MropeInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, self.activations.inv_freq.as_ptr(), self.activations.position_ids.as_ptr(), local_nqh as i32, local_nkh as i32, hd as i32, rd as i32, ms[0] as i32, ms[1] as i32, ms[2] as i32, 0).into_inst());
                 }
 
                 // 8. GQA (same as legacy path)
                 let seq_len = (position + 1) as i32;
                 {
-                    let mut inst = Instruction::new(OP_GQA_ATTN, local_nqh as u32);
-                    inst.set_output_ptr(1, out_ptr as *mut f32);
-                    inst.set_ptr(2, q_ptr as *const f32);
-                    inst.set_ptr(3, kv_k_base as *const f32);
-                    inst.set_ptr(4, kv_v_base as *const f32);
-                    inst.set_int(5, nqh as i32);          // global nqh for gqa_group
-                    inst.set_int(6, nkh as i32);          // global nkh
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, seq_len);
-                    inst.set_int(9, max_sl as i32);
-                    inst.set_int(10, (gpu_i * local_nqh) as i32); // q_head_start
-                    batch.push(inst);
+                    let mut inst = GqaAttnInstLocal::new(local_nqh as u32, out_ptr as *mut f32, q_ptr as *const f32, kv_k_base as *const f32, kv_v_base as *const f32, nqh as i32, nkh as i32, hd as i32, seq_len, max_sl as i32);
+                    inst.q_head_start = (gpu_i * local_nqh) as u64;
+                    batch.push(inst.into_inst());
                 }
             } else {
                 // ── Legacy mode (QKV already projected on GPU 0) ─────────────────────────
@@ -677,47 +624,23 @@ impl Model {
                         kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
                     let dst_v =
                         kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    let mut inst = Instruction::new(OP_D2D_COPY, ((hd as u32) + 255) / 256);
-                    inst.set_output_ptr(1, dst_k as *mut f32);
-                    inst.set_ptr(2, src_k as *const f32);
-                    inst.set_int(3, hd as i32);
-                    inst.set_no_sync();
-                    batch.push(inst);
-                    let mut inst = Instruction::new(OP_D2D_COPY, ((hd as u32) + 255) / 256);
-                    inst.set_output_ptr(1, dst_v as *mut f32);
-                    inst.set_ptr(2, src_v as *const f32);
-                    inst.set_int(3, hd as i32);
-                    inst.set_no_sync();
-                    batch.push(inst);
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).no_sync().into_inst());
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).no_sync().into_inst());
                 }
 
                 // For GPU i > 0: copy Q slice from GPU 0's q_attn to local attn_q
                 if gpu_i > 0 {
                     let src_q = q_attn_base + (gpu_i * local_nqh * hd * 4) as u64;
-                    let mut inst =
-                        Instruction::new(OP_D2D_COPY, ((local_nqh * hd) as u32 + 255) / 256);
-                    inst.set_output_ptr(1, q_ptr as *mut f32);
-                    inst.set_ptr(2, src_q as *const f32);
-                    inst.set_int(3, (local_nqh * hd) as i32);
-                    batch.push(inst);
+                    batch.push(D2dCopyInst::new(((local_nqh * hd) as u32 + 255) / 256, q_ptr as *mut f32, src_q as *const f32, (local_nqh * hd) as i32).into_inst());
                 }
 
                 // GQA attention
                 let seq_len = (position + 1) as i32;
                 let q_src = if gpu_i == 0 { q_attn_base } else { q_ptr };
                 {
-                    let mut inst = Instruction::new(OP_GQA_ATTN, local_nqh as u32);
-                    inst.set_output_ptr(1, out_ptr as *mut f32);
-                    inst.set_ptr(2, q_src as *const f32);
-                    inst.set_ptr(3, kv_k_base as *const f32);
-                    inst.set_ptr(4, kv_v_base as *const f32);
-                    inst.set_int(5, nqh as i32);          // global nqh for gqa_group
-                    inst.set_int(6, nkh as i32);          // global nkh
-                    inst.set_int(7, hd as i32);
-                    inst.set_int(8, seq_len);
-                    inst.set_int(9, max_sl as i32);
-                    inst.set_int(10, (gpu_i * local_nqh) as i32); // q_head_start
-                    batch.push(inst);
+                    let mut inst = GqaAttnInstLocal::new(local_nqh as u32, out_ptr as *mut f32, q_src as *const f32, kv_k_base as *const f32, kv_v_base as *const f32, nqh as i32, nkh as i32, hd as i32, seq_len, max_sl as i32);
+                    inst.q_head_start = (gpu_i * local_nqh) as u64;
+                    batch.push(inst.into_inst());
                 }
             }
 
@@ -779,12 +702,7 @@ impl Model {
                     .as_ptr() as *const f32;
                 let dst =
                     unsafe { (self.activations.attn_out.as_write_ptr()).add(gpu_i * n_elems) };
-                let mut inst = Instruction::new(OP_D2D_COPY, grid_x);
-                inst.set_output_ptr(1, dst);
-                inst.set_ptr(2, src);
-                inst.set_int(3, n_elems as i32);
-                inst.set_no_sync();
-                gather_batch.push(inst);
+                gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).no_sync().into_inst());
             }
 
             // gate_attn gather: GPU i → act.gate_attn[i*n_elems..]
@@ -802,12 +720,7 @@ impl Model {
                             .as_write_ptr()
                             .add(gpu_i * n_elems)
                     };
-                    let mut inst = Instruction::new(OP_D2D_COPY, grid_x);
-                    inst.set_output_ptr(1, dst);
-                    inst.set_ptr(2, src);
-                    inst.set_int(3, n_elems as i32);
-                    inst.set_no_sync();
-                    gather_batch.push(inst);
+                    gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).no_sync().into_inst());
                 }
             }
 
@@ -851,7 +764,7 @@ impl Model {
         };
 
         for inst in batch {
-            let opcode = (inst.words[0] & 0x7FFFFFFF) as u32;
+            let opcode = (inst.words[0] & INST_OPCODE_MASK) as u32;
             match opcode {
                 OP_D2D_COPY => {
                     let dst = inst.words[1] as *mut u8;

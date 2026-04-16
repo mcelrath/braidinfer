@@ -80,6 +80,9 @@ pub struct MoeWorkerGpu {
     pub shutdown: MappedHostBuffer<u32>,
     /// Host-mapped done flag (kernel writes 1 before returning after shutdown).
     pub done: MappedHostBuffer<u32>,
+    /// GART timing buffer: [N_TIMING_SLOTS * 4] u64 cycle timestamps.
+    /// Layout per slot i: [t_work_start, t_copy_done, t_experts_done, t_output_done].
+    pub timing_buf: MappedHostBuffer<u64>,
     pub stream: Stream,
     pub module: Module,
 }
@@ -213,6 +216,9 @@ impl MoeP2pContext {
             let local_output = DeviceBuffer::<f32>::alloc(device, hidden_size)?;
             let shutdown = MappedHostBuffer::<u32>::alloc(1)?;
             let done = MappedHostBuffer::<u32>::alloc(1)?;
+            // Timing buffer: 64 slots × 4 timestamps each (GART, CPU-readable without memcpy).
+            let timing_buf = MappedHostBuffer::<u64>::alloc(64 * 4)?;
+            unsafe { std::ptr::write_bytes(timing_buf.host_ptr(), 0, 64 * 4); }
             let stream = Stream::new(device)?;
             let module = Module::load(device, &kernel_dir.join("moe_worker.hsaco"))?;
             let func = module.get_function("moe_worker_kernel")?;
@@ -240,7 +246,8 @@ impl MoeP2pContext {
             let mut sa_ptr = scratch_act.as_ptr() as *mut std::ffi::c_void;
             let mut lo_ptr = local_output.as_ptr() as *mut std::ffi::c_void;
             let mut gid = gpu_id;
-            let mut args: [*mut std::ffi::c_void; 10] = [
+            let mut tb_ptr = timing_buf.device_ptr() as *mut std::ffi::c_void;
+            let mut args: [*mut std::ffi::c_void; 11] = [
                 std::ptr::addr_of_mut!(wq_ptr).cast(),
                 std::ptr::addr_of_mut!(sd_ptr).cast(),
                 std::ptr::addr_of_mut!(lc_ptr).cast(),
@@ -251,6 +258,7 @@ impl MoeP2pContext {
                 std::ptr::addr_of_mut!(sa_ptr).cast(),
                 std::ptr::addr_of_mut!(lo_ptr).cast(),
                 std::ptr::addr_of_mut!(gid).cast(),
+                std::ptr::addr_of_mut!(tb_ptr).cast(),
             ];
 
             let num_cus = multiprocessor_count(device)?;
@@ -288,6 +296,7 @@ impl MoeP2pContext {
                 local_output,
                 shutdown,
                 done,
+                timing_buf,
                 stream,
                 module,
             }));
@@ -306,6 +315,61 @@ impl MoeP2pContext {
             num_gpus,
             hidden_size,
         })
+    }
+
+    /// Print timing analysis from the worker GPU timing buffers.
+    /// GPU clock frequency for 7900XTX (RDNA3): ~2500 MHz.
+    /// Call after at least one token has been generated.
+    pub fn print_timing_report(&self, gpu_clock_mhz: f64) {
+        let cycles_per_us = gpu_clock_mhz / 1000.0;
+        for (i, worker) in self.workers.iter().enumerate() {
+            let buf = worker.timing_buf.host_ptr();
+            let mut slots_used = 0u32;
+            // Count non-zero slots
+            for s in 0..64 {
+                let t0 = unsafe { std::ptr::read_volatile(buf.add(s * 4)) };
+                if t0 == 0 { break; }
+                slots_used += 1;
+            }
+            if slots_used == 0 {
+                eprintln!("  Worker GPU {}: no timing data (timing_buf all zero)", i + 1);
+                continue;
+            }
+            eprintln!("  Worker GPU {} timing ({} layers, clock={} MHz):", i + 1, slots_used, gpu_clock_mhz as u64);
+            let mut total_outer_us = 0.0f64;
+            let mut total_copy_us = 0.0f64;
+            let mut total_expert_us = 0.0f64;
+            let mut total_output_us = 0.0f64;
+            for s in 0..(slots_used as usize) {
+                let t0 = unsafe { std::ptr::read_volatile(buf.add(s * 4    )) }; // work_start
+                let t1 = unsafe { std::ptr::read_volatile(buf.add(s * 4 + 1)) }; // copy_done
+                let t2 = unsafe { std::ptr::read_volatile(buf.add(s * 4 + 2)) }; // experts_done
+                let t3 = unsafe { std::ptr::read_volatile(buf.add(s * 4 + 3)) }; // output_done
+                if t0 == 0 || t1 < t0 || t2 < t1 || t3 < t2 { continue; }
+                total_copy_us   += (t1 - t0) as f64 / cycles_per_us;
+                total_expert_us += (t2 - t1) as f64 / cycles_per_us;
+                total_output_us += (t3 - t2) as f64 / cycles_per_us;
+                // Outer sync cost: gap between this slot's output_done and next slot's work_start
+                if s + 1 < slots_used as usize {
+                    let t_next = unsafe { std::ptr::read_volatile(buf.add((s + 1) * 4)) };
+                    if t_next > t3 {
+                        total_outer_us += (t_next - t3) as f64 / cycles_per_us;
+                    }
+                }
+            }
+            let n = (slots_used - 1).max(1) as f64;
+            eprintln!("    Outer sync+poll avg: {:.1} us/layer  (TOTAL {:.1} us)",
+                total_outer_us / n, total_outer_us);
+            eprintln!("    Activation copy avg: {:.1} us/layer  (TOTAL {:.1} us)",
+                total_copy_us / slots_used as f64, total_copy_us);
+            eprintln!("    Expert compute  avg: {:.1} us/layer  (TOTAL {:.1} us)",
+                total_expert_us / slots_used as f64, total_expert_us);
+            eprintln!("    Output copy     avg: {:.1} us/layer  (TOTAL {:.1} us)",
+                total_output_us / slots_used as f64, total_output_us);
+            let total = total_outer_us + total_copy_us + total_expert_us + total_output_us;
+            eprintln!("    Total measured:      {:.1} us  ({:.1} tok/s if dominant)",
+                total, 1e6 / total);
+        }
     }
 }
 

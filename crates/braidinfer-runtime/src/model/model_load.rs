@@ -11,6 +11,7 @@ use braidinfer_hip::stream::Stream;
 
 use super::Model;
 use crate::config::*;
+use crate::kernel::AllKernels;
 use crate::weights::*;
 
 impl Model {
@@ -631,8 +632,14 @@ impl Model {
                 let conv_raw: &[u16] = unsafe {
                     std::slice::from_raw_parts(conv_raw_bytes.as_ptr() as *const u16, conv_total)
                 };
-                let mut conv1d_weight_buf = DeviceBuffer::<u16>::alloc(device, conv_total)?;
-                conv1d_weight_buf.copy_from_host(conv_raw)?;
+                let trace_path = std::env::var("TRACE").ok();
+                let conv1d_weight_buf = if trace_path.is_some() {
+                    let mut buf = DeviceBuffer::<u16>::alloc(device, conv_total)?;
+                    buf.copy_from_host(conv_raw)?;
+                    Some(buf)
+                } else {
+                    None
+                };
                 let mut conv_w_q_buf = DeviceBuffer::<u16>::alloc(device, q_dim * ck)?;
                 let mut conv_w_k_buf = DeviceBuffer::<u16>::alloc(device, q_dim * ck)?;
                 let mut conv_w_v_buf = DeviceBuffer::<u16>::alloc(device, v_dim * ck)?;
@@ -651,7 +658,7 @@ impl Model {
                     w_a: load_lw(&format!("{p}linear_attn.in_proj_a.weight"), nvh, hs)?,
                     w_b: load_lw(&format!("{p}linear_attn.in_proj_b.weight"), nvh, hs)?,
                     w_z: load_lw(&format!("{p}linear_attn.in_proj_z.weight"), z_out, hs)?,
-                    conv1d_weight: conv1d_weight_buf,
+                    conv1d_weight: conv1d_weight_buf, // Some only when TRACE env var set
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
                     conv1d_weight_v: conv_w_v_buf,
@@ -887,12 +894,6 @@ impl Model {
             logits_mapped: braidinfer_hip::MappedHostBuffer::<f32>::alloc(vs)?,
             inv_freq: inv_freq_buf,
             position_ids: pos_buf,
-            gdn_cs_q: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,
-            gdn_cs_k: DeviceBuffer::<f32>::alloc(device, nh * kd * (ck - 1))?,
-            gdn_cs_v: DeviceBuffer::<f32>::alloc(device, nvh * vd * (ck - 1))?,
-            gdn_conv_out_q: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
-            gdn_conv_out_k: DeviceBuffer::<f32>::alloc(device, nh * kd)?,
-            gdn_conv_out_v: DeviceBuffer::<f32>::alloc(device, nvh * vd)?,
             // MoE scratch: sized for per-layer max expert dimensions
             moe_scores: DeviceBuffer::<f32>::alloc(
                 device,

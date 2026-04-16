@@ -10,9 +10,9 @@ use braidinfer_hip::stream::Stream;
 use crate::paged_kv::{PageAllocator, SequenceState};
 
 use super::{
-    CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_HALT,
-    OP_KV_QUANTIZE,
+    CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
 };
+use super::instructions::{AttnPagedInst, AttnPagedQInst, EmbeddingInst, GqaAttnInst, HaltInst, KvQuantizeInst, make_opcode_gridx};
 
 impl MegakernelProgram {
     pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
@@ -23,7 +23,10 @@ impl MegakernelProgram {
         );
 
         // Update embedding token_id
-        self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
+        unsafe {
+            let inst = self.instructions[self.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
+            (*inst).token_id = token_id as u64;
+        }
 
         // Update position_ids on device ([temporal, height, width] = all equal position for text)
         // Use synchronous hipMemcpy because pos_data is a stack local
@@ -55,7 +58,10 @@ impl MegakernelProgram {
         // Update GQA attention seq_len
         let seq_len = position + 1;
         for &idx in &self.gqa_attn_inst_indices {
-            self.instructions[idx].set_int(8, seq_len as i32);
+            unsafe {
+                let inst = self.instructions[idx].words.as_mut_ptr() as *mut GqaAttnInst;
+                (*inst).seq_len = seq_len as u64;
+            }
         }
 
         // Upload entire instruction buffer in one hipMemcpyAsync call.
@@ -88,7 +94,10 @@ impl MegakernelProgram {
     pub fn update_step_host_only(&mut self, token_id: u32, position: u32) -> HipResult<()> {
         assert!(position < self.max_seq_len);
 
-        self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
+        unsafe {
+            let inst = self.instructions[self.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
+            (*inst).token_id = token_id as u64;
+        }
 
         // position_ids is now MappedHostBuffer — written via host_ptr by caller,
         // GPU reads through device_ptr. No hipMemcpy needed.
@@ -108,7 +117,10 @@ impl MegakernelProgram {
 
         let seq_len = position + 1;
         for &idx in &self.gqa_attn_inst_indices {
-            self.instructions[idx].set_int(8, seq_len as i32);
+            unsafe {
+                let inst = self.instructions[idx].words.as_mut_ptr() as *mut GqaAttnInst;
+                (*inst).seq_len = seq_len as u64;
+            }
         }
 
         Ok(())
@@ -132,7 +144,10 @@ impl MegakernelProgram {
         assert!(self.paged, "update_step_paged called on non-paged program");
 
         // 1. Patch embedding token_id
-        self.instructions[self.embedding_inst_idx].set_int(3, token_id as i32);
+        unsafe {
+            let inst = self.instructions[self.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
+            (*inst).token_id = token_id as u64;
+        }
 
         // 2. Append scalar logical position to position_table in sequence order.
         // Use synchronous hipMemcpy (not Async) because source is a stack local
@@ -232,9 +247,12 @@ impl MegakernelProgram {
             // Patch OP_ATTN_PAGED_Q: enable (grid_x=nqh), quant page table, sealed seq_len
             for &idx in &self.attn_quant_inst_indices {
                 self.instructions[idx].words[0] = (OP_ATTN_PAGED_Q as u64) | ((nqh as u64) << 32);
-                self.instructions[idx].words[3] = quant_pt_ptr;
-                self.instructions[idx].words[4] = pos_table_ptr;
-                self.instructions[idx].set_int(9, sealed_tokens);
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                    (*inst).quant_page_table = quant_pt_ptr;
+                    (*inst).pos_table = pos_table_ptr;
+                    (*inst).quant_seq_len = sealed_tokens as u64;
+                }
             }
 
             // Patch OP_ATTN_PAGED: f32 page table (only active chunk), active seq_len
@@ -246,10 +264,12 @@ impl MegakernelProgram {
                 // Point page_table at the last entry (active chunk)
                 let active_pt_ptr =
                     page_table_ptr + (num_sealed * std::mem::size_of::<u64>()) as u64;
-                self.instructions[idx].words[3] = active_pt_ptr;
-                self.instructions[idx].words[4] =
-                    pos_table_ptr + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
-                self.instructions[idx].set_int(9, active_tokens);
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                    (*inst).page_table = active_pt_ptr;
+                    (*inst).pos_table = pos_table_ptr + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
+                    (*inst).seq_len = active_tokens as u64;
+                }
             }
         } else {
             // No quantized chunks yet (or quantized_kv not enabled): all f32
@@ -259,11 +279,17 @@ impl MegakernelProgram {
             }
             // OP_ATTN_PAGED sees all chunks, no partial_state
             for &idx in &self.attn_paged_inst_indices {
-                self.instructions[idx].words[3] = page_table_ptr;
-                self.instructions[idx].words[4] = pos_table_ptr;
-                self.instructions[idx].set_int(9, total_seq_len);
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                    (*inst).page_table = page_table_ptr;
+                    (*inst).pos_table = pos_table_ptr;
+                    (*inst).seq_len = total_seq_len as u64;
+                }
                 if !self.quantized_kv {
-                    self.instructions[idx].words[14] = 0; // no partial_state
+                    unsafe {
+                        let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                        (*inst).partial_state = 0;
+                    }
                 }
             }
         }
@@ -443,19 +469,22 @@ impl MegakernelProgram {
 
             for (is_v, f32_src) in [(false, f32_k), (true, f32_v)] {
                 let (q1d, q1s, rd, rs) = quantized_kv_offsets(cfg, CHUNK_TOKENS, layer_i, is_v);
-                let mut inst = Instruction::new(OP_KV_QUANTIZE, (nkh * hd) as u32);
-                inst.words[1] = f32_src;
-                inst.words[2] = quant_chunk_ptr as u64 + q1d as u64;
-                inst.words[3] = quant_chunk_ptr as u64 + q1s as u64;
-                inst.words[4] = quant_chunk_ptr as u64 + rd as u64;
-                inst.words[5] = quant_chunk_ptr as u64 + rs as u64;
-                inst.set_int(6, nkh as i32);
-                inst.set_int(7, hd as i32);
-                inst.set_int(8, CHUNK_TOKENS as i32);
-                instructions.push(inst);
+                instructions.push(KvQuantizeInst {
+                    opcode_gridx: make_opcode_gridx(OP_KV_QUANTIZE, (nkh * hd) as u32),
+                    src:          f32_src as *const f32,
+                    q1_data:      (quant_chunk_ptr as u64 + q1d as u64) as *mut u8,
+                    q1_scale:     (quant_chunk_ptr as u64 + q1s as u64) as *mut f32,
+                    r_data:       (quant_chunk_ptr as u64 + rd as u64) as *mut u8,
+                    r_scale:      (quant_chunk_ptr as u64 + rs as u64) as *mut f32,
+                    num_kv_heads: nkh as i32,
+                    head_dim:     hd as i32,
+                    chunk_tokens: CHUNK_TOKENS as i32,
+                    _pad0:        0,
+                    _pad:         [0; 10],
+                }.into_inst());
             }
         }
-        instructions.push(Instruction::new(OP_HALT, 0));
+        instructions.push(HaltInst::new().into_inst());
 
         // Upload and execute
         let flat: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();

@@ -536,6 +536,38 @@ impl CausalConv1dUpdateKernel {
         func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
     }
 
+    /// Raw-pointer variant: state/input/weight/output as pre-offset pointers.
+    /// Avoids staging copies when operating on sub-regions of a packed buffer.
+    pub fn forward_ptr(
+        &self,
+        state_ptr: *mut f32,
+        input_ptr: *const f32,
+        weight_ptr: *const u16,
+        output_ptr: *mut f32,
+        conv_dim: u32,
+        kernel_size: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("causal_conv1d_update_f32")?;
+        let mut sp = state_ptr as *mut c_void;
+        let mut ip = input_ptr as *const c_void;
+        let mut wp = weight_ptr as *const c_void;
+        let mut op = output_ptr as *mut c_void;
+        let mut cd = conv_dim as i32;
+        let mut ks = kernel_size as i32;
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(sp).cast(),
+            std::ptr::addr_of_mut!(ip).cast(),
+            std::ptr::addr_of_mut!(wp).cast(),
+            std::ptr::addr_of_mut!(op).cast(),
+            std::ptr::addr_of_mut!(cd).cast(),
+            std::ptr::addr_of_mut!(ks).cast(),
+        ];
+        let block_size = 256u32;
+        let grid_size = (conv_dim + block_size - 1) / block_size;
+        func.launch((grid_size, 1, 1), (block_size, 1, 1), 0, stream, &mut args)
+    }
+
     /// Variant with per-channel bias (for Mamba2 conv1d).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_with_bias(

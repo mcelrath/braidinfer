@@ -73,168 +73,58 @@ impl Model {
             &self.stream,
         )?;
 
-        // 4. Causal conv1d: split qkv into q/k/v
-        unsafe {
-            d2d_copy_f32(
-                &mut self.activations.q_gdn,
-                0,
-                &self.activations.qkv,
-                0,
-                nh as usize * kd as usize,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.activations.k_gdn,
-                0,
-                &self.activations.qkv,
-                nh as usize * kd as usize,
-                nh as usize * kd as usize,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.activations.v_gdn,
-                0,
-                &self.activations.qkv,
-                nh as usize * kd as usize * 2,
-                nvh as usize * vd as usize,
-                &self.stream,
-            )?;
-        }
-
-        let conv_q_out_len = nh as usize * kd as usize;
-        let conv_k_out_len = nh as usize * kd as usize;
-        let conv_v_out_len = nvh as usize * vd as usize;
+        // 4. Causal conv1d on Q, K, V — using raw-pointer variant to avoid staging copies.
+        //
+        // gdn_conv_states[gdn_idx] is packed [q_state | k_state | v_state]:
+        //   q_state: [nh*kd, ck-1], k_state: [nh*kd, ck-1], v_state: [nvh*vd, ck-1]
+        // Input for each is the corresponding slice of qkv: [q | k | v]
+        // Output goes directly to q_gdn / k_gdn / v_gdn.
+        //
+        // SAFETY: raw pointers into DeviceBuffers that remain live and unmodified for the
+        // duration of these async kernel launches (all on the same stream).
+        let conv_q_len = nh as usize * kd as usize;
+        let conv_k_len = nh as usize * kd as usize;
+        let conv_v_len = nvh as usize * vd as usize;
         let ck_usize = ck as usize;
+        let conv_state_q_len = conv_q_len * (ck_usize - 1);
+        let conv_state_k_len = conv_k_len * (ck_usize - 1);
 
-        // Split conv state into q/k/v sub-states
-        // gdn_conv_states[gdn_idx] is [6144, ck-1] = [6144 * (ck-1)].
-        // Split into 3 sub-states: q=[2048,ck-1], k=[2048,ck-1], v=[2048,ck-1].
-        let conv_state_q_len = conv_q_out_len * (ck_usize - 1);
-        let conv_state_k_len = conv_k_out_len * (ck_usize - 1);
-        let conv_state_v_len = conv_v_out_len * (ck_usize - 1);
-
-        unsafe {
-            d2d_copy_f32(
-                &mut self.activations.gdn_cs_q,
-                0,
-                &self.gdn_conv_states[gdn_idx],
-                0,
-                conv_state_q_len,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.activations.gdn_cs_k,
-                0,
-                &self.gdn_conv_states[gdn_idx],
-                conv_state_q_len,
-                conv_state_k_len,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.activations.gdn_cs_v,
-                0,
-                &self.gdn_conv_states[gdn_idx],
-                conv_state_q_len + conv_state_k_len,
-                conv_state_v_len,
-                &self.stream,
-            )?;
-        }
-
-        // Run 3 conv1d operations using pre-split weight buffers from the layer
-        // SAFETY: Raw pointers break the borrow on self.layers so we can mutably access
-        // self.activations. The pointers remain valid because layers[layer_idx] is not
-        // modified or moved during this function call.
         let (conv_w_q_ptr, conv_w_k_ptr, conv_w_v_ptr) = match &self.layers[layer_idx] {
             LayerWeights::Gdn(w) => (
-                &w.conv1d_weight_q as *const DeviceBuffer<u16>,
-                &w.conv1d_weight_k as *const DeviceBuffer<u16>,
-                &w.conv1d_weight_v as *const DeviceBuffer<u16>,
+                w.conv1d_weight_q.as_ptr(),
+                w.conv1d_weight_k.as_ptr(),
+                w.conv1d_weight_v.as_ptr(),
             ),
             _ => unreachable!(),
         };
+        let state_base = self.gdn_conv_states[gdn_idx].as_mut_ptr();
+        let qkv_base = self.activations.qkv.as_ptr();
         unsafe {
-            self.kernels.causal_conv1d.forward(
-                &mut self.activations.gdn_cs_q,
-                &self.activations.q_gdn,
-                &*conv_w_q_ptr,
-                &mut self.activations.gdn_conv_out_q,
-                conv_q_out_len as u32,
+            self.kernels.causal_conv1d.forward_ptr(
+                state_base,
+                qkv_base,
+                conv_w_q_ptr,
+                self.activations.q_gdn.as_mut_ptr(),
+                conv_q_len as u32,
                 ck,
                 &self.stream,
             )?;
-            self.kernels.causal_conv1d.forward(
-                &mut self.activations.gdn_cs_k,
-                &self.activations.k_gdn,
-                &*conv_w_k_ptr,
-                &mut self.activations.gdn_conv_out_k,
-                conv_k_out_len as u32,
+            self.kernels.causal_conv1d.forward_ptr(
+                state_base.add(conv_state_q_len),
+                qkv_base.add(conv_q_len),
+                conv_w_k_ptr,
+                self.activations.k_gdn.as_mut_ptr(),
+                conv_k_len as u32,
                 ck,
                 &self.stream,
             )?;
-            self.kernels.causal_conv1d.forward(
-                &mut self.activations.gdn_cs_v,
-                &self.activations.v_gdn,
-                &*conv_w_v_ptr,
-                &mut self.activations.gdn_conv_out_v,
-                conv_v_out_len as u32,
+            self.kernels.causal_conv1d.forward_ptr(
+                state_base.add(conv_state_q_len + conv_state_k_len),
+                qkv_base.add(conv_q_len + conv_k_len),
+                conv_w_v_ptr,
+                self.activations.v_gdn.as_mut_ptr(),
+                conv_v_len as u32,
                 ck,
-                &self.stream,
-            )?;
-        }
-
-        // Write back updated conv states
-        unsafe {
-            d2d_copy_f32(
-                &mut self.gdn_conv_states[gdn_idx],
-                0,
-                &self.activations.gdn_cs_q,
-                0,
-                conv_state_q_len,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.gdn_conv_states[gdn_idx],
-                conv_state_q_len,
-                &self.activations.gdn_cs_k,
-                0,
-                conv_state_k_len,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.gdn_conv_states[gdn_idx],
-                conv_state_q_len + conv_state_k_len,
-                &self.activations.gdn_cs_v,
-                0,
-                conv_state_v_len,
-                &self.stream,
-            )?;
-        }
-
-        // conv_out_q/k/v now hold the post-conv Q,K,V (with SiLU applied inside the kernel)
-        // Copy them back to q_gdn, k_gdn, v_gdn
-        unsafe {
-            d2d_copy_f32(
-                &mut self.activations.q_gdn,
-                0,
-                &self.activations.gdn_conv_out_q,
-                0,
-                conv_q_out_len,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.activations.k_gdn,
-                0,
-                &self.activations.gdn_conv_out_k,
-                0,
-                conv_k_out_len,
-                &self.stream,
-            )?;
-            d2d_copy_f32(
-                &mut self.activations.v_gdn,
-                0,
-                &self.activations.gdn_conv_out_v,
-                0,
-                conv_v_out_len,
                 &self.stream,
             )?;
         }

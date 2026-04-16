@@ -12,14 +12,15 @@
 // grid_x = 1 (single block processes one token's routing)
 __device__ void op_moe_gate(const u64* inst, u32 vblock) {
     if (vblock > 0) return;
-    const float* scores = inst_fptr(inst, 1);
-    int* expert_ids = (int*)(inst[2]);
-    float* expert_weights = inst_fptr(inst, 3);
-    int num_experts = inst_int(inst, 4);
-    int k = inst_int(inst, 5);
-    int gate_mode = inst_int(inst, 6);
-    float scaling = inst_float(inst, 7);
-    const float* correction_bias = inst_fptr(inst, 8);
+    const MoeGateInst* i = (const MoeGateInst*)inst;
+    const float* scores = i->scores;
+    int* expert_ids = i->expert_ids;
+    float* expert_weights = i->expert_weights;
+    int num_experts = (int)i->ne;
+    int k = (int)i->k;
+    int gate_mode = (int)i->gate_mode;
+    float scaling; uint32_t rsf_bits32 = (uint32_t)i->rsf_bits; __builtin_memcpy(&scaling, &rsf_bits32, 4);
+    const float* correction_bias = (const float*)i->bias;
 
     int tid = threadIdx.x;
     int stride = blockDim.x;
@@ -106,26 +107,27 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
 // grid_x should be max(eis, hs) to give enough virtual blocks for all matmuls.
 template<typename GridGroup>
 __device__ void op_moe_ffn(const u64* inst, GridGroup& grid) {
-    const int* expert_ids = (const int*)(inst[1]);
-    const float* expert_weights = inst_fptr(inst, 2);
-    const float* input = inst_fptr(inst, 3);
-    float* output = inst_fptr(inst, 4);
-    const unsigned char* gate_up_base = (const unsigned char*)inst_ptr(inst, 5);
-    long long gate_up_expert_stride = (long long)inst[6];
-    const unsigned char* down_base = (const unsigned char*)inst_ptr(inst, 7);
-    long long down_expert_stride = (long long)inst[8];
-    int k = inst_int(inst, 9);
-    int packed_dims = inst_int(inst, 10);
+    const MoeFfnInst* i = (const MoeFfnInst*)inst;
+    const int* expert_ids = i->expert_ids;
+    const float* expert_weights = i->expert_weights;
+    const float* input = i->normed;
+    float* output = i->ffn_down;
+    const unsigned char* gate_up_base = i->gate_up_data;
+    long long gate_up_expert_stride = (long long)i->gate_up_expert_stride;
+    const unsigned char* down_base = i->down_data;
+    long long down_expert_stride = (long long)i->down_expert_stride;
+    int k = (int)i->k;
+    int packed_dims = (int)i->hs_eis;
     int hs = packed_dims & 0xFFFF;
     int eis = (packed_dims >> 16) & 0xFFFF;
-    int flags = inst_int(inst, 11);
+    int flags = (int)i->flags;
     bool has_gate_proj = flags & 1;
     bool relu_sq = flags & 2;
-    float* scratch_gate = inst_fptr(inst, 12);
-    float* scratch_up = inst_fptr(inst, 13);
-    float* scratch_act = inst_fptr(inst, 14);
-    float* scratch_out = inst_fptr(inst, 15);
-    long long gate_up_row_stride = (long long)inst[16];
+    float* scratch_gate = (float*)i->expert_gate;
+    float* scratch_up = (float*)i->expert_up;
+    float* scratch_act = (float*)i->expert_act;
+    float* scratch_out = (float*)i->expert_out;
+    long long gate_up_row_stride = (long long)i->gate_up_row_stride;
 
     int tid = threadIdx.x;
 

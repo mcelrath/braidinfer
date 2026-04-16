@@ -1,0 +1,1124 @@
+//! Per-opcode instruction structs for the megakernel.
+//!
+//! Each struct is `#[repr(C)]` with exactly `INST_SIZE` (18) u64-equivalent fields.
+//! `words[0]` = `opcode_gridx: u64` encoding `opcode | (grid_x << 32)`.
+//! All structs transmute to/from `Instruction` via `into_inst()`.
+//!
+//! Only the Rust encoding layer is changed here. The `Instruction { words: [u64; INST_SIZE] }`
+//! storage type is preserved. GPU-side `.hip` files are NOT modified (Phase 2).
+
+use super::{
+    FLAG_NO_SYNC, INST_SIZE, Instruction,
+    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
+    OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT,
+    OP_KV_QUANTIZE, OP_LM_HEAD, OP_MAMBA2_CONV1D, OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH,
+    OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM, OP_RELU_SQ,
+    OP_RESIDUAL_ADD, OP_RMSNORM_GATE, OP_SCALE_ADD,
+    OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
+};
+
+// Compile-time size assertions: each struct must be exactly INST_SIZE * 8 bytes.
+const _INST_BYTES: usize = INST_SIZE * 8;
+
+macro_rules! assert_inst_size {
+    ($t:ty) => {
+        const _: () = assert!(
+            std::mem::size_of::<$t>() == _INST_BYTES,
+            concat!(stringify!($t), " size mismatch")
+        );
+    };
+}
+
+/// Helper: encode opcode + grid_x into words[0].
+#[inline(always)]
+pub(crate) fn make_opcode_gridx(opcode: u32, grid_x: u32) -> u64 {
+    opcode as u64 | ((grid_x as u64) << 32)
+}
+
+// ─── Macro for no_sync / FLAG_NO_SYNC helper ────────────────────────────────
+macro_rules! impl_no_sync {
+    ($t:ty) => {
+        #[allow(dead_code)]
+        impl $t {
+            pub(crate) fn no_sync(mut self) -> Self {
+                self.opcode_gridx |= FLAG_NO_SYNC as u64;
+                self
+            }
+            pub(crate) fn into_inst(self) -> Instruction {
+                unsafe { std::mem::transmute(self) }
+            }
+        }
+        unsafe impl Send for $t {}
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_NOP / dump header (opcode=0)
+// words[1] = dump_buf_ptr, words[2] = max_slots (i32), words[3] = dump_counter_ptr
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct NopInst {
+    pub opcode_gridx: u64,
+    pub dump_buf: *const u8,
+    pub max_slots: u64,
+    pub dump_counter: *const i32,
+    pub _pad: [u64; 14],
+}
+assert_inst_size!(NopInst);
+impl_no_sync!(NopInst);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_RMSNORM / OP_RMSNORM_WX (opcodes 1, 27)
+// words[1]=output, [2]=input, [3]=weight, [4]=dim(i32), [5]=eps(f32 bits)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct RmsNormInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub input: *const f32,
+    pub weight: *const u16, // bf16 weight
+    pub dim: u64,           // i32 zero-extended
+    pub eps_bits: u64,      // f32::to_bits() as u64
+    pub _pad: [u64; 12],
+}
+assert_inst_size!(RmsNormInst);
+impl_no_sync!(RmsNormInst);
+
+impl RmsNormInst {
+    pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, input: *const f32, weight: *const u16, dim: i32, eps: f32) -> Self {
+        RmsNormInst {
+            opcode_gridx: make_opcode_gridx(opcode, grid_x),
+            output,
+            input,
+            weight,
+            dim: dim as u64,
+            eps_bits: eps.to_bits() as u64,
+            _pad: [0; 12],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_LINEAR_PROJ / OP_LINEAR_PROJ_RNF4 / OP_LINEAR_PROJ_PCG32 (opcodes 2, 25, 26)
+// words[1]=output, [2]=weight, [3]=input, [4]=out_dim(i32), [5]=in_dim(i32), [6]=batch(i32)
+// Note: batch defaults to 0 (kernel treats 0 as batch=1 for decode path).
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct LinearProjInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub weight: *const u8, // bf16 or packed u8
+    pub input: *const f32,
+    pub out_dim: u64,      // i32 zero-extended
+    pub in_dim: u64,       // i32 zero-extended
+    pub batch: u64,        // i32, 0 = single token
+    pub _pad: [u64; 11],
+}
+assert_inst_size!(LinearProjInst);
+impl_no_sync!(LinearProjInst);
+
+impl LinearProjInst {
+    pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, weight: *const u8, input: *const f32, out_dim: i32, in_dim: i32, batch: i32) -> Self {
+        LinearProjInst {
+            opcode_gridx: make_opcode_gridx(opcode, grid_x),
+            output,
+            weight,
+            input,
+            out_dim: out_dim as u64,
+            in_dim: in_dim as u64,
+            batch: batch as u64,
+            _pad: [0; 11],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_CONV1D (opcode 3)
+// words[1]=state(w), [2]=input, [3]=weight, [4]=output(w), [5]=dim(i32), [6]=kernel_size(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct Conv1dInst {
+    pub opcode_gridx: u64,
+    pub state: *mut f32,
+    pub input: *const f32,
+    pub weight: *const u16, // bf16
+    pub output: *mut f32,
+    pub dim: u64,
+    pub kernel_size: u64,
+    pub _pad: [u64; 11],
+}
+assert_inst_size!(Conv1dInst);
+impl_no_sync!(Conv1dInst);
+
+impl Conv1dInst {
+    pub(crate) fn new(grid_x: u32, state: *mut f32, input: *const f32, weight: *const u16, output: *mut f32, dim: i32, kernel_size: i32) -> Self {
+        Conv1dInst {
+            opcode_gridx: make_opcode_gridx(OP_CONV1D, grid_x),
+            state,
+            input,
+            weight,
+            output,
+            dim: dim as u64,
+            kernel_size: kernel_size as u64,
+            _pad: [0; 11],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_GDN_GATE (opcode 4)
+// words[1]=output(w), [2]=a_proj, [3]=a_log, [4]=dt_bias, [5]=num_heads(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct GdnGateInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub a_proj: *const f32,
+    pub a_log: *const f32,
+    pub dt_bias: *const u16, // bf16
+    pub num_heads: u64,
+    pub _pad: [u64; 12],
+}
+assert_inst_size!(GdnGateInst);
+impl_no_sync!(GdnGateInst);
+
+impl GdnGateInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, a_proj: *const f32, a_log: *const f32, dt_bias: *const u16, num_heads: i32) -> Self {
+        GdnGateInst {
+            opcode_gridx: make_opcode_gridx(OP_GDN_GATE, grid_x),
+            output,
+            a_proj,
+            a_log,
+            dt_bias,
+            num_heads: num_heads as u64,
+            _pad: [0; 12],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_GDN_RECUR (opcode 5)
+// words[1]=q, [2]=k, [3]=v, [4]=gate, [5]=b_proj, [6]=state(w), [7]=out(w),
+//        [8]=kd(i32), [9]=vd(i32), [10]=gqa_group(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct GdnRecurInst {
+    pub opcode_gridx: u64,
+    pub q: *const f32,
+    pub k: *const f32,
+    pub v: *const f32,
+    pub gate: *const f32,
+    pub b_proj: *const f32,
+    pub state: *mut f32,
+    pub output: *mut f32,
+    pub kd: u64,
+    pub vd: u64,
+    pub gqa_group: u64,
+    pub _pad: [u64; 7],
+}
+assert_inst_size!(GdnRecurInst);
+impl_no_sync!(GdnRecurInst);
+
+impl GdnRecurInst {
+    pub(crate) fn new(grid_x: u32, q: *const f32, k: *const f32, v: *const f32, gate: *const f32, b_proj: *const f32, state: *mut f32, output: *mut f32, kd: i32, vd: i32, gqa_group: i32) -> Self {
+        GdnRecurInst {
+            opcode_gridx: make_opcode_gridx(OP_GDN_RECUR, grid_x),
+            q, k, v, gate, b_proj, state, output,
+            kd: kd as u64,
+            vd: vd as u64,
+            gqa_group: gqa_group as u64,
+            _pad: [0; 7],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_RMSNORM_GATE (opcode 6)
+// words[1]=output(w), [2]=x, [3]=z, [4]=weight, [5]=num_heads, [6]=vd, [7]=eps
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct RmsNormGateInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub x: *const f32,
+    pub z: *const f32,
+    pub weight: *const f32, // f32 (GDN output_norm uses f32)
+    pub num_heads: u64,
+    pub vd: u64,
+    pub eps_bits: u64,
+    pub _pad: [u64; 10],
+}
+assert_inst_size!(RmsNormGateInst);
+impl_no_sync!(RmsNormGateInst);
+
+impl RmsNormGateInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, x: *const f32, z: *const f32, weight: *const f32, num_heads: i32, vd: i32, eps: f32) -> Self {
+        RmsNormGateInst {
+            opcode_gridx: make_opcode_gridx(OP_RMSNORM_GATE, grid_x),
+            output, x, z, weight,
+            num_heads: num_heads as u64,
+            vd: vd as u64,
+            eps_bits: eps.to_bits() as u64,
+            _pad: [0; 10],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_RESIDUAL_ADD (opcode 7)
+// words[1]=output(w), [2]=src, [3]=residual, [4]=n(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct ResidualAddInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub src: *const f32,
+    pub residual: *const f32,
+    pub n: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(ResidualAddInst);
+impl_no_sync!(ResidualAddInst);
+
+impl ResidualAddInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, src: *const f32, residual: *const f32, n: i32) -> Self {
+        ResidualAddInst {
+            opcode_gridx: make_opcode_gridx(OP_RESIDUAL_ADD, grid_x),
+            output, src, residual,
+            n: n as u64,
+            _pad: [0; 13],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_QK_NORM (opcode 8)
+// words[1]=q(w), [2]=k(w), [3]=q_norm, [4]=k_norm, [5]=nqh, [6]=nkh, [7]=hd, [8]=eps, [9]=n(batch)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct QkNormInst {
+    pub opcode_gridx: u64,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub q_norm: *const u16,
+    pub k_norm: *const u16,
+    pub nqh: u64,
+    pub nkh: u64,
+    pub hd: u64,
+    pub eps_bits: u64,
+    pub batch: u64, // only set for n>1; 0 for single-token
+    pub _pad: [u64; 8],
+}
+assert_inst_size!(QkNormInst);
+impl_no_sync!(QkNormInst);
+
+impl QkNormInst {
+    pub(crate) fn new(grid_x: u32, q: *mut f32, k: *mut f32, q_norm: *const u16, k_norm: *const u16, nqh: i32, nkh: i32, hd: i32, eps: f32, batch: i32) -> Self {
+        QkNormInst {
+            opcode_gridx: make_opcode_gridx(OP_QK_NORM, grid_x),
+            q, k, q_norm, k_norm,
+            nqh: nqh as u64,
+            nkh: nkh as u64,
+            hd: hd as u64,
+            eps_bits: eps.to_bits() as u64,
+            batch: batch as u64,
+            _pad: [0; 8],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MROPE (opcode 9)
+// words[1]=q(w), [2]=k(w), [3]=inv_freq, [4]=pos_ids, [5]=nqh, [6]=nkh,
+//        [7]=hd, [8]=rd, [9]=s0, [10]=s1, [11]=s2, [12]=batch
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct MropeInst {
+    pub opcode_gridx: u64,
+    pub q: *mut f32,
+    pub k: *mut f32,
+    pub inv_freq: *const f32,
+    pub pos_ids: *const i32,
+    pub nqh: u64,
+    pub nkh: u64,
+    pub hd: u64,
+    pub rd: u64,
+    pub s0: u64,
+    pub s1: u64,
+    pub s2: u64,
+    pub batch: u64,
+    pub _pad: [u64; 5],
+}
+assert_inst_size!(MropeInst);
+impl_no_sync!(MropeInst);
+
+impl MropeInst {
+    pub(crate) fn new(grid_x: u32, q: *mut f32, k: *mut f32, inv_freq: *const f32, pos_ids: *const i32, nqh: i32, nkh: i32, hd: i32, rd: i32, s0: i32, s1: i32, s2: i32, batch: i32) -> Self {
+        MropeInst {
+            opcode_gridx: make_opcode_gridx(OP_MROPE, grid_x),
+            q, k, inv_freq, pos_ids,
+            nqh: nqh as u64,
+            nkh: nkh as u64,
+            hd: hd as u64,
+            rd: rd as u64,
+            s0: s0 as u64,
+            s1: s1 as u64,
+            s2: s2 as u64,
+            batch: batch as u64,
+            _pad: [0; 5],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_GQA_ATTN (opcode 10)
+// words[1]=out(w), [2]=q, [3]=k_cache, [4]=v_cache, [5]=nqh, [6]=nkh,
+//        [7]=hd, [8]=seq_len, [9]=max_seq_len, [10]=q_head_start
+// (q_head_start is only for multi-GPU head-parallel; defaults 0)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct GqaAttnInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub q: *const f32,
+    pub k_cache: *const f32,
+    pub v_cache: *const f32,
+    pub nqh: u64,
+    pub nkh: u64,
+    pub hd: u64,
+    pub seq_len: u64,
+    pub max_seq_len: u64,
+    pub q_head_start: u64,
+    pub _pad: [u64; 7],
+}
+assert_inst_size!(GqaAttnInst);
+impl_no_sync!(GqaAttnInst);
+
+impl GqaAttnInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32, nqh: i32, nkh: i32, hd: i32, seq_len: i32, max_seq_len: i32) -> Self {
+        GqaAttnInst {
+            opcode_gridx: make_opcode_gridx(OP_GQA_ATTN, grid_x),
+            output, q, k_cache, v_cache,
+            nqh: nqh as u64,
+            nkh: nkh as u64,
+            hd: hd as u64,
+            seq_len: seq_len as u64,
+            max_seq_len: max_seq_len as u64,
+            q_head_start: 0,
+            _pad: [0; 7],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_OUTPUT_GATE (opcode 11)
+// words[1]=output(w), [2]=attn_out, [3]=gate, [4]=size(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct OutputGateInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub attn_out: *const f32,
+    pub gate: *const f32,
+    pub size: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(OutputGateInst);
+impl_no_sync!(OutputGateInst);
+
+impl OutputGateInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, attn_out: *const f32, gate: *const f32, size: i32) -> Self {
+        OutputGateInst {
+            opcode_gridx: make_opcode_gridx(OP_OUTPUT_GATE, grid_x),
+            output, attn_out, gate,
+            size: size as u64,
+            _pad: [0; 13],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_FFN_GATE_UP / OP_FFN_GATE_UP_RNF4 (opcodes 12, 30)
+// words[1]=out(w), [2]=hidden, [3]=norm_weight, [4]=w_gate, [5]=w_up,
+//        [6]=hs(i32), [7]=is(i32), [8]=eps, [9]=batch(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct FfnGateUpInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub hidden: *const f32,
+    pub norm_weight: *const u16,
+    pub w_gate: *const u8, // bf16 or packed
+    pub w_up: *const u8,
+    pub hs: u64,
+    pub intermediate: u64,
+    pub eps_bits: u64,
+    pub batch: u64,
+    pub _pad: [u64; 8],
+}
+assert_inst_size!(FfnGateUpInst);
+impl_no_sync!(FfnGateUpInst);
+
+impl FfnGateUpInst {
+    pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, hidden: *const f32, norm_weight: *const u16, w_gate: *const u8, w_up: *const u8, hs: i32, intermediate: i32, eps: f32, batch: i32) -> Self {
+        FfnGateUpInst {
+            opcode_gridx: make_opcode_gridx(opcode, grid_x),
+            output, hidden, norm_weight, w_gate, w_up,
+            hs: hs as u64,
+            intermediate: intermediate as u64,
+            eps_bits: eps.to_bits() as u64,
+            batch: batch as u64,
+            _pad: [0; 8],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_FFN_DOWN_RES / OP_FFN_DOWN_RES_RNF4 (opcodes 13, 31)
+// words[1]=out(w), [2]=residual, [3]=w_down, [4]=ffn_act, [5]=hs(i32), [6]=is(i32), [7]=batch(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct FfnDownResInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub residual: *const f32,
+    pub w_down: *const u8,
+    pub ffn_act: *const f32,
+    pub hs: u64,
+    pub intermediate: u64,
+    pub batch: u64,
+    pub _pad: [u64; 10],
+}
+assert_inst_size!(FfnDownResInst);
+impl_no_sync!(FfnDownResInst);
+
+impl FfnDownResInst {
+    pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, residual: *const f32, w_down: *const u8, ffn_act: *const f32, hs: i32, intermediate: i32, batch: i32) -> Self {
+        FfnDownResInst {
+            opcode_gridx: make_opcode_gridx(opcode, grid_x),
+            output, residual, w_down, ffn_act,
+            hs: hs as u64,
+            intermediate: intermediate as u64,
+            batch: batch as u64,
+            _pad: [0; 10],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_EMBEDDING (opcode 14)
+// words[1]=output(w), [2]=embed_weight, [3]=token_id(i32), [4]=hs(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct EmbeddingInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub embed_weight: *const u16, // bf16
+    pub token_id: u64,
+    pub hs: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(EmbeddingInst);
+impl_no_sync!(EmbeddingInst);
+
+impl EmbeddingInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, embed_weight: *const u16, token_id: i32, hs: i32) -> Self {
+        EmbeddingInst {
+            opcode_gridx: make_opcode_gridx(OP_EMBEDDING, grid_x),
+            output,
+            embed_weight,
+            token_id: token_id as u64,
+            hs: hs as u64,
+            _pad: [0; 13],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_LM_HEAD (opcode 15) — same layout as OP_LINEAR_PROJ (reuses LinearProjInst)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_HALT (opcode 16)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct HaltInst {
+    pub opcode_gridx: u64,
+    pub _pad: [u64; 17],
+}
+assert_inst_size!(HaltInst);
+impl_no_sync!(HaltInst);
+
+impl HaltInst {
+    pub(crate) fn new() -> Self {
+        HaltInst {
+            opcode_gridx: make_opcode_gridx(OP_HALT, 0),
+            _pad: [0; 17],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_D2D_COPY (opcode 17)
+// words[1]=dst(w), [2]=src, [3]=n_elems(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct D2dCopyInst {
+    pub opcode_gridx: u64,
+    pub dst: *mut f32,
+    pub src: *const f32,
+    pub n_elems: u64,
+    pub _pad: [u64; 14],
+}
+assert_inst_size!(D2dCopyInst);
+impl_no_sync!(D2dCopyInst);
+
+impl D2dCopyInst {
+    pub(crate) fn new(grid_x: u32, dst: *mut f32, src: *const f32, n_elems: i32) -> Self {
+        D2dCopyInst {
+            opcode_gridx: make_opcode_gridx(OP_D2D_COPY, grid_x),
+            dst, src,
+            n_elems: n_elems as u64,
+            _pad: [0; 14],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_ATTN_PAGED (opcode 18)
+// words[1]=out(w), [2]=q, [3]=page_table(ptr, patched), [4]=pos_table(ptr, patched),
+//        [5]=inv_freq, [6]=nqh, [7]=nkh, [8]=hd, [9]=seq_len, [10]=chunk_tokens,
+//        [11]=rd, [12]=layer_k_offset(raw u64), [13]=layer_v_offset(raw u64),
+//        [14]=partial_state(patched), [16]=k_norm
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct AttnPagedInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub q: *const f32,
+    pub page_table: u64, // patched per step
+    pub pos_table: u64,  // patched per step
+    pub inv_freq: *const f32,
+    pub nqh: u64,
+    pub nkh: u64,
+    pub hd: u64,
+    pub seq_len: u64,
+    pub chunk_tokens: u64,
+    pub rd: u64,
+    pub layer_k_offset: u64, // raw byte offset for layer within paged buffer
+    pub layer_v_offset: u64,
+    pub partial_state: u64, // patched when quantized KV enabled
+    pub _pad1: u64,
+    pub k_norm: *const u16, // null if no QK-norm
+    pub _pad2: u64,
+}
+assert_inst_size!(AttnPagedInst);
+impl_no_sync!(AttnPagedInst);
+
+impl AttnPagedInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, seq_len: i32, chunk_tokens: i32, rd: i32, layer_k_offset: u64, layer_v_offset: u64, k_norm: *const u16) -> Self {
+        AttnPagedInst {
+            opcode_gridx: make_opcode_gridx(OP_ATTN_PAGED, grid_x),
+            output,
+            q,
+            page_table: 0,
+            pos_table: 0,
+            inv_freq,
+            nqh: nqh as u64,
+            nkh: nkh as u64,
+            hd: hd as u64,
+            seq_len: seq_len as u64,
+            chunk_tokens: chunk_tokens as u64,
+            rd: rd as u64,
+            layer_k_offset,
+            layer_v_offset,
+            partial_state: 0,
+            _pad1: 0,
+            k_norm,
+            _pad2: 0,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_ATTN_PREFILL (opcode 19)
+// words[1]=out(w), [2]=q, [3]=k_cache, [4]=v_cache, [5]=nqh, [6]=nkh, [7]=hd,
+//        [8]=start_pos, [9]=n, [10]=max_seq_len
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct AttnPrefillInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub q: *const f32,
+    pub k_cache: *const f32,
+    pub v_cache: *const f32,
+    pub nqh: u64,
+    pub nkh: u64,
+    pub hd: u64,
+    pub start_pos: u64,
+    pub n: u64,
+    pub max_seq_len: u64,
+    pub _pad: [u64; 7],
+}
+assert_inst_size!(AttnPrefillInst);
+impl_no_sync!(AttnPrefillInst);
+
+impl AttnPrefillInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32, nqh: i32, nkh: i32, hd: i32, start_pos: i32, n: i32, max_seq_len: i32) -> Self {
+        AttnPrefillInst {
+            opcode_gridx: make_opcode_gridx(OP_ATTN_PREFILL, grid_x),
+            output, q, k_cache, v_cache,
+            nqh: nqh as u64,
+            nkh: nkh as u64,
+            hd: hd as u64,
+            start_pos: start_pos as u64,
+            n: n as u64,
+            max_seq_len: max_seq_len as u64,
+            _pad: [0; 7],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_DEINTERLEAVE (opcode 20)
+// words[1]=dst_q(w), [2]=dst_gate(w), [3]=src, [4]=num_heads, [5]=head_dim, [6]=batch
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct DeinterleaveInst {
+    pub opcode_gridx: u64,
+    pub dst_q: *mut f32,
+    pub dst_gate: *mut f32,
+    pub src: *const f32,
+    pub num_heads: u64,
+    pub head_dim: u64,
+    pub batch: u64,
+    pub _pad: [u64; 11],
+}
+assert_inst_size!(DeinterleaveInst);
+impl_no_sync!(DeinterleaveInst);
+
+impl DeinterleaveInst {
+    pub(crate) fn new(grid_x: u32, dst_q: *mut f32, dst_gate: *mut f32, src: *const f32, num_heads: i32, head_dim: i32, batch: i32) -> Self {
+        DeinterleaveInst {
+            opcode_gridx: make_opcode_gridx(OP_DEINTERLEAVE, grid_x),
+            dst_q, dst_gate, src,
+            num_heads: num_heads as u64,
+            head_dim: head_dim as u64,
+            batch: batch as u64,
+            _pad: [0; 11],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_KV_QUANTIZE (opcode 21)
+// words[1]=src(f32), [2]=q1_data(u8*), [3]=q1_scale(f32*), [4]=r_data(u8*),
+//        [5]=r_scale(f32*), [6]=num_kv_heads, [7]=head_dim, [8]=chunk_tokens
+// grid_x = nkh * head_dim
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct KvQuantizeInst {
+    pub opcode_gridx: u64,
+    pub src:          *const f32,
+    pub q1_data:      *mut u8,
+    pub q1_scale:     *mut f32,
+    pub r_data:       *mut u8,
+    pub r_scale:      *mut f32,
+    pub num_kv_heads: i32,
+    pub head_dim:     i32,
+    pub chunk_tokens: i32,
+    pub _pad0:        i32,
+    pub _pad:         [u64; 10],
+}
+assert_inst_size!(KvQuantizeInst);
+impl_no_sync!(KvQuantizeInst);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_ATTN_PAGED_Q (opcode 22)
+// words[1]=scratch_ptr(patched), [2]=q, [3]=quant_page_table(patched),
+//        [4]=pos_table(patched), [5]=inv_freq, [6]=nqh, [7]=nkh, [8]=hd,
+//        [9]=quant_seq_len(patched), [10]=chunk_tokens, [11]=rd,
+//        [12]=q1d, [13]=q1s, [14]=rd_off, [15]=rs, [16]=k_norm
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct AttnPagedQInst {
+    pub opcode_gridx: u64,
+    pub scratch: u64, // patched when quantized KV enabled
+    pub q: *const f32,
+    pub quant_page_table: u64, // patched per step
+    pub pos_table: u64,        // patched per step
+    pub inv_freq: *const f32,
+    pub nqh: u64,
+    pub nkh: u64,
+    pub hd: u64,
+    pub quant_seq_len: u64, // patched per step
+    pub chunk_tokens: u64,
+    pub rd: u64,
+    pub q1d: u64,
+    pub q1s: u64,
+    pub rd_off: u64,
+    pub rs: u64,
+    pub k_norm: *const u16, // null if no QK-norm
+    pub _pad: u64,
+}
+assert_inst_size!(AttnPagedQInst);
+impl_no_sync!(AttnPagedQInst);
+
+impl AttnPagedQInst {
+    pub(crate) fn new(q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, chunk_tokens: i32, rd: i32, q1d: u64, q1s: u64, rd_off: u64, rs: u64, k_norm: *const u16) -> Self {
+        AttnPagedQInst {
+            opcode_gridx: make_opcode_gridx(OP_ATTN_PAGED_Q, 0),
+            scratch: 0,
+            q,
+            quant_page_table: 0,
+            pos_table: 0,
+            inv_freq,
+            nqh: nqh as u64,
+            nkh: nkh as u64,
+            hd: hd as u64,
+            quant_seq_len: 0,
+            chunk_tokens: chunk_tokens as u64,
+            rd: rd as u64,
+            q1d,
+            q1s,
+            rd_off,
+            rs,
+            k_norm,
+            _pad: 0,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MOE_GATE (opcode 23)
+// words[1]=scores, [2]=expert_ids(w), [3]=expert_weights(w), [4]=ne, [5]=k,
+//        [6]=gate_mode, [7]=rsf(f32 bits), [8]=bias_ptr
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct MoeGateInst {
+    pub opcode_gridx: u64,
+    pub scores: *const f32,
+    pub expert_ids: *mut i32,     // output
+    pub expert_weights: *mut f32, // output
+    pub ne: u64,
+    pub k: u64,
+    pub gate_mode: u64,
+    pub rsf_bits: u64, // routed_scaling_factor as f32 bits
+    pub bias: *const u8,
+    pub _pad: [u64; 9],
+}
+assert_inst_size!(MoeGateInst);
+impl_no_sync!(MoeGateInst);
+
+impl MoeGateInst {
+    pub(crate) fn new(scores: *const f32, expert_ids: *mut i32, expert_weights: *mut f32, ne: i32, k: i32, gate_mode: u32, rsf: f32, bias: *const u8) -> Self {
+        MoeGateInst {
+            opcode_gridx: make_opcode_gridx(OP_MOE_GATE, 1),
+            scores, expert_ids, expert_weights,
+            ne: ne as u64,
+            k: k as u64,
+            gate_mode: gate_mode as u64,
+            rsf_bits: rsf.to_bits() as u64,
+            bias,
+            _pad: [0; 9],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MOE_FFN (opcode 24)
+// words[1]=expert_ids, [2]=expert_weights, [3]=normed, [4]=ffn_down(w),
+//        [5]=gate_up_data, [6]=gate_up_expert_stride(raw), [7]=down_data,
+//        [8]=down_expert_stride(raw), [9]=k, [10]=hs|eis<<16, [11]=flags,
+//        [12]=moe_expert_gate, [13]=moe_expert_up, [14]=moe_expert_act, [15]=moe_expert_out,
+//        [16]=gate_up_row_stride(raw)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct MoeFfnInst {
+    pub opcode_gridx: u64,
+    pub expert_ids: *const i32,
+    pub expert_weights: *const f32,
+    pub normed: *const f32,
+    pub ffn_down: *mut f32,
+    pub gate_up_data: *const u8,
+    pub gate_up_expert_stride: u64,
+    pub down_data: *const u8,
+    pub down_expert_stride: u64,
+    pub k: u64,
+    pub hs_eis: u64, // hs | (eis << 16)
+    pub flags: u64,
+    pub expert_gate: *const f32,
+    pub expert_up: *const f32,
+    pub expert_act: *const f32,
+    pub expert_out: *const f32,
+    pub gate_up_row_stride: u64,
+    pub _pad: u64,
+}
+assert_inst_size!(MoeFfnInst);
+impl_no_sync!(MoeFfnInst);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_SIGMOID_WEIGHTED_ADD (opcode 32)
+// words[1]=output(w), [2]=scalar_ptr, [3]=input, [4]=n(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct SigmoidWeightedAddInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub scalar: *const f32,
+    pub input: *const f32,
+    pub n: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(SigmoidWeightedAddInst);
+impl_no_sync!(SigmoidWeightedAddInst);
+
+impl SigmoidWeightedAddInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, scalar: *const f32, input: *const f32, n: i32) -> Self {
+        SigmoidWeightedAddInst {
+            opcode_gridx: make_opcode_gridx(OP_SIGMOID_WEIGHTED_ADD, grid_x),
+            output, scalar, input,
+            n: n as u64,
+            _pad: [0; 13],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MOE_DISPATCH (opcode 34)
+// words[1..17] are raw u64s set directly (see compile_inner_p2p).
+// Provide a raw-words struct for clarity.
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct MoeDispatchInst {
+    pub opcode_gridx: u64,
+    pub work_queue: u64,
+    pub output_slots: u64,
+    pub final_output: u64,
+    pub expert_ids: u64,
+    pub expert_weights: u64,
+    pub seq_counter: u64,
+    pub num_workers_hs: u64, // (num_workers << 32) | hidden_size
+    pub layer_k: u64,        // (layer_idx << 32) | k
+    pub eis_gate: u64,       // (eis << 32) | has_gate
+    pub activation: u64,
+    pub layer_config_ptrs: u64,
+    pub scratch_gate: u64,
+    pub scratch_up: u64,
+    pub scratch_act: u64,
+    pub num_gpus: u64,
+    pub gate_up_in_dim: u64,
+    pub _pad: u64,
+}
+assert_inst_size!(MoeDispatchInst);
+impl_no_sync!(MoeDispatchInst);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_SCALE_ADD (opcode 36)
+// output[i] += scale * src[i]; args: [1]=output, [2]=src, [3]=scale(f32 bits), [4]=size
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct ScaleAddInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub src: *const f32,
+    pub scale_bits: u64,
+    pub size: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(ScaleAddInst);
+impl_no_sync!(ScaleAddInst);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_RELU_SQ (opcode 37)
+// output[i] = relu(input[i])^2; args: [1]=output, [2]=input, [3]=size
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct ReluSqInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub input: *const f32,
+    pub size: u64,
+    pub _pad: [u64; 14],
+}
+assert_inst_size!(ReluSqInst);
+impl_no_sync!(ReluSqInst);
+
+impl ReluSqInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, input: *const f32, size: i32) -> Self {
+        ReluSqInst {
+            opcode_gridx: make_opcode_gridx(OP_RELU_SQ, grid_x),
+            output, input,
+            size: size as u64,
+            _pad: [0; 14],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MAMBA2_CONV1D (opcode 38)
+// args: [1]=state(w), [2]=input, [3]=weight(u16), [4]=bias(f32 ptr), [5]=output(w),
+//       [6]=conv_dim(i32), [7]=kernel_size(i32)
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct Mamba2Conv1dInst {
+    pub opcode_gridx: u64,
+    pub state: *mut f32,
+    pub input: *const f32,
+    pub weight: *const u16, // f16/bf16
+    pub bias: *const f32,
+    pub output: *mut f32,
+    pub conv_dim: u64,
+    pub kernel_size: u64,
+    pub _pad: [u64; 10],
+}
+assert_inst_size!(Mamba2Conv1dInst);
+impl_no_sync!(Mamba2Conv1dInst);
+
+impl Mamba2Conv1dInst {
+    pub(crate) fn new(grid_x: u32, state: *mut f32, input: *const f32, weight: *const u16, bias: *const f32, output: *mut f32, conv_dim: i32, kernel_size: i32) -> Self {
+        Mamba2Conv1dInst {
+            opcode_gridx: make_opcode_gridx(OP_MAMBA2_CONV1D, grid_x),
+            state, input, weight, bias, output,
+            conv_dim: conv_dim as u64,
+            kernel_size: kernel_size as u64,
+            _pad: [0; 10],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MAMBA2_NORM_GATED (opcode 39)
+// rms_norm(x*silu(z))*weight; args: [1]=output(w), [2]=x, [3]=z, [4]=weight,
+//   [5]=num_heads, [6]=value_dim, [7]=eps
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct Mamba2NormGatedInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub x: *const f32,
+    pub z: *const f32,
+    pub weight: *const f32, // f32 (norm_weight loaded as f32)
+    pub num_heads: u64,
+    pub value_dim: u64,
+    pub eps_bits: u64,
+    pub _pad: [u64; 10],
+}
+assert_inst_size!(Mamba2NormGatedInst);
+impl_no_sync!(Mamba2NormGatedInst);
+
+impl Mamba2NormGatedInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, x: *const f32, z: *const f32, weight: *const f32, num_heads: i32, value_dim: i32, eps: f32) -> Self {
+        Mamba2NormGatedInst {
+            opcode_gridx: make_opcode_gridx(OP_MAMBA2_NORM_GATED, grid_x),
+            output, x, z, weight,
+            num_heads: num_heads as u64,
+            value_dim: value_dim as u64,
+            eps_bits: eps.to_bits() as u64,
+            _pad: [0; 10],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_SSM_UPDATE (opcode 29)
+// args: [1]=state(w), [2]=x(conv_out), [3]=dt, [4]=dt_bias, [5]=a_log,
+//       [6]=B, [7]=C, [8]=d_weight, [9]=output(w), [10]=nh, [11]=hd, [12]=sd, [13]=ng
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct SsmUpdateInst {
+    pub opcode_gridx: u64,
+    pub state: *mut f32,
+    pub x: *const f32,
+    pub dt: *const f32,
+    pub dt_bias: *const f32,
+    pub a_log: *const f32,
+    pub b: *const f32,
+    pub c: *const f32,
+    pub d_weight: *const f32,
+    pub output: *mut f32,
+    pub nh: u64,
+    pub hd: u64,
+    pub sd: u64,
+    pub ng: u64,
+    pub _pad: [u64; 4],
+}
+assert_inst_size!(SsmUpdateInst);
+impl_no_sync!(SsmUpdateInst);
+
+impl SsmUpdateInst {
+    pub(crate) fn new(grid_x: u32, state: *mut f32, x: *const f32, dt: *const f32, dt_bias: *const f32, a_log: *const f32, b: *const f32, c: *const f32, d_weight: *const f32, output: *mut f32, nh: i32, hd: i32, sd: i32, ng: i32) -> Self {
+        SsmUpdateInst {
+            opcode_gridx: make_opcode_gridx(OP_SSM_UPDATE, grid_x),
+            state, x, dt, dt_bias, a_log, b, c, d_weight, output,
+            nh: nh as u64,
+            hd: hd as u64,
+            sd: sd as u64,
+            ng: ng as u64,
+            _pad: [0; 4],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_SILU_MUL (opcode 28)
+// output[i] = silu(gate[i]) * up[i]; args: [1]=output, [2]=gate, [3]=up, [4]=size
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct SiluMulInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub gate: *const f32,
+    pub up: *const f32,
+    pub size: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(SiluMulInst);
+impl_no_sync!(SiluMulInst);
+
+impl SiluMulInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, gate: *const f32, up: *const f32, size: i32) -> Self {
+        SiluMulInst {
+            opcode_gridx: make_opcode_gridx(OP_SILU_MUL, grid_x),
+            output, gate, up,
+            size: size as u64,
+            _pad: [0; 13],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_BARRIER (internal IR, opcode 33)
+// words[1]=barrier_flag_ptr, [2]=resume_flag_ptr, [3]=layer_idx
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct BarrierInst {
+    pub opcode_gridx: u64,
+    pub barrier_flag: *const u32,
+    pub resume_flag: *const u32,
+    pub layer_idx: u64,
+    pub _pad: [u64; 14],
+}
+assert_inst_size!(BarrierInst);
+impl_no_sync!(BarrierInst);
+
+impl BarrierInst {
+    pub(crate) fn new(layer_idx: i32) -> Self {
+        BarrierInst {
+            opcode_gridx: make_opcode_gridx(OP_BARRIER, 1),
+            barrier_flag: std::ptr::null(),
+            resume_flag: std::ptr::null(),
+            layer_idx: layer_idx as u64,
+            _pad: [0; 14],
+        }
+    }
+}
+
+// Suppress unused import warnings for opcodes used only in assertions/macros
+const _: () = {
+    let _ = OP_LM_HEAD;
+    let _ = OP_KV_QUANTIZE;
+    let _ = OP_MOE_FFN;
+    let _ = OP_SCALE_ADD;
+    let _ = OP_MOE_DISPATCH;
+};

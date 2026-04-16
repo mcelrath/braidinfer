@@ -8,11 +8,12 @@
 // args: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 // grid_x = batch (default 1). vblock = batch index. Each block normalizes one row.
 __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
-    float* output_base = inst_fptr(inst, 1);
-    const float* input_base = inst_fptr(inst, 2);
-    const unsigned short* weight = inst_u16ptr(inst, 3);
-    int hidden_size = inst_int(inst, 4);
-    float eps = inst_float(inst, 5);
+    const RmsNormInst* i = (const RmsNormInst*)inst;
+    float* output_base = i->output;
+    const float* input_base = i->input;
+    const uint16_t* weight = i->weight;
+    int hidden_size = (int)i->dim;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
 
     const float* input = input_base + (long long)vblock * hidden_size;
     float* output = output_base + (long long)vblock * hidden_size;
@@ -48,12 +49,13 @@ __device__ void op_rmsnorm(const u64* inst, u32 vblock) {
 #define MAX_PREFILL_BATCH 64
 #define B_TILE 8
 __device__ void op_linear_proj(const u64* inst, u32 vblock) {
-    float* output_base = inst_fptr(inst, 1);
-    const unsigned short* weight = inst_u16ptr(inst, 2);
-    const float* input_base = inst_fptr(inst, 3);
-    int out_dim = inst_int(inst, 4);
-    int in_dim = inst_int(inst, 5);
-    int batch = inst_int(inst, 6);
+    const LinearProjInst* i = (const LinearProjInst*)inst;
+    float* output_base = i->output;
+    const uint16_t* weight = (const uint16_t*)i->weight;
+    const float* input_base = i->input;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     int row = vblock;
@@ -145,10 +147,11 @@ __device__ void op_linear_proj(const u64* inst, u32 vblock) {
 // OP_SILU_MUL: output[i] = silu(gate[i]) * up[i]
 // args: [1]=output, [2]=gate, [3]=up, [4]=size
 __device__ void op_silu_mul(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* gate = inst_fptr(inst, 2);
-    const float* up = inst_fptr(inst, 3);
-    int size = inst_int(inst, 4);
+    const SiluMulInst* i = (const SiluMulInst*)inst;
+    float* output = i->output;
+    const float* gate = i->gate;
+    const float* up = i->up;
+    int size = (int)i->size;
 
     // vblock indexes chunks of blockDim.x elements
     int base = vblock * blockDim.x + threadIdx.x;
@@ -171,19 +174,21 @@ __device__ void op_silu_mul(const u64* inst, u32 vblock) {
 //   [8..8+7679]     input tile (7680 floats = 30720 bytes)
 //   [8+7680..8+7680+255]  partial outputs per row (256 floats = 1024 bytes)
 // Total: (8+7680+256)*4 = 31776 bytes. 2 blocks/CU: 63552 < 65536 ✓
-#define LPROJ_TILE_FLOATS  7680   // 240*32 PCG32 groups or 60*128 RNF4 groups
-#define LPROJ_MAX_ROWS     256    // max rows per block; limits out_dim ≤ 256*gridDim.x
+#define LPROJ_TILE_FLOATS    7680   // 240*32 PCG32 groups or 60*128 RNF4 groups
+#define LPROJ_MAX_ROWS        256   // max rows per block; limits out_dim ≤ 256*gridDim.x
+#define SHARED_LPROJ_TOTAL  31776   // (8 + LPROJ_TILE_FLOATS + LPROJ_MAX_ROWS) * 4 bytes per block
 
 // OP_LINEAR_PROJ_RNF4 (full, tiled-LDS): loads input tile once per block,
 // processes all assigned rows per tile. One call replaces the virtual block loop.
 // batch=1 (decode) only; batch>1 falls back to per-row approach.
 __device__ void op_linear_proj_rnf4_full(const u64* inst, u32 grid_x) {
-    float* output_base = inst_fptr(inst, 1);
-    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
-    const float* input_base = inst_fptr(inst, 3);
-    int out_dim = inst_int(inst, 4);
-    int in_dim = inst_int(inst, 5);
-    int batch = inst_int(inst, 6);
+    const LinearProjInst* i = (const LinearProjInst*)inst;
+    float* output_base = i->output;
+    const unsigned char* weight = i->weight;
+    const float* input_base = i->input;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     const int tid = threadIdx.x;
@@ -301,12 +306,13 @@ __device__ void op_linear_proj_rnf4_full(const u64* inst, u32 grid_x) {
 // Each thread handles in_dim/512 pairs (2 elements each). No shared memory for input
 // (read from global — L2 cached after first row in this block).
 __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
-    float* output_base = inst_fptr(inst, 1);
-    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
-    const float* input_base = inst_fptr(inst, 3);
-    int out_dim = inst_int(inst, 4);
-    int in_dim = inst_int(inst, 5);
-    int batch = inst_int(inst, 6);
+    const LinearProjInst* i = (const LinearProjInst*)inst;
+    float* output_base = i->output;
+    const unsigned char* weight = i->weight;
+    const float* input_base = i->input;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     int row = vblock;
@@ -398,12 +404,13 @@ __device__ void op_linear_proj_rnf4(const u64* inst, u32 vblock) {
 // loads input in tiles into LDS once per block, then processes all assigned rows per tile.
 // One call handles all virtual blocks; must NOT be called from the virtual block loop.
 __device__ void op_linear_proj_pcg32_full(const u64* inst, u32 grid_x) {
-    float* output_base = inst_fptr(inst, 1);
-    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
-    const float* input_base = inst_fptr(inst, 3);
-    int out_dim = inst_int(inst, 4);
-    int in_dim = inst_int(inst, 5);
-    int batch = inst_int(inst, 6);
+    const LinearProjInst* i = (const LinearProjInst*)inst;
+    float* output_base = i->output;
+    const unsigned char* weight = i->weight;
+    const float* input_base = i->input;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     const int tid = threadIdx.x;
@@ -508,12 +515,13 @@ __device__ void op_linear_proj_pcg32_full(const u64* inst, u32 grid_x) {
 // args: [1]=output, [2]=weight (packed pcg32), [3]=input, [4]=out_dim, [5]=in_dim
 // Weight layout per row: groups of 32 elements, each 20 bytes.
 __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
-    float* output_base = inst_fptr(inst, 1);
-    const unsigned char* weight = (const unsigned char*)inst_ptr(inst, 2);
-    const float* input_base = inst_fptr(inst, 3);
-    int out_dim = inst_int(inst, 4);
-    int in_dim = inst_int(inst, 5);
-    int batch = inst_int(inst, 6);
+    const LinearProjInst* i = (const LinearProjInst*)inst;
+    float* output_base = i->output;
+    const unsigned char* weight = i->weight;
+    const float* input_base = i->input;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     int row = vblock;
@@ -590,11 +598,12 @@ __device__ void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
 // OP_RMSNORM_WX: y = x * w / sqrt(mean(x^2) + eps) — standard w*x variant (Llama, OLMoE)
 // Same args as OP_RMSNORM: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 __device__ void op_rmsnorm_wx(const u64* inst, u32 vblock) {
-    float* output_base = inst_fptr(inst, 1);
-    const float* input_base = inst_fptr(inst, 2);
-    const unsigned short* weight = inst_u16ptr(inst, 3);
-    int hidden_size = inst_int(inst, 4);
-    float eps = inst_float(inst, 5);
+    const RmsNormInst* i = (const RmsNormInst*)inst;
+    float* output_base = i->output;
+    const float* input_base = i->input;
+    const uint16_t* weight = i->weight;
+    int hidden_size = (int)i->dim;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
 
     // DEBUG: print input[0] to track hidden state evolution
     // vblock = batch index (same as op_rmsnorm)
@@ -626,12 +635,13 @@ __device__ void op_rmsnorm_wx(const u64* inst, u32 vblock) {
 // OP_CONV1D: causal conv1d update with SiLU activation (one virtual block per channel)
 // args: [1]=state, [2]=input, [3]=weight, [4]=output, [5]=conv_dim, [6]=kernel_size
 __device__ void op_conv1d(const u64* inst, u32 vblock) {
-    float* state = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
-    const unsigned short* weight = inst_u16ptr(inst, 3);
-    float* output = inst_fptr(inst, 4);
-    int conv_dim = inst_int(inst, 5);
-    int kernel_size = inst_int(inst, 6);
+    const Conv1dInst* i = (const Conv1dInst*)inst;
+    float* state = i->state;
+    const float* input = i->input;
+    const uint16_t* weight = i->weight;
+    float* output = i->output;
+    int conv_dim = (int)i->dim;
+    int kernel_size = (int)i->kernel_size;
 
     int ch = vblock * blockDim.x + threadIdx.x;
     if (ch >= conv_dim) return;
@@ -656,11 +666,12 @@ __device__ void op_conv1d(const u64* inst, u32 vblock) {
 // OP_GDN_GATE: gate = exp(-exp(A_log) * softplus(a + dt_bias))
 // args: [1]=gate_out, [2]=a_input, [3]=A_log, [4]=dt_bias, [5]=num_heads
 __device__ void op_gdn_gate(const u64* inst, u32 vblock) {
-    float* gate_out = inst_fptr(inst, 1);
-    const float* a_input = inst_fptr(inst, 2);
-    const float* A_log = inst_fptr(inst, 3);
-    const unsigned short* dt_bias = inst_u16ptr(inst, 4);
-    int num_heads = inst_int(inst, 5);
+    const GdnGateInst* i = (const GdnGateInst*)inst;
+    float* gate_out = i->output;
+    const float* a_input = i->a_proj;
+    const float* A_log = i->a_log;
+    const uint16_t* dt_bias = i->dt_bias;
+    int num_heads = (int)i->num_heads;
 
     int h = vblock * blockDim.x + threadIdx.x;
     if (h >= num_heads) return;
@@ -674,16 +685,17 @@ __device__ void op_gdn_gate(const u64* inst, u32 vblock) {
 // OP_GDN_RECUR: gated delta rule recurrence (one block per head)
 // args: [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b, [6]=state, [7]=output, [8]=key_dim, [9]=value_dim
 __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
-    const float* q = inst_fptr(inst, 1);
-    const float* k = inst_fptr(inst, 2);
-    const float* v = inst_fptr(inst, 3);
-    const float* gate = inst_fptr(inst, 4);
-    const float* b = inst_fptr(inst, 5);
-    float* state = inst_fptr(inst, 6);
-    float* output = inst_fptr(inst, 7);
-    int key_dim = inst_int(inst, 8);
-    int value_dim = inst_int(inst, 9);
-    int gqa_group = inst_int(inst, 10);
+    const GdnRecurInst* i = (const GdnRecurInst*)inst;
+    const float* q = i->q;
+    const float* k = i->k;
+    const float* v = i->v;
+    const float* gate = i->gate;
+    const float* b = i->b_proj;
+    float* state = i->state;
+    float* output = i->output;
+    int key_dim = (int)i->kd;
+    int value_dim = (int)i->vd;
+    int gqa_group = (int)i->gqa_group;
     if (gqa_group <= 0) gqa_group = 1;
 
     const int h = vblock;
@@ -764,12 +776,13 @@ __device__ void op_gdn_recurrent(const u64* inst, u32 vblock) {
 // OP_RMSNORM_GATE: RMSNorm(x) * SiLU(z) with direct weight multiply (no 1+w)
 // args: [1]=output, [2]=x, [3]=z, [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
 __device__ void op_rmsnorm_gated(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* x = inst_fptr(inst, 2);
-    const float* z = inst_fptr(inst, 3);
-    const float* weight = inst_fptr(inst, 4);
-    int value_dim = inst_int(inst, 6);
-    float eps = inst_float(inst, 7);
+    const RmsNormGateInst* i = (const RmsNormGateInst*)inst;
+    float* output = i->output;
+    const float* x = i->x;
+    const float* z = i->z;
+    const float* weight = i->weight;
+    int value_dim = (int)i->vd;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
 
     int h = vblock;
     const int tid = threadIdx.x;
@@ -800,10 +813,11 @@ __device__ void op_rmsnorm_gated(const u64* inst, u32 vblock) {
 // OP_RESIDUAL_ADD: output = a + b
 // args: [1]=output, [2]=a, [3]=b, [4]=size
 __device__ void op_residual_add(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* a = inst_fptr(inst, 2);
-    const float* b = inst_fptr(inst, 3);
-    int size = inst_int(inst, 4);
+    const ResidualAddInst* i = (const ResidualAddInst*)inst;
+    float* output = i->output;
+    const float* a = i->src;
+    const float* b = i->residual;
+    int size = (int)i->n;
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] = a[idx] + b[idx];
@@ -814,10 +828,11 @@ __device__ void op_residual_add(const u64* inst, u32 vblock) {
 //       [3]=input (float*, [size]), [4]=size
 // Used for shared expert gating: output = ffn_down, scalar = gate@normed, input = shared_expert_out
 __device__ void op_sigmoid_weighted_add(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* scalar = inst_fptr(inst, 2);
-    const float* input = inst_fptr(inst, 3);
-    int size = inst_int(inst, 4);
+    const SigmoidWeightedAddInst* i = (const SigmoidWeightedAddInst*)inst;
+    float* output = i->output;
+    const float* scalar = i->scalar;
+    const float* input = i->input;
+    int size = (int)i->n;
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -829,11 +844,12 @@ __device__ void op_sigmoid_weighted_add(const u64* inst, u32 vblock) {
 // OP_SCALE_ADD: output[i] += scale * src[i]
 // args: [1]=output (float*), [2]=src (float*), [3]=scale (f32 bits packed as u32), [4]=size
 __device__ void op_scale_add(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* src = inst_fptr(inst, 2);
-    u32 scale_bits = (u32)inst[3];
+    const ScaleAddInst* i = (const ScaleAddInst*)inst;
+    float* output = i->output;
+    const float* src = i->src;
+    u32 scale_bits = (u32)i->scale_bits;
     float scale; __builtin_memcpy(&scale, &scale_bits, sizeof(float));
-    int size = inst_int(inst, 4);
+    int size = (int)i->size;
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < size) output[idx] += scale * src[idx];
 }
@@ -842,13 +858,14 @@ __device__ void op_scale_add(const u64* inst, u32 vblock) {
 // args: [1]=state(w), [2]=input, [3]=weight(u16/bf16), [4]=bias(f32), [5]=output(w), [6]=conv_dim, [7]=kernel_size
 // One virtual block per 256 channels. grid_x = ceil(conv_dim / 256).
 __device__ void op_mamba2_conv1d(const u64* inst, u32 vblock) {
-    float* state = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
-    const unsigned short* weight = inst_u16ptr(inst, 3);
-    const float* bias = inst_fptr(inst, 4);
-    float* output = inst_fptr(inst, 5);
-    int conv_dim = inst_int(inst, 6);
-    int kernel_size = inst_int(inst, 7);
+    const Mamba2Conv1dInst* i = (const Mamba2Conv1dInst*)inst;
+    float* state = i->state;
+    const float* input = i->input;
+    const uint16_t* weight = i->weight;
+    const float* bias = i->bias;
+    float* output = i->output;
+    int conv_dim = (int)i->conv_dim;
+    int kernel_size = (int)i->kernel_size;
 
     int ch = vblock * blockDim.x + threadIdx.x;
     if (ch >= conv_dim) return;
@@ -872,19 +889,20 @@ __device__ void op_mamba2_conv1d(const u64* inst, u32 vblock) {
 //       [10]=num_heads, [11]=head_dim, [12]=state_size, [13]=n_groups
 // grid_x = num_heads. One block per head, 256 threads.
 __device__ void op_ssm_update(const u64* inst, u32 vblock) {
-    float* ssm_state = inst_fptr(inst, 1);
-    const float* x = inst_fptr(inst, 2);
-    const float* dt = inst_fptr(inst, 3);
-    const float* dt_bias = inst_fptr(inst, 4);
-    const float* A_log = inst_fptr(inst, 5);
-    const float* B = inst_fptr(inst, 6);
-    const float* C = inst_fptr(inst, 7);
-    const float* D = inst_fptr(inst, 8);
-    float* output = inst_fptr(inst, 9);
-    int num_heads = inst_int(inst, 10);
-    int head_dim = inst_int(inst, 11);
-    int state_size = inst_int(inst, 12);
-    int n_groups = inst_int(inst, 13);
+    const SsmUpdateInst* i = (const SsmUpdateInst*)inst;
+    float* ssm_state = i->state;
+    const float* x = i->x;
+    const float* dt = i->dt;
+    const float* dt_bias = i->dt_bias;
+    const float* A_log = i->a_log;
+    const float* B = i->b;
+    const float* C = i->c;
+    const float* D = i->d_weight;
+    float* output = i->output;
+    int num_heads = (int)i->nh;
+    int head_dim = (int)i->hd;
+    int state_size = (int)i->sd;
+    int n_groups = (int)i->ng;
 
     const int h = vblock;
     if (h >= num_heads) return;
@@ -923,12 +941,13 @@ __device__ void op_ssm_update(const u64* inst, u32 vblock) {
 // args: [1]=output(w), [2]=x(ssm_out), [3]=z(gate), [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
 // grid_x = num_heads. One block per head.
 __device__ void op_mamba2_norm_gated(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* x = inst_fptr(inst, 2);
-    const float* z = inst_fptr(inst, 3);
-    const float* weight = inst_fptr(inst, 4);
-    int value_dim = inst_int(inst, 6);
-    float eps = inst_float(inst, 7);
+    const Mamba2NormGatedInst* i = (const Mamba2NormGatedInst*)inst;
+    float* output = i->output;
+    const float* x = i->x;
+    const float* z = i->z;
+    const float* weight = i->weight;
+    int value_dim = (int)i->value_dim;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
 
     int h = vblock;
     const int tid = threadIdx.x;
@@ -966,9 +985,10 @@ __device__ void op_mamba2_norm_gated(const u64* inst, u32 vblock) {
 // OP_RELU_SQ: output[i] = relu(input[i])^2
 // args: [1]=output (float*), [2]=input (float*), [3]=size
 __device__ void op_relu_sq(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
-    int size = inst_int(inst, 3);
+    const ReluSqInst* i = (const ReluSqInst*)inst;
+    float* output = i->output;
+    const float* input = i->input;
+    int size = (int)i->size;
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < size) { float x = input[idx]; float r = x > 0.0f ? x : 0.0f; output[idx] = r * r; }
 }
@@ -979,15 +999,16 @@ __device__ void op_relu_sq(const u64* inst, u32 vblock) {
 // When batch > 1: input is [batch × hidden_size], scratch is [batch × intermediate_size].
 // vblock = batch_idx * intermediate_size + row.
 __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
-    float* scratch_base = inst_fptr(inst, 1);
-    const float* input_base = inst_fptr(inst, 2);
-    const unsigned short* rms_weight = inst_u16ptr(inst, 3);
-    const unsigned short* w_gate = inst_u16ptr(inst, 4);
-    const unsigned short* w_up = inst_u16ptr(inst, 5);
-    int hidden_size = inst_int(inst, 6);
-    int intermediate_size = inst_int(inst, 7);
-    float eps = inst_float(inst, 8);
-    int batch = inst_int(inst, 9);
+    const FfnGateUpInst* i = (const FfnGateUpInst*)inst;
+    float* scratch_base = i->output;
+    const float* input_base = i->hidden;
+    const uint16_t* rms_weight = i->norm_weight;
+    const uint16_t* w_gate = (const uint16_t*)i->w_gate;
+    const uint16_t* w_up = (const uint16_t*)i->w_up;
+    int hidden_size = (int)i->hs;
+    int intermediate_size = (int)i->intermediate;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     int row = vblock % intermediate_size;
@@ -1071,13 +1092,14 @@ __device__ void op_ffn_gate_up(const u64* inst, u32 vblock) {
 // When batch > 1: output/residual are [batch × hidden_size], scratch is [batch × intermediate_size].
 // vblock = batch_idx * hidden_size + row.
 __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
-    float* output_base = inst_fptr(inst, 1);
-    const float* residual_base = inst_fptr(inst, 2);
-    const unsigned short* w_down = inst_u16ptr(inst, 3);
-    const float* scratch_base = inst_fptr(inst, 4);
-    int hidden_size = inst_int(inst, 5);
-    int intermediate_size = inst_int(inst, 6);
-    int batch = inst_int(inst, 7);
+    const FfnDownResInst* i = (const FfnDownResInst*)inst;
+    float* output_base = i->output;
+    const float* residual_base = i->residual;
+    const uint16_t* w_down = (const uint16_t*)i->w_down;
+    const float* scratch_base = i->ffn_act;
+    int hidden_size = (int)i->hs;
+    int intermediate_size = (int)i->intermediate;
+    int batch = (int)i->batch;
     if (batch <= 1) batch = 1;
 
     int row = vblock % hidden_size;
@@ -1124,14 +1146,15 @@ __device__ void op_ffn_down_res(const u64* inst, u32 vblock) {
 //       [6]=hidden_size, [7]=intermediate_size, [8]=eps
 // vblock = output row index in [0, intermediate_size)
 __device__ void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
-    float* scratch = inst_fptr(inst, 1);
-    const float* input = inst_fptr(inst, 2);
-    const unsigned short* rms_weight = inst_u16ptr(inst, 3);
-    const unsigned char* w_gate = (const unsigned char*)inst_ptr(inst, 4);
-    const unsigned char* w_up = (const unsigned char*)inst_ptr(inst, 5);
-    int hidden_size = inst_int(inst, 6);
-    int intermediate_size = inst_int(inst, 7);
-    float eps = inst_float(inst, 8);
+    const FfnGateUpInst* i = (const FfnGateUpInst*)inst;
+    float* scratch = i->output;
+    const float* input = i->hidden;
+    const uint16_t* rms_weight = i->norm_weight;
+    const unsigned char* w_gate = i->w_gate;
+    const unsigned char* w_up = i->w_up;
+    int hidden_size = (int)i->hs;
+    int intermediate_size = (int)i->intermediate;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
 
     int row = vblock;
     if (row >= intermediate_size) return;
@@ -1220,12 +1243,13 @@ __device__ void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
 // args: [1]=output, [2]=residual, [3]=w_down (rnf4), [4]=scratch, [5]=hidden_size, [6]=intermediate_size
 // vblock = output row index in [0, hidden_size)
 __device__ void op_ffn_down_res_rnf4(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* residual = inst_fptr(inst, 2);
-    const unsigned char* w_down = (const unsigned char*)inst_ptr(inst, 3);
-    const float* scratch = inst_fptr(inst, 4);
-    int hidden_size = inst_int(inst, 5);
-    int intermediate_size = inst_int(inst, 6);
+    const FfnDownResInst* i = (const FfnDownResInst*)inst;
+    float* output = i->output;
+    const float* residual = i->residual;
+    const unsigned char* w_down = i->w_down;
+    const float* scratch = i->ffn_act;
+    int hidden_size = (int)i->hs;
+    int intermediate_size = (int)i->intermediate;
 
     int row = vblock;
     if (row >= hidden_size) return;
@@ -1269,10 +1293,11 @@ __device__ void op_ffn_down_res_rnf4(const u64* inst, u32 vblock) {
 // OP_EMBEDDING: output[i] = table[token_id * hidden_size + i]
 // args: [1]=output, [2]=table, [3]=token_id, [4]=hidden_size
 __device__ void op_embedding(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const unsigned short* table = inst_u16ptr(inst, 2);
-    int token_id = inst_int(inst, 3);
-    int hidden_size = inst_int(inst, 4);
+    const EmbeddingInst* i = (const EmbeddingInst*)inst;
+    float* output = i->output;
+    const uint16_t* table = i->embed_weight;
+    int token_id = (int)i->token_id;
+    int hidden_size = (int)i->hs;
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < hidden_size) {
@@ -1289,15 +1314,16 @@ __device__ void op_lm_head(const u64* inst, u32 vblock) {
 // OP_QK_NORM: per-head RMSNorm on Q and K with (1+weight)
 // args: [1]=q, [2]=k, [3]=q_weight, [4]=k_weight, [5]=num_q_heads, [6]=num_kv_heads, [7]=head_dim, [8]=eps
 __device__ void op_qk_norm(const u64* inst, u32 vblock) {
-    float* q = inst_fptr(inst, 1);
-    float* k = inst_fptr(inst, 2);
-    const unsigned short* q_weight = inst_u16ptr(inst, 3);
-    const unsigned short* k_weight = inst_u16ptr(inst, 4);
-    int num_q_heads = inst_int(inst, 5);
-    int num_kv_heads = inst_int(inst, 6);
-    int head_dim = inst_int(inst, 7);
-    float eps = inst_float(inst, 8);
-    int batch = inst_int(inst, 9);
+    const QkNormInst* i = (const QkNormInst*)inst;
+    float* q = i->q;
+    float* k = i->k;
+    const uint16_t* q_weight = i->q_norm;
+    const uint16_t* k_weight = i->k_norm;
+    int num_q_heads = (int)i->nqh;
+    int num_kv_heads = (int)i->nkh;
+    int head_dim = (int)i->hd;
+    float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
+    int batch = (int)i->batch;
     if (batch <= 0) batch = 1;
 
     int heads_per_token = num_q_heads + num_kv_heads;
@@ -1336,9 +1362,10 @@ __device__ void op_qk_norm(const u64* inst, u32 vblock) {
 // OP_D2D_COPY: memcpy device-to-device
 // args: [1]=dst, [2]=src, [3]=count (in floats)
 __device__ void op_d2d_copy(const u64* inst, u32 vblock) {
-    float* dst = inst_fptr(inst, 1);
-    const float* src = inst_fptr(inst, 2);
-    int count = inst_int(inst, 3);
+    const D2dCopyInst* i = (const D2dCopyInst*)inst;
+    float* dst = i->dst;
+    const float* src = i->src;
+    int count = (int)i->n_elems;
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < count) dst[idx] = src[idx];
@@ -1349,17 +1376,18 @@ __device__ void op_d2d_copy(const u64* inst, u32 vblock) {
 //       [6]=num_kv_heads, [7]=head_dim, [8]=rope_dim,
 //       [9]=section0_pairs, [10]=section1_pairs, [11]=section2_pairs
 __device__ void op_mrope(const u64* inst, u32 vblock) {
-    float* q = inst_fptr(inst, 1);
-    float* k = inst_fptr(inst, 2);
-    const float* inv_freq = inst_fptr(inst, 3);
-    const int* position_ids = (const int*)(inst[4]);
-    int num_q_heads = inst_int(inst, 5);
-    int num_kv_heads = inst_int(inst, 6);
-    int head_dim = inst_int(inst, 7);
-    int rope_dim = inst_int(inst, 8);
-    int section0_pairs = inst_int(inst, 9);
-    int section1_pairs = inst_int(inst, 10);
-    int batch = inst_int(inst, 12);
+    const MropeInst* i = (const MropeInst*)inst;
+    float* q = i->q;
+    float* k = i->k;
+    const float* inv_freq = i->inv_freq;
+    const int* position_ids = i->pos_ids;
+    int num_q_heads = (int)i->nqh;
+    int num_kv_heads = (int)i->nkh;
+    int head_dim = (int)i->hd;
+    int rope_dim = (int)i->rd;
+    int section0_pairs = (int)i->s0;
+    int section1_pairs = (int)i->s1;
+    int batch = (int)i->batch;
     if (batch <= 0) batch = 1;
 
     int heads_per_token = num_q_heads + num_kv_heads;
@@ -1393,16 +1421,17 @@ __device__ void op_mrope(const u64* inst, u32 vblock) {
 // args: [1]=output, [2]=q, [3]=k_cache, [4]=v_cache,
 //       [5]=num_q_heads, [6]=num_kv_heads, [7]=head_dim, [8]=seq_len, [9]=max_seq_len
 __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* q = inst_fptr(inst, 2);
-    const float* k_cache = inst_fptr(inst, 3);
-    const float* v_cache = inst_fptr(inst, 4);
-    int num_q_heads = inst_int(inst, 5);   // global nqh (for gqa_group)
-    int num_kv_heads = inst_int(inst, 6);  // global nkh
-    int head_dim = inst_int(inst, 7);
-    int seq_len = inst_int(inst, 8);
-    int max_seq_len = inst_int(inst, 9);
-    int q_head_start = inst_int(inst, 10); // gpu_i * local_nqh
+    const GqaAttnInst* i = (const GqaAttnInst*)inst;
+    float* output = i->output;
+    const float* q = i->q;
+    const float* k_cache = i->k_cache;
+    const float* v_cache = i->v_cache;
+    int num_q_heads = (int)i->nqh;   // global nqh (for gqa_group)
+    int num_kv_heads = (int)i->nkh;  // global nkh
+    int head_dim = (int)i->hd;
+    int seq_len = (int)i->seq_len;
+    int max_seq_len = (int)i->max_seq_len;
+    int q_head_start = (int)i->q_head_start; // gpu_i * local_nqh
 
     int q_head = vblock;                   // local Q head index (q buffer offset)
     int gqa_group = num_q_heads / num_kv_heads;
@@ -1457,10 +1486,11 @@ __device__ void op_gqa_attn(const u64* inst, u32 vblock) {
 // OP_OUTPUT_GATE: output = attn_output * sigmoid(gate)
 // args: [1]=output, [2]=attn_output, [3]=gate, [4]=size
 __device__ void op_output_gate(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* attn_output = inst_fptr(inst, 2);
-    const float* gate = inst_fptr(inst, 3);
-    int size = inst_int(inst, 4);
+    const OutputGateInst* i = (const OutputGateInst*)inst;
+    float* output = i->output;
+    const float* attn_output = i->attn_out;
+    const float* gate = i->gate;
+    int size = (int)i->size;
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < size) {
@@ -1480,20 +1510,21 @@ __device__ void op_output_gate(const u64* inst, u32 vblock) {
 //       [14]=partial_state (float* or 0; if non-null, init (m,d,v_acc) from quantized pass scratch)
 //       [16]=k_norm_weight (bf16* or null; if non-null, apply QK-norm after K load/dequant)
 __device__ void op_attn_paged(const u64* inst, u32 vblock) {
-    float* output          = inst_fptr(inst, 1);
-    const float* q         = inst_fptr(inst, 2);
-    const u64* page_table  = (const u64*)(inst[3]);
-    const int* position_table = (const int*)(inst[4]);
-    const float* inv_freq  = inst_fptr(inst, 5);
-    int num_q_heads        = inst_int(inst, 6);
-    int num_kv_heads       = inst_int(inst, 7);
-    int head_dim           = inst_int(inst, 8);
-    int seq_len            = inst_int(inst, 9);
-    int chunk_tokens       = inst_int(inst, 10);
-    int rope_dim           = inst_int(inst, 11);
-    long long layer_k_offset = (long long)(u64)(inst[12]);
-    long long layer_v_offset = (long long)(u64)(inst[13]);
-    const float* partial_state = (const float*)(inst[14]); // 0 = none
+    const AttnPagedInst* i = (const AttnPagedInst*)inst;
+    float* output          = i->output;
+    const float* q         = i->q;
+    const u64* page_table  = (const u64*)(i->page_table);
+    const int* position_table = (const int*)(i->pos_table);
+    const float* inv_freq  = i->inv_freq;
+    int num_q_heads        = (int)i->nqh;
+    int num_kv_heads       = (int)i->nkh;
+    int head_dim           = (int)i->hd;
+    int seq_len            = (int)i->seq_len;
+    int chunk_tokens       = (int)i->chunk_tokens;
+    int rope_dim           = (int)i->rd;
+    long long layer_k_offset = (long long)i->layer_k_offset;
+    long long layer_v_offset = (long long)i->layer_v_offset;
+    const float* partial_state = (const float*)(i->partial_state); // 0 = none
 
     int q_head = vblock;
     if (q_head >= num_q_heads) return;
@@ -1554,10 +1585,10 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 
             // Apply QK-norm to cached K (cache stores pre-norm K for quantization quality).
             // k[i] = k[i] * rsqrt(sum_sq/head_dim + eps) * (1 + k_norm_weight[i])
-            // k_norm_weight is passed as inst[16] (bf16 pointer, or null for non-QK-norm models)
+            // k_norm_weight is passed as k_norm field of AttnPagedInst
             // NOTE: partial aliases sh_k (both = shmem). Save K to register before reduction.
             {
-                const unsigned short* kn_w = (const unsigned short*)(inst[16]);
+                const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
                     partial[tid] = my_k * my_k;  // overwrites sh_k via alias
@@ -1642,22 +1673,23 @@ __device__ void op_attn_paged(const u64* inst, u32 vblock) {
 //       [16]=k_norm_weight (bf16* or null; if non-null, apply QK-norm after dequant)
 // V offsets = K offsets + per_kv stride, computed from nkh/ct/hd.
 __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
-    float* scratch         = inst_fptr(inst, 1);
-    const float* q         = inst_fptr(inst, 2);
-    const u64* page_table  = (const u64*)(inst[3]);
-    const int* position_table = (const int*)(inst[4]);
-    const float* inv_freq  = inst_fptr(inst, 5);
-    int num_q_heads        = inst_int(inst, 6);
-    int num_kv_heads       = inst_int(inst, 7);
-    int head_dim           = inst_int(inst, 8);
-    int seq_len            = inst_int(inst, 9);
-    int chunk_tokens       = inst_int(inst, 10);
-    int rope_dim           = inst_int(inst, 11);
+    const AttnPagedQInst* i = (const AttnPagedQInst*)inst;
+    float* scratch         = (float*)(i->scratch);
+    const float* q         = i->q;
+    const u64* page_table  = (const u64*)(i->quant_page_table);
+    const int* position_table = (const int*)(i->pos_table);
+    const float* inv_freq  = i->inv_freq;
+    int num_q_heads        = (int)i->nqh;
+    int num_kv_heads       = (int)i->nkh;
+    int head_dim           = (int)i->hd;
+    int seq_len            = (int)i->quant_seq_len;
+    int chunk_tokens       = (int)i->chunk_tokens;
+    int rope_dim           = (int)i->rd;
     // Byte offsets within each chunk for this layer's K quantized data
-    long long k_q1data_off  = (long long)(u64)(inst[12]);
-    long long k_q1scale_off = (long long)(u64)(inst[13]);
-    long long k_rdata_off   = (long long)(u64)(inst[14]);
-    long long k_rscale_off  = (long long)(u64)(inst[15]);
+    long long k_q1data_off  = (long long)i->q1d;
+    long long k_q1scale_off = (long long)i->q1s;
+    long long k_rdata_off   = (long long)i->rd_off;
+    long long k_rscale_off  = (long long)i->rs;
 
     // V offsets: per_kv bytes after K offsets
     int data_bytes = num_kv_heads * chunk_tokens * head_dim / 2;
@@ -1745,10 +1777,10 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
             __syncthreads();
 
             // Apply QK-norm to dequantized K (cache stores pre-norm K for quantization quality).
-            // k_norm_weight passed as inst[16] (bf16 pointer, or 0 for non-QK-norm models)
+            // k_norm_weight passed as k_norm field of AttnPagedQInst
             // NOTE: partial aliases sh_k (both = shmem). Save K to register before reduction.
             {
-                const unsigned short* kn_w = (const unsigned short*)(inst[16]);
+                const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
                     partial[tid] = my_k * my_k;
@@ -1841,16 +1873,17 @@ __device__ void op_attn_paged_quant(const u64* inst, u32 vblock) {
 //       [5]=num_q_heads, [6]=num_kv_heads, [7]=head_dim, [8]=start_pos,
 //       [9]=num_tokens(N), [10]=max_seq_len
 __device__ void op_attn_prefill(const u64* inst, u32 vblock) {
-    float* output = inst_fptr(inst, 1);
-    const float* q = inst_fptr(inst, 2);
-    const float* k_cache = inst_fptr(inst, 3);
-    const float* v_cache = inst_fptr(inst, 4);
-    int num_q_heads = inst_int(inst, 5);
-    int num_kv_heads = inst_int(inst, 6);
-    int head_dim = inst_int(inst, 7);
-    int start_pos = inst_int(inst, 8);
-    int num_tokens = inst_int(inst, 9);
-    int max_seq_len = inst_int(inst, 10);
+    const AttnPrefillInst* i = (const AttnPrefillInst*)inst;
+    float* output = i->output;
+    const float* q = i->q;
+    const float* k_cache = i->k_cache;
+    const float* v_cache = i->v_cache;
+    int num_q_heads = (int)i->nqh;
+    int num_kv_heads = (int)i->nkh;
+    int head_dim = (int)i->hd;
+    int start_pos = (int)i->start_pos;
+    int num_tokens = (int)i->n;
+    int max_seq_len = (int)i->max_seq_len;
 
     int token_idx = vblock / num_q_heads;
     int q_head = vblock % num_q_heads;
@@ -1912,12 +1945,13 @@ __device__ void op_attn_prefill(const u64* inst, u32 vblock) {
 // args: [1]=dst_even, [2]=dst_odd, [3]=src, [4]=num_heads, [5]=head_dim, [6]=batch
 // grid_x = total elements / blockDim.x
 __device__ void op_deinterleave(const u64* inst, u32 vblock) {
-    float* dst_even = inst_fptr(inst, 1);
-    float* dst_odd = inst_fptr(inst, 2);
-    const float* src = inst_fptr(inst, 3);
-    int num_heads = inst_int(inst, 4);
-    int head_dim = inst_int(inst, 5);
-    int batch = inst_int(inst, 6);
+    const DeinterleaveInst* i = (const DeinterleaveInst*)inst;
+    float* dst_even = i->dst_q;
+    float* dst_odd = i->dst_gate;
+    const float* src = i->src;
+    int num_heads = (int)i->num_heads;
+    int head_dim = (int)i->head_dim;
+    int batch = (int)i->batch;
     if (batch <= 0) batch = 1;
 
     int total = batch * num_heads * head_dim;
@@ -1947,14 +1981,15 @@ __device__ void op_deinterleave(const u64* inst, u32 vblock) {
 //       [6]=num_kv_heads, [7]=head_dim, [8]=chunk_tokens (64)
 // grid_x = nkh * head_dim (one block per channel)
 __device__ void op_kv_quantize(const u64* inst, u32 vblock) {
-    const float* src = inst_fptr(inst, 1);
-    unsigned char* q1_data = (unsigned char*)(inst[2]);
-    float* q1_scale = inst_fptr(inst, 3);
-    unsigned char* r_data = (unsigned char*)(inst[4]);
-    float* r_scale = inst_fptr(inst, 5);
-    int nkh = inst_int(inst, 6);
-    int hd = inst_int(inst, 7);
-    int ct = inst_int(inst, 8);
+    const KvQuantizeInst* i = (const KvQuantizeInst*)inst;
+    const float* src = i->src;
+    unsigned char* q1_data = i->q1_data;
+    float* q1_scale = i->q1_scale;
+    unsigned char* r_data = i->r_data;
+    float* r_scale = i->r_scale;
+    int nkh = i->num_kv_heads;
+    int hd = i->head_dim;
+    int ct = i->chunk_tokens;
 
     int channel = vblock;
     int total_channels = nkh * hd;
