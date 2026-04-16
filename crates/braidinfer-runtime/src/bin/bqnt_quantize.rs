@@ -58,7 +58,9 @@ const SKIP_PATTERNS: &[&str] = &[
     "conv1d.weight",
     "conv1d.bias",
     "qscale_weight",
-    "qscale_act", // FP8 per-tensor scales (scalar metadata)
+    "qscale_act",         // FP8 per-tensor scales (scalar metadata)
+    "weight_scale_inv",   // Mistral FP8 scale (inverse)
+    "activation_scale",   // Mistral FP8 activation scale
 ];
 
 fn should_skip(name: &str) -> bool {
@@ -293,30 +295,39 @@ fn main() {
                     (Some(converted), slice)
                 }
                 Dtype::F8_E4M3 => {
-                    // FP8 E4M3 -> BF16: dequantize each byte, apply qscale
+                    // FP8 E4M3 -> BF16: dequantize each byte, apply scale.
+                    // Two naming conventions:
+                    //   qscale_weight: bf16 = fp8 * qscale_weight  (braidinfer internal)
+                    //   weight_scale_inv: bf16 = fp8 * weight_scale_inv  (Mistral FP8)
                     let fp8_bytes: &[u8] = &raw[..n_elements];
+                    let tensor_prefix = name.rsplit_once('.')
+                        .map(|(prefix, _)| prefix)
+                        .unwrap_or(name);
 
-                    // Look up per-tensor scale (qscale_weight)
-                    let scale_name = format!(
-                        "{}.qscale_weight",
-                        name.rsplit_once('.')
-                            .map(|(prefix, _)| prefix)
-                            .unwrap_or(name)
-                    );
-                    let scale: f32 = safetensors
-                        .tensor(&scale_name)
-                        .ok()
-                        .and_then(|st| {
-                            let sd = st.data();
-                            if st.dtype() == Dtype::BF16 && sd.len() >= 2 {
-                                Some(bf16_to_f32(u16::from_le_bytes([sd[0], sd[1]])))
-                            } else if st.dtype() == Dtype::F32 && sd.len() >= 4 {
-                                Some(f32::from_le_bytes([sd[0], sd[1], sd[2], sd[3]]))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(1.0);
+                    fn read_scalar(data: &[u8], dtype: Dtype) -> Option<f32> {
+                        match dtype {
+                            Dtype::BF16 if data.len() >= 2 =>
+                                Some(bf16_to_f32(u16::from_le_bytes([data[0], data[1]]))),
+                            Dtype::F32 if data.len() >= 4 =>
+                                Some(f32::from_le_bytes([data[0], data[1], data[2], data[3]])),
+                            _ => None,
+                        }
+                    }
+
+                    let scale: f32 = if let Ok(st) = safetensors.tensor(
+                        &format!("{tensor_prefix}.qscale_weight")) {
+                        // qscale_weight: bf16 = fp8 * qscale_weight  (direct multiplier)
+                        read_scalar(st.data(), st.dtype()).unwrap_or(1.0)
+                    } else if let Ok(st) = safetensors.tensor(
+                        &format!("{tensor_prefix}.weight_scale_inv")) {
+                        // Mistral FP8: weight_scale_inv = 1/scale, where
+                        //   quantize:   fp8 = round(bf16 / weight_scale_inv)
+                        //   dequantize: bf16 = fp8 * weight_scale_inv
+                        read_scalar(st.data(), st.dtype()).unwrap_or(1.0)
+                    } else {
+                        eprintln!("  WARN: no scale for FP8 tensor {name}, using 1.0");
+                        1.0
+                    };
 
                     let converted: Vec<u16> = fp8_bytes
                         .iter()

@@ -25,17 +25,10 @@ impl Model {
                 self.megakernel = Some(mk);
             }
 
-            // Use same shared_mem as megakernel (4096 for MoE, 2048 for dense) + 256 for local_inst
-            let has_moe = self
-                .config
-                .layers
-                .iter()
-                .any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
-            let shared_mem = if has_moe {
-                1024u32 * 4 + 256
-            } else {
-                256u32 * 4 * 2 + 256
-            };
+            // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
+            // Use this for all models regardless of MoE — MoE models need less but
+            // allocating more is always safe (just wastes a little shared mem).
+            let shared_mem = SHARED_LPROJ_TOTAL as u32;
             let dispatch =
                 PersistentDispatch::init(&[self.device], shared_mem, 0).map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
