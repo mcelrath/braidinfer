@@ -36,6 +36,7 @@ fn main() {
         "selective_state_update",
         "argmax",
         "moe_gate",
+        "dot_sigmoid_scale_add",
         "megakernel",
         "peer_copy",
         "persistent_worker",
@@ -109,7 +110,7 @@ fn main() {
     );
     println!(
         "cargo:rerun-if-changed={}",
-        kernel_dir.join("megakernel_moe_barrier.hip").display()
+        kernel_dir.join("megakernel_moe_dispatch.hip").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

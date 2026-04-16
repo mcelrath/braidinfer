@@ -10,10 +10,11 @@ use safetensors::Dtype;
 
 use crate::config::*;
 use crate::kernel::{
-    ArgmaxKernel, CausalConv1dUpdateKernel, EmbeddingKernel, FfnFusedKernel, GdnGateKernel,
-    GdnRecurrentStepV2Kernel, GqaAttentionKernel, LinearProjKernel, LmHeadKernel, MRoPEKernel,
-    MoeGateKernel, OutputGateKernel, PagedAttentionKernel, QkNormKernel, ResidualAddKernel,
-    RmsNormGatedKernel, RmsNormKernel, SelectiveStateUpdateKernel, SiluMulKernel,
+    ArgmaxKernel, CausalConv1dUpdateKernel, DotSigmoidScaleAddKernel, EmbeddingKernel,
+    FfnFusedKernel, GdnGateKernel, GdnRecurrentStepV2Kernel, GqaAttentionKernel,
+    LinearProjKernel, LmHeadKernel, MRoPEKernel, MoeGateKernel, OutputGateKernel,
+    PagedAttentionKernel, QkNormKernel, ResidualAddKernel, RmsNormGatedKernel, RmsNormKernel,
+    SelectiveStateUpdateKernel, SiluMulKernel,
 };
 pub use crate::quant::{
     LinearWeight, PackedWeights, WeightFormat, WeightQuantMode, quantize_pc_g32_q4,
@@ -243,6 +244,7 @@ pub struct AllKernels {
     pub ssm_update: SelectiveStateUpdateKernel,
     pub argmax: ArgmaxKernel,
     pub moe_gate: MoeGateKernel,
+    pub dot_sigmoid_scale_add: DotSigmoidScaleAddKernel,
 }
 
 impl AllKernels {
@@ -267,6 +269,7 @@ impl AllKernels {
             ssm_update: SelectiveStateUpdateKernel::load(device)?,
             argmax: ArgmaxKernel::load(device)?,
             moe_gate: MoeGateKernel::load(device)?,
+            dot_sigmoid_scale_add: DotSigmoidScaleAddKernel::load(device)?,
         })
     }
 }
@@ -785,7 +788,7 @@ fn load_moe_weights_inner(
     wq: WeightQuantMode,
     bqnt: Option<&MmapBqnt>,
     skip_experts: bool,
-    mut writer: Option<&mut crate::bqnt::BqntWriter>,
+    writer: Option<&mut crate::bqnt::BqntWriter>,
 ) -> Result<MoeWeights, ModelError> {
     let FfnType::MoE {
         num_experts,

@@ -265,7 +265,7 @@ impl MultiGpuContext {
         use braidinfer_hip::memory::DeviceBuffer;
         let byte_offset = src.row_byte_offset_dim(row_start, in_dim);
         let byte_len = src.row_byte_offset_dim(num_rows, in_dim);
-        let mut dst_buf = DeviceBuffer::<u8>::alloc(dst_device, byte_len)?;
+        let dst_buf = DeviceBuffer::<u8>::alloc(dst_device, byte_len)?;
         let src_ptr = unsafe { src.raw_data_ptr().add(byte_offset) };
         braidinfer_hip::memory::memcpy_d2d(dst_buf.as_write_ptr(), src_ptr, byte_len)?;
         // Always return Packed — WeightFormat::Bf16 in Packed is valid and used by forward_sub.

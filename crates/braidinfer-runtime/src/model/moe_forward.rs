@@ -374,30 +374,25 @@ impl Model {
                 &self.stream,
             )?;
 
-            // Apply shared expert gate: sigmoid(gate @ input) * shared_output
-            let se_weight = if let Some(ref gate_buf) = moe.shared_expert_gate {
-                // Compute sigmoid(gate @ normed_input) on CPU
-                self.stream.synchronize()?;
-                let mut normed = vec![0.0f32; hs];
-                self.activations.normed.copy_to_host(&mut normed)?;
-                let mut gate_w = vec![0u16; hs];
-                gate_buf.copy_to_host(&mut gate_w)?;
-                let dot: f32 = normed
-                    .iter()
-                    .zip(gate_w.iter())
-                    .map(|(&x, &w)| x * f32::from_bits((w as u32) << 16))
-                    .sum();
-                1.0 / (1.0 + (-dot).exp()) // sigmoid
+            // Apply shared expert gate: ffn_down[i] += sigmoid(dot(gate_w, normed)) * expert_out[i]
+            if let Some(ref gate_buf) = moe.shared_expert_gate {
+                self.kernels.dot_sigmoid_scale_add.forward(
+                    &mut self.activations.ffn_down,
+                    &self.activations.moe_expert_out,
+                    &self.activations.normed,
+                    gate_buf,
+                    hs as u32,
+                    &self.stream,
+                )?;
             } else {
-                1.0
-            };
-            self.kernels.residual_add.weighted_accumulate(
-                &mut self.activations.ffn_down,
-                &self.activations.moe_expert_out,
-                se_weight,
-                hs as u32,
-                &self.stream,
-            )?;
+                self.kernels.residual_add.weighted_accumulate(
+                    &mut self.activations.ffn_down,
+                    &self.activations.moe_expert_out,
+                    1.0,
+                    hs as u32,
+                    &self.stream,
+                )?;
+            }
         }
 
         // Debug: check ffn_down magnitude

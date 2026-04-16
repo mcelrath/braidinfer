@@ -57,6 +57,8 @@ pub struct Model {
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) trace: Option<crate::trace::TraceWriter>,
     pub(crate) debug_nan: bool,
+    pub(crate) persistent: bool, // cached from PERSISTENT env var at load time
+    pub(crate) sync_debug: bool, // cached from SYNC_DEBUG env var at load time
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
     // Multi-GPU expert parallel (None for single-GPU)
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
@@ -179,14 +181,14 @@ impl Model {
             return self.decode_step_trace(token_id, position);
         }
         if is_multi_gpu {
-            if std::env::var("PERSISTENT").as_deref() == Ok("1") {
+            if self.persistent {
                 return self.decode_step_persistent_multi_gpu(token_id, position);
             }
             return Err(ModelError::InvalidConfig(
                 "Multi-GPU inference requires PERSISTENT=1".to_string(),
             ));
         }
-        if std::env::var("PERSISTENT").as_deref() == Ok("1") {
+        if self.persistent {
             // Single-GPU persistent path cannot handle MoE: compile() emits OP_MOE_FFN,
             // but persistent_worker.hip has an intentional empty first branch for OP_MOE_FFN
             // (VGPR optimization trick) so expert FFN is silently skipped → garbled output.

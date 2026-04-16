@@ -949,7 +949,7 @@ impl Model {
     pub(super) fn decode_step_trace(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let hs = self.config.hidden_size as u32;
         let eps = self.config.rms_norm_eps;
-        let sync_debug = std::env::var("SYNC_DEBUG").is_ok();
+        let sync_debug = self.sync_debug;
         if self
             .config
             .layers

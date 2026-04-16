@@ -1043,11 +1043,12 @@ impl Model {
                 .ok()
                 .and_then(|path| crate::trace::TraceWriter::open(&path).ok()),
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
+            persistent: std::env::var("PERSISTENT").as_deref() == Ok("1"),
+            sync_debug: std::env::var("SYNC_DEBUG").is_ok(),
             weight_prefix: prefix.clone(),
             multi_gpu: None,
             distributed_moe: Vec::new(),
             worker_kernels: Vec::new(),
-            megakernel_multi_gpu: None,
             moe_p2p: None,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
