@@ -1191,6 +1191,9 @@ impl Model {
             seq_mut.append_token(position as i32, alloc_mut)?;
         }
 
+        // Write position_ids to host-mapped memory before paged step (no hipMemcpy).
+        self.set_position(position).map_err(ModelError::Hip)?;
+
         let stream = &self.stream;
         let mk = self.megakernel_paged.as_mut().unwrap();
         let seq = self.paged_seq.as_ref().unwrap();

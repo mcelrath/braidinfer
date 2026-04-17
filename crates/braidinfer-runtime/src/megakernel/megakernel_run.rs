@@ -143,42 +143,25 @@ impl MegakernelProgram {
         }
 
         // 2. Append scalar logical position to position_table in sequence order.
-        // Use synchronous hipMemcpy (not Async) because source is a stack local
+        // MappedHostBuffer: write via host_ptr (no hipMemcpy — GPU reads through device_ptr).
         {
             let seq_token_idx = (seq.seq_len as usize).saturating_sub(1);
             let pos_scalar = *seq
                 .positions
                 .get(seq_token_idx)
                 .expect("position missing for appended paged token");
-            let pos_table_ptr = self
+            let host_ptr = self
                 .position_table
                 .as_ref()
                 .expect("position_table not allocated")
-                .as_ptr();
-            let dst = unsafe {
-                (pos_table_ptr as *mut u8).add(seq_token_idx * std::mem::size_of::<i32>())
-            };
-            braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpy(
-                    dst.cast(),
-                    std::ptr::addr_of!(pos_scalar).cast(),
-                    std::mem::size_of::<i32>(),
-                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                )
-            })?;
+                .host_ptr();
+            unsafe {
+                host_ptr.add(seq_token_idx).write_volatile(pos_scalar);
+            }
         }
 
-        // Also update position_ids for mRoPE (same as flat path)
-        // Use synchronous hipMemcpy because pos_data is a stack local
-        let pos_data = [position as i32, position as i32, position as i32];
-        braidinfer_hip::error::check(unsafe {
-            braidinfer_hip::ffi::hipMemcpy(
-                self.position_ids_dev_ptr as *mut std::ffi::c_void,
-                pos_data.as_ptr().cast(),
-                3 * std::mem::size_of::<i32>(),
-                braidinfer_hip::ffi::hipMemcpyHostToDevice,
-            )
-        })?;
+        // position_ids for mRoPE: written by caller via set_position() (MappedHostBuffer).
+        // No hipMemcpy needed — GPU reads through device_ptr.
 
         // 3. Patch KV write D2D_COPY destinations from paged chunk layout [H,T,D]
         // current_chunk_offset() returns len (post-increment from append_token).
@@ -393,7 +376,7 @@ impl MegakernelProgram {
         }
         if self.position_table.is_none() {
             self.position_table =
-                Some(DeviceBuffer::alloc(self.device, self.max_seq_len as usize)?);
+                Some(braidinfer_hip::memory::MappedHostBuffer::alloc(self.max_seq_len as usize)?);
         }
         Ok(())
     }

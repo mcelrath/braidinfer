@@ -1,6 +1,6 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use std::ffi::c_void;
@@ -64,7 +64,7 @@ pub struct MegakernelProgram {
     // Paged KV cache support
     pub(crate) paged: bool,
     pub(crate) page_table: Option<DeviceBuffer<u64>>, // array of chunk base pointers, uploaded per step
-    pub(crate) position_table: Option<DeviceBuffer<i32>>, // position per token, uploaded per step
+    pub(crate) position_table: Option<MappedHostBuffer<i32>>, // position per token, written via host_ptr (no hipMemcpy)
     pub(crate) attn_paged_inst_indices: Vec<usize>,   // indices of OP_ATTN_PAGED instructions
     pub(crate) attn_quant_inst_indices: Vec<usize>, // indices of OP_ATTN_PAGED_Q instructions (quantized KV)
     pub(crate) last_page_table_len: usize,          // track when a new chunk was added
