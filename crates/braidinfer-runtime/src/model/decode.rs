@@ -104,77 +104,9 @@ impl Model {
         token_id: u32,
         position: u32,
     ) -> Result<Vec<f32>, ModelError> {
-        use crate::persistent_dispatch::PersistentDispatch;
-
         // Lazy-init: compile P2P megakernel + launch workers on ALL GPUs
         if self.persistent_workers.is_none() {
-            let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-            // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS needs SHARED_LPROJ_TOTAL bytes per block.
-            // moe_worker_kernel (GPUs 1-3) only needs 4352B; persistent_worker (GPU 0) needs SHARED_LPROJ_TOTAL.
-            // Pass the larger value; moe_worker has its own calculation in moe_p2p.rs.
-            let moe_worker_shared_mem = 1024u32 * 4 + 256; // 4352B for moe_worker_kernel
-            let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
-            let hs = self.config.hidden_size;
-            let max_eis = self
-                .config
-                .layers
-                .iter()
-                .filter_map(|l| match &l.ffn_type {
-                    crate::model::FfnType::MoE {
-                        expert_intermediate_size,
-                        ..
-                    } => Some(*expert_intermediate_size),
-                    _ => None,
-                })
-                .max()
-                .unwrap_or(0);
-            // Init GPU-native P2P MoE dispatch (moe_worker_kernel on GPUs 1-3) BEFORE
-            // launching the persistent cooperative worker on GPU 0. hipMalloc on GPU 0
-            // deadlocks if the cooperative kernel is already running (ROCm synchronizes
-            // all GPU work before allocating). Launch persistent_worker LAST.
-            if self.has_moe && num_gpus > 1 {
-                let worker_devices: Vec<_> = (1..num_gpus)
-                    .map(|i| braidinfer_core::types::DeviceId(i as u32))
-                    .collect();
-                let num_total_layers = self.config.layers.len();
-                let dist_refs: Vec<Option<&crate::weights::DistributedMoeWeights>> =
-                    self.distributed_moe.iter().map(|d| d.as_ref()).collect();
-                let gate_up_in_dim = self.config.moe_latent_size.unwrap_or(hs);
-                let p2p = crate::moe_p2p::MoeP2pContext::init(
-                    self.device,
-                    &worker_devices,
-                    hs,
-                    gate_up_in_dim,
-                    max_eis,
-                    num_total_layers,
-                    &dist_refs,
-                    moe_worker_shared_mem,
-                )
-                .map_err(ModelError::Hip)?;
-                let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
-                    .map_err(ModelError::Hip)?;
-                self.moe_p2p = Some(p2p);
-                self.megakernel_multi_gpu_p2p = Some(mk_p2p);
-                eprintln!(
-                    "  MoE P2P dispatch initialized: {} worker GPUs",
-                    num_gpus - 1
-                );
-            }
-
-            // Launch persistent cooperative worker on GPU 0 LAST — after all GPU memory
-            // operations are complete (hipMalloc deadlocks on running cooperative kernels).
-            let all_devices: Vec<_> = (0..num_gpus)
-                .map(|i| braidinfer_core::types::DeviceId(i as u32))
-                .collect();
-            let dispatch = PersistentDispatch::init_multi_gpu(
-                self.device,
-                &all_devices,
-                shared_mem,
-                hs,
-                max_eis,
-            )
-            .map_err(ModelError::Hip)?;
-            self.persistent_workers = Some(dispatch);
+            self.init_multi_gpu_persistent()?;
         }
 
         // P2P megakernel is always initialized above when has_moe && num_gpus > 1.
@@ -183,6 +115,79 @@ impl Model {
             return self.decode_step_p2p(token_id, position);
         }
         self.decode_step_paged(token_id, position)
+    }
+
+    fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
+        use crate::persistent_dispatch::PersistentDispatch;
+
+        let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
+        // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS needs SHARED_LPROJ_TOTAL bytes per block.
+        // moe_worker_kernel (GPUs 1-3) only needs 4352B; persistent_worker (GPU 0) needs SHARED_LPROJ_TOTAL.
+        // Pass the larger value; moe_worker has its own calculation in moe_p2p.rs.
+        let moe_worker_shared_mem = 1024u32 * 4 + 256; // 4352B for moe_worker_kernel
+        let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
+        let hs = self.config.hidden_size;
+        let max_eis = self
+            .config
+            .layers
+            .iter()
+            .filter_map(|l| match &l.ffn_type {
+                crate::model::FfnType::MoE {
+                    expert_intermediate_size,
+                    ..
+                } => Some(*expert_intermediate_size),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        // Init GPU-native P2P MoE dispatch (moe_worker_kernel on GPUs 1-3) BEFORE
+        // launching the persistent cooperative worker on GPU 0. hipMalloc on GPU 0
+        // deadlocks if the cooperative kernel is already running (ROCm synchronizes
+        // all GPU work before allocating). Launch persistent_worker LAST.
+        if self.has_moe && num_gpus > 1 {
+            let worker_devices: Vec<_> = (1..num_gpus)
+                .map(|i| braidinfer_core::types::DeviceId(i as u32))
+                .collect();
+            let num_total_layers = self.config.layers.len();
+            let dist_refs: Vec<Option<&crate::weights::DistributedMoeWeights>> =
+                self.distributed_moe.iter().map(|d| d.as_ref()).collect();
+            let gate_up_in_dim = self.config.moe_latent_size.unwrap_or(hs);
+            let p2p = crate::moe_p2p::MoeP2pContext::init(
+                self.device,
+                &worker_devices,
+                hs,
+                gate_up_in_dim,
+                max_eis,
+                num_total_layers,
+                &dist_refs,
+                moe_worker_shared_mem,
+            )
+            .map_err(ModelError::Hip)?;
+            let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
+                .map_err(ModelError::Hip)?;
+            self.moe_p2p = Some(p2p);
+            self.megakernel_multi_gpu_p2p = Some(mk_p2p);
+            eprintln!(
+                "  MoE P2P dispatch initialized: {} worker GPUs",
+                num_gpus - 1
+            );
+        }
+
+        // Launch persistent cooperative worker on GPU 0 LAST — after all GPU memory
+        // operations are complete (hipMalloc deadlocks on running cooperative kernels).
+        let all_devices: Vec<_> = (0..num_gpus)
+            .map(|i| braidinfer_core::types::DeviceId(i as u32))
+            .collect();
+        let dispatch = PersistentDispatch::init_multi_gpu(
+            self.device,
+            &all_devices,
+            shared_mem,
+            hs,
+            max_eis,
+        )
+        .map_err(ModelError::Hip)?;
+        self.persistent_workers = Some(dispatch);
+        Ok(())
     }
 
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
