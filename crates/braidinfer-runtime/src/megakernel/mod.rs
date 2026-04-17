@@ -38,6 +38,43 @@ impl Instruction {
 
 }
 
+/// KV cache configuration used on ALL programs (paged and non-paged, decode and prefill).
+pub(crate) struct KvConfig {
+    pub max_seq_len: u32,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub kv_write_indices: Vec<Vec<(usize, usize)>>, // per attn layer, per kv_head: (k_copy_idx, v_copy_idx)
+    pub kv_base_ptrs: Vec<(u64, u64)>,              // (k_base, v_base) per attention layer
+}
+
+/// Paged KV cache state — only populated when `paged=true`.
+/// `attn_quant_inst_indices` lives here (not in QuantizedKvState) because
+/// `update_step_paged` iterates it unconditionally on all paged programs
+/// (to disable OP_ATTN_PAGED_Q when quantized_kv=false).
+pub(crate) struct PagedKvState {
+    pub page_table: Option<DeviceBuffer<u64>>,
+    pub position_table: Option<MappedHostBuffer<i32>>,
+    pub attn_paged_inst_indices: Vec<usize>,
+    pub attn_quant_inst_indices: Vec<usize>,
+    pub last_page_table_len: usize,
+    pub kv_stride_paged: usize,
+}
+
+/// Quantized KV state — only populated when `quantized_kv=true`.
+pub(crate) struct QuantizedKvState {
+    pub quant_scratch: Option<DeviceBuffer<f32>>,
+    pub quant_page_table: Option<DeviceBuffer<u64>>,
+    pub last_quant_page_table_len: usize,
+}
+
+/// Prefill-specific caching state — only populated on prefill programs.
+pub(crate) struct PrefillCacheState {
+    pub embedding_start: usize,
+    pub kv_entries: Vec<PrefillKvEntry>,
+    pub attn_inst_indices: Vec<usize>,
+    pub n: usize,
+}
+
 /// Set opcode + weight pointer for a linear projection instruction.
 /// For bf16: keeps OP_LINEAR_PROJ, sets bf16 pointer.
 /// For packed: switches opcode to OP_LINEAR_PROJ_RNF4/PCG32, sets u8 pointer.
@@ -51,30 +88,18 @@ pub struct MegakernelProgram {
     // Indices of instructions that need per-step updates
     pub(crate) embedding_inst_idx: usize,
     pub(crate) gqa_attn_inst_indices: Vec<usize>, // seq_len changes each step
-    pub(crate) kv_write_indices: Vec<Vec<(usize, usize)>>, // per attn layer, per kv_head: (k_copy_idx, v_copy_idx)
-    // Base KV cache pointers (position=0) for computing per-step write offsets
-    pub(crate) kv_base_ptrs: Vec<(u64, u64)>, // (k_base, v_base) per attention layer
-    // KV head geometry for [H,T,D] layout pointer computation
-    pub(crate) num_kv_heads_attn: usize, // nkh for attention layers
-    pub(crate) head_dim_attn: usize,     // hd for attention layers
     // mRoPE position_ids device pointer (3 i32s: temporal, height, width)
     pub(crate) position_ids_dev_ptr: u64,
-    // Bounds check
-    pub(crate) max_seq_len: u32,
-    // Paged KV cache support
+    // KV cache config (mandatory — present on all programs)
+    pub(crate) kv: KvConfig,
+    // Paged KV cache support (Some only when paged=true)
     pub(crate) paged: bool,
-    pub(crate) page_table: Option<DeviceBuffer<u64>>, // array of chunk base pointers, uploaded per step
-    pub(crate) position_table: Option<MappedHostBuffer<i32>>, // position per token, written via host_ptr (no hipMemcpy)
-    pub(crate) attn_paged_inst_indices: Vec<usize>,   // indices of OP_ATTN_PAGED instructions
-    pub(crate) attn_quant_inst_indices: Vec<usize>, // indices of OP_ATTN_PAGED_Q instructions (quantized KV)
-    pub(crate) last_page_table_len: usize,          // track when a new chunk was added
-    // kv_stride for paged KV write offset computation (nkh * hd)
-    pub(crate) kv_stride_paged: usize,
-    // Quantized KV support
-    pub(crate) quant_scratch: Option<DeviceBuffer<f32>>, // partial state: [nqh × (2+hd)] per attn layer
-    pub(crate) quant_page_table: Option<DeviceBuffer<u64>>, // page table for sealed quantized chunks
-    pub(crate) last_quant_page_table_len: usize,
-    pub quantized_kv: bool, // whether this program uses quantized KV
+    pub(crate) paged_kv: Option<PagedKvState>,
+    // Quantized KV support (Some only when quantized_kv=true)
+    pub quantized_kv: bool,
+    pub(crate) quant_kv: Option<QuantizedKvState>,
+    // Prefill-specific caching (Some only for prefill programs)
+    pub(crate) prefill_cache: Option<PrefillCacheState>,
     // Dump mode: per-instruction activation capture
     pub(crate) dump_buffer: Option<DeviceBuffer<u8>>, // slot data
     pub(crate) dump_counter: Option<DeviceBuffer<i32>>, // atomic slot counter
@@ -88,11 +113,6 @@ pub struct MegakernelProgram {
     //   rmsnorm_idx  = index of the RMSNorm instruction (flush + dispatch QKV/GQA after this)
     //   output_gate_idx = index of OP_OUTPUT_GATE or O-proj (resume megakernel here after dispatch)
     pub(crate) multi_gpu_attn_boundaries: Vec<(usize, usize)>,
-    // Prefill-specific caching: indices for per-chunk patching
-    pub(crate) prefill_embedding_start: usize,   // first of N consecutive EmbeddingInst
-    pub(crate) prefill_kv_entries: Vec<PrefillKvEntry>, // KV D2dCopy instructions to patch per chunk
-    pub(crate) prefill_attn_inst_indices: Vec<usize>,   // AttnPrefillInst indices, one per attn layer
-    pub(crate) prefill_n: usize,                 // chunk size template was compiled for
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
     /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.

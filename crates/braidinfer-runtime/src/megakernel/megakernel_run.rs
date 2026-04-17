@@ -17,11 +17,11 @@ use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingI
 
 impl MegakernelProgram {
     fn patch_kv_write_offsets(&mut self, position: u32) {
-        let hd = self.head_dim_attn;
-        let max_sl = self.max_seq_len as usize;
+        let hd = self.kv.head_dim;
+        let max_sl = self.kv.max_seq_len as usize;
         let head_stride = max_sl * hd;
-        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
-            let (k_base, v_base) = self.kv_base_ptrs[layer_i];
+        for (layer_i, head_indices) in self.kv.kv_write_indices.iter().enumerate() {
+            let (k_base, v_base) = self.kv.kv_base_ptrs[layer_i];
             for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
                 let offset =
                     (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
@@ -37,9 +37,9 @@ impl MegakernelProgram {
 
     pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
         assert!(
-            position < self.max_seq_len,
+            position < self.kv.max_seq_len,
             "position {position} >= max_seq_len {}",
-            self.max_seq_len
+            self.kv.max_seq_len
         );
 
         // Update embedding token_id
@@ -104,7 +104,7 @@ impl MegakernelProgram {
     /// For persistent worker path: worker reads instructions from host-mapped memory,
     /// not from device_program. Also writes position_ids via hipMemcpy (DMA, not SM).
     pub fn update_step_host_only(&mut self, token_id: u32, position: u32) -> HipResult<()> {
-        assert!(position < self.max_seq_len);
+        assert!(position < self.kv.max_seq_len);
 
         unsafe {
             let inst = self.instructions[self.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
@@ -138,9 +138,9 @@ impl MegakernelProgram {
         stream: &Stream,
     ) -> HipResult<()> {
         assert!(
-            position < self.max_seq_len,
+            position < self.kv.max_seq_len,
             "position {position} >= max_seq_len {}",
-            self.max_seq_len
+            self.kv.max_seq_len
         );
         assert!(self.paged, "update_step_paged called on non-paged program");
 
@@ -159,6 +159,9 @@ impl MegakernelProgram {
                 .get(seq_token_idx)
                 .expect("position missing for appended paged token");
             let host_ptr = self
+                .paged_kv
+                .as_ref()
+                .expect("paged_kv not initialized")
                 .position_table
                 .as_ref()
                 .expect("position_table not allocated")
@@ -175,12 +178,12 @@ impl MegakernelProgram {
         // current_chunk_offset() returns len (post-increment from append_token).
         // The write target is len-1 (the slot just reserved).
         let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
-        let kv_stride = self.kv_stride_paged;
-        let _nkh = self.num_kv_heads_attn;
-        let hd = self.head_dim_attn;
+        let kv_stride = self.paged_kv.as_ref().unwrap().kv_stride_paged;
+        let _nkh = self.kv.num_kv_heads;
+        let hd = self.kv.head_dim;
         let chunk_head_stride = CHUNK_TOKENS * hd; // elements between heads within chunk
 
-        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
+        for (layer_i, head_indices) in self.kv.kv_write_indices.iter().enumerate() {
             let chunk_slot = if seq.chunks.is_empty() {
                 0
             } else {
@@ -208,16 +211,20 @@ impl MegakernelProgram {
 
         // 4. Patch attention instructions
         let total_seq_len = seq.seq_len as i32;
-        let page_table_ptr = self
+        let paged_kv = self.paged_kv.as_ref().unwrap();
+        let page_table_ptr = paged_kv
             .page_table
             .as_ref()
             .expect("page_table not allocated")
             .as_ptr() as u64;
-        let pos_table_ptr = self
+        let pos_table_ptr = paged_kv
             .position_table
             .as_ref()
             .expect("position_table not allocated")
             .as_ptr() as u64;
+        let attn_paged_inst_indices = paged_kv.attn_paged_inst_indices.clone();
+        let attn_quant_inst_indices = paged_kv.attn_quant_inst_indices.clone();
+        drop(paged_kv);
 
         if self.quantized_kv && seq.chunks.len() > 1 {
             // Two-phase: quantized sealed chunks + f32 active chunk
@@ -225,18 +232,21 @@ impl MegakernelProgram {
             let sealed_tokens = (num_sealed * CHUNK_TOKENS) as i32;
             let active_tokens = total_seq_len - sealed_tokens;
             let nqh = unsafe {
-                let inst = self.instructions[self.attn_paged_inst_indices[0]].words.as_ptr() as *const AttnPagedInst;
+                let inst = self.instructions[attn_paged_inst_indices[0]].words.as_ptr() as *const AttnPagedInst;
                 (*inst).nqh as u32
             };
 
             let quant_pt_ptr = self
+                .quant_kv
+                .as_ref()
+                .expect("quant_kv not initialized")
                 .quant_page_table
                 .as_ref()
                 .expect("quant_page_table not allocated")
                 .as_ptr() as u64;
 
             // Patch OP_ATTN_PAGED_Q: enable (grid_x=nqh), quant page table, sealed seq_len
-            for &idx in &self.attn_quant_inst_indices {
+            for &idx in &attn_quant_inst_indices {
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
                     (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, nqh);
@@ -254,7 +264,7 @@ impl MegakernelProgram {
             // at offset `sealed_tokens/CHUNK_TOKENS` in the f32 page table, but simpler:
             // point to a single-entry table with just the active chunk.
             // We reuse the main page_table — the active chunk ptr is at index `num_sealed`.
-            for &idx in &self.attn_paged_inst_indices {
+            for &idx in &attn_paged_inst_indices {
                 // Point page_table at the last entry (active chunk)
                 let active_pt_ptr =
                     page_table_ptr + (num_sealed * std::mem::size_of::<u64>()) as u64;
@@ -268,14 +278,14 @@ impl MegakernelProgram {
         } else {
             // No quantized chunks yet (or quantized_kv not enabled): all f32
             // Disable OP_ATTN_PAGED_Q (grid_x=0)
-            for &idx in &self.attn_quant_inst_indices {
+            for &idx in &attn_quant_inst_indices {
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
                     (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, 0);
                 }
             }
             // OP_ATTN_PAGED sees all chunks, no partial_state
-            for &idx in &self.attn_paged_inst_indices {
+            for &idx in &attn_paged_inst_indices {
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
                     (*inst).page_table = page_table_ptr;
@@ -292,8 +302,8 @@ impl MegakernelProgram {
         }
 
         // 5. Upload page_table if chunk list changed
-        if seq.chunks.len() != self.last_page_table_len {
-            let page_table_dev = self.page_table.as_mut().expect("page_table not allocated");
+        if seq.chunks.len() != self.paged_kv.as_ref().unwrap().last_page_table_len {
+            let page_table_dev = self.paged_kv.as_mut().unwrap().page_table.as_mut().expect("page_table not allocated");
             let host_ptrs: Vec<u64> = seq
                 .chunks
                 .iter()
@@ -310,7 +320,7 @@ impl MegakernelProgram {
                     stream.raw(),
                 )
             })?;
-            self.last_page_table_len = seq.chunks.len();
+            self.paged_kv.as_mut().unwrap().last_page_table_len = seq.chunks.len();
         }
 
         // 6. Upload entire instruction buffer in one hipMemcpyAsync call.
@@ -372,7 +382,8 @@ impl MegakernelProgram {
 
                     // Upload quantized page table
                     let num_sealed = seq.chunks.len();
-                    let quant_pt = self
+                    let quant_kv = self.quant_kv.as_mut().expect("quant_kv not initialized");
+                    let quant_pt = quant_kv
                         .quant_page_table
                         .as_mut()
                         .expect("quant_page_table not allocated");
@@ -386,7 +397,7 @@ impl MegakernelProgram {
                             braidinfer_hip::ffi::hipMemcpyHostToDevice,
                         )
                     })?;
-                    self.last_quant_page_table_len = num_sealed;
+                    quant_kv.last_quant_page_table_len = num_sealed;
                 }
             }
         }
@@ -396,12 +407,13 @@ impl MegakernelProgram {
     /// Lazily allocate the page_table and position_table device buffers.
     /// Must be called once before the first update_step_paged().
     pub fn init_paged_buffers(&mut self, max_chunks: usize) -> HipResult<()> {
-        if self.page_table.is_none() {
-            self.page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
+        let paged_kv = self.paged_kv.as_mut().expect("init_paged_buffers called on non-paged program");
+        if paged_kv.page_table.is_none() {
+            paged_kv.page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
         }
-        if self.position_table.is_none() {
-            self.position_table =
-                Some(braidinfer_hip::memory::MappedHostBuffer::alloc(self.max_seq_len as usize)?);
+        if paged_kv.position_table.is_none() {
+            paged_kv.position_table =
+                Some(braidinfer_hip::memory::MappedHostBuffer::alloc(self.kv.max_seq_len as usize)?);
         }
         Ok(())
     }
@@ -423,12 +435,14 @@ impl MegakernelProgram {
         // Scratch: [nqh × (2+hd)] per attention layer (each layer gets its own scratch region)
         let scratch_per_layer = nqh * (2 + hd);
         let total_scratch = num_attn_layers * scratch_per_layer;
-        self.quant_scratch = Some(DeviceBuffer::alloc(self.device, total_scratch)?);
-        self.quant_page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
+        let quant_scratch = DeviceBuffer::alloc(self.device, total_scratch)?;
+        let quant_page_table = DeviceBuffer::alloc(self.device, max_chunks)?;
 
         // Patch OP_ATTN_PAGED_Q scratch pointers and OP_ATTN_PAGED partial_state pointers
-        let scratch_base = self.quant_scratch.as_ref().unwrap().as_ptr() as u64;
-        for (layer_i, &q_idx) in self.attn_quant_inst_indices.iter().enumerate() {
+        let scratch_base = quant_scratch.as_ptr() as u64;
+        let attn_quant_inst_indices = self.paged_kv.as_ref().unwrap().attn_quant_inst_indices.clone();
+        let attn_paged_inst_indices = self.paged_kv.as_ref().unwrap().attn_paged_inst_indices.clone();
+        for (layer_i, &q_idx) in attn_quant_inst_indices.iter().enumerate() {
             let scratch_ptr =
                 scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
             unsafe {
@@ -436,7 +450,7 @@ impl MegakernelProgram {
                 (*inst).scratch = scratch_ptr;
             }
         }
-        for (layer_i, &p_idx) in self.attn_paged_inst_indices.iter().enumerate() {
+        for (layer_i, &p_idx) in attn_paged_inst_indices.iter().enumerate() {
             let scratch_ptr =
                 scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
             unsafe {
@@ -444,6 +458,11 @@ impl MegakernelProgram {
                 (*inst).partial_state = scratch_ptr;
             }
         }
+        self.quant_kv = Some(super::QuantizedKvState {
+            quant_scratch: Some(quant_scratch),
+            quant_page_table: Some(quant_page_table),
+            last_quant_page_table_len: 0,
+        });
         self.quantized_kv = true;
         Ok(())
     }
@@ -521,12 +540,17 @@ impl MegakernelProgram {
         prefill_bufs: &mut super::PrefillBuffers,
     ) -> HipResult<()> {
         use super::instructions::{AttnPrefillInst, D2dCopyInst};
+        let prefill_cache = self.prefill_cache.as_ref().expect("update_prefill_chunk called on non-prefill program");
         let n = tokens.len();
-        assert_eq!(n, self.prefill_n, "update_prefill_chunk: token count must match template size {}", self.prefill_n);
+        assert_eq!(n, prefill_cache.n, "update_prefill_chunk: token count must match template size {}", prefill_cache.n);
+        let prefill_embedding_start = prefill_cache.embedding_start;
+        let prefill_kv_entries: Vec<_> = prefill_cache.kv_entries.iter().map(|e| (e.k_inst_idx, e.v_inst_idx, e.h, e.layer_kv_idx, e.t)).collect();
+        let prefill_attn_inst_indices: Vec<_> = prefill_cache.attn_inst_indices.clone();
+        drop(prefill_cache);
 
         // 1. Patch embedding token IDs
         for (i, &tok) in tokens.iter().enumerate() {
-            let idx = self.prefill_embedding_start + i;
+            let idx = prefill_embedding_start + i;
             unsafe {
                 let inst = self.instructions[idx].words.as_mut_ptr() as *mut EmbeddingInst;
                 (*inst).token_id = tok as u64;
@@ -534,22 +558,22 @@ impl MegakernelProgram {
         }
 
         // 2. Patch KV write D2dCopy destinations
-        let hd = self.head_dim_attn;
-        let max_sl = self.max_seq_len as usize;
-        for entry in &self.prefill_kv_entries {
-            let (k_base, v_base) = self.kv_base_ptrs[entry.layer_kv_idx];
-            let token_offset = start_pos as usize + entry.t;
-            let byte_offset = (entry.h * max_sl * hd + token_offset * hd) * std::mem::size_of::<f32>();
+        let hd = self.kv.head_dim;
+        let max_sl = self.kv.max_seq_len as usize;
+        for (k_inst_idx, v_inst_idx, h, layer_kv_idx, t) in &prefill_kv_entries {
+            let (k_base, v_base) = self.kv.kv_base_ptrs[*layer_kv_idx];
+            let token_offset = start_pos as usize + t;
+            let byte_offset = (h * max_sl * hd + token_offset * hd) * std::mem::size_of::<f32>();
             unsafe {
-                let k_inst = self.instructions[entry.k_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                let k_inst = self.instructions[*k_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
                 (*k_inst).dst = (k_base + byte_offset as u64) as *mut f32;
-                let v_inst = self.instructions[entry.v_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                let v_inst = self.instructions[*v_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
                 (*v_inst).dst = (v_base + byte_offset as u64) as *mut f32;
             }
         }
 
         // 3. Patch AttnPrefillInst start_pos fields
-        for &idx in &self.prefill_attn_inst_indices {
+        for &idx in &prefill_attn_inst_indices {
             unsafe {
                 let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPrefillInst;
                 (*inst).start_pos = start_pos as u64;

@@ -43,11 +43,11 @@ impl Model {
             let inst = mk.instructions[mk.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
             (*inst).token_id = token_id as u64;
         }
-        let hd = mk.head_dim_attn;
-        let max_sl = mk.max_seq_len as usize;
+        let hd = mk.kv.head_dim;
+        let max_sl = mk.kv.max_seq_len as usize;
         let head_stride = max_sl * hd;
-        for (layer_i, head_indices) in mk.kv_write_indices.iter().enumerate() {
-            let (k_base, v_base) = mk.kv_base_ptrs[layer_i];
+        for (layer_i, head_indices) in mk.kv.kv_write_indices.iter().enumerate() {
+            let (k_base, v_base) = mk.kv.kv_base_ptrs[layer_i];
             for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
                 let offset =
                     (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
