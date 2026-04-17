@@ -263,6 +263,12 @@ impl Model {
 
     /// Mamba2 SSM layer forward pass (Nemotron-H 'M' layers).
     /// Steps: norm → in_proj → split → conv1d → split → ssm_update → norm_gated → out_proj → residual
+    fn mamba2_debug_dump(label: &str, buf: &[f32]) {
+        let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let n = buf.len().min(5);
+        eprintln!("  M2.L0 {label}: max_abs={max_abs:.4e}, first{n}={:.4?}", &buf[..n]);
+    }
+
     pub(crate) fn mamba2_forward(
         &mut self,
         layer_idx: usize,
@@ -310,18 +316,12 @@ impl Model {
             )?;
         }
 
-        // Debug: per-step tracing for layer 0
         let dbg = self.debug_nan && layer_idx == 0;
         if dbg {
             self.stream.synchronize()?;
-            let n = self.activations.normed.len();
-            let mut buf = vec![0.0f32; n];
+            let mut buf = vec![0.0f32; self.activations.normed.len()];
             self.activations.normed.copy_to_host(&mut buf)?;
-            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            eprintln!(
-                "  M2.L0 after norm: max_abs={max_abs:.4e}, first5={:.4?}",
-                &buf[..5]
-            );
+            Self::mamba2_debug_dump("after norm", &buf);
         }
 
         // 2. in_proj: normed → [gate(intermediate), xBC(conv_dim), dt(num_heads)]
@@ -338,24 +338,11 @@ impl Model {
 
         if dbg {
             self.stream.synchronize()?;
-            let n = self.activations.mamba2_in_proj.len();
-            let mut buf = vec![0.0f32; n];
+            let mut buf = vec![0.0f32; self.activations.mamba2_in_proj.len()];
             self.activations.mamba2_in_proj.copy_to_host(&mut buf)?;
-            let gate_max = buf[..nh * hd]
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
-            let xbc_max = buf[nh * hd..nh * hd + cd]
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
-            let dt_max = buf[nh * hd + cd..]
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
-            eprintln!(
-                "  M2.L0 in_proj: gate_max={gate_max:.4e}, xBC_max={xbc_max:.4e}, dt_max={dt_max:.4e}"
-            );
+            let max_f = |s: &[f32]| s.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let (gate_max, xbc_max, dt_max) = (max_f(&buf[..nh*hd]), max_f(&buf[nh*hd..nh*hd+cd]), max_f(&buf[nh*hd+cd..]));
+            eprintln!("  M2.L0 in_proj: gate_max={gate_max:.4e}, xBC_max={xbc_max:.4e}, dt_max={dt_max:.4e}");
         }
 
         // 3. Conv1d update on xBC with bias + silu activation
@@ -378,21 +365,10 @@ impl Model {
 
         if dbg {
             self.stream.synchronize()?;
-            let n = self.activations.mamba2_conv_out.len();
-            let mut buf = vec![0.0f32; n];
+            let mut buf = vec![0.0f32; self.activations.mamba2_conv_out.len()];
             self.activations.mamba2_conv_out.copy_to_host(&mut buf)?;
-            let x_max = buf[..nh * hd]
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
-            let b_max = buf[nh * hd..nh * hd + ng * sd]
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
-            let c_max = buf[nh * hd + ng * sd..]
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
+            let max_f = |s: &[f32]| s.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+            let (x_max, b_max, c_max) = (max_f(&buf[..nh*hd]), max_f(&buf[nh*hd..nh*hd+ng*sd]), max_f(&buf[nh*hd+ng*sd..]));
             eprintln!("  M2.L0 conv1d: x_max={x_max:.4e}, B_max={b_max:.4e}, C_max={c_max:.4e}");
         }
 
@@ -423,22 +399,13 @@ impl Model {
 
         if dbg {
             self.stream.synchronize()?;
-            let state = &self.mamba2_states[mamba2_idx];
-            let ssm_n = state.ssm.len();
-            let mut ssm_buf = vec![0.0f32; ssm_n];
-            state.ssm.copy_to_host(&mut ssm_buf)?;
-            let ssm_max = ssm_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            let ssm_mean = ssm_buf.iter().map(|x| x.abs()).sum::<f32>() / ssm_n as f32;
-            eprintln!("  M2.L0 ssm_state: n={ssm_n} max_abs={ssm_max:.4e} mean_abs={ssm_mean:.4e}");
-
-            let n = self.activations.mamba2_ssm_out.len();
-            let mut buf = vec![0.0f32; n];
+            let mut ssm_buf = vec![0.0f32; self.mamba2_states[mamba2_idx].ssm.len()];
+            self.mamba2_states[mamba2_idx].ssm.copy_to_host(&mut ssm_buf)?;
+            let ssm_mean = ssm_buf.iter().map(|x| x.abs()).sum::<f32>() / ssm_buf.len() as f32;
+            eprintln!("  M2.L0 ssm_state: n={} max_abs={:.4e} mean_abs={ssm_mean:.4e}", ssm_buf.len(), ssm_buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max));
+            let mut buf = vec![0.0f32; self.activations.mamba2_ssm_out.len()];
             self.activations.mamba2_ssm_out.copy_to_host(&mut buf)?;
-            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            eprintln!(
-                "  M2.L0 ssm_out: max_abs={max_abs:.4e}, first5={:.4?}",
-                &buf[..5]
-            );
+            Self::mamba2_debug_dump("ssm_out", &buf);
         }
 
         // 6. rmsnorm_gated: normed_out = rmsnorm(ssm_out * silu(gate)) * weight
@@ -475,14 +442,9 @@ impl Model {
 
         if dbg {
             self.stream.synchronize()?;
-            let n = self.activations.out_proj.len();
-            let mut buf = vec![0.0f32; n.min(self.config.hidden_size)];
+            let mut buf = vec![0.0f32; self.activations.out_proj.len().min(self.config.hidden_size)];
             self.activations.out_proj.copy_to_host(&mut buf)?;
-            let max_abs = buf.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-            eprintln!(
-                "  M2.L0 out_proj: max_abs={max_abs:.4e}, first5={:.4?}",
-                &buf[..5]
-            );
+            Self::mamba2_debug_dump("out_proj", &buf);
         }
 
         // 8. Residual add
