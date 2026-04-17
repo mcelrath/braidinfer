@@ -7,7 +7,7 @@ use braidinfer_hip::module::Module;
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 use super::upload_program;
 use super::instructions::*;
-use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
+use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
 use super::{
     OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
@@ -795,25 +795,26 @@ impl MegakernelProgram {
                 act.ffn_down_stage.as_ptr() as u64
             };
 
-            let mut inst = Instruction::new(OP_MOE_DISPATCH, 0);
-            inst.words[1] = p2p.work_queue.device_ptr() as u64;
-            inst.words[2] = p2p.output_slots.as_ptr() as u64;
-            inst.words[3] = final_output_ptr;
-            inst.words[4] = act.moe_expert_ids.as_ptr() as u64;
-            inst.words[5] = act.moe_expert_weights.as_ptr() as u64;
-            inst.words[6] = p2p.seq_counter.device_ptr() as u64;
-            inst.words[7] = ((num_workers as u64) << 32) | (hs as u64); // num_workers | hidden_size (slot stride)
-            inst.words[8] = ((layer_idx as u64) << 32) | (k as u64);
-            inst.words[9] = ((eis as u64) << 32) | has_gate;
-            inst.words[10] = activation_ptr;
-            inst.words[11] = p2p.gpu0_layer_config_ptrs.as_ptr() as u64;
-            inst.words[12] = p2p.gpu0_scratch_gate.as_ptr() as u64;
-            inst.words[13] = p2p.gpu0_scratch_up.as_ptr() as u64;
-            inst.words[14] = p2p.gpu0_scratch_act.as_ptr() as u64;
-            inst.words[15] = num_gpus as u64;
-            inst.words[16] = gupd as u64; // gate_up_in_dim (0 → kernel defaults to hs)
-
-            prog.instructions[barrier_idx] = inst;
+            prog.instructions[barrier_idx] = MoeDispatchInst {
+                opcode_gridx: OP_MOE_DISPATCH as u64,
+                work_queue: p2p.work_queue.device_ptr() as u64,
+                output_slots: p2p.output_slots.as_ptr() as u64,
+                final_output: final_output_ptr,
+                expert_ids: act.moe_expert_ids.as_ptr() as u64,
+                expert_weights: act.moe_expert_weights.as_ptr() as u64,
+                seq_counter: p2p.seq_counter.device_ptr() as u64,
+                num_workers_hs: ((num_workers as u64) << 32) | (hs as u64),
+                layer_k: ((layer_idx as u64) << 32) | (k as u64),
+                eis_gate: ((eis as u64) << 32) | has_gate,
+                activation: activation_ptr,
+                layer_config_ptrs: p2p.gpu0_layer_config_ptrs.as_ptr() as u64,
+                scratch_gate: p2p.gpu0_scratch_gate.as_ptr() as u64,
+                scratch_up: p2p.gpu0_scratch_up.as_ptr() as u64,
+                scratch_act: p2p.gpu0_scratch_act.as_ptr() as u64,
+                num_gpus: num_gpus as u64,
+                gate_up_in_dim: gupd as u64,
+                _pad: 0,
+            }.into_inst();
         }
 
         // Pass 2: rebuild instruction stream to insert fc2+residual_add after OP_MOE_DISPATCH
