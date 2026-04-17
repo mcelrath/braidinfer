@@ -208,20 +208,22 @@ pub(crate) struct GdnRecurInst {
     pub kd: u64,
     pub vd: u64,
     pub gqa_group: u64,
-    pub _pad: [u64; 7],
+    pub num_heads: u64,
+    pub _pad: [u64; 6],
 }
 assert_inst_size!(GdnRecurInst);
 impl_inst!(GdnRecurInst);
 
 impl GdnRecurInst {
-    pub(crate) fn new(grid_x: u32, q: *const f32, k: *const f32, v: *const f32, gate: *const f32, b_proj: *const f32, state: *mut f32, output: *mut f32, kd: i32, vd: i32, gqa_group: i32) -> Self {
+    pub(crate) fn new(grid_x: u32, num_heads: u32, q: *const f32, k: *const f32, v: *const f32, gate: *const f32, b_proj: *const f32, state: *mut f32, output: *mut f32, kd: i32, vd: i32, gqa_group: i32) -> Self {
         GdnRecurInst {
             opcode_gridx: make_opcode_gridx(OP_GDN_RECUR, grid_x),
             q, k, v, gate, b_proj, state, output,
             kd: kd as u64,
             vd: vd as u64,
             gqa_group: gqa_group as u64,
-            _pad: [0; 7],
+            num_heads: num_heads as u64,
+            _pad: [0; 6],
         }
     }
 }

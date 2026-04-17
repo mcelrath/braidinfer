@@ -97,7 +97,8 @@ typedef struct {
     int64_t kd;
     int64_t vd;
     int64_t gqa_group;
-    uint64_t _pad[7];
+    uint64_t num_heads;
+    uint64_t _pad[6];
 } GdnRecurInst;
 static_assert(sizeof(GdnRecurInst) == INST_SIZE_WORDS * 8, "GdnRecurInst size mismatch");
 static_assert(offsetof(GdnRecurInst, q) == 8, "GdnRecurInst.q offset");

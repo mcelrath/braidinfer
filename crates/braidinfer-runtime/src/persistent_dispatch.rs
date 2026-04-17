@@ -113,7 +113,8 @@ impl PersistentDispatch {
             let func = module.get_function("persistent_worker")?;
             let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
             let mut args: [*mut std::ffi::c_void; 1] = [std::ptr::addr_of_mut!(queue_ptr).cast()];
-            let bpsm_max = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
+            let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+            let bpsm_max = bpsm_raw.min(2);
             let bpsm = std::env::var("BRAIDINFER_BPSM")
                 .ok().and_then(|v| v.parse::<u32>().ok())
                 .map(|v| v.clamp(1, bpsm_max as u32) as usize)
@@ -128,7 +129,7 @@ impl PersistentDispatch {
                 &mut args,
             )?;
             eprintln!(
-                "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared)",
+                "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared, bpsm_raw={bpsm_raw} bpsm={bpsm} num_cus={num_cus})",
                 device.0
             );
             braidinfer_hip::set_persistent_worker_active(true);
@@ -296,7 +297,8 @@ impl PersistentDispatch {
         let stream = Stream::new(gpu0)?;
         let module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
         let func = module.get_function("persistent_worker")?;
-        let bpsm_max = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
+        let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let bpsm_max = bpsm_raw.min(2);
         let blocks_per_sm = std::env::var("BRAIDINFER_BPSM")
             .ok().and_then(|v| v.parse::<u32>().ok())
             .map(|v| v.clamp(1, bpsm_max as u32))
@@ -313,7 +315,7 @@ impl PersistentDispatch {
             &mut args,
         )?;
         eprintln!(
-            "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B); GPUs 1+ use kbk",
+            "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared, bpsm_raw={bpsm_raw} bpsm={blocks_per_sm} num_cus={num_cus}); GPUs 1+ use kbk",
             gpu0.0
         );
         braidinfer_hip::set_persistent_worker_active(true);

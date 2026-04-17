@@ -71,7 +71,7 @@ impl Model {
         mk.instructions[lm_head_idx].words[1] =
             self.activations.logits_mapped.as_write_ptr() as u64;
 
-        // Batch dispatch: send all instructions as batches of up to 64.
+        // Batch dispatch: send all instructions as batches of up to MAX_BATCH_INSTRUCTIONS.
         // Worker processes all with grid.sync() between them, acks once per batch.
         let batch: Vec<_> = mk
             .instructions

@@ -170,6 +170,7 @@ impl MegakernelProgram {
                         &model.gdn_conv_states[gdn_idx],
                         &model.gdn_states[gdn_idx],
                         &mut instructions,
+                        num_blocks,
                     );
                     gdn_idx += 1;
                 }
@@ -572,8 +573,9 @@ impl MegakernelProgram {
                     // GDN recurrence (nvh heads with GQA key sharing)
                     {
                         let gqa_group = nvh_gdn / nh_gdn;
+                        let blocks_per_head = (num_blocks / nvh_gdn as u32).max(1);
                         instructions.push(GdnRecurInst::new(
-                            nvh_gdn as u32,
+                            nvh_gdn as u32 * blocks_per_head, nvh_gdn as u32,
                             act.q_gdn.as_ptr(),
                             act.k_gdn.as_ptr(),
                             act.v_gdn.as_ptr(),
@@ -891,8 +893,9 @@ impl MegakernelProgram {
                     instructions.push(Conv1dInst::new(div_ceil(v_dim as u32, 256), unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) }, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim) }, w.conv1d_weight_v.as_ptr(), act.v_gdn.as_write_ptr(), v_dim as i32, ck as i32).into_inst());
                     {
                         let gqa_group = nvh_gdn / nh_gdn;
+                        let blocks_per_head = (num_blocks / nvh_gdn as u32).max(1);
                         instructions.push(GdnGateInst::new(div_ceil(nvh_gdn as u32, 256), act.gate_gdn.as_write_ptr(), unsafe { prefill_bufs.a_proj.as_ptr().add(t * nvh_gdn) }, w.a_log.as_ptr(), w.dt_bias.as_ptr(), nvh_gdn as i32).into_inst());
-                        instructions.push(GdnRecurInst::new(nvh_gdn as u32, act.q_gdn.as_ptr(), act.k_gdn.as_ptr(), act.v_gdn.as_ptr(), act.gate_gdn.as_ptr(), unsafe { prefill_bufs.b_proj.as_ptr().add(t * nvh_gdn) }, gdn_state.recurrent.as_write_ptr(), act.recurrent_out.as_write_ptr(), kd as i32, vd as i32, gqa_group as i32).into_inst());
+                        instructions.push(GdnRecurInst::new(nvh_gdn as u32 * blocks_per_head, nvh_gdn as u32, act.q_gdn.as_ptr(), act.k_gdn.as_ptr(), act.v_gdn.as_ptr(), act.gate_gdn.as_ptr(), unsafe { prefill_bufs.b_proj.as_ptr().add(t * nvh_gdn) }, gdn_state.recurrent.as_write_ptr(), act.recurrent_out.as_write_ptr(), kd as i32, vd as i32, gqa_group as i32).into_inst());
                     }
                     instructions.push(RmsNormGateInst::new(nvh_gdn as u32, act.normed_gated.as_write_ptr(), act.recurrent_out.as_ptr(), unsafe { prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd) }, w.output_norm.as_ptr(), nvh_gdn as i32, vd as i32, eps).into_inst());
                     {

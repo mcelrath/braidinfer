@@ -18,6 +18,7 @@ impl MegakernelProgram {
         conv_state: &braidinfer_hip::memory::DeviceBuffer<f32>,
         gdn_state: &GdnState,
         instructions: &mut Vec<Instruction>,
+        num_blocks: u32,
     ) {
         let w = match layer {
             LayerWeights::Gdn(w) => w,
@@ -90,9 +91,10 @@ impl MegakernelProgram {
             act.gate_gdn.as_write_ptr(), act.a_proj.as_ptr(), w.a_log.as_ptr(), w.dt_bias.as_ptr(), nvh as i32,
         ).into_inst());
 
-        // 6. GDN recurrent
+        // 6. GDN recurrent: distribute blocks_per_head blocks per head for full CU utilization
+        let blocks_per_head = (num_blocks / nvh as u32).max(1);
         instructions.push(GdnRecurInst::new(
-            nvh as u32,
+            nvh as u32 * blocks_per_head, nvh as u32,
             act.q_gdn.as_ptr(), act.k_gdn.as_ptr(), act.v_gdn.as_ptr(), act.gate_gdn.as_ptr(), act.b_proj.as_ptr(),
             gdn_state.recurrent.as_write_ptr(), act.recurrent_out.as_write_ptr(),
             kd as i32, vd as i32, gqa_group as i32,

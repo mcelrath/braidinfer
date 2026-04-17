@@ -14,6 +14,8 @@ fn bench_decode_step() {
         return;
     }
 
+    // Force persistent mode for this benchmark
+    unsafe { std::env::set_var("PERSISTENT", "1"); }
     let mut model = Model::load(model_dir, device).expect("load model");
 
     // Warmup
