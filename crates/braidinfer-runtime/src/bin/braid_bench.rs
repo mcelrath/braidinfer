@@ -162,6 +162,87 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     model.reset_state().expect("reset");
 }
 
+/// Multi-GPU coherence test: verifies multi-GPU P2P prefill logits match single-GPU sequential reference.
+///
+/// Requires a MoE model (e.g. qwen35_35b_a3b.q4.bqnt) and >= 2 GPUs.
+/// Loads the model twice: single-GPU for reference, multi-GPU for test.
+/// Both runs use the sequential paged decode path (no persistent worker), so reset_state
+/// works correctly and hipMemcpy is available throughout.
+///
+/// Skipped automatically if the model has no MoE layers or only 1 GPU is present.
+fn bench_coherence_multi_gpu(model_dir: &Path, prompt_len: usize) {
+    let top10 = |logits: &[f32]| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..logits.len()).collect();
+        idx.sort_unstable_by(|&a, &b| {
+            logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        idx.truncate(10);
+        idx
+    };
+
+    let gpu_count = vram_free_per_gpu().len();
+    if gpu_count < 2 {
+        println!("=== Multi-GPU coherence test: SKIPPED ({gpu_count} GPU(s) available, need >=2) ===");
+        return;
+    }
+
+    println!("=== Multi-GPU coherence test ({gpu_count} GPUs, prompt_len={prompt_len}) ===");
+
+    let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 9906 + (i % 100)).collect();
+
+    // Single-GPU sequential reference: load without multi-GPU enabled.
+    let orig_multi_gpu = std::env::var("MULTI_GPU").ok();
+    unsafe { std::env::remove_var("MULTI_GPU") };
+
+    let mut ref_model = load_model(model_dir, false);
+
+    let model_has_moe = ref_model.config().layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+    if !model_has_moe {
+        println!("  SKIPPED: model has no MoE layers (multi-GPU path is MoE-only)");
+        if let Some(v) = orig_multi_gpu {
+            unsafe { std::env::set_var("MULTI_GPU", v) };
+        }
+        return;
+    }
+
+    ref_model.reset_state().expect("reset");
+    let mut ref_logits = vec![];
+    for (i, &tok) in prompt.iter().enumerate() {
+        ref_logits = ref_model.decode_step_paged(tok, i as u32).expect("ref decode");
+    }
+    let ref_top = top10(&ref_logits);
+    ref_model.reset_state().expect("reset ref");
+    drop(ref_model); // Free VRAM before loading multi-GPU model
+
+    // Multi-GPU model: reload with enable_multi_gpu.
+    unsafe { std::env::set_var("MULTI_GPU", "1") };
+    let mut mg_model = load_model(model_dir, true);
+
+    // prefill() on a multi-GPU MoE model takes the sequential paged path:
+    // persistent_workers is None and has_moe=true so prefill_batched is skipped.
+    // decode_step_paged never launches the persistent worker, so reset_state works.
+    mg_model.reset_state().expect("reset mg");
+    let mg_logits = mg_model.prefill(&prompt).expect("multi-GPU prefill");
+    let mg_top = top10(&mg_logits);
+    mg_model.reset_state().expect("reset mg after");
+    drop(mg_model);
+
+    if orig_multi_gpu.is_none() {
+        unsafe { std::env::remove_var("MULTI_GPU") };
+    } else if let Some(v) = orig_multi_gpu {
+        unsafe { std::env::set_var("MULTI_GPU", v) };
+    }
+
+    let matches = ref_top.iter().filter(|t| mg_top.contains(t)).count();
+    let pass = matches >= 8;
+    println!("  top-10 overlap: {matches}/10  [{}]", if pass { "PASS" } else { "FAIL" });
+    println!("  ref top-5:      {:?}", &ref_top[..5.min(ref_top.len())]);
+    println!("  mg  top-5:      {:?}", &mg_top[..5.min(mg_top.len())]);
+    if !pass {
+        eprintln!("  ERROR: multi-GPU coherence FAILED ({matches}/10 top tokens match)");
+    }
+}
+
 fn main() {
     let (model_path, bqnt_override) = match std::env::var("MODEL").ok() {
         Some(ref p) if p.ends_with(".bqnt") => {
@@ -231,6 +312,10 @@ fn main() {
         eprintln!("Auto: PERSISTENT ({reason})");
         unsafe { std::env::set_var("PERSISTENT", "1") };
     }
+
+    // Multi-GPU coherence test runs before the main model is loaded to avoid holding
+    // two large model instances in VRAM simultaneously.
+    bench_coherence_multi_gpu(model_dir, 8);
 
     let mut model = load_model(model_dir, multi_gpu);
     eprintln!("Model loaded: {model_path}");
