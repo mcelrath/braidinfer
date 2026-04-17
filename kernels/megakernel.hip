@@ -145,9 +145,9 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         const u64* inst = program + pc * INST_SIZE;
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
-        bool no_sync = inst_no_sync(inst);
 
         if (opcode == OP_HALT) break;
+        if (opcode == OP_BARRIER) { grid.sync(); continue; }
 
         // OP_MOE_FFN manages its own blocks and grid.sync() internally
         if (opcode == OP_MOE_FFN) {
@@ -226,12 +226,12 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             }
         }
 
-        if (!no_sync) grid.sync();
+        // Dump output when enabled (no grid.sync here; caller inserts BarrierInst after dump groups)
+        grid.sync();
 
-        // Dump output AFTER grid.sync() — all blocks finished writing
-        if (dump_base && !no_sync) {
+        if (dump_base) {
             dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
-            grid.sync();  // Ensure dump completes before next instruction
+            grid.sync();
         }
     }
 }

@@ -18,7 +18,7 @@ impl MegakernelProgram {
     ) {
         if moe.has_gate_proj {
             let (op, wp) = linear_proj_opcode_ptr(&se.gate_proj);
-            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_gate.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).no_sync().into_inst());
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_gate.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
             let (op, wp) = linear_proj_opcode_ptr(&se.up_proj);
             instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_up.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
             instructions.push(SiluMulInst::new(div_ceil(se_is as u32, 256), act.moe_expert_act.as_write_ptr(), act.moe_expert_gate.as_ptr(), act.moe_expert_up.as_ptr(), se_is as i32).into_inst());
@@ -49,7 +49,7 @@ impl MegakernelProgram {
     ) {
         if moe.has_gate_proj {
             let (op, wp) = linear_proj_opcode_ptr(&se.gate_proj);
-            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_gate.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).no_sync().into_inst());
+            instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_gate.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
             let (op, wp) = linear_proj_opcode_ptr(&se.up_proj);
             instructions.push(LinearProjInst::new(op, se_is as u32, act.moe_expert_up.as_write_ptr(), wp, act.normed.as_ptr(), se_is as i32, hs as i32, 0).into_inst());
             instructions.push(SiluMulInst::new(div_ceil(se_is as u32, 256), act.moe_expert_act.as_write_ptr(), act.moe_expert_gate.as_ptr(), act.moe_expert_up.as_ptr(), se_is as i32).into_inst());
@@ -102,7 +102,7 @@ impl MegakernelProgram {
         };
 
         // D2D_COPY: hidden → residual (NO_SYNC: norm reads hidden)
-        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).no_sync().into_inst());
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
 
         // RMSNorm: hidden → normed
         instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.normed.as_write_ptr(), act.hidden.as_ptr(), norm_ptr, hs as i32, eps).into_inst());
@@ -223,10 +223,10 @@ impl MegakernelProgram {
             _ => panic!("no norm weight for MoE FFN layer"),
         };
 
-        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).no_sync().into_inst());
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
         instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.normed.as_write_ptr(), act.hidden.as_ptr(), norm_ptr, hs as i32, eps).into_inst());
         instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, ne as u32, act.moe_scores.as_write_ptr(), moe.gate.as_ptr() as *const u8, act.normed.as_ptr(), ne as i32, hs as i32, 0).into_inst());
-        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.normed_stage.as_write_ptr(), act.normed.as_ptr(), hs as i32).no_sync().into_inst());
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.normed_stage.as_write_ptr(), act.normed.as_ptr(), hs as i32).into_inst());
 
         let (gate_mode, rsf) = match &gate_type {
             GateType::Softmax => (0u32, 1.0f32),

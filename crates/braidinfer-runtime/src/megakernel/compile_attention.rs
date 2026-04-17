@@ -79,25 +79,17 @@ impl MegakernelProgram {
 
         // 2. Q(+gate), K, V projections
         let q_mult = if cfg.has_output_gate { 2 } else { 1 };
-        emit_batched_linear_proj(&w.w_q_gate, q_gate_attn_ptr, normed_ptr, nqh * hd * q_mult, hs, n, true, instructions);
-        emit_batched_linear_proj(&w.w_k, k_attn_ptr, normed_ptr, nkh * hd, hs, n, true, instructions);
-        emit_batched_linear_proj(&w.w_v, v_attn_ptr, normed_ptr, nkh * hd, hs, n, false, instructions);
+        emit_batched_linear_proj(&w.w_q_gate, q_gate_attn_ptr, normed_ptr, nqh * hd * q_mult, hs, n, instructions);
+        emit_batched_linear_proj(&w.w_k, k_attn_ptr, normed_ptr, nkh * hd, hs, n, instructions);
+        emit_batched_linear_proj(&w.w_v, v_attn_ptr, normed_ptr, nkh * hd, hs, n, instructions);
 
         // 3. Deinterleave Q+gate → Q, gate
-        // no_sync for PagedKv: next instructions are KV writes which read k_attn/v_attn (not q_attn).
-        // The subsequent KV-write sync guarantees q_attn is complete before QK-norm reads it.
-        // FlatKv must sync: mRoPE immediately follows and reads q_attn.
-        let deinterleave_no_sync = matches!(variant, AttentionVariant::PagedKv { .. });
         if !cfg.has_output_gate {
             let total = n * nqh * hd;
-            let inst = D2dCopyInst::new(div_ceil(total as u32, 256), q_attn_ptr, q_gate_attn_ptr as *const f32, total as i32);
-            let inst = if deinterleave_no_sync { inst.no_sync() } else { inst };
-            instructions.push(inst.into_inst());
+            instructions.push(D2dCopyInst::new(div_ceil(total as u32, 256), q_attn_ptr, q_gate_attn_ptr as *const f32, total as i32).into_inst());
         } else {
             let total_elems = n * nqh * hd;
-            let inst = DeinterleaveInst::new(div_ceil(total_elems as u32, 256), q_attn_ptr, gate_attn_ptr, q_gate_attn_ptr as *const f32, nqh as i32, hd as i32, n as i32);
-            let inst = if deinterleave_no_sync { inst.no_sync() } else { inst };
-            instructions.push(inst.into_inst());
+            instructions.push(DeinterleaveInst::new(div_ceil(total_elems as u32, 256), q_attn_ptr, gate_attn_ptr, q_gate_attn_ptr as *const f32, nqh as i32, hd as i32, n as i32).into_inst());
         }
 
         // 4a. KV write for PagedKv — BEFORE QK-norm so cache stores pre-norm K/V.
@@ -120,11 +112,11 @@ impl MegakernelProgram {
                 let mut head_indices = Vec::new();
                 for h in 0..nkh {
                     let k_copy_idx = instructions.len();
-                    let ki = D2dCopyInst::new(div_ceil(hd as u32, 256), std::ptr::null_mut::<f32>(), unsafe { k_attn_ptr.add(h * hd) as *const f32 }, hd as i32).no_sync();
+                    let ki = D2dCopyInst::new(div_ceil(hd as u32, 256), std::ptr::null_mut::<f32>(), unsafe { k_attn_ptr.add(h * hd) as *const f32 }, hd as i32);
                     instructions.push(ki.into_inst());
                     let v_copy_idx = instructions.len();
                     let vi = D2dCopyInst::new(div_ceil(hd as u32, 256), std::ptr::null_mut::<f32>(), unsafe { v_attn_ptr.add(h * hd) as *const f32 }, hd as i32);
-                    let vi = if h < nkh - 1 { vi.no_sync() } else { vi };
+                    // no_sync removed
                     instructions.push(vi.into_inst());
                     head_indices.push((k_copy_idx, v_copy_idx));
                 }
@@ -180,7 +172,7 @@ impl MegakernelProgram {
                             unsafe { kv_cache.k.as_write_ptr().add(h * head_stride) },
                             unsafe { k_attn_ptr.add(h * hd) as *const f32 },
                             hd as i32,
-                        ).no_sync();
+                        );
                         instructions.push(ki.into_inst());
                         let v_copy_idx = instructions.len();
                         let vi = D2dCopyInst::new(
@@ -189,7 +181,7 @@ impl MegakernelProgram {
                             unsafe { v_attn_ptr.add(h * hd) as *const f32 },
                             hd as i32,
                         );
-                        let vi = if h < nkh - 1 { vi.no_sync() } else { vi };
+                        // no_sync removed
                         instructions.push(vi.into_inst());
                         head_indices.push((k_copy_idx, v_copy_idx));
                     }
@@ -246,7 +238,7 @@ impl MegakernelProgram {
                         rd as i32,
                         q1d as u64, q1s as u64, rd_off as u64, rs as u64,
                         k_norm_ptr,
-                    ).no_sync().into_inst()); // no sync between quant and f32 attention
+                    ).into_inst()); // no sync between quant and f32 attention
                 }
 
                 // OP_ATTN_PAGED: f32 attention on active chunk + merge from scratch
@@ -303,7 +295,7 @@ impl MegakernelProgram {
                         let k_src = unsafe { k_attn_ptr.add(src_off) };
                         let ki = D2dCopyInst::new(
                             div_ceil(hd as u32, 256), k_dst, k_src as *const f32, hd as i32,
-                        ).no_sync();
+                        );
                         instructions.push(ki.into_inst());
 
                         let v_dst = unsafe { kv_cache.v.as_write_ptr().add(dst_off) };
@@ -311,7 +303,7 @@ impl MegakernelProgram {
                         let vi = D2dCopyInst::new(
                             div_ceil(hd as u32, 256), v_dst, v_src as *const f32, hd as i32,
                         );
-                        let vi = if t == n - 1 && h == nkh - 1 { vi } else { vi.no_sync() };
+                        // no_sync removed
                         instructions.push(vi.into_inst());
                     }
                 }
@@ -347,10 +339,6 @@ impl MegakernelProgram {
         };
 
         // 11. Output projection + residual
-        // no_sync for n=1 decode without prefill buffer: D2D copy follows (reads hidden, not out_proj).
-        // The D2D sync guarantees out_proj is complete before ResidualAdd reads it.
-        // n>1 or prefill path: ResidualAdd immediately follows, must sync.
-        let out_proj_no_sync = n == 1 && prefill.is_none();
         emit_batched_linear_proj(
             &w.w_o,
             out_proj_ptr,
@@ -358,7 +346,6 @@ impl MegakernelProgram {
             hs,
             nqh * hd,
             n,
-            out_proj_no_sync,
             instructions,
         );
         if n > 1 {
@@ -500,7 +487,6 @@ impl MegakernelProgram {
             hs,
             nqh * hd,
             1,
-            false,
             instructions,
         );
         // Two-step residual (single-token decode): copy hidden → residual, then add

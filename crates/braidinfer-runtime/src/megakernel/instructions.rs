@@ -8,7 +8,7 @@
 //! storage type is preserved. GPU-side `.hip` files are NOT modified (Phase 2).
 
 use super::{
-    FLAG_NO_SYNC, INST_SIZE, Instruction,
+    INST_SIZE, Instruction,
     OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT,
     OP_KV_QUANTIZE, OP_LM_HEAD, OP_MAMBA2_CONV1D, OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH,
@@ -35,15 +35,9 @@ pub(crate) fn make_opcode_gridx(opcode: u32, grid_x: u32) -> u64 {
     opcode as u64 | ((grid_x as u64) << 32)
 }
 
-// ─── Macro for no_sync / FLAG_NO_SYNC helper ────────────────────────────────
-macro_rules! impl_no_sync {
+macro_rules! impl_inst {
     ($t:ty) => {
-        #[allow(dead_code)]
         impl $t {
-            pub(crate) fn no_sync(mut self) -> Self {
-                self.opcode_gridx |= FLAG_NO_SYNC as u64;
-                self
-            }
             pub(crate) fn into_inst(self) -> Instruction {
                 unsafe { std::mem::transmute(self) }
             }
@@ -65,7 +59,7 @@ pub(crate) struct NopInst {
     pub _pad: [u64; 14],
 }
 assert_inst_size!(NopInst);
-impl_no_sync!(NopInst);
+impl_inst!(NopInst);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_RMSNORM / OP_RMSNORM_WX (opcodes 1, 27)
@@ -82,7 +76,7 @@ pub(crate) struct RmsNormInst {
     pub _pad: [u64; 12],
 }
 assert_inst_size!(RmsNormInst);
-impl_no_sync!(RmsNormInst);
+impl_inst!(RmsNormInst);
 
 impl RmsNormInst {
     pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, input: *const f32, weight: *const u16, dim: i32, eps: f32) -> Self {
@@ -115,7 +109,7 @@ pub(crate) struct LinearProjInst {
     pub _pad: [u64; 11],
 }
 assert_inst_size!(LinearProjInst);
-impl_no_sync!(LinearProjInst);
+impl_inst!(LinearProjInst);
 
 impl LinearProjInst {
     pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, weight: *const u8, input: *const f32, out_dim: i32, in_dim: i32, batch: i32) -> Self {
@@ -148,7 +142,7 @@ pub(crate) struct Conv1dInst {
     pub _pad: [u64; 11],
 }
 assert_inst_size!(Conv1dInst);
-impl_no_sync!(Conv1dInst);
+impl_inst!(Conv1dInst);
 
 impl Conv1dInst {
     pub(crate) fn new(grid_x: u32, state: *mut f32, input: *const f32, weight: *const u16, output: *mut f32, dim: i32, kernel_size: i32) -> Self {
@@ -180,7 +174,7 @@ pub(crate) struct GdnGateInst {
     pub _pad: [u64; 12],
 }
 assert_inst_size!(GdnGateInst);
-impl_no_sync!(GdnGateInst);
+impl_inst!(GdnGateInst);
 
 impl GdnGateInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, a_proj: *const f32, a_log: *const f32, dt_bias: *const u16, num_heads: i32) -> Self {
@@ -217,7 +211,7 @@ pub(crate) struct GdnRecurInst {
     pub _pad: [u64; 7],
 }
 assert_inst_size!(GdnRecurInst);
-impl_no_sync!(GdnRecurInst);
+impl_inst!(GdnRecurInst);
 
 impl GdnRecurInst {
     pub(crate) fn new(grid_x: u32, q: *const f32, k: *const f32, v: *const f32, gate: *const f32, b_proj: *const f32, state: *mut f32, output: *mut f32, kd: i32, vd: i32, gqa_group: i32) -> Self {
@@ -249,7 +243,7 @@ pub(crate) struct RmsNormGateInst {
     pub _pad: [u64; 10],
 }
 assert_inst_size!(RmsNormGateInst);
-impl_no_sync!(RmsNormGateInst);
+impl_inst!(RmsNormGateInst);
 
 impl RmsNormGateInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, x: *const f32, z: *const f32, weight: *const f32, num_heads: i32, vd: i32, eps: f32) -> Self {
@@ -278,7 +272,7 @@ pub(crate) struct ResidualAddInst {
     pub _pad: [u64; 13],
 }
 assert_inst_size!(ResidualAddInst);
-impl_no_sync!(ResidualAddInst);
+impl_inst!(ResidualAddInst);
 
 impl ResidualAddInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, src: *const f32, residual: *const f32, n: i32) -> Self {
@@ -310,7 +304,7 @@ pub(crate) struct QkNormInst {
     pub _pad: [u64; 8],
 }
 assert_inst_size!(QkNormInst);
-impl_no_sync!(QkNormInst);
+impl_inst!(QkNormInst);
 
 impl QkNormInst {
     pub(crate) fn new(grid_x: u32, q: *mut f32, k: *mut f32, q_norm: *const u16, k_norm: *const u16, nqh: i32, nkh: i32, hd: i32, eps: f32, batch: i32) -> Self {
@@ -350,7 +344,7 @@ pub(crate) struct MropeInst {
     pub _pad: [u64; 5],
 }
 assert_inst_size!(MropeInst);
-impl_no_sync!(MropeInst);
+impl_inst!(MropeInst);
 
 impl MropeInst {
     pub(crate) fn new(grid_x: u32, q: *mut f32, k: *mut f32, inv_freq: *const f32, pos_ids: *const i32, nqh: i32, nkh: i32, hd: i32, rd: i32, s0: i32, s1: i32, s2: i32, batch: i32) -> Self {
@@ -392,7 +386,7 @@ pub(crate) struct GqaAttnInst {
     pub _pad: [u64; 7],
 }
 assert_inst_size!(GqaAttnInst);
-impl_no_sync!(GqaAttnInst);
+impl_inst!(GqaAttnInst);
 
 impl GqaAttnInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32, nqh: i32, nkh: i32, hd: i32, seq_len: i32, max_seq_len: i32) -> Self {
@@ -424,7 +418,7 @@ pub(crate) struct OutputGateInst {
     pub _pad: [u64; 13],
 }
 assert_inst_size!(OutputGateInst);
-impl_no_sync!(OutputGateInst);
+impl_inst!(OutputGateInst);
 
 impl OutputGateInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, attn_out: *const f32, gate: *const f32, size: i32) -> Self {
@@ -457,7 +451,7 @@ pub(crate) struct FfnGateUpInst {
     pub _pad: [u64; 8],
 }
 assert_inst_size!(FfnGateUpInst);
-impl_no_sync!(FfnGateUpInst);
+impl_inst!(FfnGateUpInst);
 
 impl FfnGateUpInst {
     pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, hidden: *const f32, norm_weight: *const u16, w_gate: *const u8, w_up: *const u8, hs: i32, intermediate: i32, eps: f32, batch: i32) -> Self {
@@ -490,7 +484,7 @@ pub(crate) struct FfnDownResInst {
     pub _pad: [u64; 10],
 }
 assert_inst_size!(FfnDownResInst);
-impl_no_sync!(FfnDownResInst);
+impl_inst!(FfnDownResInst);
 
 impl FfnDownResInst {
     pub(crate) fn new(opcode: u32, grid_x: u32, output: *mut f32, residual: *const f32, w_down: *const u8, ffn_act: *const f32, hs: i32, intermediate: i32, batch: i32) -> Self {
@@ -519,7 +513,7 @@ pub(crate) struct EmbeddingInst {
     pub _pad: [u64; 13],
 }
 assert_inst_size!(EmbeddingInst);
-impl_no_sync!(EmbeddingInst);
+impl_inst!(EmbeddingInst);
 
 impl EmbeddingInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, embed_weight: *const u16, token_id: i32, hs: i32) -> Self {
@@ -547,7 +541,7 @@ pub(crate) struct HaltInst {
     pub _pad: [u64; 17],
 }
 assert_inst_size!(HaltInst);
-impl_no_sync!(HaltInst);
+impl_inst!(HaltInst);
 
 impl HaltInst {
     pub(crate) fn new() -> Self {
@@ -571,7 +565,7 @@ pub(crate) struct D2dCopyInst {
     pub _pad: [u64; 14],
 }
 assert_inst_size!(D2dCopyInst);
-impl_no_sync!(D2dCopyInst);
+impl_inst!(D2dCopyInst);
 
 impl D2dCopyInst {
     pub(crate) fn new(grid_x: u32, dst: *mut f32, src: *const f32, n_elems: i32) -> Self {
@@ -613,7 +607,7 @@ pub(crate) struct AttnPagedInst {
     pub _pad2: u64,
 }
 assert_inst_size!(AttnPagedInst);
-impl_no_sync!(AttnPagedInst);
+impl_inst!(AttnPagedInst);
 
 impl AttnPagedInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, seq_len: i32, chunk_tokens: i32, rd: i32, layer_k_offset: u64, layer_v_offset: u64, k_norm: *const u16) -> Self {
@@ -661,7 +655,7 @@ pub(crate) struct AttnPrefillInst {
     pub _pad: [u64; 7],
 }
 assert_inst_size!(AttnPrefillInst);
-impl_no_sync!(AttnPrefillInst);
+impl_inst!(AttnPrefillInst);
 
 impl AttnPrefillInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32, nqh: i32, nkh: i32, hd: i32, start_pos: i32, n: i32, max_seq_len: i32) -> Self {
@@ -695,7 +689,7 @@ pub(crate) struct DeinterleaveInst {
     pub _pad: [u64; 11],
 }
 assert_inst_size!(DeinterleaveInst);
-impl_no_sync!(DeinterleaveInst);
+impl_inst!(DeinterleaveInst);
 
 impl DeinterleaveInst {
     pub(crate) fn new(grid_x: u32, dst_q: *mut f32, dst_gate: *mut f32, src: *const f32, num_heads: i32, head_dim: i32, batch: i32) -> Self {
@@ -731,7 +725,7 @@ pub(crate) struct KvQuantizeInst {
     pub _pad:         [u64; 10],
 }
 assert_inst_size!(KvQuantizeInst);
-impl_no_sync!(KvQuantizeInst);
+impl_inst!(KvQuantizeInst);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_ATTN_PAGED_Q (opcode 22)
@@ -762,7 +756,7 @@ pub(crate) struct AttnPagedQInst {
     pub _pad: u64,
 }
 assert_inst_size!(AttnPagedQInst);
-impl_no_sync!(AttnPagedQInst);
+impl_inst!(AttnPagedQInst);
 
 impl AttnPagedQInst {
     pub(crate) fn new(q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, chunk_tokens: i32, rd: i32, q1d: u64, q1s: u64, rd_off: u64, rs: u64, k_norm: *const u16) -> Self {
@@ -808,7 +802,7 @@ pub(crate) struct MoeGateInst {
     pub _pad: [u64; 9],
 }
 assert_inst_size!(MoeGateInst);
-impl_no_sync!(MoeGateInst);
+impl_inst!(MoeGateInst);
 
 impl MoeGateInst {
     pub(crate) fn new(scores: *const f32, expert_ids: *mut i32, expert_weights: *mut f32, ne: i32, k: i32, gate_mode: u32, rsf: f32, bias: *const u8) -> Self {
@@ -855,7 +849,7 @@ pub(crate) struct MoeFfnInst {
     pub _pad: u64,
 }
 assert_inst_size!(MoeFfnInst);
-impl_no_sync!(MoeFfnInst);
+impl_inst!(MoeFfnInst);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_SIGMOID_WEIGHTED_ADD (opcode 32)
@@ -871,7 +865,7 @@ pub(crate) struct SigmoidWeightedAddInst {
     pub _pad: [u64; 13],
 }
 assert_inst_size!(SigmoidWeightedAddInst);
-impl_no_sync!(SigmoidWeightedAddInst);
+impl_inst!(SigmoidWeightedAddInst);
 
 impl SigmoidWeightedAddInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, scalar: *const f32, input: *const f32, n: i32) -> Self {
@@ -911,7 +905,7 @@ pub(crate) struct MoeDispatchInst {
     pub _pad: u64,
 }
 assert_inst_size!(MoeDispatchInst);
-impl_no_sync!(MoeDispatchInst);
+impl_inst!(MoeDispatchInst);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_SCALE_ADD (opcode 36)
@@ -927,7 +921,7 @@ pub(crate) struct ScaleAddInst {
     pub _pad: [u64; 13],
 }
 assert_inst_size!(ScaleAddInst);
-impl_no_sync!(ScaleAddInst);
+impl_inst!(ScaleAddInst);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_RELU_SQ (opcode 37)
@@ -942,7 +936,7 @@ pub(crate) struct ReluSqInst {
     pub _pad: [u64; 14],
 }
 assert_inst_size!(ReluSqInst);
-impl_no_sync!(ReluSqInst);
+impl_inst!(ReluSqInst);
 
 impl ReluSqInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, input: *const f32, size: i32) -> Self {
@@ -973,7 +967,7 @@ pub(crate) struct Mamba2Conv1dInst {
     pub _pad: [u64; 10],
 }
 assert_inst_size!(Mamba2Conv1dInst);
-impl_no_sync!(Mamba2Conv1dInst);
+impl_inst!(Mamba2Conv1dInst);
 
 impl Mamba2Conv1dInst {
     pub(crate) fn new(grid_x: u32, state: *mut f32, input: *const f32, weight: *const u16, bias: *const f32, output: *mut f32, conv_dim: i32, kernel_size: i32) -> Self {
@@ -1005,7 +999,7 @@ pub(crate) struct Mamba2NormGatedInst {
     pub _pad: [u64; 10],
 }
 assert_inst_size!(Mamba2NormGatedInst);
-impl_no_sync!(Mamba2NormGatedInst);
+impl_inst!(Mamba2NormGatedInst);
 
 impl Mamba2NormGatedInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, x: *const f32, z: *const f32, weight: *const f32, num_heads: i32, value_dim: i32, eps: f32) -> Self {
@@ -1044,7 +1038,7 @@ pub(crate) struct SsmUpdateInst {
     pub _pad: [u64; 4],
 }
 assert_inst_size!(SsmUpdateInst);
-impl_no_sync!(SsmUpdateInst);
+impl_inst!(SsmUpdateInst);
 
 impl SsmUpdateInst {
     pub(crate) fn new(grid_x: u32, state: *mut f32, x: *const f32, dt: *const f32, dt_bias: *const f32, a_log: *const f32, b: *const f32, c: *const f32, d_weight: *const f32, output: *mut f32, nh: i32, hd: i32, sd: i32, ng: i32) -> Self {
@@ -1074,7 +1068,7 @@ pub(crate) struct SiluMulInst {
     pub _pad: [u64; 13],
 }
 assert_inst_size!(SiluMulInst);
-impl_no_sync!(SiluMulInst);
+impl_inst!(SiluMulInst);
 
 impl SiluMulInst {
     pub(crate) fn new(grid_x: u32, output: *mut f32, gate: *const f32, up: *const f32, size: i32) -> Self {
@@ -1100,7 +1094,7 @@ pub(crate) struct BarrierInst {
     pub _pad: [u64; 14],
 }
 assert_inst_size!(BarrierInst);
-impl_no_sync!(BarrierInst);
+impl_inst!(BarrierInst);
 
 impl BarrierInst {
     pub(crate) fn new(layer_idx: i32) -> Self {

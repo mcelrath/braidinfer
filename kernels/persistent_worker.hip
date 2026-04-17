@@ -78,7 +78,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
 
-        if (opcode == OP_MOE_FFN) {
+        if (opcode == OP_BARRIER) {
+            grid.sync();
+        } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
         } else if (opcode == OP_MOE_DISPATCH) {
             op_moe_dispatch(inst, grid);
@@ -129,7 +131,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     default: break;
                 }
             }
-            if (!inst_no_sync(inst)) grid.sync();
+            grid.sync();
         }
 
         } // end for (pc = 0; pc < num_inst; pc++)

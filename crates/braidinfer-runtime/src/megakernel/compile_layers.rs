@@ -3,7 +3,7 @@
 use super::compile_common::{div_ceil, emit_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 use crate::quant::WeightFormat;
 use super::instructions::*;
-use super::{FLAG_NO_SYNC, Instruction, MegakernelProgram, PrefillBuffers};
+use super::{Instruction, MegakernelProgram, PrefillBuffers};
 use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4, OP_LINEAR_PROJ};
 #[allow(unused_imports)]
 use crate::model::{
@@ -38,58 +38,52 @@ impl MegakernelProgram {
             act.normed.as_write_ptr(), act.hidden.as_ptr(), w.input_norm.as_ptr(), hs as i32, eps,
         ).into_inst());
 
-        // 2. QKV projection — NO_SYNC: next 3 instructions (a/b/z proj) read normed, not qkv
+        // 2. QKV projection (parallel with a/b/z: all read normed)
         {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_qkv);
-            instructions.push(LinearProjInst::new(op, qkv_dim as u32, act.qkv.as_write_ptr(), wp, act.normed.as_ptr(), qkv_dim as i32, hs as i32, 0).no_sync().into_inst());
+            instructions.push(LinearProjInst::new(op, qkv_dim as u32, act.qkv.as_write_ptr(), wp, act.normed.as_ptr(), qkv_dim as i32, hs as i32, 0).into_inst());
         }
 
         // 3. Project a, b, z
         {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_a);
-            instructions.push(LinearProjInst::new(op, nvh as u32, act.a_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).no_sync().into_inst());
+            instructions.push(LinearProjInst::new(op, nvh as u32, act.a_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).into_inst());
         }
         {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_b);
-            instructions.push(LinearProjInst::new(op, nvh as u32, act.b_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).no_sync().into_inst());
+            instructions.push(LinearProjInst::new(op, nvh as u32, act.b_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).into_inst());
         }
-        // z proj: SYNC ensures QKV+a+b+z all complete before conv1d reads qkv
         {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_z);
             instructions.push(LinearProjInst::new(op, (nvh * vd) as u32, act.z_proj.as_write_ptr(), wp, act.normed.as_ptr(), (nvh * vd) as i32, hs as i32, 0).into_inst());
         }
-
         // 4. Causal conv1d on QKV (3 separate calls for q, k, v slices)
         let q_dim = nh * kd;
         let k_dim = nh * kd;
         let v_dim = nvh * vd;
 
-        // Conv on Q — NO_SYNC
+        // Conv on Q/K/V (parallel: read different slices of qkv)
         instructions.push(Conv1dInst::new(
             div_ceil(q_dim as u32, 256),
             conv_state.as_write_ptr(), act.qkv.as_ptr(), w.conv1d_weight_q.as_ptr(), act.q_gdn.as_write_ptr(),
             q_dim as i32, ck as i32,
-        ).no_sync().into_inst());
-
-        // Conv on K — NO_SYNC
+        ).into_inst());
         instructions.push(Conv1dInst::new(
             div_ceil(k_dim as u32, 256),
             unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) },
             unsafe { act.qkv.as_ptr().add(q_dim) },
             w.conv1d_weight_k.as_ptr(), act.k_gdn.as_write_ptr(),
             k_dim as i32, ck as i32,
-        ).no_sync().into_inst());
-
-        // Conv on V — NO_SYNC (GDN gate reads a_proj, not v_gdn; next sync covers v_gdn)
+        ).into_inst());
         instructions.push(Conv1dInst::new(
             div_ceil(v_dim as u32, 256),
             unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) },
             unsafe { act.qkv.as_ptr().add(q_dim + k_dim) },
             w.conv1d_weight_v.as_ptr(), act.v_gdn.as_write_ptr(),
             v_dim as i32, ck as i32,
-        ).no_sync().into_inst());
+        ).into_inst());
 
-        // 5. GDN gate
+        // 5. GDN gate (reads a_proj)
         let gqa_group = nvh / nh;
         instructions.push(GdnGateInst::new(
             div_ceil(nvh as u32, 256),
@@ -242,7 +236,7 @@ impl MegakernelProgram {
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
                 hs as i32, is as i32, eps, n as i32,
-            ).no_sync().into_inst());
+            ).into_inst());
             instructions.push(D2dCopyInst::new(
                 div_ceil((n * hs) as u32, 256),
                 bufs.residual.as_write_ptr(), bufs.hidden.as_ptr(), (n * hs) as i32,
@@ -263,7 +257,7 @@ impl MegakernelProgram {
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
                 wg_ptr, wu_ptr,
                 hs as i32, is as i32, eps, n as i32,
-            ).no_sync().into_inst());
+            ).into_inst());
             instructions.push(D2dCopyInst::new(
                 div_ceil((n * hs) as u32, 256),
                 bufs.residual.as_write_ptr(), bufs.hidden.as_ptr(), (n * hs) as i32,
@@ -285,7 +279,7 @@ impl MegakernelProgram {
                 // D2D_COPY: hidden[t] → residual[t]  (no_sync: RMSNorm reads hidden, not residual)
                 instructions.push(D2dCopyInst::new(
                     div_ceil(hs as u32, 256), residual_t, hidden_t, hs as i32,
-                ).no_sync().into_inst());
+                ).into_inst());
 
                 // RMSNorm: hidden[t] → normed[t]
                 instructions.push(RmsNormInst::new(
@@ -301,7 +295,6 @@ impl MegakernelProgram {
                     inst.words[3] = normed_t as u64;
                     inst.words[4] = is as u64;
                     inst.words[5] = hs as u64;
-                    inst.words[0] |= FLAG_NO_SYNC as u64;
                     instructions.push(inst);
                 }
 
@@ -375,7 +368,7 @@ impl MegakernelProgram {
                 act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
                 hs as i32, is as i32, eps, 0,
-            ).no_sync().into_inst());
+            ).into_inst());
             instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
             instructions.push(FfnDownResInst::new(
                 OP_FFN_DOWN_RES, hs as u32,
@@ -391,7 +384,7 @@ impl MegakernelProgram {
                 act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate_ptr, w_up_ptr,
                 hs as i32, is as i32, eps, 0,
-            ).no_sync().into_inst());
+            ).into_inst());
             instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
             instructions.push(FfnDownResInst::new(
                 OP_FFN_DOWN_RES_RNF4, hs as u32,
@@ -400,11 +393,11 @@ impl MegakernelProgram {
             ).into_inst());
         } else {
             // Unfused path for quantized weights (decode n=1 only)
-            instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).no_sync().into_inst());
+            instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
             instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.normed.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(), hs as i32, eps).into_inst());
             {
                 let (op, wp) = linear_proj_opcode_ptr(w_gate);
-                instructions.push(LinearProjInst::new(op, is as u32, act.ffn_gate.as_write_ptr(), wp, act.normed.as_ptr(), is as i32, hs as i32, 0).no_sync().into_inst());
+                instructions.push(LinearProjInst::new(op, is as u32, act.ffn_gate.as_write_ptr(), wp, act.normed.as_ptr(), is as i32, hs as i32, 0).into_inst());
             }
             {
                 let (op, wp) = linear_proj_opcode_ptr(w_up);

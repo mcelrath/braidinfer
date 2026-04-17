@@ -35,6 +35,7 @@
 #define OP_FFN_GATE_UP_RNF4  30  // Fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights)
 #define OP_FFN_DOWN_RES_RNF4 31  // Fused down_proj + residual add (rnf4 weights)
 #define OP_SIGMOID_WEIGHTED_ADD 32  // output[i] += sigmoid(scalar[0]) * input[i]
+#define OP_BARRIER      33  // explicit grid.sync() barrier instruction
 #define OP_MOE_DISPATCH 34  // GPU-initiated MoE: write work queue, poll ack flags, sum output slots
 #define OP_EXPERT_FFN   35  // Compound: gate+up+silu+down (Q4 PcG32) with internal grid.sync()
 #define OP_SCALE_ADD    36  // output[i] += scale * src[i]; args: [1]=output, [2]=src, [3]=scale(f32 bits), [4]=size

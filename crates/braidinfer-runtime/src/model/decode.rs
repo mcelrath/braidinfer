@@ -1,6 +1,6 @@
 use braidinfer_hip::memory::DeviceBuffer;
 
-use crate::megakernel::{MegakernelProgram, INST_OPCODE_MASK, OP_HALT, SHARED_LPROJ_TOTAL};
+use crate::megakernel::{MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
 use crate::megakernel::instructions::{EmbeddingInst, GqaAttnInst};
 
 use super::Model;
@@ -82,7 +82,7 @@ impl Model {
         let batch: Vec<_> = mk
             .instructions
             .iter()
-            .take_while(|inst| (inst.words[0] & INST_OPCODE_MASK) != OP_HALT as u64)
+            .take_while(|inst| (inst.words[0] as u32 as u64) != OP_HALT as u64)
             .cloned()
             .collect();
         let dispatch = self.persistent_workers.as_mut().unwrap();
@@ -254,7 +254,7 @@ impl Model {
         while i < n_inst {
             let inst = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].clone();
             i += 1;
-            let opcode = inst.words[0] & INST_OPCODE_MASK;
+            let opcode = inst.words[0] as u32 as u64;
             if opcode == OP_HALT as u64 {
                 break;
             }
@@ -477,7 +477,7 @@ impl Model {
 
                 // 0. Broadcast normed to GPUs 1..n
                 if gpu_i > 0 {
-                    batch.push(D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32).no_sync().into_inst());
+                    batch.push(D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32).into_inst());
                 }
 
                 // 1-3. QKV projections.
@@ -583,8 +583,8 @@ impl Model {
                         kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
                     let dst_v =
                         kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).no_sync().into_inst());
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).no_sync().into_inst());
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).into_inst());
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).into_inst());
                 }
 
                 // 7. mRoPE on local Q+K — only for models that use RoPE
@@ -612,8 +612,8 @@ impl Model {
                         kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
                     let dst_v =
                         kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).no_sync().into_inst());
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).no_sync().into_inst());
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).into_inst());
+                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).into_inst());
                 }
 
                 // For GPU i > 0: copy Q slice from GPU 0's q_attn to local attn_q
@@ -690,7 +690,7 @@ impl Model {
                     .as_ptr() as *const f32;
                 let dst =
                     unsafe { (self.activations.attn_out.as_write_ptr()).add(gpu_i * n_elems) };
-                gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).no_sync().into_inst());
+                gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).into_inst());
             }
 
             // gate_attn gather: GPU i → act.gate_attn[i*n_elems..]
@@ -708,7 +708,7 @@ impl Model {
                             .as_write_ptr()
                             .add(gpu_i * n_elems)
                     };
-                    gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).no_sync().into_inst());
+                    gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).into_inst());
                 }
             }
 
@@ -752,7 +752,7 @@ impl Model {
         };
 
         for inst in batch {
-            let opcode = (inst.words[0] & INST_OPCODE_MASK) as u32;
+            let opcode = inst.words[0] as u32;
             match opcode {
                 OP_D2D_COPY => {
                     let dst = inst.words[1] as *mut u8;

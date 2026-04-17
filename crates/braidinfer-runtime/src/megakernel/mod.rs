@@ -14,13 +14,6 @@ pub const CHUNK_TOKENS: usize = 64;
 // Opcode constants — auto-generated from kernels/opcodes.h (single source of truth)
 include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 
-// OP_BARRIER is an internal IR value used by compile_moe_ffn_multi_gpu and patched to
-// OP_MOE_DISPATCH by compile_inner_p2p. It is NOT dispatched in any GPU kernel.
-// Removed from opcodes.h (C side) since no kernel handler exists for it.
-pub(crate) const OP_BARRIER: u32 = 33;
-
-pub(crate) const FLAG_NO_SYNC: u32 = 0x80000000; // bit 31: skip grid.sync() after this instruction
-pub(crate) const INST_OPCODE_MASK: u64 = 0x7FFFFFFF; // mask out FLAG_NO_SYNC to get opcode
 /// Shared memory bytes per block for tiled-LDS linear_proj ops: (8 + 7680 + 256) * 4.
 /// Must match SHARED_LPROJ_TOTAL in kernels/megakernel_ops.hip.
 pub(crate) const SHARED_LPROJ_TOTAL: u32 = 31776;

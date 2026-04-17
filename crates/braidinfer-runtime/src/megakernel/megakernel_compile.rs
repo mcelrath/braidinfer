@@ -7,10 +7,10 @@ use braidinfer_hip::module::Module;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, emit_linear_proj, rmsnorm_opcode};
 use super::instructions::*;
-use super::{CHUNK_TOKENS, INST_OPCODE_MASK, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
+use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
 use super::{
-    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_CONV1D, OP_D2D_COPY,
+    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP,
     OP_FFN_GATE_UP_RNF4, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT, OP_KV_QUANTIZE,
     OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_LM_HEAD, OP_MAMBA2_CONV1D,
@@ -348,7 +348,6 @@ impl MegakernelProgram {
                 tokens[t] as i32,
                 hs as i32,
             );
-            let inst = if t + 1 < n { inst.no_sync() } else { inst };
             instructions.push(inst.into_inst());
         }
 
@@ -442,7 +441,6 @@ impl MegakernelProgram {
                     conv_dim,
                     hs,
                     n,
-                    true,
                     &mut instructions,
                 );
 
@@ -454,7 +452,6 @@ impl MegakernelProgram {
                     nvh_gdn,
                     hs,
                     n,
-                    true,
                     &mut instructions,
                 );
 
@@ -466,7 +463,6 @@ impl MegakernelProgram {
                     nvh_gdn,
                     hs,
                     n,
-                    true,
                     &mut instructions,
                 );
 
@@ -478,7 +474,6 @@ impl MegakernelProgram {
                     nvh_gdn * vd,
                     hs,
                     n,
-                    false,
                     &mut instructions,
                 );
 
@@ -497,7 +492,7 @@ impl MegakernelProgram {
                         act.q_gdn.as_write_ptr(),
                         q_dim as i32,
                         ck as i32,
-                    ).no_sync().into_inst());
+                    ).into_inst());
 
                     // Conv1d on K
                     instructions.push(Conv1dInst::new(
@@ -508,7 +503,7 @@ impl MegakernelProgram {
                         act.k_gdn.as_write_ptr(),
                         k_dim as i32,
                         ck as i32,
-                    ).no_sync().into_inst());
+                    ).into_inst());
 
                     // Conv1d on V
                     instructions.push(Conv1dInst::new(
@@ -737,7 +732,7 @@ impl MegakernelProgram {
             // compile_moe_ffn_multi_gpu order: ..., D2D_COPY(normed→normed_stage), OP_MOE_GATE, OP_BARRIER
             if barrier_idx >= 2 {
                 let prev2 = &prog.instructions[barrier_idx - 2];
-                let prev2_opcode = (prev2.words[0] & INST_OPCODE_MASK) as u32;
+                let prev2_opcode = prev2.words[0] as u32;
                 let normed_stage_ptr = act.normed_stage.as_ptr() as u64;
                 if prev2_opcode == OP_D2D_COPY && prev2.words[1] == normed_stage_ptr {
                     if let Some(ref fc1) = moe.fc1_latent_proj {

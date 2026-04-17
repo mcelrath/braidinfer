@@ -32,12 +32,10 @@ pub(super) fn emit_batched_linear_proj(
     out_dim: usize,
     in_dim: usize,
     n: usize,
-    no_sync: bool,
     instructions: &mut Vec<Instruction>,
 ) {
     let (opcode, w_ptr) = linear_proj_opcode_ptr(weight);
     let inst = LinearProjInst::new(opcode, out_dim as u32, output, w_ptr, input, out_dim as i32, in_dim as i32, n as i32);
-    let inst = if no_sync { inst.no_sync() } else { inst };
     instructions.push(inst.into_inst());
 }
 
