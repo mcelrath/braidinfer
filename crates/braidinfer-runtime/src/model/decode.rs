@@ -240,6 +240,9 @@ impl Model {
         let mut attn_i = 0usize;
         let mut i = 0usize;
         let mut seg_start = 0usize; // start of current segment in mk.instructions
+        // Gather instructions returned from dispatch_head_parallel_attention, prepended
+        // to the next segment to save one dispatch round-trip per attention layer.
+        let mut pending_gather: Vec<crate::megakernel::Instruction> = Vec::new();
 
         while i < n_inst {
             let opcode = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].words[0] as u32 as u64;
@@ -251,13 +254,21 @@ impl Model {
             if has_head_parallel && attn_i < attn_boundaries.len() {
                 let (flush_idx, resume_idx) = attn_boundaries[attn_i];
                 if i == flush_idx {
-                    // Include this instruction in the segment, then flush
+                    // Include this instruction in the segment, then flush.
+                    // Prepend any pending gather from previous attention layer.
                     let seg_end = i + 1;
                     {
-                        let insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end];
-                        self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, insts);
+                        let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end];
+                        if pending_gather.is_empty() {
+                            self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, mk_insts);
+                        } else {
+                            // Fuse pending gather with this segment: one combined dispatch
+                            let mut combined = std::mem::take(&mut pending_gather);
+                            combined.extend_from_slice(mk_insts);
+                            self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, &combined);
+                        }
                     }
-                    self.dispatch_head_parallel_attention(attn_i, position)?;
+                    pending_gather = self.dispatch_head_parallel_attention(attn_i, position)?;
                     attn_i += 1;
                     i = if use_distributed_qkv { resume_idx } else { resume_idx + 1 };
                     seg_start = i;
@@ -268,22 +279,39 @@ impl Model {
             i += 1;
         }
 
-        // Dispatch remaining segment
-        if seg_start < i {
+        // Dispatch remaining segment, prepending any pending gather
+        if seg_start < i || !pending_gather.is_empty() {
             let debug_hidden = self.debug_p2p_hidden;
-            let insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
+            let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
             let mut batch_idx = 0usize;
-            for chunk in insts.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-                self.persistent_workers.as_mut().unwrap().dispatch_batch(0, chunk);
-                if debug_hidden {
-                    // Sync + read hidden[0:2] after each batch
-                    let src = self.activations.hidden.as_ptr() as *const u8;
-                    let mut buf = [0u8; 8];
-                    braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
-                    let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
-                    let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
-                    eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
-                    batch_idx += 1;
+            if pending_gather.is_empty() {
+                for chunk in mk_insts.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                    self.persistent_workers.as_mut().unwrap().dispatch_batch(0, chunk);
+                    if debug_hidden {
+                        let src = self.activations.hidden.as_ptr() as *const u8;
+                        let mut buf = [0u8; 8];
+                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
+                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
+                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
+                        eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
+                        batch_idx += 1;
+                    }
+                }
+            } else {
+                // Fuse pending gather with remaining segment
+                let mut combined = pending_gather;
+                combined.extend_from_slice(mk_insts);
+                for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                    self.persistent_workers.as_mut().unwrap().dispatch_batch(0, chunk);
+                    if debug_hidden {
+                        let src = self.activations.hidden.as_ptr() as *const u8;
+                        let mut buf = [0u8; 8];
+                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
+                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
+                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
+                        eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
+                        batch_idx += 1;
+                    }
                 }
             }
         }
@@ -332,11 +360,15 @@ impl Model {
     ///
     /// After this returns, activations.attn_out[0..nqh*hd] contains the concatenated GQA outputs,
     /// and (for distributed mode) activations.gate_attn[0..nqh*hd] contains the full gate.
+    /// Head-parallel attention dispatch.
+    /// Returns gather instructions (OP_D2D_COPY from GPUs 1+ to GPU 0) to be prepended
+    /// to the next GPU 0 segment, saving one dispatch round-trip per attention layer.
+    /// GPU 1+ streams are synchronized before return, so gather is safe to fuse.
     fn dispatch_head_parallel_attention(
         &mut self,
         attn_i: usize,
         position: u32,
-    ) -> Result<(), ModelError> {
+    ) -> Result<Vec<crate::megakernel::Instruction>, ModelError> {
         use crate::megakernel::instructions::{
             D2dCopyInst, DeinterleaveInst, GqaAttnInst as GqaAttnInstLocal, LinearProjInst,
             MropeInst, QkNormInst,
@@ -661,56 +693,50 @@ impl Model {
         // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.
         // MUST NOT use peer_copy_async (kernel launch on GPU 0) while persistent cooperative
         // worker holds all CUs. Route all GPU-0 copies through persistent worker protocol.
-        {
-            let mut gather_batch: Vec<Instruction> = Vec::new();
-            let n_elems = local_nqh * hd;
-            let grid_x = ((n_elems as u32) + 255) / 256;
+        // These instructions are returned to the caller to be prepended to the next segment,
+        // fusing them into one dispatch round-trip (safe: GPU 1+ streams already synchronized).
+        let mut gather_batch: Vec<Instruction> = Vec::new();
+        let n_elems = local_nqh * hd;
+        let grid_x = ((n_elems as u32) + 255) / 256;
 
-            // attn_out gather: GPU i → act.attn_out[i*n_elems..]
+        // attn_out gather: GPU i → act.attn_out[i*n_elems..]
+        for gpu_i in 1..num_gpus {
+            let src = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
+                .attn_out
+                .as_ref()
+                .unwrap()
+                .as_ptr() as *const f32;
+            let dst =
+                unsafe { (self.activations.attn_out.as_write_ptr()).add(gpu_i * n_elems) };
+            gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).into_inst());
+        }
+
+        // gate_attn gather: GPU i → act.gate_attn[i*n_elems..]
+        // GPU 0's gate was written directly to act.gate_attn[0..n_elems] by deinterleave.
+        if use_distributed_qkv && has_gate {
             for gpu_i in 1..num_gpus {
                 let src = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                    .attn_out
+                    .attn_gate
                     .as_ref()
                     .unwrap()
                     .as_ptr() as *const f32;
-                let dst =
-                    unsafe { (self.activations.attn_out.as_write_ptr()).add(gpu_i * n_elems) };
+                let dst = unsafe {
+                    self.activations
+                        .gate_attn
+                        .as_write_ptr()
+                        .add(gpu_i * n_elems)
+                };
                 gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).into_inst());
-            }
-
-            // gate_attn gather: GPU i → act.gate_attn[i*n_elems..]
-            // GPU 0's gate was written directly to act.gate_attn[0..n_elems] by deinterleave.
-            if use_distributed_qkv && has_gate {
-                for gpu_i in 1..num_gpus {
-                    let src = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                        .attn_gate
-                        .as_ref()
-                        .unwrap()
-                        .as_ptr() as *const f32;
-                    let dst = unsafe {
-                        self.activations
-                            .gate_attn
-                            .as_write_ptr()
-                            .add(gpu_i * n_elems)
-                    };
-                    gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).into_inst());
-                }
-            }
-
-            if !gather_batch.is_empty() {
-                assert!(
-                    gather_batch.len() <= MAX_BATCH_INSTRUCTIONS,
-                    "gather batch overflow len={}",
-                    gather_batch.len()
-                );
-                self.persistent_workers
-                    .as_mut()
-                    .unwrap()
-                    .dispatch_batch(0, &gather_batch);
             }
         }
 
-        Ok(())
+        assert!(
+            gather_batch.len() <= MAX_BATCH_INSTRUCTIONS,
+            "gather batch overflow len={}",
+            gather_batch.len()
+        );
+
+        Ok(gather_batch)
     }
 
     /// Dispatch a batch of attention instructions via kbk on GPU i's compute_stream.
