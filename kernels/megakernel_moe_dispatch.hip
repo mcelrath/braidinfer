@@ -24,7 +24,7 @@
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
 
-__device__ void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid) {
+__device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid) {
     const MoeDispatchInst* i = (const MoeDispatchInst*)inst;
     volatile MoeWorkItem* wq = (volatile MoeWorkItem*)(uintptr_t)i->work_queue;
     float* output_slots = (float*)(uintptr_t)i->output_slots;

@@ -10,7 +10,7 @@
 //       [7]=routed_scaling_factor (float)
 //       [8]=correction_bias (float* or NULL — added to scores before selection)
 // grid_x = 1 (single block processes one token's routing)
-__device__ void op_moe_gate(const u64* inst, u32 vblock) {
+__device__ __attribute__((noinline)) void op_moe_gate(const u64* inst, u32 vblock) {
     if (vblock > 0) return;
     const MoeGateInst* i = (const MoeGateInst*)inst;
     const float* scores = i->scores;
@@ -106,7 +106,7 @@ __device__ void op_moe_gate(const u64* inst, u32 vblock) {
 // Weight format: PcG32Q4 (group_size=32, 20 bytes/group). Other formats use fallback path.
 // grid_x should be max(eis, hs) to give enough virtual blocks for all matmuls.
 template<typename GridGroup>
-__device__ void op_moe_ffn(const u64* inst, GridGroup& grid) {
+__device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup& grid) {
     const MoeFfnInst* i = (const MoeFfnInst*)inst;
     const int* expert_ids = i->expert_ids;
     const float* expert_weights = i->expert_weights;
