@@ -193,8 +193,6 @@ impl Model {
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
     /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        use crate::megakernel::Instruction;
-
         self.set_position(position).map_err(ModelError::Hip)?;
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
@@ -239,14 +237,12 @@ impl Model {
             .instructions
             .len();
 
-        let mut segment: Vec<Instruction> = Vec::new();
         let mut attn_i = 0usize;
         let mut i = 0usize;
+        let mut seg_start = 0usize; // start of current segment in mk.instructions
 
         while i < n_inst {
-            let inst = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].clone();
-            i += 1;
-            let opcode = inst.words[0] as u32 as u64;
+            let opcode = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].words[0] as u32 as u64;
             if opcode == OP_HALT as u64 {
                 break;
             }
@@ -254,34 +250,31 @@ impl Model {
             // Head-parallel attention boundary: flush segment, dispatch parallel QKV+GQA
             if has_head_parallel && attn_i < attn_boundaries.len() {
                 let (flush_idx, resume_idx) = attn_boundaries[attn_i];
-                if i - 1 == flush_idx {
-                    segment.push(inst);
-                    let dispatch = self.persistent_workers.as_mut().unwrap();
-                    for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS)
+                if i == flush_idx {
+                    // Include this instruction in the segment, then flush
+                    let seg_end = i + 1;
                     {
-                        dispatch.dispatch_batch(0, chunk);
+                        let insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end];
+                        self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, insts);
                     }
-                    segment.clear();
                     self.dispatch_head_parallel_attention(attn_i, position)?;
                     attn_i += 1;
-                    i = if use_distributed_qkv {
-                        resume_idx
-                    } else {
-                        resume_idx + 1
-                    };
+                    i = if use_distributed_qkv { resume_idx } else { resume_idx + 1 };
+                    seg_start = i;
                     continue;
                 }
             }
 
-            segment.push(inst);
+            i += 1;
         }
 
-        if !segment.is_empty() {
-            let dispatch = self.persistent_workers.as_mut().unwrap();
+        // Dispatch remaining segment
+        if seg_start < i {
             let debug_hidden = self.debug_p2p_hidden;
+            let insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
             let mut batch_idx = 0usize;
-            for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-                dispatch.dispatch_batch(0, chunk);
+            for chunk in insts.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                self.persistent_workers.as_mut().unwrap().dispatch_batch(0, chunk);
                 if debug_hidden {
                     // Sync + read hidden[0:2] after each batch
                     let src = self.activations.hidden.as_ptr() as *const u8;

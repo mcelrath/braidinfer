@@ -232,6 +232,14 @@ impl PersistentDispatch {
         }
     }
 
+    /// Dispatch a slice of instructions to a GPU, sending in chunks of MAX_BATCH_INSTRUCTIONS.
+    /// Avoids the caller needing to collect into an owned Vec first.
+    pub(crate) fn dispatch_batch_slice(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        for chunk in instructions.chunks(MAX_BATCH_INSTRUCTIONS) {
+            self.dispatch_batch(gpu_idx, chunk);
+        }
+    }
+
     /// Fire a batch of instructions to a GPU WITHOUT waiting for ack. Returns seq for wait_ack.
     /// Caller must call wait_ack(gpu_idx, seq) before reading GPU 0 output.
     /// Used to overlap GPU 0 OP_EXPERT_FFN with kbk dispatch on GPUs 1+.
