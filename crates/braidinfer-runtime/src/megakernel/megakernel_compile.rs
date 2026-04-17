@@ -249,6 +249,7 @@ impl MegakernelProgram {
 
         // Upload program to device
         let device_program = upload_program(device, &instructions)?;
+        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         Ok(MegakernelProgram {
             instructions,
@@ -286,6 +287,7 @@ impl MegakernelProgram {
             prefill_kv_entries: Vec::new(),
             prefill_attn_inst_indices: Vec::new(),
             prefill_n: 0,
+            flat_program,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -671,6 +673,7 @@ impl MegakernelProgram {
 
         // Upload
         let device_program = upload_program(device, &instructions)?;
+        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         Ok(MegakernelProgram {
             instructions,
@@ -708,6 +711,7 @@ impl MegakernelProgram {
             prefill_kv_entries,
             prefill_attn_inst_indices,
             prefill_n: n,
+            flat_program,
             _not_send: std::marker::PhantomData,
         })
     }

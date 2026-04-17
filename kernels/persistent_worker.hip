@@ -12,7 +12,7 @@
 
 // Work queue for CPU → GPU communication (host-mapped memory).
 // CPU writes an instruction + increments seq_num. Worker polls seq_num.
-#define MAX_BATCH_INSTRUCTIONS 64
+#define MAX_BATCH_INSTRUCTIONS 256
 
 struct WorkerQueue {
     volatile uint32_t seq_num;      // monotonic counter, triggers worker

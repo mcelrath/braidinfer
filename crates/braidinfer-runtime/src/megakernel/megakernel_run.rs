@@ -70,7 +70,11 @@ impl MegakernelProgram {
 
         // Upload entire instruction buffer in one hipMemcpyAsync call.
         // ~500 instructions × 128 bytes = ~64KB; one 64KB copy is cheaper than 24× 128-byte copies.
-        let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
+        // Reuse pre-allocated flat_program buffer to avoid per-step allocation.
+        self.flat_program.clear();
+        for inst in &self.instructions {
+            self.flat_program.extend_from_slice(&inst.words);
+        }
         // When dump is active, device_program has an OP_NOP header at offset 0;
         // instructions start at offset INST_SIZE words.
         let offset_words = if self.dump_buffer.is_some() {
@@ -79,11 +83,11 @@ impl MegakernelProgram {
             0
         };
         let dev_ptr = unsafe { self.device_program.as_mut_ptr().add(offset_words) };
-        let size = flat.len() * std::mem::size_of::<u64>();
+        let size = self.flat_program.len() * std::mem::size_of::<u64>();
         braidinfer_hip::error::check(unsafe {
             braidinfer_hip::ffi::hipMemcpyAsync(
                 dev_ptr.cast(),
-                flat.as_ptr().cast(),
+                self.flat_program.as_ptr().cast(),
                 size,
                 braidinfer_hip::ffi::hipMemcpyHostToDevice,
                 stream.raw(),
@@ -293,18 +297,22 @@ impl MegakernelProgram {
         }
 
         // 6. Upload entire instruction buffer in one hipMemcpyAsync call.
-        let flat: Vec<u64> = self.instructions.iter().flat_map(|i| i.words).collect();
+        // Reuse pre-allocated flat_program buffer to avoid per-step allocation.
+        self.flat_program.clear();
+        for inst in &self.instructions {
+            self.flat_program.extend_from_slice(&inst.words);
+        }
         let offset_words = if self.dump_buffer.is_some() {
             INST_SIZE
         } else {
             0
         };
         let dev_ptr = unsafe { self.device_program.as_mut_ptr().add(offset_words) };
-        let size = flat.len() * std::mem::size_of::<u64>();
+        let size = self.flat_program.len() * std::mem::size_of::<u64>();
         braidinfer_hip::error::check(unsafe {
             braidinfer_hip::ffi::hipMemcpyAsync(
                 dev_ptr.cast(),
-                flat.as_ptr().cast(),
+                self.flat_program.as_ptr().cast(),
                 size,
                 braidinfer_hip::ffi::hipMemcpyHostToDevice,
                 stream.raw(),
@@ -536,11 +544,11 @@ impl MegakernelProgram {
         prefill_bufs.position_ids.copy_from_host(&pos_data)?;
 
         // 5. Re-upload modified instructions to device
-        let total_words = self.instructions.len() * INST_SIZE;
-        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
+        // Reuse pre-allocated flat_program buffer to avoid per-chunk allocation.
+        self.flat_program.clear();
         for inst in &self.instructions {
-            flat.extend_from_slice(&inst.words);
+            self.flat_program.extend_from_slice(&inst.words);
         }
-        self.device_program.copy_from_host(&flat)
+        self.device_program.copy_from_host(&self.flat_program)
     }
 }

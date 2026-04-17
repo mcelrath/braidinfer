@@ -95,6 +95,9 @@ pub struct MegakernelProgram {
     pub(crate) prefill_n: usize,                 // chunk size template was compiled for
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
+    /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.
+    /// Avoids a Vec allocation per decode step.
+    pub(crate) flat_program: Vec<u64>,
 }
 
 /// One KV-write D2dCopy pair (K and V) for prefill chunk patching.

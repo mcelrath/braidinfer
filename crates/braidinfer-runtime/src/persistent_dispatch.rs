@@ -36,7 +36,7 @@ use braidinfer_hip::stream::Stream;
 use crate::megakernel::{INST_SIZE, Instruction};
 
 /// Max instructions per batch dispatch (dense worker).
-pub const MAX_BATCH_INSTRUCTIONS: usize = 64;
+pub const MAX_BATCH_INSTRUCTIONS: usize = 256;
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
 #[repr(C)]
