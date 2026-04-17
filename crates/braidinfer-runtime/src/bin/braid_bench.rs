@@ -60,8 +60,16 @@ fn load_model(model_dir: &Path, multi_gpu: bool) -> Model {
     model
 }
 
+fn percentile(sorted: &[u128], pct: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = (pct / 100.0 * (sorted.len() - 1) as f64).round() as usize;
+    sorted[idx.min(sorted.len() - 1)] as f64 / 1_000_000.0
+}
+
 fn bench_decode(model: &mut Model, warmup: usize, runs: usize) {
-    println!("=== Decode benchmark ===");
+    println!("=== Decode benchmark (warmup={warmup} runs={runs}) ===");
     let token_id = 9906u32; // "Hello"
 
     // Warmup: advance position to warmup, let the model run without timing
@@ -83,11 +91,13 @@ fn bench_decode(model: &mut Model, warmup: usize, runs: usize) {
         pos += 1;
     }
 
+    times_ns.sort_unstable();
     let avg_ms = times_ns.iter().sum::<u128>() as f64 / runs as f64 / 1_000_000.0;
-    let min_ms = times_ns.iter().min().unwrap().clone() as f64 / 1_000_000.0;
-    let max_ms = times_ns.iter().max().unwrap().clone() as f64 / 1_000_000.0;
+    let p10 = percentile(&times_ns, 10.0);
+    let p50 = percentile(&times_ns, 50.0);
+    let p90 = percentile(&times_ns, 90.0);
     println!(
-        "  positions {}-{}  avg={avg_ms:.2}ms  min={min_ms:.2}ms  max={max_ms:.2}ms  {:.1} tok/s",
+        "  positions {}-{}  avg={avg_ms:.2}ms  p10={p10:.2}ms  p50={p50:.2}ms  p90={p90:.2}ms  {:.1} tok/s",
         warmup, warmup + runs - 1, 1000.0 / avg_ms,
     );
 }
@@ -229,7 +239,17 @@ fn main() {
     let runs: usize = std::env::var("BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
 
     // Coherence and prefill FIRST: must run before persistent worker starts.
+    // Print bench header with config info
+    let gpu_count = {
+        let mut count: i32 = 0;
+        unsafe { braidinfer_hip::ffi::hipGetDeviceCount(&mut count) };
+        count
+    };
+    if multi_gpu {
+        println!("multi-GPU: {gpu_count} GPUs");
+    }
+
     bench_coherence(&mut model, 8);
-    bench_prefill(&mut model, &[8, 32, 128, 512]);
+    bench_prefill(&mut model, &[1, 8, 32, 64, 128, 256, 512]);
     bench_decode(&mut model, warmup, runs);
 }
