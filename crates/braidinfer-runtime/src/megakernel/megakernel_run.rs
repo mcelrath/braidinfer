@@ -13,7 +13,7 @@ use super::{
     CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
     upload_program,
 };
-use super::instructions::{AttnPagedInst, AttnPagedQInst, EmbeddingInst, GqaAttnInst, HaltInst, KvQuantizeInst, make_opcode_gridx};
+use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingInst, GqaAttnInst, HaltInst, KvQuantizeInst, make_opcode_gridx};
 
 impl MegakernelProgram {
     fn patch_kv_write_offsets(&mut self, position: u32) {
@@ -25,8 +25,12 @@ impl MegakernelProgram {
             for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
                 let offset =
                     (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
-                self.instructions[k_idx].words[1] = k_base + offset as u64;
-                self.instructions[v_idx].words[1] = v_base + offset as u64;
+                unsafe {
+                    let k_inst = self.instructions[k_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                    (*k_inst).dst = (k_base + offset as u64) as *mut f32;
+                    let v_inst = self.instructions[v_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                    (*v_inst).dst = (v_base + offset as u64) as *mut f32;
+                }
             }
         }
     }
@@ -193,8 +197,12 @@ impl MegakernelProgram {
                     (h * chunk_head_stride + chunk_offset * hd) * std::mem::size_of::<f32>();
                 let k_ptr = chunk_base + layer_k_offset + head_byte_off as u64;
                 let v_ptr = chunk_base + layer_v_offset + head_byte_off as u64;
-                self.instructions[k_idx].words[1] = k_ptr;
-                self.instructions[v_idx].words[1] = v_ptr;
+                unsafe {
+                    let k_inst = self.instructions[k_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                    (*k_inst).dst = k_ptr as *mut f32;
+                    let v_inst = self.instructions[v_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                    (*v_inst).dst = v_ptr as *mut f32;
+                }
             }
         }
 
@@ -216,7 +224,10 @@ impl MegakernelProgram {
             let num_sealed = seq.chunks.len() - 1;
             let sealed_tokens = (num_sealed * CHUNK_TOKENS) as i32;
             let active_tokens = total_seq_len - sealed_tokens;
-            let nqh = self.instructions[self.attn_paged_inst_indices[0]].words[6] as u32;
+            let nqh = unsafe {
+                let inst = self.instructions[self.attn_paged_inst_indices[0]].words.as_ptr() as *const AttnPagedInst;
+                (*inst).nqh as u32
+            };
 
             let quant_pt_ptr = self
                 .quant_page_table
@@ -226,7 +237,10 @@ impl MegakernelProgram {
 
             // Patch OP_ATTN_PAGED_Q: enable (grid_x=nqh), quant page table, sealed seq_len
             for &idx in &self.attn_quant_inst_indices {
-                self.instructions[idx].words[0] = (OP_ATTN_PAGED_Q as u64) | ((nqh as u64) << 32);
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                    (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, nqh);
+                }
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
                     (*inst).quant_page_table = quant_pt_ptr;
@@ -255,7 +269,10 @@ impl MegakernelProgram {
             // No quantized chunks yet (or quantized_kv not enabled): all f32
             // Disable OP_ATTN_PAGED_Q (grid_x=0)
             for &idx in &self.attn_quant_inst_indices {
-                self.instructions[idx].words[0] = OP_ATTN_PAGED_Q as u64; // grid_x=0
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                    (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, 0);
+                }
             }
             // OP_ATTN_PAGED sees all chunks, no partial_state
             for &idx in &self.attn_paged_inst_indices {
@@ -414,12 +431,18 @@ impl MegakernelProgram {
         for (layer_i, &q_idx) in self.attn_quant_inst_indices.iter().enumerate() {
             let scratch_ptr =
                 scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
-            self.instructions[q_idx].words[1] = scratch_ptr;
+            unsafe {
+                let inst = self.instructions[q_idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                (*inst).scratch = scratch_ptr;
+            }
         }
         for (layer_i, &p_idx) in self.attn_paged_inst_indices.iter().enumerate() {
             let scratch_ptr =
                 scratch_base + (layer_i * scratch_per_layer * std::mem::size_of::<f32>()) as u64;
-            self.instructions[p_idx].words[14] = scratch_ptr;
+            unsafe {
+                let inst = self.instructions[p_idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                (*inst).partial_state = scratch_ptr;
+            }
         }
         self.quantized_kv = true;
         Ok(())
