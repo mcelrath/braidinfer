@@ -1030,6 +1030,7 @@ impl Model {
             gdn_conv_states,
             legacy_kv_caches: Some(kv_caches),
             megakernel: None,
+            megakernel_prefill: None,
             prefill_bufs: None,
             gdn_states,
             mamba2_states,

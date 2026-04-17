@@ -288,6 +288,10 @@ impl MegakernelProgram {
             head_dim_attn: cfg.head_dim,
             barrier_layer_map,
             multi_gpu_attn_boundaries,
+            prefill_embedding_start: 0,
+            prefill_kv_entries: Vec::new(),
+            prefill_attn_inst_indices: Vec::new(),
+            prefill_n: 0,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -367,6 +371,9 @@ impl MegakernelProgram {
         let mut gdn_idx = 0usize;
         let mut kv_idx = 0usize;
         let mut _attn_layer_count = 0usize;
+        let mut prefill_kv_entries: Vec<super::PrefillKvEntry> = Vec::new();
+        let mut prefill_attn_inst_indices: Vec<usize> = Vec::new();
+        let mut prefill_kv_base_ptrs: Vec<(u64, u64)> = Vec::new();
 
         for layer_i in 0..cfg.num_layers {
             use crate::model::LayerType;
@@ -382,6 +389,11 @@ impl MegakernelProgram {
                     .get(kv_idx)
                     .expect("missing legacy KV cache");
 
+                // Record KV base pointers for this attention layer (at position 0)
+                prefill_kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
+                let layer_kv_idx = prefill_kv_base_ptrs.len() - 1;
+
+                let attn_start = instructions.len();
                 Self::emit_attention_layer(
                     cfg,
                     w,
@@ -399,6 +411,32 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                 );
+
+                // Scan emitted instructions for D2dCopy (KV writes) and AttnPrefillInst
+                let nkh = cfg.num_kv_heads;
+                let mut kv_pair_count = 0usize;
+                for idx in attn_start..instructions.len() {
+                    let opcode = instructions[idx].words[0] as u32;
+                    if opcode == OP_D2D_COPY && kv_pair_count < n * nkh * 2 {
+                        // KV writes: laid out as [t0h0K, t0h0V, t0h1K, t0h1V, ..., tnhkK, tnhkV]
+                        let pair_flat = kv_pair_count / 2; // which (t, h) pair
+                        let is_v = kv_pair_count % 2 == 1;
+                        if !is_v {
+                            let t = pair_flat / nkh;
+                            let h = pair_flat % nkh;
+                            // peek ahead for V
+                            let v_idx = idx + 1;
+                            prefill_kv_entries.push(super::PrefillKvEntry {
+                                k_inst_idx: idx,
+                                v_inst_idx: v_idx,
+                                t, h, layer_kv_idx,
+                            });
+                        }
+                        kv_pair_count += 1;
+                    } else if opcode == OP_ATTN_PREFILL {
+                        prefill_attn_inst_indices.push(idx);
+                    }
+                }
 
                 // Batched FFN
                 Self::compile_ffn_batched(
@@ -658,8 +696,8 @@ impl MegakernelProgram {
             _mrope_inst_indices: Vec::new(),
             gqa_attn_inst_indices: Vec::new(),
             kv_write_indices: Vec::new(),
-            kv_base_ptrs: Vec::new(),
-            position_ids_dev_ptr: act.position_ids.as_ptr() as u64,
+            kv_base_ptrs: prefill_kv_base_ptrs,
+            position_ids_dev_ptr: prefill_bufs.position_ids.as_ptr() as u64,
             max_seq_len: cfg.max_seq_len as u32,
             paged: false,
             page_table: None,
@@ -679,6 +717,10 @@ impl MegakernelProgram {
             head_dim_attn: cfg.head_dim,
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
+            prefill_embedding_start: embedding_inst_idx,
+            prefill_kv_entries,
+            prefill_attn_inst_indices,
+            prefill_n: n,
             _not_send: std::marker::PhantomData,
         })
     }

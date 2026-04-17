@@ -74,15 +74,31 @@ impl Model {
             let chunk = &tokens[offset..end];
             let start_pos = self.seq_len + offset as u32;
 
-            // take() avoids split-borrow: compile_prefill takes &Model + &mut PrefillBuffers
+            // take() avoids split-borrow: compile/update take &Model + &mut PrefillBuffers
             let mut bufs = self.prefill_bufs.take().unwrap();
-            let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
-                .map_err(ModelError::Hip)?;
-            self.prefill_bufs = Some(bufs);
 
-            mk.execute(&self.stream).map_err(ModelError::Hip)?;
+            if chunk.len() == CHUNK_TOKENS {
+                // Full chunk: compile once and cache, then patch per chunk.
+                if self.megakernel_prefill.is_none() {
+                    let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
+                        .map_err(ModelError::Hip)?;
+                    self.megakernel_prefill = Some(mk);
+                } else {
+                    let mk = self.megakernel_prefill.as_mut().unwrap();
+                    mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
+                }
+                self.prefill_bufs = Some(bufs);
+                let mk = self.megakernel_prefill.as_ref().unwrap();
+                mk.execute(&self.stream).map_err(ModelError::Hip)?;
+            } else {
+                // Partial last chunk: recompile (rare, only for the last chunk).
+                let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
+                    .map_err(ModelError::Hip)?;
+                self.prefill_bufs = Some(bufs);
+                mk.execute(&self.stream).map_err(ModelError::Hip)?;
+            }
+
             self.stream.synchronize().map_err(ModelError::Hip)?;
-
             offset = end;
         }
 

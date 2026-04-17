@@ -88,8 +88,22 @@ pub struct MegakernelProgram {
     //   rmsnorm_idx  = index of the RMSNorm instruction (flush + dispatch QKV/GQA after this)
     //   output_gate_idx = index of OP_OUTPUT_GATE or O-proj (resume megakernel here after dispatch)
     pub(crate) multi_gpu_attn_boundaries: Vec<(usize, usize)>,
+    // Prefill-specific caching: indices for per-chunk patching
+    pub(crate) prefill_embedding_start: usize,   // first of N consecutive EmbeddingInst
+    pub(crate) prefill_kv_entries: Vec<PrefillKvEntry>, // KV D2dCopy instructions to patch per chunk
+    pub(crate) prefill_attn_inst_indices: Vec<usize>,   // AttnPrefillInst indices, one per attn layer
+    pub(crate) prefill_n: usize,                 // chunk size template was compiled for
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
+}
+
+/// One KV-write D2dCopy pair (K and V) for prefill chunk patching.
+pub(crate) struct PrefillKvEntry {
+    pub k_inst_idx: usize,
+    pub v_inst_idx: usize,
+    pub t: usize,           // token offset within chunk (0..n)
+    pub h: usize,           // KV head index
+    pub layer_kv_idx: usize, // index into kv_base_ptrs
 }
 
 /// Activation buffers sized for N-token prefill chunks.

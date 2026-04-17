@@ -506,4 +506,67 @@ impl MegakernelProgram {
             &mut args,
         )
     }
+
+    /// Patch a cached prefill MegakernelProgram for a new chunk (tokens, start_pos).
+    /// Faster than recompiling: only updates token IDs, KV write pointers, AttnPrefillInst, and position IDs.
+    pub(crate) fn update_prefill_chunk(
+        &mut self,
+        tokens: &[u32],
+        start_pos: u32,
+        prefill_bufs: &mut super::PrefillBuffers,
+    ) -> HipResult<()> {
+        use super::instructions::{AttnPrefillInst, D2dCopyInst};
+        let n = tokens.len();
+        assert_eq!(n, self.prefill_n, "update_prefill_chunk: token count must match template size {}", self.prefill_n);
+
+        // 1. Patch embedding token IDs
+        for (i, &tok) in tokens.iter().enumerate() {
+            let idx = self.prefill_embedding_start + i;
+            unsafe {
+                let inst = self.instructions[idx].words.as_mut_ptr() as *mut EmbeddingInst;
+                (*inst).token_id = tok as u64;
+            }
+        }
+
+        // 2. Patch KV write D2dCopy destinations
+        let hd = self.head_dim_attn;
+        let max_sl = self.max_seq_len as usize;
+        for entry in &self.prefill_kv_entries {
+            let (k_base, v_base) = self.kv_base_ptrs[entry.layer_kv_idx];
+            let token_offset = start_pos as usize + entry.t;
+            let byte_offset = (entry.h * max_sl * hd + token_offset * hd) * std::mem::size_of::<f32>();
+            unsafe {
+                let k_inst = self.instructions[entry.k_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                (*k_inst).dst = (k_base + byte_offset as u64) as *mut f32;
+                let v_inst = self.instructions[entry.v_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                (*v_inst).dst = (v_base + byte_offset as u64) as *mut f32;
+            }
+        }
+
+        // 3. Patch AttnPrefillInst start_pos fields
+        for &idx in &self.prefill_attn_inst_indices {
+            unsafe {
+                let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPrefillInst;
+                (*inst).start_pos = start_pos as u64;
+            }
+        }
+
+        // 4. Upload updated position IDs
+        let mut pos_data = vec![0i32; n * 3];
+        for t in 0..n {
+            let pos = (start_pos + t as u32) as i32;
+            pos_data[t * 3] = pos;
+            pos_data[t * 3 + 1] = pos;
+            pos_data[t * 3 + 2] = pos;
+        }
+        prefill_bufs.position_ids.copy_from_host(&pos_data)?;
+
+        // 5. Re-upload modified instructions to device
+        let total_words = self.instructions.len() * INST_SIZE;
+        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
+        for inst in &self.instructions {
+            flat.extend_from_slice(&inst.words);
+        }
+        self.device_program.copy_from_host(&flat)
+    }
 }
