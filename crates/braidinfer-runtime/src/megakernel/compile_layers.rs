@@ -80,14 +80,14 @@ impl MegakernelProgram {
             k_dim as i32, ck as i32,
         ).no_sync().into_inst());
 
-        // Conv on V
+        // Conv on V — NO_SYNC (GDN gate reads a_proj, not v_gdn; next sync covers v_gdn)
         instructions.push(Conv1dInst::new(
             div_ceil(v_dim as u32, 256),
             unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) },
             unsafe { act.qkv.as_ptr().add(q_dim + k_dim) },
             w.conv1d_weight_v.as_ptr(), act.v_gdn.as_write_ptr(),
             v_dim as i32, ck as i32,
-        ).into_inst());
+        ).no_sync().into_inst());
 
         // 5. GDN gate
         let gqa_group = nvh / nh;
@@ -242,7 +242,7 @@ impl MegakernelProgram {
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
                 hs as i32, is as i32, eps, n as i32,
-            ).into_inst());
+            ).no_sync().into_inst());
             instructions.push(D2dCopyInst::new(
                 div_ceil((n * hs) as u32, 256),
                 bufs.residual.as_write_ptr(), bufs.hidden.as_ptr(), (n * hs) as i32,
@@ -263,7 +263,7 @@ impl MegakernelProgram {
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
                 wg_ptr, wu_ptr,
                 hs as i32, is as i32, eps, n as i32,
-            ).into_inst());
+            ).no_sync().into_inst());
             instructions.push(D2dCopyInst::new(
                 div_ceil((n * hs) as u32, 256),
                 bufs.residual.as_write_ptr(), bufs.hidden.as_ptr(), (n * hs) as i32,
@@ -375,7 +375,7 @@ impl MegakernelProgram {
                 act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
                 hs as i32, is as i32, eps, 0,
-            ).into_inst());
+            ).no_sync().into_inst());
             instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
             instructions.push(FfnDownResInst::new(
                 OP_FFN_DOWN_RES, hs as u32,
@@ -391,7 +391,7 @@ impl MegakernelProgram {
                 act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate_ptr, w_up_ptr,
                 hs as i32, is as i32, eps, 0,
-            ).into_inst());
+            ).no_sync().into_inst());
             instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
             instructions.push(FfnDownResInst::new(
                 OP_FFN_DOWN_RES_RNF4, hs as u32,

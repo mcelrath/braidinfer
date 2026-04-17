@@ -84,12 +84,20 @@ impl MegakernelProgram {
         emit_batched_linear_proj(&w.w_v, v_attn_ptr, normed_ptr, nkh * hd, hs, n, false, instructions);
 
         // 3. Deinterleave Q+gate → Q, gate
+        // no_sync for PagedKv: next instructions are KV writes which read k_attn/v_attn (not q_attn).
+        // The subsequent KV-write sync guarantees q_attn is complete before QK-norm reads it.
+        // FlatKv must sync: mRoPE immediately follows and reads q_attn.
+        let deinterleave_no_sync = matches!(variant, AttentionVariant::PagedKv { .. });
         if !cfg.has_output_gate {
             let total = n * nqh * hd;
-            instructions.push(D2dCopyInst::new(div_ceil(total as u32, 256), q_attn_ptr, q_gate_attn_ptr as *const f32, total as i32).into_inst());
+            let inst = D2dCopyInst::new(div_ceil(total as u32, 256), q_attn_ptr, q_gate_attn_ptr as *const f32, total as i32);
+            let inst = if deinterleave_no_sync { inst.no_sync() } else { inst };
+            instructions.push(inst.into_inst());
         } else {
             let total_elems = n * nqh * hd;
-            instructions.push(DeinterleaveInst::new(div_ceil(total_elems as u32, 256), q_attn_ptr, gate_attn_ptr, q_gate_attn_ptr as *const f32, nqh as i32, hd as i32, n as i32).into_inst());
+            let inst = DeinterleaveInst::new(div_ceil(total_elems as u32, 256), q_attn_ptr, gate_attn_ptr, q_gate_attn_ptr as *const f32, nqh as i32, hd as i32, n as i32);
+            let inst = if deinterleave_no_sync { inst.no_sync() } else { inst };
+            instructions.push(inst.into_inst());
         }
 
         // 4a. KV write for PagedKv — BEFORE QK-norm so cache stores pre-norm K/V.
@@ -339,6 +347,10 @@ impl MegakernelProgram {
         };
 
         // 11. Output projection + residual
+        // no_sync for n=1 decode without prefill buffer: D2D copy follows (reads hidden, not out_proj).
+        // The D2D sync guarantees out_proj is complete before ResidualAdd reads it.
+        // n>1 or prefill path: ResidualAdd immediately follows, must sync.
+        let out_proj_no_sync = n == 1 && prefill.is_none();
         emit_batched_linear_proj(
             &w.w_o,
             out_proj_ptr,
@@ -346,7 +358,7 @@ impl MegakernelProgram {
             hs,
             nqh * hd,
             n,
-            false,
+            out_proj_no_sync,
             instructions,
         );
         if n > 1 {

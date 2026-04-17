@@ -129,7 +129,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     default: break;
                 }
             }
-            grid.sync();
+            if (!inst_no_sync(inst)) grid.sync();
         }
 
         } // end for (pc = 0; pc < num_inst; pc++)

@@ -112,11 +112,11 @@ impl PersistentDispatch {
             let func = module.get_function("persistent_worker")?;
             let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
             let mut args: [*mut std::ffi::c_void; 1] = [std::ptr::addr_of_mut!(queue_ptr).cast()];
-            // Cap at 2 blocks/SM to match __launch_bounds__(256, 2) intent.
-            // Higher occupancy (e.g. 3 blocks/SM when shared_mem is small) causes
-            // grid.sync() hangs because the virtual-block loop assumes exactly
-            // num_cus * 2 blocks are coordinating on each instruction.
-            let bpsm = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
+            let bpsm_max = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
+            let bpsm = std::env::var("BRAIDINFER_BPSM")
+                .ok().and_then(|v| v.parse::<u32>().ok())
+                .map(|v| v.clamp(1, bpsm_max as u32) as usize)
+                .unwrap_or(bpsm_max as usize);
             let num_cus = multiprocessor_count(device)?;
             let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
             func.launch_cooperative(
@@ -287,9 +287,13 @@ impl PersistentDispatch {
         let stream = Stream::new(gpu0)?;
         let module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
         let func = module.get_function("persistent_worker")?;
-        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
+        let bpsm_max = func.max_active_blocks_per_sm(256, shared_mem as usize)?.min(2);
+        let blocks_per_sm = std::env::var("BRAIDINFER_BPSM")
+            .ok().and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.clamp(1, bpsm_max as u32))
+            .unwrap_or(bpsm_max as u32);
         let num_cus = multiprocessor_count(gpu0)?;
-        let num_blocks = (blocks_per_sm as u32 * num_cus).max(num_cus);
+        let num_blocks = (blocks_per_sm * num_cus as u32).max(num_cus as u32);
         let mut q = queue.device_ptr() as *mut std::ffi::c_void;
         let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
         func.launch_cooperative(
