@@ -2,10 +2,10 @@
 //! Extracted from megakernel.rs for maintainability.
 
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, emit_linear_proj, rmsnorm_opcode};
+use super::upload_program;
 use super::instructions::*;
 use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
@@ -248,13 +248,7 @@ impl MegakernelProgram {
         instructions.push(HaltInst::new().into_inst());
 
         // Upload program to device
-        let total_words = instructions.len() * INST_SIZE;
-        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
-        for inst in &instructions {
-            flat.extend_from_slice(&inst.words);
-        }
-        let mut device_program = DeviceBuffer::alloc(device, total_words)?;
-        device_program.copy_from_host(&flat)?;
+        let device_program = upload_program(device, &instructions)?;
 
         Ok(MegakernelProgram {
             instructions,
@@ -677,13 +671,7 @@ impl MegakernelProgram {
         instructions.push(Instruction::new(OP_HALT, 0));
 
         // Upload
-        let total_words = instructions.len() * INST_SIZE;
-        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
-        for inst in &instructions {
-            flat.extend_from_slice(&inst.words);
-        }
-        let mut device_program = DeviceBuffer::alloc(device, total_words)?;
-        device_program.copy_from_host(&flat)?;
+        let device_program = upload_program(device, &instructions)?;
 
         Ok(MegakernelProgram {
             instructions,

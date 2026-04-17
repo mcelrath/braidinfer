@@ -11,6 +11,7 @@ use crate::paged_kv::{PageAllocator, SequenceState};
 
 use super::{
     CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
+    upload_program,
 };
 use super::instructions::{AttnPagedInst, AttnPagedQInst, EmbeddingInst, GqaAttnInst, HaltInst, KvQuantizeInst, make_opcode_gridx};
 
@@ -487,9 +488,7 @@ impl MegakernelProgram {
         instructions.push(HaltInst::new().into_inst());
 
         // Upload and execute
-        let flat: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
-        let mut prog_buf = DeviceBuffer::<u64>::alloc(self.device, flat.len())?;
-        prog_buf.copy_from_host(&flat)?;
+        let prog_buf = upload_program(self.device, &instructions)?;
 
         let func = self.module.get_function("megakernel_f32")?;
         let mut prog_ptr: *const c_void = prog_buf.as_ptr().cast();

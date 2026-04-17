@@ -278,14 +278,7 @@ impl MegakernelProgram {
         self.dump_counter = None;
         self.dump_capacity = 0;
         // Rebuild device program without the NOP header
-        let total_words = self.instructions.len() * INST_SIZE;
-        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
-        for inst in &self.instructions {
-            flat.extend_from_slice(&inst.words);
-        }
-        let mut new_prog = DeviceBuffer::alloc(self.device, total_words)?;
-        new_prog.copy_from_host(&flat)?;
-        self.device_program = new_prog;
+        self.device_program = upload_program(self.device, &self.instructions)?;
         Ok(())
     }
 
@@ -328,6 +321,14 @@ impl MegakernelProgram {
             &mut args,
         )
     }
+}
+
+/// Upload an instruction slice to a new device buffer.
+fn upload_program(device: DeviceId, instructions: &[Instruction]) -> HipResult<DeviceBuffer<u64>> {
+    let flat: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
+    let mut buf = DeviceBuffer::alloc(device, flat.len())?;
+    buf.copy_from_host(&flat)?;
+    Ok(buf)
 }
 
 fn opcode_name(op: u32) -> &'static str {
