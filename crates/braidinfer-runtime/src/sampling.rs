@@ -9,6 +9,12 @@ pub struct SamplingParams {
     pub top_p: f32,
     pub repetition_penalty: f32,
     pub seed: Option<u64>,
+    /// Min-p filtering threshold (0.0 = disabled). After temperature scaling and
+    /// top-k, removes tokens whose probability is below `min_p * max_prob`.
+    pub min_p: f32,
+    /// Per-token additive logit bias applied before temperature scaling.
+    /// Each entry is `(token_id, delta)`.
+    pub logit_bias: Option<Vec<(u32, f32)>>,
 }
 
 impl Default for SamplingParams {
@@ -19,6 +25,8 @@ impl Default for SamplingParams {
             top_p: 1.0,
             repetition_penalty: 1.0,
             seed: None,
+            min_p: 0.0,
+            logit_bias: None,
         }
     }
 }
@@ -31,6 +39,8 @@ impl SamplingParams {
             top_p: 1.0,
             repetition_penalty: 1.0,
             seed: None,
+            min_p: 0.0,
+            logit_bias: None,
         }
     }
 }
@@ -42,6 +52,16 @@ pub fn sample(
     rng: &mut impl Rng,
 ) -> u32 {
     let n = logits.len();
+
+    // Logit bias: additive adjustment before any other processing
+    if let Some(ref biases) = params.logit_bias {
+        for &(token_id, delta) in biases {
+            let idx = token_id as usize;
+            if idx < n {
+                logits[idx] += delta;
+            }
+        }
+    }
 
     // Repetition penalty
     if params.repetition_penalty != 1.0 {
@@ -80,6 +100,20 @@ pub fn sample(
             logits[i] = f32::NEG_INFINITY;
         }
         let _ = threshold; // used implicitly
+    }
+
+    // Min-p filtering: remove tokens with prob < min_p * max_prob
+    if params.min_p > 0.0 {
+        // Compute unnormalized probs from current logits to find max_prob
+        let max_logit = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_prob = (max_logit - max_logit).exp(); // = 1.0 by definition (relative to max)
+        let threshold = params.min_p * max_prob; // = min_p
+        // Filter: keep only tokens where exp(logit - max_logit) >= min_p
+        for v in logits.iter_mut() {
+            if *v > f32::NEG_INFINITY && (*v - max_logit).exp() < threshold {
+                *v = f32::NEG_INFINITY;
+            }
+        }
     }
 
     // Top-p (nucleus) filtering
@@ -236,6 +270,7 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 1.0,
             seed: Some(0),
+            ..Default::default()
         };
         let mut logits = base_logits.clone();
         let tok = sample(&mut logits, &params_cold, &[], &mut rng);
@@ -250,6 +285,7 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 1.0,
             seed: Some(0),
+            ..Default::default()
         };
         let mut logits = vec![0.1f32; 20];
         logits[0] = 5.0;
@@ -282,6 +318,44 @@ mod tests {
     }
 
     #[test]
+    fn test_min_p_filters() {
+        // With min_p=0.5, tokens whose softmax prob < 0.5 * max_prob are removed.
+        // logits: [10.0, 0.0, 0.0, 0.0] — after temperature=1.0, max_logit=10.0,
+        // exp(0-10) << 0.5 so only token 0 survives.
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: Some(0),
+            min_p: 0.5,
+            logit_bias: None,
+        };
+        let mut rng = small_rng();
+        let mut logits = vec![10.0f32, 0.0, 0.0, 0.0];
+        let tok = sample(&mut logits, &params, &[], &mut rng);
+        assert_eq!(tok, 0, "only token 0 should survive min_p=0.5 filter");
+    }
+
+    #[test]
+    fn test_logit_bias_applied() {
+        // Boost token 1 by 100 so it wins despite lower base logit.
+        let params = SamplingParams {
+            temperature: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            seed: None,
+            min_p: 0.0,
+            logit_bias: Some(vec![(1u32, 100.0f32)]),
+        };
+        let mut logits = vec![10.0f32, 1.0, 5.0, 3.0];
+        let mut rng = small_rng();
+        let tok = sample(&mut logits, &params, &[], &mut rng);
+        assert_eq!(tok, 1, "logit_bias should boost token 1 to win");
+    }
+
+    #[test]
     fn test_repetition_penalty() {
         let params = SamplingParams {
             temperature: 0.0,
@@ -289,6 +363,7 @@ mod tests {
             top_p: 1.0,
             repetition_penalty: 2.0,
             seed: None,
+            ..Default::default()
         };
         // Token 3 has highest logit but is in history; after penalty it should lose
         let mut logits = vec![0.1f32, 0.2, 0.3, 10.0, 0.4];
