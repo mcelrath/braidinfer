@@ -1206,28 +1206,6 @@ pub unsafe fn d2d_copy_u16(
     }
 }
 
-// D2D memcpy: copy `count` f32 elements from src at offset src_off to dst at offset dst_off
-pub unsafe fn d2d_copy_f32(
-    dst: &mut DeviceBuffer<f32>,
-    dst_off: usize,
-    src: &DeviceBuffer<f32>,
-    src_off: usize,
-    count: usize,
-    stream: &Stream,
-) -> HipResult<()> {
-    unsafe {
-        let dst_ptr = dst.as_mut_ptr().add(dst_off) as *mut std::ffi::c_void;
-        let src_ptr = src.as_ptr().add(src_off) as *const std::ffi::c_void;
-        braidinfer_hip::error::check(ffi::hipMemcpyAsync(
-            dst_ptr,
-            src_ptr,
-            count * 4,
-            ffi::hipMemcpyDeviceToDevice,
-            stream.raw(),
-        ))
-    }
-}
-
 // ---- Precompute inv_freq ----
 
 pub fn compute_inv_freq(rope_dim: usize, rope_theta: f32) -> Vec<f32> {

@@ -7,6 +7,7 @@ use super::Model;
 use super::ModelError;
 use crate::config::*;
 use crate::weights::*;
+use crate::gpu_utils::d2d_copy_f32;
 
 impl Model {
     /// Persistent worker decode: compile megakernel program, replay via CPU-scheduled dispatch.

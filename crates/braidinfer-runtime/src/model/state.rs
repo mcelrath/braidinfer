@@ -6,6 +6,7 @@ use super::Model;
 use super::ModelError;
 use crate::config::*;
 use crate::weights::*;
+use crate::gpu_utils::d2d_copy_f32;
 
 impl Model {
     /// Save the current GDN recurrent states into a checkpoint pool slot.

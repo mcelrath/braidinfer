@@ -4,6 +4,7 @@ use braidinfer_hip::memory::DeviceBuffer;
 
 use super::Model;
 use crate::weights::*;
+use crate::gpu_utils::d2d_copy_f32;
 
 impl Model {
     pub(crate) fn attention_forward(
