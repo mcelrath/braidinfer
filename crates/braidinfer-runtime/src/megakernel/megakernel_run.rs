@@ -16,6 +16,21 @@ use super::{
 use super::instructions::{AttnPagedInst, AttnPagedQInst, EmbeddingInst, GqaAttnInst, HaltInst, KvQuantizeInst, make_opcode_gridx};
 
 impl MegakernelProgram {
+    fn patch_kv_write_offsets(&mut self, position: u32) {
+        let hd = self.head_dim_attn;
+        let max_sl = self.max_seq_len as usize;
+        let head_stride = max_sl * hd;
+        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
+            let (k_base, v_base) = self.kv_base_ptrs[layer_i];
+            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
+                let offset =
+                    (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
+                self.instructions[k_idx].words[1] = k_base + offset as u64;
+                self.instructions[v_idx].words[1] = v_base + offset as u64;
+            }
+        }
+    }
+
     pub fn update_step(&mut self, token_id: u32, position: u32, stream: &Stream) -> HipResult<()> {
         assert!(
             position < self.max_seq_len,
@@ -42,19 +57,7 @@ impl MegakernelProgram {
         })?;
 
         // Update KV cache write offsets (position-dependent, [H,T,D] layout)
-        let _nkh = self.num_kv_heads_attn;
-        let hd = self.head_dim_attn;
-        let max_sl = self.max_seq_len as usize;
-        let head_stride = max_sl * hd; // elements between consecutive heads
-        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
-            let (k_base, v_base) = self.kv_base_ptrs[layer_i];
-            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
-                let offset =
-                    (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
-                self.instructions[k_idx].words[1] = k_base + offset as u64;
-                self.instructions[v_idx].words[1] = v_base + offset as u64;
-            }
-        }
+        self.patch_kv_write_offsets(position);
 
         // Update GQA attention seq_len
         let seq_len = position + 1;
@@ -103,18 +106,7 @@ impl MegakernelProgram {
         // position_ids is now MappedHostBuffer — written via host_ptr by caller,
         // GPU reads through device_ptr. No hipMemcpy needed.
 
-        let hd = self.head_dim_attn;
-        let max_sl = self.max_seq_len as usize;
-        let head_stride = max_sl * hd;
-        for (layer_i, head_indices) in self.kv_write_indices.iter().enumerate() {
-            let (k_base, v_base) = self.kv_base_ptrs[layer_i];
-            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
-                let offset =
-                    (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
-                self.instructions[k_idx].words[1] = k_base + offset as u64;
-                self.instructions[v_idx].words[1] = v_base + offset as u64;
-            }
-        }
+        self.patch_kv_write_offsets(position);
 
         let seq_len = position + 1;
         for &idx in &self.gqa_attn_inst_indices {
