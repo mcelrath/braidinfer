@@ -40,10 +40,16 @@ impl Model {
         if self.persistent && self.persistent_workers.is_none() && !self.has_moe {
             return self.prefill_batched(tokens);
         }
-        // Sequential fallback.
+        // Sequential fallback: use paged path if worker not started (coherent with decode_step_paged reference).
+        let use_paged = self.persistent_workers.is_none();
         let mut logits = vec![];
         for (i, &tok) in tokens.iter().enumerate() {
-            logits = self.decode_step(tok, self.seq_len + i as u32)?;
+            let pos = self.seq_len + i as u32;
+            logits = if use_paged {
+                self.decode_step_paged(tok, pos)?
+            } else {
+                self.decode_step(tok, pos)?
+            };
         }
         Ok(logits)
     }
@@ -557,6 +563,12 @@ impl Model {
             for cache in caches {
                 cache.k.copy_from_host(&zeros_kv)?;
                 cache.v.copy_from_host(&zeros_kv)?;
+            }
+        }
+        if let RecurrentLayerKind::Mamba2 { num_heads: m_nh, head_dim: m_hd, state_dim: m_sd, conv_kernel: m_ck, conv_dim: m_cd, .. } = &self.config.recurrent_kind {
+            for state in &mut self.mamba2_states {
+                state.ssm.copy_from_host(&vec![0.0f32; m_nh * m_hd * m_sd])?;
+                state.conv.copy_from_host(&vec![0.0f32; m_cd * (m_ck - 1)])?;
             }
         }
         self.seq_len = 0;
