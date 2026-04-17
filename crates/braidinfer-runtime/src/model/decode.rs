@@ -31,7 +31,7 @@ impl Model {
             // allocating more is always safe (just wastes a little shared mem).
             let shared_mem = SHARED_LPROJ_TOTAL as u32;
             let dispatch =
-                PersistentDispatch::init(&[self.device], shared_mem, 0).map_err(ModelError::Hip)?;
+                PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size).map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
         }
 

@@ -37,6 +37,16 @@ use crate::megakernel::{INST_SIZE, Instruction};
 
 /// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 256;
+
+/// Compute optimal cooperative block count for a given model hidden size.
+/// Launches 4 blocks per vblock-width of hidden size, reducing idle blocks at grid.sync().
+/// The stride loop `for (vb = blockIdx.x; vb < grid_x; vb += gridDim.x)` handles
+/// any grid_x (including vocab-sized LM head) correctly with fewer blocks.
+fn optimal_worker_blocks(max_blocks: u32, hidden_size: usize) -> u32 {
+    if hidden_size == 0 { return max_blocks; }
+    let hidden_grid_x = (hidden_size as u32 + 255) / 256;
+    (hidden_grid_x * 4).max(4).min(max_blocks)
+}
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
 #[repr(C)]
@@ -99,7 +109,7 @@ impl PersistentDispatch {
 
     /// Launch persistent workers on specified GPUs.
     /// `hidden_size`: for MoE output slot allocation (0 if no MoE).
-    pub fn init(devices: &[DeviceId], shared_mem: u32, _hidden_size: usize) -> HipResult<Self> {
+    pub fn init(devices: &[DeviceId], shared_mem: u32, hidden_size: usize) -> HipResult<Self> {
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         let mut workers = Vec::with_capacity(devices.len());
@@ -118,7 +128,8 @@ impl PersistentDispatch {
                 .map(|v| v.clamp(1, bpsm_max as u32) as usize)
                 .unwrap_or(bpsm_max as usize);
             let num_cus = multiprocessor_count(device)?;
-            let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
+            let max_blocks = (bpsm as u32 * num_cus).max(num_cus);
+            let num_blocks = optimal_worker_blocks(max_blocks, hidden_size);
             func.launch_cooperative(
                 (num_blocks, 1, 1),
                 (256, 1, 1),
@@ -301,7 +312,8 @@ impl PersistentDispatch {
             .map(|v| v.clamp(1, bpsm_max as u32))
             .unwrap_or(bpsm_max as u32);
         let num_cus = multiprocessor_count(gpu0)?;
-        let num_blocks = (blocks_per_sm * num_cus as u32).max(num_cus as u32);
+        let max_blocks = (blocks_per_sm * num_cus as u32).max(num_cus as u32);
+        let num_blocks = optimal_worker_blocks(max_blocks, hidden_size);
         let mut q = queue.device_ptr() as *mut std::ffi::c_void;
         let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
         func.launch_cooperative(
