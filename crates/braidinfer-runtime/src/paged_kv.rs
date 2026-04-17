@@ -227,9 +227,11 @@ impl ChunkHandle {
             .ok_or(HipError(ffi::hipErrorOutOfMemory))?;
         let old_ptr = allocator.slot_ptr(self.inner.slot_index);
         let len = self.inner.len.load(Ordering::Acquire) as usize;
-        // Copy entire chunk regardless of fill level. With [H,T,D] layout, valid
-        // tokens for each head are at stride offsets, not a contiguous prefix.
-        // Copying only a prefix would miss valid data for heads > 0.
+        // KV layout is [num_layers, K/V, num_heads, chunk_tokens, head_dim].
+        // Valid tokens 0..len occupy stride-offset positions within each head's
+        // slice — they are NOT a contiguous prefix of the flat buffer.
+        // We must copy chunk_bytes() to capture all valid data when len > 0.
+        // The len == 0 case avoids a D2D copy for a freshly allocated chunk.
         let copy_bytes = if len == 0 { 0 } else { allocator.chunk_bytes() };
         if copy_bytes > 0 {
             hip_check(unsafe {
@@ -345,6 +347,12 @@ impl SequenceState {
     }
 
     /// Release all owned f32 chunk slots and clear sequence metadata.
+    ///
+    /// Chunks with `Arc` refcount > 1 are intentionally NOT freed here. A refcount
+    /// greater than 1 means another `SequenceState` holds a `Clone` of this handle
+    /// (copy-on-write sharing via `make_exclusive`). Freeing such a chunk would
+    /// corrupt the other sequence's KV data. The slot is freed by the last owner
+    /// whose `reset()` observes refcount == 1.
     pub fn reset(&mut self, allocator: &mut PageAllocator) {
         for chunk in self.chunks.drain(..) {
             if Arc::strong_count(&chunk.inner) == 1 {
