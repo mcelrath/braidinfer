@@ -38,7 +38,7 @@ impl Model {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
         // Batched path: persistent mode, worker not yet started (can still do hipMemcpy).
-        if self.persistent && self.persistent_workers.is_none() && !self.has_moe {
+        if self.persistent && self.persistent_workers.is_none() {
             return self.prefill_batched(tokens);
         }
         // Sequential fallback: use paged path if worker not started (coherent with decode_step_paged reference).
@@ -53,6 +53,147 @@ impl Model {
             };
         }
         Ok(logits)
+    }
+
+    /// Process one chunk of tokens for a model that has MoE layers.
+    /// Non-MoE layer spans are batched via compile_prefill_segment.
+    /// MoE layers are processed per-token via moe_ffn_forward with d2d hidden-state handoff.
+    /// Does NOT increment seq_len (caller does that once).
+    fn prefill_mixed_chunk(
+        &mut self,
+        chunk: &[u32],
+        start_pos: u32,
+    ) -> Result<(), ModelError> {
+        use crate::config::LayerType;
+        use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, PrefillBuffers};
+
+        if self.prefill_bufs.is_none() {
+            self.prefill_bufs = Some(
+                PrefillBuffers::alloc(self.device, &self.config, CHUNK_TOKENS)
+                    .map_err(ModelError::Hip)?,
+            );
+        }
+
+        let n = chunk.len();
+        let hs = self.config.hidden_size;
+        let num_layers = self.config.num_layers;
+
+        // Emit embedding instructions via megakernel: one per token into prefill_bufs.hidden[t*hs]
+        // We compile a tiny "embedding-only" segment by treating layer_start=0,layer_end=0.
+        // Then for each span of non-MoE layers, compile_prefill_segment handles them.
+        // For MoE layers, use moe_ffn_forward with d2d handoff.
+
+        // Step 1: Embed all tokens into prefill_bufs.hidden via a tiny megakernel
+        {
+            use crate::megakernel::instructions::*;
+            use crate::megakernel::{Instruction, NUM_CUS, OP_HALT};
+
+            let grid_x = (hs as u32 + 255) / 256;
+            let module = braidinfer_hip::module::Module::load(
+                self.device,
+                &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+            ).map_err(ModelError::Hip)?;
+            let shared_mem = (256u32 * 4 * 2).max(hs as u32 * 4).max(31776u32);
+            let func = module.get_function("megakernel_f32").map_err(ModelError::Hip)?;
+            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize).map_err(ModelError::Hip)?;
+            let num_blocks = blocks_per_sm.max(1) as u32 * NUM_CUS;
+
+            let mut insts: Vec<Instruction> = Vec::new();
+            let bufs = self.prefill_bufs.as_ref().unwrap();
+            for t in 0..n {
+                insts.push(EmbeddingInst::new(
+                    grid_x,
+                    unsafe { bufs.hidden.as_write_ptr().add(t * hs) },
+                    self.embed_weight.as_ptr(),
+                    chunk[t] as i32,
+                    hs as i32,
+                ).into_inst());
+            }
+            insts.push(Instruction::new(OP_HALT, 0));
+
+            let flat: Vec<u64> = insts.iter().flat_map(|i| i.words).collect();
+            let mut dev_prog = braidinfer_hip::memory::DeviceBuffer::alloc(self.device, flat.len()).map_err(ModelError::Hip)?;
+            dev_prog.copy_from_host(&flat).map_err(ModelError::Hip)?;
+
+            let mut prog_ptr: *const std::ffi::c_void = dev_prog.as_ptr().cast();
+            let mut num_inst = insts.len() as i32;
+            let mut args: [*mut std::ffi::c_void; 2] = [
+                std::ptr::addr_of_mut!(prog_ptr).cast(),
+                std::ptr::addr_of_mut!(num_inst).cast(),
+            ];
+            func.launch_cooperative(
+                (num_blocks, 1, 1),
+                (256, 1, 1),
+                shared_mem,
+                &self.stream,
+                &mut args,
+            ).map_err(ModelError::Hip)?;
+            self.stream.synchronize().map_err(ModelError::Hip)?;
+        }
+
+        // Step 2: Walk layers, identify contiguous non-MoE spans vs MoE layers
+        let mut layer_i = 0usize;
+        while layer_i < num_layers {
+            let lt = self.config.layers[layer_i].layer_type.clone();
+            if lt == LayerType::MoeFfn {
+                // MoE layer: per-token d2d handoff + moe_ffn_forward
+                for t in 0..n {
+                    let mut bufs = self.prefill_bufs.take().unwrap();
+                    unsafe {
+                        d2d_copy_f32(
+                            &mut self.activations.hidden,
+                            0,
+                            &bufs.hidden,
+                            t * hs,
+                            hs,
+                            &self.stream,
+                        ).map_err(ModelError::Hip)?;
+                    }
+                    self.prefill_bufs = Some(bufs);
+                    self.moe_ffn_forward(layer_i).map_err(ModelError::Hip)?;
+                    let mut bufs2 = self.prefill_bufs.take().unwrap();
+                    unsafe {
+                        d2d_copy_f32(
+                            &mut bufs2.hidden,
+                            t * hs,
+                            &self.activations.hidden,
+                            0,
+                            hs,
+                            &self.stream,
+                        ).map_err(ModelError::Hip)?;
+                    }
+                    self.prefill_bufs = Some(bufs2);
+                }
+                self.stream.synchronize().map_err(ModelError::Hip)?;
+                layer_i += 1;
+            } else {
+                // Find end of this non-MoE span
+                let span_start = layer_i;
+                while layer_i < num_layers && self.config.layers[layer_i].layer_type != LayerType::MoeFfn {
+                    layer_i += 1;
+                }
+                let span_end = layer_i;
+                let is_last = span_end == num_layers;
+
+                let key = (span_start, span_end, n);
+                let mut bufs = self.prefill_bufs.take().unwrap();
+
+                if !self.megakernel_prefill_segments.contains_key(&key) {
+                    let mk = MegakernelProgram::compile_prefill_segment(
+                        self, chunk, start_pos,
+                        span_start, span_end, is_last,
+                        &mut bufs,
+                    ).map_err(ModelError::Hip)?;
+                    self.megakernel_prefill_segments.insert(key, mk);
+                }
+                self.prefill_bufs = Some(bufs);
+                let mk = self.megakernel_prefill_segments.get(&key).unwrap();
+                mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                self.stream.synchronize().map_err(ModelError::Hip)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn prefill_batched(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
@@ -70,48 +211,60 @@ impl Model {
         let total = tokens.len();
         let mut offset = 0;
 
-        while offset < total {
-            let end = (offset + CHUNK_TOKENS).min(total);
-            let chunk = &tokens[offset..end];
-            let start_pos = self.seq_len + offset as u32;
-
-            // take() avoids split-borrow: compile/update take &Model + &mut PrefillBuffers
-            let mut bufs = self.prefill_bufs.take().unwrap();
-
-            if chunk.len() == CHUNK_TOKENS {
-                // Full chunk: compile once and cache, then patch per chunk.
-                if self.megakernel_prefill.is_none() {
-                    let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
-                        .map_err(ModelError::Hip)?;
-                    self.megakernel_prefill = Some(mk);
-                } else {
-                    let mk = self.megakernel_prefill.as_mut().unwrap();
-                    mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
-                }
-                self.prefill_bufs = Some(bufs);
-                let mk = self.megakernel_prefill.as_ref().unwrap();
-                mk.execute(&self.stream).map_err(ModelError::Hip)?;
-            } else {
-                // Partial last chunk: cache by token count to avoid recompile on repeated prompts.
-                let n = chunk.len();
-                if self.megakernel_prefill_partial_n == n
-                    && self.megakernel_prefill_partial.is_some()
-                {
-                    let mk = self.megakernel_prefill_partial.as_mut().unwrap();
-                    mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
-                } else {
-                    let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
-                        .map_err(ModelError::Hip)?;
-                    self.megakernel_prefill_partial = Some(mk);
-                    self.megakernel_prefill_partial_n = n;
-                }
-                self.prefill_bufs = Some(bufs);
-                let mk = self.megakernel_prefill_partial.as_ref().unwrap();
-                mk.execute(&self.stream).map_err(ModelError::Hip)?;
+        if self.has_moe {
+            // Mixed path: batch non-MoE spans, sequential MoE layers
+            while offset < total {
+                let end = (offset + CHUNK_TOKENS).min(total);
+                let chunk = &tokens[offset..end];
+                let start_pos = self.seq_len + offset as u32;
+                self.prefill_mixed_chunk(chunk, start_pos)?;
+                offset = end;
             }
+        } else {
+            // Pure non-MoE path: use original compile_prefill
+            while offset < total {
+                let end = (offset + CHUNK_TOKENS).min(total);
+                let chunk = &tokens[offset..end];
+                let start_pos = self.seq_len + offset as u32;
 
-            self.stream.synchronize().map_err(ModelError::Hip)?;
-            offset = end;
+                // take() avoids split-borrow: compile/update take &Model + &mut PrefillBuffers
+                let mut bufs = self.prefill_bufs.take().unwrap();
+
+                if chunk.len() == CHUNK_TOKENS {
+                    // Full chunk: compile once and cache, then patch per chunk.
+                    if self.megakernel_prefill.is_none() {
+                        let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
+                            .map_err(ModelError::Hip)?;
+                        self.megakernel_prefill = Some(mk);
+                    } else {
+                        let mk = self.megakernel_prefill.as_mut().unwrap();
+                        mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
+                    }
+                    self.prefill_bufs = Some(bufs);
+                    let mk = self.megakernel_prefill.as_ref().unwrap();
+                    mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                } else {
+                    // Partial last chunk: cache by token count to avoid recompile on repeated prompts.
+                    let n = chunk.len();
+                    if self.megakernel_prefill_partial_n == n
+                        && self.megakernel_prefill_partial.is_some()
+                    {
+                        let mk = self.megakernel_prefill_partial.as_mut().unwrap();
+                        mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
+                    } else {
+                        let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
+                            .map_err(ModelError::Hip)?;
+                        self.megakernel_prefill_partial = Some(mk);
+                        self.megakernel_prefill_partial_n = n;
+                    }
+                    self.prefill_bufs = Some(bufs);
+                    let mk = self.megakernel_prefill_partial.as_ref().unwrap();
+                    mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                }
+
+                self.stream.synchronize().map_err(ModelError::Hip)?;
+                offset = end;
+            }
         }
 
         self.seq_len += total as u32;

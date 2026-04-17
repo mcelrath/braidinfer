@@ -1033,6 +1033,7 @@ impl Model {
             megakernel_prefill: None,
             megakernel_prefill_partial: None,
             megakernel_prefill_partial_n: 0,
+            megakernel_prefill_segments: std::collections::HashMap::new(),
             prefill_bufs: None,
             gdn_states,
             mamba2_states,

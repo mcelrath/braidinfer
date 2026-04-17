@@ -50,6 +50,8 @@ pub struct Model {
     pub(crate) megakernel_prefill: Option<MegakernelProgram>,
     pub(crate) megakernel_prefill_partial: Option<MegakernelProgram>,
     pub(crate) megakernel_prefill_partial_n: usize,
+    /// Cache of segment megakernel programs keyed by (layer_start, layer_end, chunk_len).
+    pub(crate) megakernel_prefill_segments: std::collections::HashMap<(usize, usize, usize), MegakernelProgram>,
     pub(crate) prefill_bufs: Option<crate::megakernel::PrefillBuffers>,
     // Paged KV path (lazy-init)
     pub(crate) megakernel_paged: Option<MegakernelProgram>,
