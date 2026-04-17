@@ -36,14 +36,7 @@ impl Model {
         }
 
         // Write position_ids directly to host-mapped memory (no hipMemcpy)
-        let pos_data = [position as i32, position as i32, position as i32];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                pos_data.as_ptr(),
-                self.activations.position_ids.host_ptr(),
-                3,
-            );
-        }
+        self.set_position(position).map_err(ModelError::Hip)?;
 
         let mk = self.megakernel.as_mut().unwrap();
         unsafe {
@@ -197,14 +190,7 @@ impl Model {
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         use crate::megakernel::Instruction;
 
-        let pos_data = [position as i32, position as i32, position as i32];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                pos_data.as_ptr(),
-                self.activations.position_ids.host_ptr(),
-                3,
-            );
-        }
+        self.set_position(position).map_err(ModelError::Hip)?;
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
         let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
@@ -874,14 +860,7 @@ impl Model {
         }
 
         // Set position_ids for mRoPE/RoPE
-        let pos_data = [position as i32, position as i32, position as i32];
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                pos_data.as_ptr(),
-                self.activations.position_ids.host_ptr(),
-                pos_data.len(),
-            )
-        };
+        self.set_position(position).map_err(ModelError::Hip)?;
 
         // Embedding
         self.kernels.embedding.forward(
