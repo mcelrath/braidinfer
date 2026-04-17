@@ -200,6 +200,10 @@ impl MegakernelProgram {
                 crate::model::FfnType::MoE { .. } => {
                     if multi_gpu {
                         let moe = model.moe_weights[layer_i].as_ref().unwrap();
+                        // emit_post_barrier=false for fc2_latent_proj layers (Nemotron-H): the
+                        // correct post-barrier sequence (fc2 + shared_expert + residual_add) is
+                        // inserted by compile_inner_p2p after patching OP_BARRIER→OP_MOE_DISPATCH.
+                        let emit_post_barrier = moe.fc2_latent_proj.is_none();
                         let barrier_inst_idx = Self::compile_moe_ffn_multi_gpu(
                             cfg,
                             layer_i,
@@ -207,6 +211,7 @@ impl MegakernelProgram {
                             moe,
                             act,
                             &mut instructions,
+                            emit_post_barrier,
                         );
                         barrier_layer_map.push((barrier_inst_idx, layer_i));
                     } else {
@@ -821,27 +826,12 @@ impl MegakernelProgram {
             }.into_inst();
         }
 
-        // Pass 2: rebuild instruction stream to insert fc2+residual_add after OP_MOE_DISPATCH
-        // (needed for Nemotron-H). Also skip stale shared_up_proj at barrier_idx+1 for those layers.
+        // Pass 2: rebuild instruction stream to insert fc2+shared_expert+residual_add after
+        // OP_MOE_DISPATCH for Nemotron-H layers with fc2_latent_proj.
         //
-        // For models with fc2_latent_proj:
-        //   - compile_moe_ffn_multi_gpu returns early → emits LINEAR_PROJ(shared_up) at barrier_idx+1
-        //     and NO residual_add. We skip that stale instruction and insert fc2+residual_add instead.
-        // For models without fc2:
-        //   - normal flow: no insertion needed (residual_add already present).
-        let stale_positions: std::collections::HashSet<usize> = prog
-            .barrier_layer_map
-            .iter()
-            .filter(|&&(bi, li)| {
-                model.moe_weights[li]
-                    .as_ref()
-                    .map(|m| m.fc2_latent_proj.is_some())
-                    .unwrap_or(false)
-                    && bi + 1 < prog.instructions.len()
-            })
-            .map(|&(bi, _)| bi + 1)
-            .collect();
-
+        // compile_moe_ffn_multi_gpu emits NO post-barrier instructions for fc2_latent_proj layers
+        // (emit_post_barrier=false), so there are no stale instructions to skip — only insertions.
+        // The old_to_new map tracks index shift due to inserted instructions for attn-boundary remap.
         let has_fc2_layers: bool = prog
             .barrier_layer_map
             .iter()
@@ -855,16 +845,12 @@ impl MegakernelProgram {
         if has_fc2_layers {
             let mut new_instructions =
                 Vec::with_capacity(prog.instructions.len() + 2 * barrier_map.len());
-            // old_to_new[i] = index of old instruction i in new_instructions (-1 if skipped)
-            let mut old_to_new: Vec<i64> = vec![-1i64; prog.instructions.len()];
+            // inserted_before[i] = number of instructions inserted before old index i
+            let mut inserted_before: Vec<usize> = vec![0usize; prog.instructions.len() + 1];
             for (i, inst) in prog.instructions.iter().enumerate() {
-                if stale_positions.contains(&i) {
-                    // Skip the stale shared_up_proj left by compile_moe_ffn_multi_gpu's early return
-                    continue;
-                }
-                old_to_new[i] = new_instructions.len() as i64;
+                inserted_before[i] = new_instructions.len() - i;
                 new_instructions.push(inst.clone());
-                // After OP_MOE_DISPATCH: insert fc2_latent_proj + residual_add (when fc2 exists)
+                // After OP_MOE_DISPATCH: insert fc2_latent_proj + shared_expert + residual_add
                 if let Some(&layer_idx) = barrier_map.get(&i) {
                     let moe = model.moe_weights[layer_idx].as_ref().unwrap();
                     let dist = model.distributed_moe[layer_idx].as_ref();
@@ -881,7 +867,7 @@ impl MegakernelProgram {
                             ).into_inst());
                         }
 
-                        // Shared expert (relu² + down_proj, missing in compile_moe_ffn_multi_gpu early return)
+                        // Shared expert (relu² path for Nemotron-H, no gate_proj)
                         if let Some(ref se) = moe.shared_expert {
                             let se_is = match &cfg.layers[layer_idx].ffn_type {
                                 crate::model::FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
@@ -943,12 +929,10 @@ impl MegakernelProgram {
                                     ).into_inst());
                                 }
                             }
-                            // Note: has_gate_proj shared expert already handled correctly by
-                            // compile_moe_ffn_multi_gpu (no early return in that branch).
+                            // Note: has_gate_proj shared expert handled by compile_moe_ffn_multi_gpu.
                         }
 
-                        // residual_add: hidden = residual + ffn_down_stage
-                        // (missing for Nemotron-H because compile_moe_ffn_multi_gpu returns early)
+                        // residual_add: hidden = residual + ffn_down_stage (Nemotron-H)
                         new_instructions.push(ResidualAddInst::new(
                             div_ceil(hs as u32, 256),
                             act.hidden.as_write_ptr(),
@@ -959,20 +943,14 @@ impl MegakernelProgram {
                     }
                 }
             }
+            inserted_before[prog.instructions.len()] = new_instructions.len() - prog.instructions.len();
             prog.instructions = new_instructions;
 
-            // Remap multi_gpu_attn_boundaries to new instruction indices.
-            // old_to_new maps old index → new index (-1 if skipped).
-            prog.multi_gpu_attn_boundaries = prog.multi_gpu_attn_boundaries.iter().enumerate().map(|(_attn_i, &(flush, resume))| {
-                let new_flush = old_to_new[flush];
-                let new_resume = old_to_new[resume];
-                assert!(new_flush >= 0, "attn flush_idx {flush} was in stale_positions — logic error");
-                assert!(new_resume >= 0, "attn resume_idx {resume} was in stale_positions — logic error");
-                let nf = new_flush as usize;
-                let nr = new_resume as usize;
-                // Verify: flush instruction should be OP_RMSNORM
-                (nf, nr)
-            }).collect();
+            // Remap multi_gpu_attn_boundaries: each old index shifts by inserted_before[i].
+            prog.multi_gpu_attn_boundaries = prog.multi_gpu_attn_boundaries.iter()
+                .map(|&(flush, resume)| {
+                    (flush + inserted_before[flush], resume + inserted_before[resume])
+                }).collect();
         }
 
         // Clear barrier_layer_map so it's not misinterpreted after OP_BARRIER→OP_MOE_DISPATCH patch

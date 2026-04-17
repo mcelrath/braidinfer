@@ -188,6 +188,9 @@ impl MegakernelProgram {
     ///
     /// Note: barrier_flag_ptr and resume_flag_ptr are patched in after MoeBarrierState is
     /// allocated (in compile_multi_gpu). Initially zero; patched by execute_multi_gpu().
+    /// `emit_post_barrier`: when false, skip shared-expert + residual_add after OP_BARRIER.
+    /// Used by compile_inner_p2p for Nemotron-H fc2_latent_proj layers, where those
+    /// instructions are inserted in the correct form after OP_MOE_DISPATCH instead.
     pub(super) fn compile_moe_ffn_multi_gpu(
         cfg: &ModelConfig,
         layer_idx: usize,
@@ -195,6 +198,7 @@ impl MegakernelProgram {
         moe: &crate::model::MoeWeights,
         act: &ActivationBuffers,
         instructions: &mut Vec<Instruction>,
+        emit_post_barrier: bool,
     ) -> usize {
         use crate::model::{FfnType, GateType};
         let hs = cfg.hidden_size;
@@ -240,19 +244,21 @@ impl MegakernelProgram {
         let barrier_inst_idx = instructions.len();
         instructions.push(BarrierInst::new(layer_idx as i32).into_inst());
 
-        // After barrier: compute shared expert (if present) and add to ffn_down_stage.
-        if let Some(ref se) = moe.shared_expert {
-            let se_is = match &cfg.layers[layer_idx].ffn_type {
-                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
-                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
-                }
-                _ => eis,
-            };
-            Self::emit_shared_expert_stage(se, moe, act, hs, se_is, instructions);
-        }
+        if emit_post_barrier {
+            // After barrier: compute shared expert (if present) and add to ffn_down_stage.
+            if let Some(ref se) = moe.shared_expert {
+                let se_is = match &cfg.layers[layer_idx].ffn_type {
+                    FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                        if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
+                    }
+                    _ => eis,
+                };
+                Self::emit_shared_expert_stage(se, moe, act, hs, se_is, instructions);
+            }
 
-        // Final residual: hidden = residual + ffn_down_stage
-        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.residual.as_ptr(), act.ffn_down_stage.as_ptr() as *const f32, hs as i32).into_inst());
+            // Final residual: hidden = residual + ffn_down_stage
+            instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.residual.as_ptr(), act.ffn_down_stage.as_ptr() as *const f32, hs as i32).into_inst());
+        }
 
         barrier_inst_idx
     }
