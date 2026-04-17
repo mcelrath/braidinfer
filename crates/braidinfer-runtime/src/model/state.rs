@@ -92,10 +92,21 @@ impl Model {
                 let mk = self.megakernel_prefill.as_ref().unwrap();
                 mk.execute(&self.stream).map_err(ModelError::Hip)?;
             } else {
-                // Partial last chunk: recompile (rare, only for the last chunk).
-                let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
-                    .map_err(ModelError::Hip)?;
+                // Partial last chunk: cache by token count to avoid recompile on repeated prompts.
+                let n = chunk.len();
+                if self.megakernel_prefill_partial_n == n
+                    && self.megakernel_prefill_partial.is_some()
+                {
+                    let mk = self.megakernel_prefill_partial.as_mut().unwrap();
+                    mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
+                } else {
+                    let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
+                        .map_err(ModelError::Hip)?;
+                    self.megakernel_prefill_partial = Some(mk);
+                    self.megakernel_prefill_partial_n = n;
+                }
                 self.prefill_bufs = Some(bufs);
+                let mk = self.megakernel_prefill_partial.as_ref().unwrap();
                 mk.execute(&self.stream).map_err(ModelError::Hip)?;
             }
 
