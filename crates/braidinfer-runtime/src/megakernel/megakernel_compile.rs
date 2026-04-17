@@ -6,13 +6,6 @@ use braidinfer_hip::module::Module;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 
-/// Compute optimal cooperative block count for a given model hidden size.
-/// Launches 4 blocks per vblock-width, enough to saturate HBM without excess grid.sync overhead.
-/// The persistent worker's stride loop handles grid_x > gridDim.x correctly for wide ops (LM head).
-fn optimal_blocks(max_blocks: u32, hidden_size: usize) -> u32 {
-    let hidden_grid_x = (hidden_size as u32 + 255) / 256;
-    (hidden_grid_x * 4).max(4).min(max_blocks)
-}
 use super::upload_program;
 use super::instructions::*;
 use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
@@ -79,7 +72,7 @@ impl MegakernelProgram {
         // NUM_CUS=48 = WGP count (MultiprocessorCount on RDNA3). Max cooperative blocks = blocks_per_sm * WGPs.
         // blocks_per_sm=0 means LDS-limited; fall back to 1/WGP.
         let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
-        let num_blocks = optimal_blocks(blocks_per_sm_clamped * NUM_CUS, cfg.hidden_size);
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
 
         let mut instructions: Vec<Instruction> = Vec::new();
         let mut mrope_inst_indices: Vec<usize> = Vec::new();
@@ -338,7 +331,7 @@ impl MegakernelProgram {
         );
         // NUM_CUS=48 = WGP count (MultiprocessorCount on RDNA3). Max cooperative blocks = blocks_per_sm * WGPs.
         let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
-        let num_blocks = optimal_blocks(blocks_per_sm_clamped * NUM_CUS, cfg.hidden_size);
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
         let mut instructions: Vec<Instruction> = Vec::new();
 
         let hs = cfg.hidden_size;
@@ -761,7 +754,7 @@ impl MegakernelProgram {
         let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
-        let num_blocks = optimal_blocks(blocks_per_sm_clamped * NUM_CUS, cfg.hidden_size);
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
         let mut instructions: Vec<Instruction> = Vec::new();
 
         let hs = cfg.hidden_size;
