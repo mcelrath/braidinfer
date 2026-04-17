@@ -62,6 +62,7 @@ pub(crate) struct PagedKvState {
 
 /// Quantized KV state — only populated when `quantized_kv=true`.
 pub(crate) struct QuantizedKvState {
+    #[allow(dead_code)]
     pub quant_scratch: Option<DeviceBuffer<f32>>,
     pub quant_page_table: Option<DeviceBuffer<u64>>,
     pub last_quant_page_table_len: usize,

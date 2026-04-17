@@ -224,7 +224,7 @@ impl MegakernelProgram {
             .as_ptr() as u64;
         let attn_paged_inst_indices = paged_kv.attn_paged_inst_indices.clone();
         let attn_quant_inst_indices = paged_kv.attn_quant_inst_indices.clone();
-        drop(paged_kv);
+
 
         if self.quantized_kv && seq.chunks.len() > 1 {
             // Two-phase: quantized sealed chunks + f32 active chunk
@@ -546,7 +546,7 @@ impl MegakernelProgram {
         let prefill_embedding_start = prefill_cache.embedding_start;
         let prefill_kv_entries: Vec<_> = prefill_cache.kv_entries.iter().map(|e| (e.k_inst_idx, e.v_inst_idx, e.h, e.layer_kv_idx, e.t)).collect();
         let prefill_attn_inst_indices: Vec<_> = prefill_cache.attn_inst_indices.clone();
-        drop(prefill_cache);
+
 
         // 1. Patch embedding token IDs
         for (i, &tok) in tokens.iter().enumerate() {

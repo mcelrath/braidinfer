@@ -29,6 +29,73 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
     if sign == 1 { -val } else { val }
 }
 
+/// Convert FP8_E5M2 byte to f32.
+/// E5M2: 1 sign, 5 exponent (bias=15), 2 mantissa. Inf/NaN encodings exist.
+fn fp8_e5m2_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let exp = (b >> 2) & 0x1F;
+    let mant = b & 0x3;
+    if exp == 0x1F {
+        if mant != 0 {
+            return 0.0; // NaN → 0
+        } else {
+            // Inf → clamp to bf16::MAX (0x7F7F = 3.3895313e38)
+            let bf16_max = bf16_to_f32(0x7F7F);
+            return if sign == 1 { -bf16_max } else { bf16_max };
+        }
+    }
+    let val = if exp == 0 {
+        // subnormal: (-1)^sign * 2^(-14) * (mant / 4)
+        (mant as f32 / 4.0) * (1.0 / (1u32 << 14) as f32)
+    } else {
+        // normal: (-1)^sign * 2^(exp-15) * (1 + mant/4)
+        (1.0 + mant as f32 / 4.0) * f32::from_bits(((exp as u32 + 112) & 0xFF) << 23)
+    };
+    if sign == 1 { -val } else { val }
+}
+
+/// Per-channel or scalar scale tensor.
+enum ScaleTensor {
+    Scalar(f32),
+    PerChannel(Vec<f32>),
+}
+
+/// Read a scale tensor, handling scalar (1 element) or per-channel (out_dim elements).
+fn read_scale_tensor(tensors: &SafeTensors, key: &str, out_dim: usize) -> Option<ScaleTensor> {
+    let st = tensors.tensor(key).ok()?;
+    let data = st.data();
+    let dtype = st.dtype();
+    let elem_size = match dtype {
+        Dtype::F32 => 4,
+        Dtype::BF16 => 2,
+        _ => return None,
+    };
+    let n_elems = data.len() / elem_size;
+    let read_f32 = |i: usize| -> f32 {
+        match dtype {
+            Dtype::F32 => {
+                let off = i * 4;
+                f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]])
+            }
+            Dtype::BF16 => {
+                let off = i * 2;
+                bf16_to_f32(u16::from_le_bytes([data[off], data[off+1]]))
+            }
+            _ => 1.0,
+        }
+    };
+    if n_elems == 1 {
+        Some(ScaleTensor::Scalar(read_f32(0)))
+    } else if n_elems == out_dim {
+        Some(ScaleTensor::PerChannel((0..out_dim).map(read_f32).collect()))
+    } else if n_elems > 0 {
+        // Unexpected size: use first element as scalar fallback
+        Some(ScaleTensor::Scalar(read_f32(0)))
+    } else {
+        None
+    }
+}
+
 /// Convert f32 to bf16 (truncate lower 16 bits of mantissa, round-to-nearest-even).
 fn f32_to_bf16(f: f32) -> u16 {
     let bits = f.to_bits();
@@ -294,8 +361,8 @@ fn main() {
                     let slice = unsafe { std::slice::from_raw_parts(ptr, n_elements) };
                     (Some(converted), slice)
                 }
-                Dtype::F8_E4M3 => {
-                    // FP8 E4M3 -> BF16: dequantize each byte, apply scale.
+                Dtype::F8_E4M3 | Dtype::F8_E5M2 => {
+                    // FP8 -> BF16: dequantize each byte, apply scale.
                     // Two naming conventions:
                     //   qscale_weight: bf16 = fp8 * qscale_weight  (braidinfer internal)
                     //   weight_scale_inv: bf16 = fp8 * weight_scale_inv  (Mistral FP8)
@@ -304,35 +371,36 @@ fn main() {
                         .map(|(prefix, _)| prefix)
                         .unwrap_or(name);
 
-                    fn read_scalar(data: &[u8], dtype: Dtype) -> Option<f32> {
-                        match dtype {
-                            Dtype::BF16 if data.len() >= 2 =>
-                                Some(bf16_to_f32(u16::from_le_bytes([data[0], data[1]]))),
-                            Dtype::F32 if data.len() >= 4 =>
-                                Some(f32::from_le_bytes([data[0], data[1], data[2], data[3]])),
-                            _ => None,
-                        }
-                    }
-
-                    let scale: f32 = if let Ok(st) = safetensors.tensor(
-                        &format!("{tensor_prefix}.qscale_weight")) {
-                        // qscale_weight: bf16 = fp8 * qscale_weight  (direct multiplier)
-                        read_scalar(st.data(), st.dtype()).unwrap_or(1.0)
-                    } else if let Ok(st) = safetensors.tensor(
-                        &format!("{tensor_prefix}.weight_scale_inv")) {
-                        // Mistral FP8: weight_scale_inv = 1/scale, where
-                        //   quantize:   fp8 = round(bf16 / weight_scale_inv)
-                        //   dequantize: bf16 = fp8 * weight_scale_inv
-                        read_scalar(st.data(), st.dtype()).unwrap_or(1.0)
+                    let decode: fn(u8) -> f32 = if dtype == Dtype::F8_E4M3 {
+                        fp8_e4m3_to_f32
                     } else {
-                        eprintln!("  WARN: no scale for FP8 tensor {name}, using 1.0");
-                        1.0
+                        fp8_e5m2_to_f32
                     };
 
-                    let converted: Vec<u16> = fp8_bytes
-                        .iter()
-                        .map(|&b| f32_to_bf16(fp8_e4m3_to_f32(b) * scale))
-                        .collect();
+                    let scale_tensor = read_scale_tensor(
+                        &safetensors, &format!("{tensor_prefix}.qscale_weight"), out_dim)
+                    .or_else(|| read_scale_tensor(
+                        &safetensors, &format!("{tensor_prefix}.weight_scale_inv"), out_dim));
+
+                    let converted: Vec<u16> = match scale_tensor {
+                        None => {
+                            eprintln!("  WARN: no scale for FP8 tensor {name}, using 1.0");
+                            fp8_bytes.iter().map(|&b| f32_to_bf16(decode(b))).collect()
+                        }
+                        Some(ScaleTensor::Scalar(s)) => {
+                            fp8_bytes.iter().map(|&b| f32_to_bf16(decode(b) * s)).collect()
+                        }
+                        Some(ScaleTensor::PerChannel(ref scales)) => {
+                            fp8_bytes
+                                .chunks(in_dim)
+                                .enumerate()
+                                .flat_map(|(r, row)| {
+                                    let s = scales[r];
+                                    row.iter().map(move |&b| f32_to_bf16(decode(b) * s))
+                                })
+                                .collect()
+                        }
+                    };
                     let ptr = converted.as_ptr();
                     let slice = unsafe { std::slice::from_raw_parts(ptr, n_elements) };
                     (Some(converted), slice)
@@ -426,4 +494,78 @@ fn main() {
         effective_bpw
     );
     eprintln!("Output:  {output_path}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // E5M2: normal value: sign=0 exp=16 (bias=15 → 2^1) mant=1 → 1.0 * 2^1 * (1+0.25) = 2.5
+    // byte: 0b0_10000_01 = 0x41
+    #[test]
+    fn test_fp8_e5m2_normal() {
+        let b = 0b0_10000_01u8; // exp=16, mant=1
+        let v = fp8_e5m2_to_f32(b);
+        assert!((v - 2.5).abs() < 1e-6, "expected 2.5, got {v}");
+    }
+
+    // E5M2: subnormal: sign=0 exp=0 mant=2 → 2^-14 * (2/4) = 2^-14 * 0.5 = 2^-15
+    // byte: 0b0_00000_10 = 0x02
+    #[test]
+    fn test_fp8_e5m2_subnormal() {
+        let b = 0b0_00000_10u8;
+        let v = fp8_e5m2_to_f32(b);
+        let expected = 0.5 / (1u32 << 14) as f32;
+        assert!((v - expected).abs() < 1e-10, "expected {expected}, got {v}");
+    }
+
+    // E5M2: NaN (exp=0x1F, mant!=0) → 0.0
+    // byte: 0b0_11111_01 = 0x7D
+    #[test]
+    fn test_fp8_e5m2_nan_to_zero() {
+        let b = 0b0_11111_01u8;
+        let v = fp8_e5m2_to_f32(b);
+        assert_eq!(v, 0.0, "NaN should map to 0.0, got {v}");
+    }
+
+    // E5M2: Inf (exp=0x1F, mant=0) → bf16::MAX
+    // byte: 0b0_11111_00 = 0x7C
+    #[test]
+    fn test_fp8_e5m2_inf_to_bf16_max() {
+        let b = 0b0_11111_00u8;
+        let v = fp8_e5m2_to_f32(b);
+        let bf16_max = bf16_to_f32(0x7F7F);
+        assert_eq!(v, bf16_max, "Inf should map to bf16::MAX ({bf16_max}), got {v}");
+    }
+
+    // Per-channel scale: 2 rows with different scales
+    #[test]
+    fn test_per_channel_scale_application() {
+        // 2 rows, 2 cols, fp8 E4M3 bytes all 0x3C (value 1.0 in E4M3)
+        // verify by checking output bf16 values
+        // 0x38: sign=0 exp=7 mant=0 → (1+0/8)*2^(7-7) = 1.0
+        let b = fp8_e4m3_to_f32(0x38);
+        assert!((b - 1.0).abs() < 1e-5, "fp8 0x38 should be ~1.0, got {b}");
+
+        let scales = vec![2.0f32, 3.0f32];
+        let fp8_bytes = [0x38u8; 4]; // 2 rows × 2 cols
+        let in_dim = 2usize;
+        let converted: Vec<u16> = fp8_bytes
+            .chunks(in_dim)
+            .enumerate()
+            .flat_map(|(r, row)| {
+                let s = scales[r];
+                row.iter().map(move |&byte| f32_to_bf16(fp8_e4m3_to_f32(byte) * s))
+            })
+            .collect();
+
+        let row0 = bf16_to_f32(converted[0]);
+        let row0b = bf16_to_f32(converted[1]);
+        let row1 = bf16_to_f32(converted[2]);
+        let row1b = bf16_to_f32(converted[3]);
+        assert!((row0 - 2.0).abs() < 0.01, "row0 col0: expected 2.0, got {row0}");
+        assert!((row0b - 2.0).abs() < 0.01, "row0 col1: expected 2.0, got {row0b}");
+        assert!((row1 - 3.0).abs() < 0.01, "row1 col0: expected 3.0, got {row1}");
+        assert!((row1b - 3.0).abs() < 0.01, "row1 col1: expected 3.0, got {row1b}");
+    }
 }
