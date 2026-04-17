@@ -69,10 +69,14 @@ fn bench_decode(model: &mut Model, warmup: usize, runs: usize) {
         model.decode_step_token(token_id, p).expect("decode");
     }
 
+    // Sync before timing: ensure all warmup GPU work is complete before t0.
+    model.stream().synchronize().expect("stream sync");
+
     // Timed: run `runs` consecutive decode steps and time each
     let mut pos = warmup as u32;
     let mut times_ns = Vec::with_capacity(runs);
     for _ in 0..runs {
+        model.stream().synchronize().expect("stream sync");
         let t0 = Instant::now();
         model.decode_step_token(token_id, pos).expect("decode");
         times_ns.push(t0.elapsed().as_nanos());
@@ -102,6 +106,7 @@ fn bench_prefill(model: &mut Model, token_counts: &[usize]) {
     for &n in token_counts {
         let tokens: Vec<u32> = vec![token_id; n];
         model.reset_state().expect("reset");
+        model.stream().synchronize().expect("stream sync");
         let t0 = Instant::now();
         model.prefill(&tokens).expect("prefill");
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
