@@ -287,7 +287,7 @@ impl Model {
 
         if !segment.is_empty() {
             let dispatch = self.persistent_workers.as_mut().unwrap();
-            let debug_hidden = std::env::var("DEBUG_P2P_HIDDEN").is_ok();
+            let debug_hidden = self.debug_p2p_hidden;
             let mut batch_idx = 0usize;
             for chunk in segment.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
                 dispatch.dispatch_batch(0, chunk);
@@ -327,7 +327,7 @@ impl Model {
         }
 
         // After first token: print worker timing report if MOE_TIMING env var is set.
-        if self.seq_len == 0 && std::env::var("MOE_TIMING").is_ok() {
+        if self.seq_len == 0 && self.moe_timing {
             if let Some(ref p2p) = self.moe_p2p {
                 p2p.print_timing_report(2500.0); // 7900XTX ~2500 MHz
             }

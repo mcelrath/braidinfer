@@ -1050,6 +1050,8 @@ impl Model {
             has_moe,
             persistent: std::env::var("PERSISTENT").as_deref() == Ok("1"),
             sync_debug: std::env::var("SYNC_DEBUG").is_ok(),
+            debug_p2p_hidden: std::env::var("DEBUG_P2P_HIDDEN").is_ok(),
+            moe_timing: std::env::var("MOE_TIMING").is_ok(),
             weight_prefix: prefix.clone(),
             multi_gpu: None,
             distributed_moe: Vec::new(),
