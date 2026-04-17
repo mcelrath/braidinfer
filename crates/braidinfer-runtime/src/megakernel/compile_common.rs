@@ -5,24 +5,6 @@ use super::Instruction;
 use super::{OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_RMSNORM, OP_RMSNORM_WX};
 use crate::model::{KvCache, LinearWeight, WeightFormat};
 
-pub(super) fn emit_linear_proj(inst: &mut Instruction, weight: &LinearWeight, ptr_slot: usize) {
-    match weight {
-        LinearWeight::Bf16(buf) => {
-            inst.words[ptr_slot] = buf.as_ptr() as u64;
-        }
-        LinearWeight::Packed(pw) => {
-            let op = match pw.format {
-                WeightFormat::Rnf4G128 => OP_LINEAR_PROJ_RNF4,
-                WeightFormat::PcG32Q4 => OP_LINEAR_PROJ_PCG32,
-                WeightFormat::Bf16 => OP_LINEAR_PROJ,
-            };
-            // Replace opcode (low 32 bits), preserve grid_x (high 32 bits)
-            inst.words[0] = (inst.words[0] & 0xFFFF_FFFF_0000_0000u64) | op as u64;
-            inst.words[ptr_slot] = pw.data.as_ptr() as u64;
-        }
-    }
-}
-
 /// Emit a batched linear projection. For bf16, uses single batched instruction.
 /// For quantized (PCG32/RNF4), emits per-token loop (kernel batching TODO: braidinfer-xxy).
 pub(super) fn emit_batched_linear_proj(

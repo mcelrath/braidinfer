@@ -1,10 +1,10 @@
 //! GDN, Mamba2, and FFN layer compilation.
 
-use super::compile_common::{div_ceil, emit_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
+use super::compile_common::{div_ceil, linear_proj_opcode_ptr, rmsnorm_opcode};
 use crate::quant::WeightFormat;
 use super::instructions::*;
 use super::{Instruction, MegakernelProgram, PrefillBuffers};
-use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4, OP_LINEAR_PROJ};
+use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4};
 #[allow(unused_imports)]
 use crate::model::{
     ActivationBuffers, GdnState, LayerWeights, Mamba2State, ModelConfig, RecurrentLayerKind,
@@ -289,24 +289,22 @@ impl MegakernelProgram {
 
                 // Gate: normed[t] → ffn_gate_scratch  (no_sync: up reads same normed)
                 {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
-                    emit_linear_proj(&mut inst, w_gate, 2);
-                    inst.words[1] = bufs.ffn_gate_scratch.as_write_ptr() as u64;
-                    inst.words[3] = normed_t as u64;
-                    inst.words[4] = is as u64;
-                    inst.words[5] = hs as u64;
-                    instructions.push(inst);
+                    let (lp_op, lp_w) = linear_proj_opcode_ptr(w_gate);
+                    instructions.push(LinearProjInst::new(
+                        lp_op, is as u32,
+                        bufs.ffn_gate_scratch.as_write_ptr(), lp_w, normed_t,
+                        is as i32, hs as i32, 0,
+                    ).into_inst());
                 }
 
                 // Up: normed[t] → ffn_up_scratch
                 {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, is as u32);
-                    emit_linear_proj(&mut inst, w_up, 2);
-                    inst.words[1] = bufs.ffn_up_scratch.as_write_ptr() as u64;
-                    inst.words[3] = normed_t as u64;
-                    inst.words[4] = is as u64;
-                    inst.words[5] = hs as u64;
-                    instructions.push(inst);
+                    let (lp_op, lp_w) = linear_proj_opcode_ptr(w_up);
+                    instructions.push(LinearProjInst::new(
+                        lp_op, is as u32,
+                        bufs.ffn_up_scratch.as_write_ptr(), lp_w, normed_t,
+                        is as i32, hs as i32, 0,
+                    ).into_inst());
                 }
 
                 // SiLU(gate) * up → ffn_act[t..t+is]
@@ -318,13 +316,12 @@ impl MegakernelProgram {
 
                 // Down: ffn_act[t] → ffn_down_scratch
                 {
-                    let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                    emit_linear_proj(&mut inst, w_down, 2);
-                    inst.words[1] = bufs.ffn_down_scratch.as_write_ptr() as u64;
-                    inst.words[3] = ffn_act_t as u64;
-                    inst.words[4] = hs as u64;
-                    inst.words[5] = is as u64;
-                    instructions.push(inst);
+                    let (lp_op, lp_w) = linear_proj_opcode_ptr(w_down);
+                    instructions.push(LinearProjInst::new(
+                        lp_op, hs as u32,
+                        bufs.ffn_down_scratch.as_write_ptr(), lp_w, ffn_act_t,
+                        hs as i32, is as i32, 0,
+                    ).into_inst());
                 }
 
                 // Residual: ffn_down_scratch + residual[t] → hidden[t]

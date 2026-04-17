@@ -4,7 +4,7 @@
 use braidinfer_hip::HipResult;
 use braidinfer_hip::module::Module;
 
-use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, emit_linear_proj, rmsnorm_opcode};
+use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 use super::upload_program;
 use super::instructions::*;
 use super::{CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
@@ -590,13 +590,12 @@ impl MegakernelProgram {
 
                     // Output projection
                     {
-                        let mut inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                        inst.words[1] = act.out_proj.as_write_ptr() as u64;
-                        emit_linear_proj(&mut inst, &w.w_out, 2);
-                        inst.words[3] = act.normed_gated.as_ptr() as u64;
-                        inst.words[4] = hs as u64;
-                        inst.words[5] = (nvh_gdn * vd) as u64;
-                        instructions.push(inst);
+                        let (lp_op, lp_w) = linear_proj_opcode_ptr(&w.w_out);
+                        instructions.push(LinearProjInst::new(
+                            lp_op, hs as u32,
+                            act.out_proj.as_write_ptr(), lp_w, act.normed_gated.as_ptr(),
+                            hs as i32, (nvh_gdn * vd) as i32, 0,
+                        ).into_inst());
                     }
 
                     // Residual: hidden[t] = out_proj + hidden[t]
@@ -767,13 +766,12 @@ impl MegakernelProgram {
                 if prev2_opcode == OP_D2D_COPY && prev2.words[1] == normed_stage_ptr {
                     if let Some(ref fc1) = moe.fc1_latent_proj {
                         // Emit fc1: normed(hs) → moe_latent(gupd)
-                        let mut fc1_inst = Instruction::new(OP_LINEAR_PROJ, gupd as u32);
-                        fc1_inst.words[1] = act.moe_latent.as_write_ptr() as u64;
-                        emit_linear_proj(&mut fc1_inst, fc1, 2);
-                        fc1_inst.words[3] = act.normed.as_ptr() as u64;
-                        fc1_inst.words[4] = gupd as u64;
-                        fc1_inst.words[5] = hs as u64;
-                        prog.instructions[barrier_idx - 2] = fc1_inst;
+                        let (lp_op, lp_w) = linear_proj_opcode_ptr(fc1);
+                        prog.instructions[barrier_idx - 2] = LinearProjInst::new(
+                            lp_op, gupd as u32,
+                            act.moe_latent.as_write_ptr(), lp_w, act.normed.as_ptr(),
+                            gupd as i32, hs as i32, 0,
+                        ).into_inst();
                     } else {
                         // NOP: no normed_stage copy needed in P2P path
                         prog.instructions[barrier_idx - 2] = Instruction::new(OP_D2D_COPY, 0);
@@ -870,13 +868,12 @@ impl MegakernelProgram {
                     if let Some(ref fc2) = moe.fc2_latent_proj {
                         // fc2: moe_latent(gupd) → ffn_down_stage(hs)
                         {
-                            let mut fc2_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                            fc2_inst.words[1] = act.ffn_down_stage.as_write_ptr() as u64;
-                            emit_linear_proj(&mut fc2_inst, fc2, 2);
-                            fc2_inst.words[3] = act.moe_latent.as_ptr() as u64;
-                            fc2_inst.words[4] = hs as u64;
-                            fc2_inst.words[5] = gupd as u64;
-                            new_instructions.push(fc2_inst);
+                            let (lp_op, lp_w) = linear_proj_opcode_ptr(fc2);
+                            new_instructions.push(LinearProjInst::new(
+                                lp_op, hs as u32,
+                                act.ffn_down_stage.as_write_ptr(), lp_w, act.moe_latent.as_ptr(),
+                                hs as i32, gupd as i32, 0,
+                            ).into_inst());
                         }
 
                         // Shared expert (relu² + down_proj, missing in compile_moe_ffn_multi_gpu early return)
@@ -890,13 +887,12 @@ impl MegakernelProgram {
                             if !moe.has_gate_proj {
                                 // relu² path (Nemotron-H): up_proj → relu² → down_proj
                                 {
-                                    let mut up_inst = Instruction::new(OP_LINEAR_PROJ, se_is as u32);
-                                    up_inst.words[1] = act.moe_expert_up.as_write_ptr() as u64;
-                                    emit_linear_proj(&mut up_inst, &se.up_proj, 2);
-                                    up_inst.words[3] = act.normed.as_ptr() as u64;
-                                    up_inst.words[4] = se_is as u64;
-                                    up_inst.words[5] = hs as u64;
-                                    new_instructions.push(up_inst);
+                                    let (lp_op, lp_w) = linear_proj_opcode_ptr(&se.up_proj);
+                                    new_instructions.push(LinearProjInst::new(
+                                        lp_op, se_is as u32,
+                                        act.moe_expert_up.as_write_ptr(), lp_w, act.normed.as_ptr(),
+                                        se_is as i32, hs as i32, 0,
+                                    ).into_inst());
                                 }
                                 new_instructions.push(ReluSqInst::new(
                                     div_ceil(se_is as u32, 256),
@@ -905,13 +901,12 @@ impl MegakernelProgram {
                                     se_is as i32,
                                 ).into_inst());
                                 {
-                                    let mut dn_inst = Instruction::new(OP_LINEAR_PROJ, hs as u32);
-                                    dn_inst.words[1] = act.moe_expert_out.as_write_ptr() as u64;
-                                    emit_linear_proj(&mut dn_inst, &se.down_proj, 2);
-                                    dn_inst.words[3] = act.moe_expert_act.as_ptr() as u64;
-                                    dn_inst.words[4] = hs as u64;
-                                    dn_inst.words[5] = se_is as u64;
-                                    new_instructions.push(dn_inst);
+                                    let (lp_op, lp_w) = linear_proj_opcode_ptr(&se.down_proj);
+                                    new_instructions.push(LinearProjInst::new(
+                                        lp_op, hs as u32,
+                                        act.moe_expert_out.as_write_ptr(), lp_w, act.moe_expert_act.as_ptr(),
+                                        hs as i32, se_is as i32, 0,
+                                    ).into_inst());
                                 }
 
                                 if let Some(ref gate_buf) = moe.shared_expert_gate {
