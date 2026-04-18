@@ -6,12 +6,17 @@
 
 #define MOE_MAX_ACTIVE_EXPERTS 32
 #define MOE_MAX_GPUS 8
+// Maximum tokens per batched prefill dispatch (= CHUNK_TOKENS).
+// Fixed so expert_ids/expert_weights arrays have static size — no C VLAs.
+#define MOE_MAX_PREFILL_BATCH 64
 
 struct MoeWorkItem {
     // Monotonic sequence number. Workers poll this. 0 = no work.
     volatile uint32_t seq_num;
+    // Number of tokens in this dispatch. 1 for decode, up to MOE_MAX_PREFILL_BATCH for prefill.
+    uint32_t batch_size;
     uint32_t layer_idx;
-    uint32_t num_active;          // k (top-k experts selected)
+    uint32_t num_active;          // k (top-k experts selected per token)
     uint32_t hidden_size;
     uint32_t expert_intermediate_size;
     uint32_t has_gate_proj;       // 1 = gate+up (SiLU*up), 0 = up only (ReLU²)
@@ -20,22 +25,24 @@ struct MoeWorkItem {
     // Used by workers for gate_up/down projection in_dim and activation copy count.
     uint32_t gate_up_in_dim;
 
-    int32_t  expert_ids[MOE_MAX_ACTIVE_EXPERTS];
-    float    expert_weights[MOE_MAX_ACTIVE_EXPERTS];
+    // Per-token expert routing: layout [batch_size × num_active], indexed [t * num_active + j].
+    // Fixed size: MOE_MAX_PREFILL_BATCH × MOE_MAX_ACTIVE_EXPERTS entries.
+    int32_t  expert_ids[MOE_MAX_PREFILL_BATCH * MOE_MAX_ACTIVE_EXPERTS];
+    float    expert_weights[MOE_MAX_PREFILL_BATCH * MOE_MAX_ACTIVE_EXPERTS];
 
-    // GPU 0 VRAM pointer to expert activation [gate_up_in_dim] (for reference)
+    // GPU 0 VRAM pointer to expert activation [gate_up_in_dim] (single-token, for decode)
     uint64_t activation_ptr;
-    // GPU 0 VRAM pointer to per-worker output slots [num_workers * hidden_size]
+    // GPU 0 VRAM pointer to per-worker output slots [batch_size × num_workers × hidden_size]
+    // Layout: output_slots[(t * num_workers + gpu_idx) * hidden_size]
     uint64_t output_slots_ptr;
 
-    // Per-worker ack flags. Worker writes seq_num here when done.
+    // Per-worker ack flags. Worker writes seq_num here when done (single ack covers full batch).
     volatile uint32_t ack_flags[MOE_MAX_GPUS];
 
-    // Activation cache: GPU 0 writes gate_up_in_dim floats here (GART, bypasses L2)
-    // so workers can read without P2P VRAM staleness. Flexible array — allocation is
-    // sizeof(MoeWorkItem) + gate_up_in_dim * sizeof(float) bytes.
-    // Each GPU accesses this via its own per-GPU device VA (from hipHostGetDevicePointer),
-    // so offsetof arithmetic is always correct regardless of address space.
+    // Activation cache: GPU 0 writes batch_size × gate_up_in_dim floats here (GART, bypasses L2).
+    // Layout: activation_cache[t * gate_up_in_dim + d] for token t, dimension d.
+    // Flexible array — allocation is sizeof(MoeWorkItem) + batch_size * gate_up_in_dim * sizeof(float).
+    // Each GPU accesses this via its own per-GPU device VA (from hipHostGetDevicePointer).
     float activation_cache[];
 };
 

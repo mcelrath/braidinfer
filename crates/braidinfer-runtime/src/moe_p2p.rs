@@ -109,15 +109,20 @@ pub struct MoeP2pContext {
     pub hidden_size: usize,
 }
 
-/// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache array.
-/// seq_num(4)+layer_idx(4)+num_active(4)+hidden_size(4)+eis(4)+
-/// has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 32
-/// expert_ids[32]*4=128, expert_weights[32]*4=128
-/// activation_ptr(8)+output_slots_ptr(8)=16
-/// ack_flags[8]*4=32
-/// Total fixed = 336 bytes.
-/// Full work_queue size = MOE_WORK_QUEUE_FIXED + gate_up_in_dim * 4 (flexible activation_cache[]).
-pub const MOE_WORK_QUEUE_FIXED: usize = 336;
+/// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache[] tail.
+/// seq_num(4)+batch_size(4)+layer_idx(4)+num_active(4)+hidden_size(4)+
+/// eis(4)+has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 36
+/// expert_ids[64*32]*4 = 8192, expert_weights[64*32]*4 = 8192
+/// activation_ptr(8)+output_slots_ptr(8) = 16
+/// ack_flags[8]*4 = 32
+/// Total fixed = 36 + 8192 + 8192 + 16 + 32 = 16468 bytes.
+/// Full work_queue size = MOE_WORK_QUEUE_FIXED + batch_size * gate_up_in_dim * 4.
+pub const MOE_WORK_QUEUE_FIXED: usize = 16468;
+
+/// Maximum tokens per batched prefill dispatch (must match MOE_MAX_PREFILL_BATCH in moe_work_queue.h).
+pub const MAX_PREFILL_BATCH: usize = 64;
+/// Maximum active experts per token (must match MOE_MAX_ACTIVE_EXPERTS in moe_work_queue.h).
+pub const MAX_ACTIVE_EXPERTS: usize = 32;
 
 impl MoeP2pContext {
     /// Initialize GPU-native P2P MoE dispatch.
@@ -149,10 +154,14 @@ impl MoeP2pContext {
         // because P2P is enabled between all GPUs at init time.
         // Work queue includes flexible activation_cache[] at the end, sized to gate_up_in_dim.
         Device::set_current(gpu0)?;
-        let wq_size = MOE_WORK_QUEUE_FIXED + gate_up_in_dim * std::mem::size_of::<f32>();
+        // Allocate GART work queue sized for max batch (MAX_PREFILL_BATCH tokens).
+        // The flexible activation_cache tail holds batch_size * gate_up_in_dim floats.
+        let wq_size = MOE_WORK_QUEUE_FIXED + MAX_PREFILL_BATCH * gate_up_in_dim * std::mem::size_of::<f32>();
         let work_queue = MappedHostBuffer::<u8>::alloc(wq_size)?;
         let seq_counter = MappedHostBuffer::<u32>::alloc(1)?;
-        let output_slots = DeviceBuffer::<f32>::alloc(gpu0, num_gpus * hidden_size)?;
+        // Output slots sized for MAX_PREFILL_BATCH × num_gpus × hidden_size.
+        // Decode uses only the first (0 * num_gpus + gpu) * hs slot (batch_size=1).
+        let output_slots = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * num_gpus * hidden_size)?;
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
             gpu0,
@@ -315,6 +324,113 @@ impl MoeP2pContext {
             num_gpus,
             hidden_size,
         })
+    }
+
+    // Offsets into the MoeWorkItem byte buffer (must match moe_work_queue.h layout).
+    // seq_num(4)+batch_size(4)+layer_idx(4)+num_active(4)+hidden_size(4)+
+    // eis(4)+has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 36
+    // expert_ids[64*32]*4 = 8192 at offset 36
+    // expert_weights[64*32]*4 = 8192 at offset 8228
+    // activation_ptr(8)+output_slots_ptr(8) = 16 at offset 16420
+    // ack_flags[8]*4 = 32 at offset 16436
+    // activation_cache[] at MOE_WORK_QUEUE_FIXED = 16468
+    const OFF_BATCH_SIZE: usize = 4;
+    const OFF_LAYER_IDX: usize = 8;
+    const OFF_NUM_ACTIVE: usize = 12;
+    const OFF_HIDDEN_SIZE: usize = 16;
+    const OFF_EIS: usize = 20;
+    const OFF_HAS_GATE: usize = 24;
+    const OFF_NUM_WORKERS: usize = 28;
+    const OFF_GATE_UP_IN_DIM: usize = 32;
+    const OFF_EXPERT_IDS: usize = 36;
+    const OFF_EXPERT_WEIGHTS: usize = Self::OFF_EXPERT_IDS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4;
+    const OFF_OUTPUT_SLOTS_PTR: usize = Self::OFF_EXPERT_WEIGHTS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4 + 8; // skip activation_ptr
+    const OFF_ACK_FLAGS: usize = Self::OFF_OUTPUT_SLOTS_PTR + 8;
+    const OFF_ACTIVATION_CACHE: usize = MOE_WORK_QUEUE_FIXED;
+
+    /// CPU-initiated batched MoE dispatch for prefill.
+    ///
+    /// Writes batch_size tokens' activations + routing into the GART work queue,
+    /// triggers all worker GPUs, and returns the dispatch sequence number.
+    /// Caller should do GPU 0 local expert computation, then call `poll_prefill_batch_ack`.
+    ///
+    /// `activations`: [batch_size × gate_up_in_dim] flat slice
+    /// `expert_ids`: [batch_size × k] flat slice (row-major, k per token)
+    /// `expert_weights`: [batch_size × k] flat slice
+    pub fn trigger_prefill_batch(
+        &mut self,
+        activations: &[f32],
+        expert_ids: &[i32],
+        expert_weights: &[f32],
+        batch_size: usize,
+        k: usize,
+        layer_idx: u32,
+        hs: usize,
+        eis: usize,
+        has_gate_proj: bool,
+        gate_up_in_dim: usize,
+    ) -> u32 {
+        assert!(batch_size <= MAX_PREFILL_BATCH);
+        assert!(k <= MAX_ACTIVE_EXPERTS);
+        let num_workers = self.workers.len();
+        let wq_ptr = self.work_queue.host_ptr() as *mut u8;
+        unsafe {
+            (wq_ptr.add(Self::OFF_BATCH_SIZE) as *mut u32).write_volatile(batch_size as u32);
+            (wq_ptr.add(Self::OFF_LAYER_IDX) as *mut u32).write_volatile(layer_idx);
+            (wq_ptr.add(Self::OFF_NUM_ACTIVE) as *mut u32).write_volatile(k as u32);
+            (wq_ptr.add(Self::OFF_HIDDEN_SIZE) as *mut u32).write_volatile(hs as u32);
+            (wq_ptr.add(Self::OFF_EIS) as *mut u32).write_volatile(eis as u32);
+            (wq_ptr.add(Self::OFF_HAS_GATE) as *mut u32).write_volatile(has_gate_proj as u32);
+            (wq_ptr.add(Self::OFF_NUM_WORKERS) as *mut u32).write_volatile(num_workers as u32);
+            (wq_ptr.add(Self::OFF_GATE_UP_IN_DIM) as *mut u32).write_volatile(gate_up_in_dim as u32);
+            // output_slots_ptr
+            (wq_ptr.add(Self::OFF_OUTPUT_SLOTS_PTR) as *mut u64)
+                .write_volatile(self.output_slots.as_ptr() as u64);
+            // expert routing: [t * MAX_ACTIVE_EXPERTS + j]
+            let ids_dst = wq_ptr.add(Self::OFF_EXPERT_IDS) as *mut i32;
+            let wts_dst = wq_ptr.add(Self::OFF_EXPERT_WEIGHTS) as *mut f32;
+            for t in 0..batch_size {
+                for j in 0..k {
+                    ids_dst.add(t * MAX_ACTIVE_EXPERTS + j).write_volatile(expert_ids[t * k + j]);
+                    wts_dst.add(t * MAX_ACTIVE_EXPERTS + j).write_volatile(expert_weights[t * k + j]);
+                }
+            }
+            // activation cache: [batch_size × gate_up_in_dim]
+            let act_dst = wq_ptr.add(Self::OFF_ACTIVATION_CACHE) as *mut f32;
+            for i in 0..batch_size * gate_up_in_dim {
+                act_dst.add(i).write_volatile(activations[i]);
+            }
+            // clear ack flags
+            let ack_ptr = wq_ptr.add(Self::OFF_ACK_FLAGS) as *mut u32;
+            for w in 1..=num_workers {
+                ack_ptr.add(w).write_volatile(0u32);
+            }
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            let seq_ptr = self.seq_counter.host_ptr();
+            let seq = seq_ptr.read_volatile().wrapping_add(1);
+            seq_ptr.write_volatile(seq);
+            (wq_ptr as *mut u32).write_volatile(seq); // seq_num triggers workers
+            seq
+        }
+    }
+
+    /// Poll ack flags from all worker GPUs after `trigger_prefill_batch`.
+    /// Call after GPU 0 has finished its local expert computation.
+    pub fn poll_prefill_batch_ack(&self, seq: u32) {
+        let num_workers = self.workers.len();
+        let wq_ptr = self.work_queue.host_ptr() as *const u8;
+        let ack_ptr = unsafe { wq_ptr.add(Self::OFF_ACK_FLAGS) as *const u32 };
+        for w in 1..=num_workers {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let ack = unsafe { ack_ptr.add(w).read_volatile() };
+                if ack == seq { break; }
+                if std::time::Instant::now() > deadline {
+                    panic!("MoE worker GPU {} prefill batch ack timeout (seq={seq})", w);
+                }
+                std::hint::spin_loop();
+            }
+        }
     }
 
     /// Print timing analysis from the worker GPU timing buffers.

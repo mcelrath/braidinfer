@@ -109,77 +109,87 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         // gate_up_in_dim: expert input dimension (= hidden_size for standard MoE,
         // = moe_latent_size for Nemotron-H). Default to hs for backward compat.
         uint32_t gupd = (work_queue->gate_up_in_dim > 0) ? work_queue->gate_up_in_dim : hs;
-        // activation_cache: GPU 0 wrote activation here (GART, bypassing L2) before writing seq_num.
-        // Workers read from GART → always see fresh data (no L2-stale issue from GPU 0's VRAM).
-        const float* activation_src = (const float*)work_queue->activation_cache;
+        uint32_t bs = work_queue->batch_size;
+        if (bs == 0) bs = 1; // backward compat: decode path writes batch_size=1
+
         float* output_slots = (float*)work_queue->output_slots_ptr;
-        // Output slot stride is always hidden_size so GPU 0's sum loop uses consistent offsets.
-        float* my_output_slot = output_slots + my_gpu * hs;
-        // 1. Copy activation from work queue GART cache to local VRAM (gupd elements)
-        coop_copy(local_activation, activation_src, gupd, grid);
 
-        // t_copy_done: after activation copy (one inner grid.sync done).
-        if (timing_buf && threadIdx.x == 0 && blockIdx.x == 0 && timing_slot < N_TIMING_SLOTS) {
-            timing_buf[timing_slot * TIMING_FIELDS + 1] = gpu_clock();
-        }
+        // Process all tokens in the batch. For decode (bs=1), this is identical to the
+        // prior single-token path. For prefill (bs>1), all tokens are processed in one
+        // cooperative dispatch to avoid N sequential round-trips.
+        for (uint32_t t = 0; t < bs; t++) {
+            // activation_cache layout: [t * gupd .. (t+1) * gupd)
+            const float* activation_src = (const float*)work_queue->activation_cache + (size_t)t * gupd;
+            // output_slots layout: [(t * num_workers + my_gpu) * hs .. ...]
+            uint32_t num_workers = work_queue->num_workers;
+            float* my_output_slot = output_slots + ((size_t)t * num_workers + my_gpu) * hs;
 
-        grid.sync();
+            // 1. Copy activation from work queue GART cache to local VRAM (gupd elements)
+            coop_copy(local_activation, activation_src, gupd, grid);
 
-        // 2. Zero local output
-        coop_zero(local_output, hs, grid);
-
-        // 3. Process each expert assigned to this GPU
-        for (uint32_t j = 0; j < k; j++) {
-            int32_t eid = work_queue->expert_ids[j];
-            float ew = work_queue->expert_weights[j];
-            if (eid < 0 || eid >= 512) continue;
-
-            MoeExpertEntry& entry = config->entries[eid];
-            if (entry.gate_up_ptr == 0) continue;
-
-            const unsigned char* gate_up_data = (const unsigned char*)entry.gate_up_ptr;
-            const unsigned char* down_data = (const unsigned char*)entry.down_ptr;
-
-            if (has_gate) {
-                coop_gemv_pcg32(scratch_gate, gate_up_data,
-                                local_activation, eis, gupd, grid);
-                const unsigned char* up_data = gate_up_data +
-                    (long long)eis * config->gate_up_row_stride;
-                coop_gemv_pcg32(scratch_up, up_data,
-                                local_activation, eis, gupd, grid);
-                coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
-            } else {
-                coop_gemv_pcg32(scratch_up, gate_up_data,
-                                local_activation, eis, gupd, grid);
-                coop_relu_squared(scratch_act, scratch_up, eis, grid);
+            if (t == 0) {
+                // t_copy_done: after first token's activation copy.
+                if (timing_buf && threadIdx.x == 0 && blockIdx.x == 0 && timing_slot < N_TIMING_SLOTS) {
+                    timing_buf[timing_slot * TIMING_FIELDS + 1] = gpu_clock();
+                }
             }
 
-            // down: eis → gupd (= gate_up_in_dim, not necessarily hidden_size)
-            coop_gemv_pcg32(scratch_gate, down_data,
-                            scratch_act, gupd, eis, grid);
-            coop_weighted_acc(local_output, scratch_gate, ew, gupd, grid);
-        }
+            grid.sync();
 
-        // t_experts_done: after all expert GEMVs.
-        if (timing_buf && threadIdx.x == 0 && blockIdx.x == 0 && timing_slot < N_TIMING_SLOTS) {
-            timing_buf[timing_slot * TIMING_FIELDS + 2] = gpu_clock();
-        }
+            // 2. Zero local output
+            coop_zero(local_output, hs, grid);
 
-        // 4. P2P write local_output to GPU 0's output_slots (gupd elements)
-        // __threadfence_system() ensures the write is visible to GPU 0 after
-        // it polls ack_flags (which polls MTYPE_UC host-mapped memory).
-        __threadfence_system();
-        coop_copy(my_output_slot, local_output, gupd, grid);
+            // 3. Process each expert for this token
+            for (uint32_t j = 0; j < k; j++) {
+                int32_t eid = work_queue->expert_ids[t * MOE_MAX_ACTIVE_EXPERTS + j];
+                float ew = work_queue->expert_weights[t * MOE_MAX_ACTIVE_EXPERTS + j];
+                if (eid < 0 || eid >= 512) continue;
 
-        // t_output_done: after output P2P copy.
+                MoeExpertEntry& entry = config->entries[eid];
+                if (entry.gate_up_ptr == 0) continue;
+
+                const unsigned char* gate_up_data = (const unsigned char*)entry.gate_up_ptr;
+                const unsigned char* down_data = (const unsigned char*)entry.down_ptr;
+
+                if (has_gate) {
+                    coop_gemv_pcg32(scratch_gate, gate_up_data,
+                                    local_activation, eis, gupd, grid);
+                    const unsigned char* up_data = gate_up_data +
+                        (long long)eis * config->gate_up_row_stride;
+                    coop_gemv_pcg32(scratch_up, up_data,
+                                    local_activation, eis, gupd, grid);
+                    coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
+                } else {
+                    coop_gemv_pcg32(scratch_up, gate_up_data,
+                                    local_activation, eis, gupd, grid);
+                    coop_relu_squared(scratch_act, scratch_up, eis, grid);
+                }
+
+                // down: eis → gupd (= gate_up_in_dim, not necessarily hidden_size)
+                coop_gemv_pcg32(scratch_gate, down_data,
+                                scratch_act, gupd, eis, grid);
+                coop_weighted_acc(local_output, scratch_gate, ew, gupd, grid);
+            }
+
+            if (t == 0) {
+                // t_experts_done: after first token's expert GEMVs.
+                if (timing_buf && threadIdx.x == 0 && blockIdx.x == 0 && timing_slot < N_TIMING_SLOTS) {
+                    timing_buf[timing_slot * TIMING_FIELDS + 2] = gpu_clock();
+                }
+            }
+
+            // 4. P2P write local_output to GPU 0's output_slots.
+            __threadfence_system();
+            coop_copy(my_output_slot, local_output, gupd, grid);
+        } // end token loop
+
+        // t_output_done: after all tokens written.
         if (timing_buf && threadIdx.x == 0 && blockIdx.x == 0 && timing_slot < N_TIMING_SLOTS) {
             timing_buf[timing_slot * TIMING_FIELDS + 3] = gpu_clock();
             timing_slot++;
         }
 
-        // 5. Ack via host-mapped flag
-        // __threadfence_system() after coop_copy ensures P2P writes to output_slots
-        // are committed before the ack is visible to GPU 0.
+        // 5. Ack via host-mapped flag (single ack covers entire batch).
         __threadfence_system();
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             work_queue->ack_flags[my_gpu] = seq;

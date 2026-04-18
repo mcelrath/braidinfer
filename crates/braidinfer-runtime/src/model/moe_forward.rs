@@ -5,6 +5,7 @@ use super::Model;
 use crate::config::*;
 use crate::weights::*;
 use crate::gpu_utils::d2d_copy_f32;
+use crate::moe_p2p::{MAX_ACTIVE_EXPERTS, MAX_PREFILL_BATCH};
 
 impl Model {
     /// Uses individual kernel launches (no megakernel).
@@ -426,6 +427,350 @@ impl Model {
             &self.stream,
         )?;
 
+        Ok(())
+    }
+
+    /// Process n tokens through one MoE layer using batched P2P dispatch.
+    /// Input: prefill_hidden[0..n*hs] — current layer's input.
+    /// Output: prefill_hidden[0..n*hs] updated with MoE FFN output + residual.
+    ///
+    /// Dispatches all n tokens to worker GPUs in a single round-trip, while GPU 0
+    /// computes its own local experts in parallel. Replaces n sequential round-trips.
+    pub(crate) fn moe_ffn_forward_prefill_batched(
+        &mut self,
+        layer_idx: usize,
+        prefill_hidden: &mut DeviceBuffer<f32>, // [n × hs]
+        n: usize,
+    ) -> HipResult<()> {
+        assert!(n <= MAX_PREFILL_BATCH, "n={n} exceeds MAX_PREFILL_BATCH={MAX_PREFILL_BATCH}");
+        // SAFETY: raw pointer breaks borrow on moe_weights to allow mutable self.activations access.
+        let moe_ptr = self.moe_weights[layer_idx]
+            .as_ref()
+            .expect("moe_ffn_forward_prefill_batched called on non-MoE layer")
+            as *const crate::weights::MoeWeights;
+        let moe = unsafe { &*moe_ptr };
+        let hs = self.config.hidden_size;
+        let eis = moe.expert_intermediate_size;
+        let latent_size = moe.gate_up_in_dim;
+        let has_gate = moe.has_gate_proj;
+        let fc1_ptr: Option<*const crate::quant::LinearWeight> =
+            moe.fc1_latent_proj.as_ref().map(|w| w as *const _);
+        let fc2_ptr: Option<*const crate::quant::LinearWeight> =
+            moe.fc2_latent_proj.as_ref().map(|w| w as *const _);
+        let norm_weight = match &self.layers[layer_idx] {
+            LayerWeights::MoeFfn(w) => &w.input_norm as *const DeviceBuffer<u16>,
+            _ => panic!("layer {} is not MoeFfn", layer_idx),
+        };
+        let (k, gate_type) = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { num_active, gate_type, .. } => (*num_active, gate_type.clone()),
+            _ => unreachable!(),
+        };
+        assert!(k <= MAX_ACTIVE_EXPERTS, "k={k} > MAX_ACTIVE_EXPERTS={MAX_ACTIVE_EXPERTS}");
+        let (gate_mode, rsf) = match &gate_type {
+            GateType::Softmax => (0u32, 1.0f32),
+            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
+            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
+        };
+        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
+            .map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+
+        let mut all_activations = vec![0.0f32; n * latent_size];
+        let mut all_expert_ids = vec![0i32; n * k];
+        let mut all_expert_weights = vec![0.0f32; n * k];
+
+        // Step 1: Per-token norm + gate + topk + collect activation to host staging
+        for t in 0..n {
+            unsafe {
+                d2d_copy_f32(&mut self.activations.hidden, 0, prefill_hidden, t * hs, hs, &self.stream)?;
+            }
+            unsafe {
+                self.kernels.rmsnorm.forward(
+                    &mut self.activations.normed,
+                    &self.activations.hidden,
+                    &*norm_weight,
+                    1, hs as u32, self.config.rms_norm_eps, self.config.rms_norm_one_plus_w,
+                    &self.stream,
+                )?;
+            }
+            if let Some(fc1) = fc1_ptr {
+                unsafe { &*fc1 }.forward(
+                    &self.kernels.linear_proj, &mut self.activations.moe_latent,
+                    &self.activations.normed, latent_size as u32, hs as u32, &self.stream,
+                )?;
+            }
+            self.kernels.linear_proj.forward(
+                &mut self.activations.moe_scores, &moe.gate, &self.activations.normed,
+                moe.num_experts as u32, hs as u32, &self.stream,
+            )?;
+            self.kernels.moe_gate.forward(
+                &self.activations.moe_scores,
+                self.activations.moe_expert_ids.as_mut_ptr(),
+                self.activations.moe_expert_weights.as_mut_ptr(),
+                bias_ptr, moe.num_experts as u32, k as u32, gate_mode, rsf, &self.stream,
+            )?;
+            self.stream.synchronize()?;
+
+            let act_src = if fc1_ptr.is_some() {
+                self.activations.moe_latent.as_ptr()
+            } else {
+                self.activations.normed.as_ptr()
+            };
+            let dst_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    all_activations[t * latent_size..].as_mut_ptr() as *mut u8,
+                    latent_size * 4,
+                )
+            };
+            braidinfer_hip::memory::memcpy_d2h(dst_bytes, act_src as *const u8, latent_size * 4)?;
+
+            let ids_src = unsafe {
+                std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k)
+            };
+            let wts_src = unsafe {
+                std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k)
+            };
+            all_expert_ids[t * k..(t + 1) * k].copy_from_slice(ids_src);
+            all_expert_weights[t * k..(t + 1) * k].copy_from_slice(wts_src);
+        }
+
+        // Step 2: Trigger worker GPUs with full batch (single round-trip)
+        let seq = {
+            let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
+            p2p.trigger_prefill_batch(
+                &all_activations, &all_expert_ids, &all_expert_weights,
+                n, k, layer_idx as u32, hs, eis, has_gate, latent_size,
+            )
+        };
+
+        // Step 3: GPU 0 computes its local expert subset for all tokens in parallel with workers.
+        // Accumulate into ffn_down, then D2D copy to output_slots[(t * num_gpus + 0) * hs].
+        let (output_slots_raw, num_gpus) = {
+            let p2p = self.moe_p2p.as_mut().unwrap();
+            (p2p.output_slots.as_mut_ptr(), p2p.num_gpus)
+        };
+        for t in 0..n {
+            // Load token t's activation into GPU buffer for expert computation
+            let act_dst_ptr = if fc1_ptr.is_some() {
+                self.activations.moe_latent.as_mut_ptr() as *mut u8
+            } else {
+                self.activations.normed.as_mut_ptr() as *mut u8
+            };
+            let src_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    all_activations[t * latent_size..].as_ptr() as *const u8,
+                    latent_size * 4,
+                )
+            };
+            braidinfer_hip::memory::memcpy_h2d(act_dst_ptr, src_bytes, latent_size * 4)?;
+
+            // Zero ffn_down for accumulation
+            unsafe {
+                let rc = braidinfer_hip::ffi::hipMemsetAsync(
+                    self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
+                    0, hs * 4, self.stream.raw(),
+                );
+                if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+            }
+
+            let expert_in: *const f32 = if fc1_ptr.is_some() {
+                self.activations.moe_latent.as_ptr()
+            } else {
+                self.activations.normed.as_ptr()
+            };
+
+            // Run experts assigned to GPU 0 (slot_map[eid] is Some iff on GPU 0)
+            if let Some(dist) = &self.distributed_moe[layer_idx] {
+                let buf0 = &dist.expert_buffers[0];
+                for j in 0..k {
+                    let eid = all_expert_ids[t * k + j] as usize;
+                    let ew = all_expert_weights[t * k + j];
+                    if buf0.slot_map[eid].is_none() { continue; }
+                    let down_off = moe.expert_down.row_byte_offset_dim(eid * latent_size, eis);
+                    if has_gate {
+                        let gate_off = moe.expert_gate_up.row_byte_offset_dim(eid * 2 * eis, latent_size);
+                        let up_off = moe.expert_gate_up.row_byte_offset_dim(eid * 2 * eis + eis, latent_size);
+                        moe.expert_gate_up.forward_sub(
+                            &self.kernels.linear_proj,
+                            self.activations.moe_expert_gate.as_mut_ptr(),
+                            expert_in, eis as u32, latent_size as u32, gate_off, &self.stream,
+                        )?;
+                        moe.expert_gate_up.forward_sub(
+                            &self.kernels.linear_proj,
+                            self.activations.moe_expert_up.as_mut_ptr(),
+                            expert_in, eis as u32, latent_size as u32, up_off, &self.stream,
+                        )?;
+                        self.kernels.silu_mul.forward(
+                            &mut self.activations.moe_expert_act,
+                            &self.activations.moe_expert_gate,
+                            &self.activations.moe_expert_up,
+                            eis as u32, &self.stream,
+                        )?;
+                    } else {
+                        let up_off = moe.expert_gate_up.row_byte_offset_dim(eid * eis, latent_size);
+                        moe.expert_gate_up.forward_sub(
+                            &self.kernels.linear_proj,
+                            self.activations.moe_expert_up.as_mut_ptr(),
+                            expert_in, eis as u32, latent_size as u32, up_off, &self.stream,
+                        )?;
+                        self.kernels.silu_mul.relu_squared(
+                            &mut self.activations.moe_expert_act,
+                            &self.activations.moe_expert_up,
+                            eis as u32, &self.stream,
+                        )?;
+                    }
+                    moe.expert_down.forward_sub(
+                        &self.kernels.linear_proj,
+                        self.activations.moe_expert_out.as_mut_ptr(),
+                        self.activations.moe_expert_act.as_ptr(),
+                        latent_size as u32, eis as u32, down_off, &self.stream,
+                    )?;
+                    self.kernels.residual_add.weighted_accumulate(
+                        &mut self.activations.ffn_down,
+                        &self.activations.moe_expert_out,
+                        ew, latent_size as u32, &self.stream,
+                    )?;
+                }
+            }
+
+            // D2D copy ffn_down → output_slots[(t * num_gpus + 0) * hs]
+            unsafe {
+                let rc = braidinfer_hip::ffi::hipMemcpyAsync(
+                    output_slots_raw.add(t * num_gpus * hs) as *mut std::ffi::c_void,
+                    self.activations.ffn_down.as_ptr() as *const std::ffi::c_void,
+                    latent_size * 4,
+                    braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                    self.stream.raw(),
+                );
+                if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+            }
+        }
+
+        // Step 4: Wait for all worker GPUs to finish
+        self.stream.synchronize()?;
+        {
+            let p2p = self.moe_p2p.as_ref().unwrap();
+            p2p.poll_prefill_batch_ack(seq);
+        }
+
+        // Step 5: Sum output_slots + shared expert + residual per token
+        let output_slots_raw = self.moe_p2p.as_ref().unwrap().output_slots.as_ptr();
+        for t in 0..n {
+            unsafe {
+                d2d_copy_f32(&mut self.activations.hidden, 0, prefill_hidden, t * hs, hs, &self.stream)?;
+                d2d_copy_f32(&mut self.activations.residual, 0, &self.activations.hidden, 0, hs, &self.stream)?;
+            }
+            // Zero ffn_down; sum all GPU slots into it via moe_expert_out as temp
+            unsafe {
+                let rc = braidinfer_hip::ffi::hipMemsetAsync(
+                    self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
+                    0, hs * 4, self.stream.raw(),
+                );
+                if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+            }
+            for g in 0..num_gpus {
+                let slot_offset = (t * num_gpus + g) * hs;
+                unsafe {
+                    let rc = braidinfer_hip::ffi::hipMemcpyAsync(
+                        self.activations.moe_expert_out.as_mut_ptr() as *mut std::ffi::c_void,
+                        output_slots_raw.add(slot_offset) as *const std::ffi::c_void,
+                        latent_size * 4,
+                        braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                        self.stream.raw(),
+                    );
+                    if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+                }
+                self.kernels.residual_add.weighted_accumulate(
+                    &mut self.activations.ffn_down,
+                    &self.activations.moe_expert_out,
+                    1.0, latent_size as u32, &self.stream,
+                )?;
+            }
+
+            // fc2_latent_proj if present: ffn_down has latent-space sum, project → hs
+            if let Some(fc2) = fc2_ptr {
+                // Copy ffn_down (latent) → moe_expert_out as input to fc2
+                unsafe {
+                    let rc = braidinfer_hip::ffi::hipMemcpyAsync(
+                        self.activations.moe_expert_out.as_mut_ptr() as *mut std::ffi::c_void,
+                        self.activations.ffn_down.as_ptr() as *const std::ffi::c_void,
+                        latent_size * 4,
+                        braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
+                        self.stream.raw(),
+                    );
+                    if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+                }
+                unsafe { &*fc2 }.forward(
+                    &self.kernels.linear_proj,
+                    &mut self.activations.ffn_down,
+                    &self.activations.moe_expert_out,
+                    hs as u32, latent_size as u32, &self.stream,
+                )?;
+            }
+
+            // Shared expert (re-compute normed for this token)
+            let moe = self.moe_weights[layer_idx].as_ref().unwrap();
+            if let Some(ref se) = moe.shared_expert {
+                let se_is = match &self.config.layers[layer_idx].ffn_type {
+                    FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                        if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
+                    }
+                    _ => eis,
+                };
+                unsafe {
+                    self.kernels.rmsnorm.forward(
+                        &mut self.activations.normed, &self.activations.hidden, &*norm_weight,
+                        1, hs as u32, self.config.rms_norm_eps, self.config.rms_norm_one_plus_w,
+                        &self.stream,
+                    )?;
+                }
+                se.up_proj.forward(
+                    &self.kernels.linear_proj, &mut self.activations.moe_expert_up,
+                    &self.activations.normed, se_is as u32, hs as u32, &self.stream,
+                )?;
+                if moe.has_gate_proj {
+                    se.gate_proj.forward(
+                        &self.kernels.linear_proj, &mut self.activations.moe_expert_gate,
+                        &self.activations.normed, se_is as u32, hs as u32, &self.stream,
+                    )?;
+                    self.kernels.silu_mul.forward(
+                        &mut self.activations.moe_expert_act,
+                        &self.activations.moe_expert_gate, &self.activations.moe_expert_up,
+                        se_is as u32, &self.stream,
+                    )?;
+                } else {
+                    self.kernels.silu_mul.relu_squared(
+                        &mut self.activations.moe_expert_act, &self.activations.moe_expert_up,
+                        se_is as u32, &self.stream,
+                    )?;
+                }
+                se.down_proj.forward(
+                    &self.kernels.linear_proj, &mut self.activations.moe_expert_out,
+                    &self.activations.moe_expert_act, hs as u32, se_is as u32, &self.stream,
+                )?;
+                if let Some(ref gate_buf) = moe.shared_expert_gate {
+                    self.kernels.dot_sigmoid_scale_add.forward(
+                        &mut self.activations.ffn_down, &self.activations.moe_expert_out,
+                        &self.activations.normed, gate_buf, hs as u32, &self.stream,
+                    )?;
+                } else {
+                    self.kernels.residual_add.weighted_accumulate(
+                        &mut self.activations.ffn_down, &self.activations.moe_expert_out,
+                        1.0, hs as u32, &self.stream,
+                    )?;
+                }
+            }
+
+            // Residual add → write back to prefill_hidden[t * hs]
+            self.kernels.residual_add.forward(
+                &mut self.activations.hidden, &self.activations.residual,
+                &self.activations.ffn_down, hs as u32, &self.stream,
+            )?;
+            unsafe {
+                d2d_copy_f32(prefill_hidden, t * hs, &self.activations.hidden, 0, hs, &self.stream)?;
+            }
+        }
+
+        self.stream.synchronize()?;
         Ok(())
     }
 }

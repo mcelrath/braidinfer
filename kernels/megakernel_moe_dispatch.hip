@@ -77,6 +77,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
             wq->expert_ids[j] = src_expert_ids[j];
             wq->expert_weights[j] = src_expert_weights[j];
         }
+        wq->batch_size = 1;  // decode: single token per dispatch
         wq->layer_idx = layer_idx;
         wq->num_active = k;
         wq->hidden_size = hs;

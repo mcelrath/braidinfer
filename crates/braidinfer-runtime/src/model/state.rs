@@ -74,6 +74,10 @@ impl Model {
             );
         }
 
+        // Start MoE worker GPUs lazily (no-op if single-GPU or already started).
+        // Must happen before MoE layer processing and before the decode persistent worker launches.
+        self.ensure_moe_workers_started()?;
+
         let n = chunk.len();
         let hs = self.config.hidden_size;
         let num_layers = self.config.num_layers;
@@ -136,35 +140,43 @@ impl Model {
         while layer_i < num_layers {
             let lt = self.config.layers[layer_i].layer_type.clone();
             if lt == LayerType::MoeFfn {
-                // MoE layer: per-token d2d handoff + moe_ffn_forward
-                for t in 0..n {
-                    let bufs = self.prefill_bufs.take().unwrap();
-                    unsafe {
-                        d2d_copy_f32(
-                            &mut self.activations.hidden,
-                            0,
-                            &bufs.hidden,
-                            t * hs,
-                            hs,
-                            &self.stream,
-                        ).map_err(ModelError::Hip)?;
-                    }
+                if self.moe_p2p.is_some() {
+                    // Multi-GPU batched path: dispatch all n tokens in one round-trip
+                    let mut bufs = self.prefill_bufs.take().unwrap();
+                    self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
+                        .map_err(ModelError::Hip)?;
                     self.prefill_bufs = Some(bufs);
-                    self.moe_ffn_forward(layer_i).map_err(ModelError::Hip)?;
-                    let mut bufs2 = self.prefill_bufs.take().unwrap();
-                    unsafe {
-                        d2d_copy_f32(
-                            &mut bufs2.hidden,
-                            t * hs,
-                            &self.activations.hidden,
-                            0,
-                            hs,
-                            &self.stream,
-                        ).map_err(ModelError::Hip)?;
+                } else {
+                    // Single-GPU path: per-token d2d handoff + moe_ffn_forward
+                    for t in 0..n {
+                        let bufs = self.prefill_bufs.take().unwrap();
+                        unsafe {
+                            d2d_copy_f32(
+                                &mut self.activations.hidden,
+                                0,
+                                &bufs.hidden,
+                                t * hs,
+                                hs,
+                                &self.stream,
+                            ).map_err(ModelError::Hip)?;
+                        }
+                        self.prefill_bufs = Some(bufs);
+                        self.moe_ffn_forward(layer_i).map_err(ModelError::Hip)?;
+                        let mut bufs2 = self.prefill_bufs.take().unwrap();
+                        unsafe {
+                            d2d_copy_f32(
+                                &mut bufs2.hidden,
+                                t * hs,
+                                &self.activations.hidden,
+                                0,
+                                hs,
+                                &self.stream,
+                            ).map_err(ModelError::Hip)?;
+                        }
+                        self.prefill_bufs = Some(bufs2);
                     }
-                    self.prefill_bufs = Some(bufs2);
+                    self.stream.synchronize().map_err(ModelError::Hip)?;
                 }
-                self.stream.synchronize().map_err(ModelError::Hip)?;
                 layer_i += 1;
             } else {
                 // Find end of this non-MoE span
