@@ -723,6 +723,10 @@ impl Model {
     }
 
     pub fn reset_state(&mut self) -> Result<(), ModelError> {
+        // Persistent worker holds all GPU CUs — must shut it down before any hipMemcpy.
+        // It will be re-launched lazily on the next decode_step call.
+        drop(self.persistent_workers.take());
+
         let nh = self.config.linear_num_heads;
         let kd = self.config.linear_key_head_dim;
         let vd = self.config.linear_value_head_dim;
