@@ -38,6 +38,7 @@ pub(crate) fn make_opcode_gridx(opcode: u32, grid_x: u32) -> u64 {
 macro_rules! impl_inst {
     ($t:ty) => {
         impl $t {
+            #[allow(dead_code)]
             pub(crate) fn into_inst(self) -> Instruction {
                 unsafe { std::mem::transmute(self) }
             }

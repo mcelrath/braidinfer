@@ -393,5 +393,6 @@ impl Drop for PersistentDispatch {
                 }
             }
         }
+        braidinfer_hip::set_persistent_worker_active(false);
     }
 }

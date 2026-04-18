@@ -138,7 +138,7 @@ impl Model {
             if lt == LayerType::MoeFfn {
                 // MoE layer: per-token d2d handoff + moe_ffn_forward
                 for t in 0..n {
-                    let mut bufs = self.prefill_bufs.take().unwrap();
+                    let bufs = self.prefill_bufs.take().unwrap();
                     unsafe {
                         d2d_copy_f32(
                             &mut self.activations.hidden,
