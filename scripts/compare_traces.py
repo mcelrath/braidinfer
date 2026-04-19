@@ -47,8 +47,14 @@ def main():
     ref_checkpoints = read_trace(args.ref)
     test_checkpoints = read_trace(args.test)
 
-    ref_map = {name: data for name, data in ref_checkpoints}
-    test_map = {name: data for name, data in test_checkpoints}
+    ref_map = {}
+    for name, data in ref_checkpoints:
+        if name not in ref_map:
+            ref_map[name] = data
+    test_map = {}
+    for name, data in test_checkpoints:
+        if name not in test_map:
+            test_map[name] = data
 
     all_names = [name for name, _ in ref_checkpoints]
     diverged = False

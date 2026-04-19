@@ -164,6 +164,7 @@ impl MoeP2pContext {
         // Decode uses only the first (0 * num_gpus + gpu) * hs slot (batch_size=1).
         let output_slots = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * num_gpus * hidden_size)?;
 
+
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
             gpu0,
             0,

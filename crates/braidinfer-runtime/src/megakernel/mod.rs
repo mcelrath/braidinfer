@@ -4,6 +4,7 @@ use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use crate::model::ModelConfig;
 use crate::trace::TraceWriter;
@@ -82,7 +83,7 @@ pub(crate) struct PrefillCacheState {
 pub struct MegakernelProgram {
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) device_program: DeviceBuffer<u64>,
-    pub(crate) module: Module,
+    pub(crate) module: Arc<Module>,
     pub(crate) num_blocks: u32,
     pub(crate) shared_mem: u32,
     pub(crate) device: DeviceId,

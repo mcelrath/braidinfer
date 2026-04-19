@@ -82,6 +82,14 @@ impl Model {
         let hs = self.config.hidden_size;
         let num_layers = self.config.num_layers;
 
+        // Load megakernel module once and share across all segment compilations via Arc.
+        let megakernel_module = std::sync::Arc::new(
+            braidinfer_hip::module::Module::load(
+                self.device,
+                &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+            ).map_err(ModelError::Hip)?
+        );
+
         // Emit embedding instructions via megakernel: one per token into prefill_bufs.hidden[t*hs]
         // We compile a tiny "embedding-only" segment by treating layer_start=0,layer_end=0.
         // Then for each span of non-MoE layers, compile_prefill_segment handles them.
@@ -93,10 +101,7 @@ impl Model {
             use crate::megakernel::{Instruction, NUM_CUS, OP_HALT};
 
             let grid_x = (hs as u32 + 255) / 256;
-            let module = braidinfer_hip::module::Module::load(
-                self.device,
-                &crate::kernel::kernel_dir().join("megakernel.hsaco"),
-            ).map_err(ModelError::Hip)?;
+            let module = std::sync::Arc::clone(&megakernel_module);
             let shared_mem = (256u32 * 4 * 2).max(hs as u32 * 4).max(31776u32);
             let func = module.get_function("megakernel_f32").map_err(ModelError::Hip)?;
             let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize).map_err(ModelError::Hip)?;
@@ -184,8 +189,9 @@ impl Model {
                     self.stream.synchronize().map_err(ModelError::Hip)?;
                 }
                 layer_i += 1;
-            } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. }) {
-                // Attention + MoE FFN layer (Qwen-style): run attention via 1-layer segment,
+            } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
+                && (lt == LayerType::Attention || lt == LayerType::Gdn) {
+                // Attention/GDN + MoE FFN layer: run mixer via 1-layer segment,
                 // then dispatch MoE FFN separately.
                 let span_start = layer_i;
                 let span_end = layer_i + 1;
@@ -194,8 +200,8 @@ impl Model {
                 let key = (span_start, span_end, n);
                 let mut bufs = self.prefill_bufs.take().unwrap();
                 if !self.megakernel_prefill_segments.contains_key(&key) {
-                    let mk = MegakernelProgram::compile_prefill_segment(
-                        self, chunk, start_pos,
+                    let mk = MegakernelProgram::compile_prefill_segment_with_module(
+                        self, std::sync::Arc::clone(&megakernel_module), chunk, start_pos,
                         span_start, span_end, is_last,
                         &mut bufs,
                     ).map_err(ModelError::Hip)?;
@@ -238,10 +244,11 @@ impl Model {
             } else {
                 // Dense non-MoE span: accumulate contiguous dense layers
                 let span_start = layer_i;
-                while layer_i < num_layers
-                    && self.config.layers[layer_i].layer_type != LayerType::MoeFfn
-                    && !matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
-                {
+                while layer_i < num_layers {
+                    let l = &self.config.layers[layer_i];
+                    if l.layer_type == LayerType::MoeFfn { break; }
+                    if matches!(l.ffn_type, FfnType::MoE { .. })
+                        && (l.layer_type == LayerType::Attention || l.layer_type == LayerType::Gdn) { break; }
                     layer_i += 1;
                 }
                 let span_end = layer_i;
@@ -251,8 +258,8 @@ impl Model {
                 let mut bufs = self.prefill_bufs.take().unwrap();
 
                 if !self.megakernel_prefill_segments.contains_key(&key) {
-                    let mk = MegakernelProgram::compile_prefill_segment(
-                        self, chunk, start_pos,
+                    let mk = MegakernelProgram::compile_prefill_segment_with_module(
+                        self, std::sync::Arc::clone(&megakernel_module), chunk, start_pos,
                         span_start, span_end, is_last,
                         &mut bufs,
                     ).map_err(ModelError::Hip)?;
@@ -263,6 +270,18 @@ impl Model {
                 mk.execute(&self.stream).map_err(ModelError::Hip)?;
                 self.stream.synchronize().map_err(ModelError::Hip)?;
             }
+        }
+
+        // When the last layer is a standalone MoeFfn, no dense span has is_last=true,
+        // so the final norm + LM head was never emitted. Compute it now.
+        if self.config.layers[num_layers - 1].layer_type == LayerType::MoeFfn {
+            let bufs = self.prefill_bufs.take().unwrap();
+            let mk = MegakernelProgram::compile_final_norm_lm_head(
+                self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
+            ).map_err(ModelError::Hip)?;
+            self.prefill_bufs = Some(bufs);
+            mk.execute(&self.stream).map_err(ModelError::Hip)?;
+            self.stream.synchronize().map_err(ModelError::Hip)?;
         }
 
         Ok(())

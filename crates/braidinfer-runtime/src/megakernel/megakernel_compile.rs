@@ -3,6 +3,7 @@
 
 use braidinfer_hip::HipResult;
 use braidinfer_hip::module::Module;
+use std::sync::Arc;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 
@@ -217,14 +218,20 @@ impl MegakernelProgram {
                         );
                         barrier_layer_map.push((barrier_inst_idx, layer_i));
                     } else {
-                        Self::compile_moe_ffn(
-                            cfg,
-                            layer_i,
-                            &model.layers[layer_i],
-                            model.moe_weights[layer_i].as_ref().unwrap(),
-                            act,
-                            &mut instructions,
-                        );
+                        let moe = model.moe_weights[layer_i].as_ref().unwrap();
+                        // Skip if weights are lite-loaded (empty expert buffers, multi-GPU model).
+                        // When MULTI_GPU=1, expert_gate_up is a zero-size placeholder; using its
+                        // pointer in the megakernel would fault.
+                        if moe.expert_gate_up.num_elements() > 0 {
+                            Self::compile_moe_ffn(
+                                cfg,
+                                layer_i,
+                                &model.layers[layer_i],
+                                moe,
+                                act,
+                                &mut instructions,
+                            );
+                        }
                     }
                 }
                 crate::model::FfnType::None => {
@@ -261,7 +268,7 @@ impl MegakernelProgram {
         Ok(MegakernelProgram {
             instructions,
             device_program,
-            module,
+            module: Arc::new(module),
             num_blocks,
             shared_mem,
             device,
@@ -691,7 +698,7 @@ impl MegakernelProgram {
         Ok(MegakernelProgram {
             instructions,
             device_program,
-            module,
+            module: Arc::new(module),
             num_blocks,
             shared_mem,
             device,
@@ -740,6 +747,26 @@ impl MegakernelProgram {
         is_last_segment: bool,
         prefill_bufs: &mut PrefillBuffers,
     ) -> HipResult<Self> {
+        let module = Arc::new(Module::load(
+            model.device,
+            &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+        )?);
+        Self::compile_prefill_segment_with_module(
+            model, module, tokens, start_pos, layer_start, layer_end,
+            is_last_segment, prefill_bufs,
+        )
+    }
+
+    pub fn compile_prefill_segment_with_module(
+        model: &Model,
+        module: Arc<Module>,
+        tokens: &[u32],
+        start_pos: u32,
+        layer_start: usize,
+        layer_end: usize,
+        is_last_segment: bool,
+        prefill_bufs: &mut PrefillBuffers,
+    ) -> HipResult<Self> {
         let n = tokens.len();
         assert!(n > 0 && n <= CHUNK_TOKENS);
         assert!(layer_start <= layer_end);
@@ -747,11 +774,6 @@ impl MegakernelProgram {
         let cfg = &model.config;
         let device = model.device;
         let act = &model.activations;
-
-        let module = Module::load(
-            device,
-            &crate::kernel::kernel_dir().join("megakernel.hsaco"),
-        )?;
         let shared_mem = (256u32 * 4 * 2)
             .max((cfg.hidden_size as u32) * 4)
             .max(31776u32);
@@ -782,13 +804,15 @@ impl MegakernelProgram {
             prefill_bufs.position_ids.copy_from_host(&pos_data)?;
         }
 
-        // Count GDN/KV indices up to layer_start
+        // Count GDN/KV/Mamba2 indices up to layer_start
         let mut gdn_idx = 0usize;
+        let mut mamba2_idx = 0usize;
         let mut kv_idx = 0usize;
         for i in 0..layer_start {
             use crate::model::LayerType;
             match cfg.layers[i].layer_type {
-                LayerType::Gdn | LayerType::Mamba2 => gdn_idx += 1,
+                LayerType::Gdn => gdn_idx += 1,
+                LayerType::Mamba2 => mamba2_idx += 1,
                 LayerType::Attention => kv_idx += 1,
                 _ => {}
             }
@@ -910,10 +934,22 @@ impl MegakernelProgram {
 
                 Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
                 gdn_idx += 1;
+            } else if cfg.layers[layer_i].layer_type == LayerType::Mamba2 {
+                let state = &model.mamba2_states[mamba2_idx];
+                // Sequential per-token Mamba2: for t=0..n, D2D(hidden[t]→act.hidden),
+                // run Mamba2 step (updates ssm/conv state in place), D2D(act.hidden→hidden[t]).
+                for t in 0..n {
+                    let hidden_t = unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) };
+                    let hidden_t_w = unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) };
+                    instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), hidden_t, hs as i32).into_inst());
+                    Self::compile_mamba2_layer(cfg, &model.layers[layer_i], act, state, &mut instructions);
+                    instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), hidden_t_w, act.hidden.as_ptr(), hs as i32).into_inst());
+                }
+                mamba2_idx += 1;
+                // compile_ffn_batched skips Mamba2 layers (FfnType::None), so no call needed.
             } else if cfg.layers[layer_i].layer_type == LayerType::MoeFfn {
                 // MoeFfn layers are handled by the CPU path in prefill_mixed_chunk — skip here.
             }
-            // Mamba2 not handled in prefill — skip silently
         }
 
         if is_last_segment {
@@ -959,6 +995,81 @@ impl MegakernelProgram {
                 attn_inst_indices: prefill_attn_inst_indices,
                 n,
             }),
+            dump_buffer: None,
+            dump_counter: None,
+            dump_capacity: 0,
+            barrier_layer_map: Vec::new(),
+            multi_gpu_attn_boundaries: Vec::new(),
+            flat_program,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// Compile a tiny program that applies final RMSNorm + LM head to the last token
+    /// in prefill_bufs.hidden and writes logits to act.logits.
+    /// Used when the model's last layer is a standalone MoeFfn (no dense is_last span).
+    pub(crate) fn compile_final_norm_lm_head(
+        model: &Model,
+        module: Arc<Module>,
+        prefill_bufs: &PrefillBuffers,
+        n: usize,
+    ) -> HipResult<Self> {
+        let cfg = &model.config;
+        let act = &model.activations;
+        let hs = cfg.hidden_size;
+        let eps = cfg.rms_norm_eps;
+        let vs = cfg.vocab_size;
+        let grid_x = div_ceil(hs as u32, 256);
+        let device = model.device;
+
+        let shared_mem = (256u32 * 4 * 2).max(hs as u32 * 4).max(super::SHARED_LPROJ_TOTAL);
+        let func = module.get_function("megakernel_f32")?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let num_blocks = blocks_per_sm.max(1) as u32 * NUM_CUS;
+
+        let mut instructions: Vec<Instruction> = Vec::new();
+        instructions.push(D2dCopyInst::new(grid_x, act.hidden.as_write_ptr(),
+            unsafe { prefill_bufs.hidden.as_ptr().add((n - 1) * hs) }, hs as i32).into_inst());
+        instructions.push(D2dCopyInst::new(grid_x, act.normed.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+        instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+            act.hidden.as_write_ptr(), act.normed.as_ptr(),
+            model.final_norm_weight.as_ptr(), hs as i32, eps).into_inst());
+        let lm_w_ptr = if cfg.tie_word_embeddings {
+            model.embed_weight.as_ptr() as *const u8
+        } else {
+            model.lm_head_weight.as_ptr() as *const u8
+        };
+        instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, vs as u32,
+            act.logits.as_write_ptr(), lm_w_ptr, act.hidden.as_ptr(),
+            vs as i32, hs as i32, 0).into_inst());
+        instructions.push(Instruction::new(OP_HALT, 0));
+
+        let device_program = upload_program(device, &instructions)?;
+        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
+
+        Ok(MegakernelProgram {
+            instructions,
+            device_program,
+            module,
+            num_blocks,
+            shared_mem,
+            device,
+            embedding_inst_idx: 0,
+            _mrope_inst_indices: Vec::new(),
+            gqa_attn_inst_indices: Vec::new(),
+            position_ids_dev_ptr: 0,
+            kv: super::KvConfig {
+                max_seq_len: cfg.max_seq_len as u32,
+                num_kv_heads: cfg.num_kv_heads,
+                head_dim: cfg.head_dim,
+                kv_write_indices: Vec::new(),
+                kv_base_ptrs: Vec::new(),
+            },
+            paged: false,
+            paged_kv: None,
+            quantized_kv: false,
+            quant_kv: None,
+            prefill_cache: None,
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,

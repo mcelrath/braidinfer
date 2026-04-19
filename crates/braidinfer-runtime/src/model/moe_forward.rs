@@ -460,7 +460,8 @@ impl Model {
         let norm_weight = match &self.layers[layer_idx] {
             LayerWeights::MoeFfn(w) => &w.input_norm as *const DeviceBuffer<u16>,
             LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
-            _ => panic!("layer {} is not MoeFfn or Attention", layer_idx),
+            LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
+            _ => panic!("layer {} is not MoeFfn, Attention, or Gdn", layer_idx),
         };
         let (k, gate_type) = match &self.config.layers[layer_idx].ffn_type {
             FfnType::MoE { num_active, gate_type, .. } => (*num_active, gate_type.clone()),
@@ -511,6 +512,14 @@ impl Model {
             )?;
             self.stream.synchronize()?;
 
+            // Trace: capture normed (pre-fc1) for token 0 — safe here, persistent worker not started.
+            if t == 0 && self.trace.is_some() {
+                let mut normed_buf = vec![0.0f32; hs];
+                self.activations.normed.copy_to_host(&mut normed_buf)?;
+                self.trace.as_mut().unwrap()
+                    .write_checkpoint(&format!("L{layer_idx}.moe_normed"), &normed_buf);
+            }
+
             let act_src = if fc1_ptr.is_some() {
                 self.activations.moe_latent.as_ptr()
             } else {
@@ -532,6 +541,15 @@ impl Model {
             };
             all_expert_ids[t * k..(t + 1) * k].copy_from_slice(ids_src);
             all_expert_weights[t * k..(t + 1) * k].copy_from_slice(wts_src);
+        }
+
+        // Trace: write expert IDs and weights for token 0
+        if self.trace.is_some() {
+            let ids_f32: Vec<f32> = all_expert_ids[0..k].iter().map(|&x| x as f32).collect();
+            self.trace.as_mut().unwrap()
+                .write_checkpoint(&format!("L{layer_idx}.moe_expert_ids"), &ids_f32);
+            self.trace.as_mut().unwrap()
+                .write_checkpoint(&format!("L{layer_idx}.moe_expert_weights"), &all_expert_weights[0..k]);
         }
 
         // Step 2: Trigger worker GPUs with full batch (single round-trip)
@@ -579,26 +597,33 @@ impl Model {
                 self.activations.normed.as_ptr()
             };
 
-            // Run experts assigned to GPU 0 (slot_map[eid] is Some iff on GPU 0)
+            // Run experts assigned to GPU 0 (slot_map[eid] is Some iff on GPU 0).
+            // Use dist.gpu0_gate_up_base/gpu0_down_base with slot-based strides:
+            // moe.expert_gate_up is lite-loaded (hipMalloc(0)) for MULTI_GPU models and
+            // must not be dereferenced.
             if let Some(dist) = &self.distributed_moe[layer_idx] {
                 let buf0 = &dist.expert_buffers[0];
+                let func_name = match dist.weight_format {
+                    crate::model::WeightFormat::Bf16 => "linear_proj_f32",
+                    crate::model::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
+                    crate::model::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
+                };
                 for j in 0..k {
                     let eid = all_expert_ids[t * k + j] as usize;
                     let ew = all_expert_weights[t * k + j];
-                    if buf0.slot_map[eid].is_none() { continue; }
-                    let down_off = moe.expert_down.row_byte_offset_dim(eid * latent_size, eis);
+                    let slot = match buf0.slot_map[eid] { Some(s) => s, None => continue };
+                    let gu_ptr = unsafe { dist.gpu0_gate_up_base.add(slot * dist.gate_up_expert_stride) };
+                    let dn_ptr = unsafe { dist.gpu0_down_base.add(slot * dist.down_expert_stride) };
                     if has_gate {
-                        let gate_off = moe.expert_gate_up.row_byte_offset_dim(eid * 2 * eis, latent_size);
-                        let up_off = moe.expert_gate_up.row_byte_offset_dim(eid * 2 * eis + eis, latent_size);
-                        moe.expert_gate_up.forward_sub(
-                            &self.kernels.linear_proj,
+                        // gate rows [0..eis), up rows [eis..2*eis) packed consecutively
+                        let up_ptr = unsafe { gu_ptr.add(eis * dist.gate_up_row_stride) };
+                        self.kernels.linear_proj.forward_packed_ptr(
                             self.activations.moe_expert_gate.as_mut_ptr(),
-                            expert_in, eis as u32, latent_size as u32, gate_off, &self.stream,
+                            gu_ptr, expert_in, eis as u32, latent_size as u32, func_name, &self.stream,
                         )?;
-                        moe.expert_gate_up.forward_sub(
-                            &self.kernels.linear_proj,
+                        self.kernels.linear_proj.forward_packed_ptr(
                             self.activations.moe_expert_up.as_mut_ptr(),
-                            expert_in, eis as u32, latent_size as u32, up_off, &self.stream,
+                            up_ptr, expert_in, eis as u32, latent_size as u32, func_name, &self.stream,
                         )?;
                         self.kernels.silu_mul.forward(
                             &mut self.activations.moe_expert_act,
@@ -607,11 +632,9 @@ impl Model {
                             eis as u32, &self.stream,
                         )?;
                     } else {
-                        let up_off = moe.expert_gate_up.row_byte_offset_dim(eid * eis, latent_size);
-                        moe.expert_gate_up.forward_sub(
-                            &self.kernels.linear_proj,
+                        self.kernels.linear_proj.forward_packed_ptr(
                             self.activations.moe_expert_up.as_mut_ptr(),
-                            expert_in, eis as u32, latent_size as u32, up_off, &self.stream,
+                            gu_ptr, expert_in, eis as u32, latent_size as u32, func_name, &self.stream,
                         )?;
                         self.kernels.silu_mul.relu_squared(
                             &mut self.activations.moe_expert_act,
@@ -619,11 +642,10 @@ impl Model {
                             eis as u32, &self.stream,
                         )?;
                     }
-                    moe.expert_down.forward_sub(
-                        &self.kernels.linear_proj,
+                    self.kernels.linear_proj.forward_packed_ptr(
                         self.activations.moe_expert_out.as_mut_ptr(),
-                        self.activations.moe_expert_act.as_ptr(),
-                        latent_size as u32, eis as u32, down_off, &self.stream,
+                        dn_ptr, self.activations.moe_expert_act.as_ptr(),
+                        latent_size as u32, eis as u32, func_name, &self.stream,
                     )?;
                     self.kernels.residual_add.weighted_accumulate(
                         &mut self.activations.ffn_down,
@@ -759,6 +781,15 @@ impl Model {
                         1.0, hs as u32, &self.stream,
                     )?;
                 }
+            }
+
+            // Trace: ffn_down after all expert accumulation + shared expert (token 0 only)
+            if t == 0 && self.trace.is_some() {
+                self.stream.synchronize()?;
+                let mut buf = vec![0.0f32; hs];
+                self.activations.ffn_down.copy_to_host(&mut buf)?;
+                self.trace.as_mut().unwrap()
+                    .write_checkpoint(&format!("L{layer_idx}.moe_ffn_down"), &buf);
             }
 
             // Residual add → write back to prefill_hidden[t * hs]
