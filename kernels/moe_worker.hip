@@ -114,15 +114,10 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
 
         float* output_slots = (float*)work_queue->output_slots_ptr;
 
-        // Process all tokens in the batch. For decode (bs=1), this is identical to the
-        // prior single-token path. For prefill (bs>1), all tokens are processed in one
-        // cooperative dispatch to avoid N sequential round-trips.
         for (uint32_t t = 0; t < bs; t++) {
-            // activation_cache layout: [t * gupd .. (t+1) * gupd)
             const float* activation_src = (const float*)work_queue->activation_cache + (size_t)t * gupd;
-            // output_slots layout: [(t * num_workers + my_gpu) * hs .. ...]
-            uint32_t num_workers = work_queue->num_workers;
-            float* my_output_slot = output_slots + ((size_t)t * num_workers + my_gpu) * hs;
+            uint32_t total_gpus = work_queue->num_workers + 1;
+            float* my_output_slot = output_slots + ((size_t)t * total_gpus + my_gpu) * hs;
 
             // 1. Copy activation from work queue GART cache to local VRAM (gupd elements)
             coop_copy(local_activation, activation_src, gupd, grid);

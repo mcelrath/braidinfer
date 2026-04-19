@@ -30,10 +30,15 @@ struct MoeWorkItem {
     int32_t  expert_ids[MOE_MAX_PREFILL_BATCH * MOE_MAX_ACTIVE_EXPERTS];
     float    expert_weights[MOE_MAX_PREFILL_BATCH * MOE_MAX_ACTIVE_EXPERTS];
 
+    // Explicit padding to ensure 8-byte alignment for activation_ptr.
+    // After the header (9×uint32 = 36 bytes) + expert_ids (8192 bytes) + expert_weights (8192 bytes)
+    // = 16420 bytes, which is 4 mod 8. Four bytes of padding brings to 16424 (8-byte aligned).
+    uint32_t _pad_align;
+
     // GPU 0 VRAM pointer to expert activation [gate_up_in_dim] (single-token, for decode)
     uint64_t activation_ptr;
-    // GPU 0 VRAM pointer to per-worker output slots [batch_size × num_workers × hidden_size]
-    // Layout: output_slots[(t * num_workers + gpu_idx) * hidden_size]
+    // GPU 0 VRAM pointer to per-worker output slots [batch_size × total_gpus × hidden_size]
+    // Layout: output_slots[(t * total_gpus + gpu_idx) * hidden_size], total_gpus = num_workers + 1
     uint64_t output_slots_ptr;
 
     // Per-worker ack flags. Worker writes seq_num here when done (single ack covers full batch).

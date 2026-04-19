@@ -459,7 +459,8 @@ impl Model {
             moe.fc2_latent_proj.as_ref().map(|w| w as *const _);
         let norm_weight = match &self.layers[layer_idx] {
             LayerWeights::MoeFfn(w) => &w.input_norm as *const DeviceBuffer<u16>,
-            _ => panic!("layer {} is not MoeFfn", layer_idx),
+            LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
+            _ => panic!("layer {} is not MoeFfn or Attention", layer_idx),
         };
         let (k, gate_type) = match &self.config.layers[layer_idx].ffn_type {
             FfnType::MoE { num_active, gate_type, .. } => (*num_active, gate_type.clone()),

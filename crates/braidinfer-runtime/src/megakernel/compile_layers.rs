@@ -208,12 +208,17 @@ impl MegakernelProgram {
 
     pub(super) fn compile_ffn_batched(
         cfg: &ModelConfig,
+        layer_i: usize,
         layer: &LayerWeights,
         bufs: &PrefillBuffers,
         n: usize,
         instructions: &mut Vec<Instruction>,
     ) {
-        use crate::model::LinearWeight;
+        use crate::model::{FfnType, LinearWeight};
+        match &cfg.layers[layer_i].ffn_type {
+            FfnType::MoE { .. } | FfnType::None => return,
+            FfnType::Dense => {}
+        }
         let hs = cfg.hidden_size;
         let is = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;

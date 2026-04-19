@@ -113,11 +113,12 @@ pub struct MoeP2pContext {
 /// seq_num(4)+batch_size(4)+layer_idx(4)+num_active(4)+hidden_size(4)+
 /// eis(4)+has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 36
 /// expert_ids[64*32]*4 = 8192, expert_weights[64*32]*4 = 8192
+/// _pad_align(4) to align activation_ptr to 8 bytes (offset 16420 → 16424)
 /// activation_ptr(8)+output_slots_ptr(8) = 16
 /// ack_flags[8]*4 = 32
-/// Total fixed = 36 + 8192 + 8192 + 16 + 32 = 16468 bytes.
+/// Total fixed = 36 + 8192 + 8192 + 4 + 16 + 32 = 16472 bytes.
 /// Full work_queue size = MOE_WORK_QUEUE_FIXED + batch_size * gate_up_in_dim * 4.
-pub const MOE_WORK_QUEUE_FIXED: usize = 16468;
+pub const MOE_WORK_QUEUE_FIXED: usize = 16472;
 
 /// Maximum tokens per batched prefill dispatch (must match MOE_MAX_PREFILL_BATCH in moe_work_queue.h).
 pub const MAX_PREFILL_BATCH: usize = 64;
@@ -331,9 +332,11 @@ impl MoeP2pContext {
     // eis(4)+has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 36
     // expert_ids[64*32]*4 = 8192 at offset 36
     // expert_weights[64*32]*4 = 8192 at offset 8228
-    // activation_ptr(8)+output_slots_ptr(8) = 16 at offset 16420
-    // ack_flags[8]*4 = 32 at offset 16436
-    // activation_cache[] at MOE_WORK_QUEUE_FIXED = 16468
+    // _pad_align(4) at offset 16420 (alignment padding before activation_ptr)
+    // activation_ptr(8) at offset 16424
+    // output_slots_ptr(8) at offset 16432
+    // ack_flags[8]*4 = 32 at offset 16440
+    // activation_cache[] at MOE_WORK_QUEUE_FIXED = 16472
     const OFF_BATCH_SIZE: usize = 4;
     const OFF_LAYER_IDX: usize = 8;
     const OFF_NUM_ACTIVE: usize = 12;
@@ -344,7 +347,8 @@ impl MoeP2pContext {
     const OFF_GATE_UP_IN_DIM: usize = 32;
     const OFF_EXPERT_IDS: usize = 36;
     const OFF_EXPERT_WEIGHTS: usize = Self::OFF_EXPERT_IDS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4;
-    const OFF_OUTPUT_SLOTS_PTR: usize = Self::OFF_EXPERT_WEIGHTS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4 + 8; // skip activation_ptr
+    // +4 for _pad_align, +8 for activation_ptr, then output_slots_ptr
+    const OFF_OUTPUT_SLOTS_PTR: usize = Self::OFF_EXPERT_WEIGHTS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4 + 4 + 8;
     const OFF_ACK_FLAGS: usize = Self::OFF_OUTPUT_SLOTS_PTR + 8;
     const OFF_ACTIVATION_CACHE: usize = MOE_WORK_QUEUE_FIXED;
 

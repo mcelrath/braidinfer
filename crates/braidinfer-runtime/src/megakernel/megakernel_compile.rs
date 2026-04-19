@@ -447,6 +447,7 @@ impl MegakernelProgram {
                 // Batched FFN
                 Self::compile_ffn_batched(
                     cfg,
+                    layer_i,
                     &model.layers[layer_i],
                     prefill_bufs,
                     n,
@@ -627,6 +628,7 @@ impl MegakernelProgram {
                 // --- Batched FFN ---
                 Self::compile_ffn_batched(
                     cfg,
+                    layer_i,
                     &model.layers[layer_i],
                     prefill_bufs,
                     n,
@@ -856,7 +858,7 @@ impl MegakernelProgram {
                     }
                 }
 
-                Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
                 _attn_layer_count += 1;
                 kv_idx += 1;
             } else if cfg.layers[layer_i].layer_type == LayerType::Gdn {
@@ -906,7 +908,7 @@ impl MegakernelProgram {
                     instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), hidden_t, act.out_proj.as_ptr(), hidden_t, hs as i32).into_inst());
                 }
 
-                Self::compile_ffn_batched(cfg, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
                 gdn_idx += 1;
             } else if cfg.layers[layer_i].layer_type == LayerType::MoeFfn {
                 // MoeFfn layers are handled by the CPU path in prefill_mixed_chunk — skip here.

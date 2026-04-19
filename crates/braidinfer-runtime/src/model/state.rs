@@ -135,11 +135,17 @@ impl Model {
             self.stream.synchronize().map_err(ModelError::Hip)?;
         }
 
-        // Step 2: Walk layers, identify contiguous non-MoE spans vs MoE layers
+        // Step 2: Walk layers, identify contiguous non-MoE spans vs MoE layers.
+        // MoE layer types:
+        //   - LayerType::MoeFfn: standalone MoE FFN (Nemotron 'E'), no attention — dispatch only
+        //   - LayerType::Attention + ffn_type::MoE: attention + MoE FFN (Qwen) — 1-layer attention
+        //     span (compile_prefill_segment skips FFN for MoE) then MoE FFN dispatch
         let mut layer_i = 0usize;
+
         while layer_i < num_layers {
             let lt = self.config.layers[layer_i].layer_type.clone();
             if lt == LayerType::MoeFfn {
+                // Nemotron standalone MoE FFN layer (no attention part).
                 if self.moe_p2p.is_some() {
                     // Multi-GPU batched path: dispatch all n tokens in one round-trip
                     let mut bufs = self.prefill_bufs.take().unwrap();
@@ -178,10 +184,64 @@ impl Model {
                     self.stream.synchronize().map_err(ModelError::Hip)?;
                 }
                 layer_i += 1;
-            } else {
-                // Find end of this non-MoE span
+            } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. }) {
+                // Attention + MoE FFN layer (Qwen-style): run attention via 1-layer segment,
+                // then dispatch MoE FFN separately.
                 let span_start = layer_i;
-                while layer_i < num_layers && self.config.layers[layer_i].layer_type != LayerType::MoeFfn {
+                let span_end = layer_i + 1;
+                let is_last = span_end == num_layers;
+
+                let key = (span_start, span_end, n);
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                if !self.megakernel_prefill_segments.contains_key(&key) {
+                    let mk = MegakernelProgram::compile_prefill_segment(
+                        self, chunk, start_pos,
+                        span_start, span_end, is_last,
+                        &mut bufs,
+                    ).map_err(ModelError::Hip)?;
+                    self.megakernel_prefill_segments.insert(key, mk);
+                }
+                self.prefill_bufs = Some(bufs);
+                let mk = self.megakernel_prefill_segments.get(&key).unwrap();
+                mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                self.stream.synchronize().map_err(ModelError::Hip)?;
+
+                // Dispatch MoE FFN for this layer
+                if self.moe_p2p.is_some() {
+                    let mut bufs = self.prefill_bufs.take().unwrap();
+                    self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
+                        .map_err(ModelError::Hip)?;
+                    self.prefill_bufs = Some(bufs);
+                } else {
+                    for t in 0..n {
+                        let bufs = self.prefill_bufs.take().unwrap();
+                        unsafe {
+                            d2d_copy_f32(
+                                &mut self.activations.hidden, 0,
+                                &bufs.hidden, t * hs, hs, &self.stream,
+                            ).map_err(ModelError::Hip)?;
+                        }
+                        self.prefill_bufs = Some(bufs);
+                        self.moe_ffn_forward(layer_i).map_err(ModelError::Hip)?;
+                        let mut bufs2 = self.prefill_bufs.take().unwrap();
+                        unsafe {
+                            d2d_copy_f32(
+                                &mut bufs2.hidden, t * hs,
+                                &self.activations.hidden, 0, hs, &self.stream,
+                            ).map_err(ModelError::Hip)?;
+                        }
+                        self.prefill_bufs = Some(bufs2);
+                    }
+                    self.stream.synchronize().map_err(ModelError::Hip)?;
+                }
+                layer_i += 1;
+            } else {
+                // Dense non-MoE span: accumulate contiguous dense layers
+                let span_start = layer_i;
+                while layer_i < num_layers
+                    && self.config.layers[layer_i].layer_type != LayerType::MoeFfn
+                    && !matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
+                {
                     layer_i += 1;
                 }
                 let span_end = layer_i;
