@@ -342,10 +342,14 @@ fn main() {
     }
 
     // Skip coherence and prefill for very large models where VRAM is too tight for extra buffers.
-    // Threshold: model uses > 80% of total VRAM.
+    // Use post-load free VRAM to handle cases where bqnt file size is unavailable (bqnt_size_bytes=0).
+    let post_load_free: usize = vram_free_per_gpu().iter().sum();
     let vram_used_pct = if total_free_vram > 0 { bqnt_size_bytes as usize * 100 / total_free_vram } else { 0 };
-    if vram_used_pct > 80 {
-        println!("=== Coherence test: SKIPPED (model uses ~{vram_used_pct}% of total VRAM) ===");
+    // Skip if: bqnt says >80% used, OR post-load free < 20% of total (catches bqnt_size_bytes=0 case)
+    let vram_too_tight = vram_used_pct > 80 || (total_free_vram > 0 && post_load_free * 100 / total_free_vram < 20);
+    if vram_too_tight {
+        println!("=== Coherence test: SKIPPED (model uses ~{vram_used_pct}% of total VRAM, {:.1}GB free post-load) ===",
+            post_load_free as f64 / 1e9);
         println!("=== Prefill benchmark: SKIPPED (model uses ~{vram_used_pct}% of total VRAM) ===");
     } else {
         bench_coherence(&mut model, 8);
