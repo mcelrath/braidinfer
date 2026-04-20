@@ -315,7 +315,14 @@ fn main() {
 
     // Multi-GPU coherence test runs before the main model is loaded to avoid holding
     // two large model instances in VRAM simultaneously.
-    bench_coherence_multi_gpu(model_dir, 8);
+    // Skip if model is too large to fit two copies (bqnt_size_bytes > 40% of total free VRAM).
+    let total_free_vram: usize = vram_free_per_gpu().iter().sum();
+    if bqnt_size_bytes as usize > total_free_vram * 2 / 5 {
+        println!("=== Multi-GPU coherence test: SKIPPED (model {:.1}GB > 40% of {:.1}GB total free VRAM) ===",
+            bqnt_size_bytes as f64 / 1e9, total_free_vram as f64 / 1e9);
+    } else {
+        bench_coherence_multi_gpu(model_dir, 8);
+    }
 
     let mut model = load_model(model_dir, multi_gpu);
     eprintln!("Model loaded: {model_path}");
@@ -334,7 +341,15 @@ fn main() {
         println!("multi-GPU: {gpu_count} GPUs");
     }
 
-    bench_coherence(&mut model, 8);
-    bench_prefill(&mut model, &[1, 8, 32, 64, 128, 256, 512]);
+    // Skip coherence and prefill for very large models where VRAM is too tight for extra buffers.
+    // Threshold: model uses > 80% of total VRAM.
+    let vram_used_pct = if total_free_vram > 0 { bqnt_size_bytes as usize * 100 / total_free_vram } else { 0 };
+    if vram_used_pct > 80 {
+        println!("=== Coherence test: SKIPPED (model uses ~{vram_used_pct}% of total VRAM) ===");
+        println!("=== Prefill benchmark: SKIPPED (model uses ~{vram_used_pct}% of total VRAM) ===");
+    } else {
+        bench_coherence(&mut model, 8);
+        bench_prefill(&mut model, &[1, 8, 32, 64, 128, 256, 512]);
+    }
     bench_decode(&mut model, warmup, runs);
 }
