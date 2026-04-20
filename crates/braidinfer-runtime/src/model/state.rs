@@ -318,23 +318,6 @@ impl Model {
             }
         }
 
-        // Advance paged_seq for attention-bearing models so decode_step (including trace
-        // path) can call append_paged_decode_token(seq_len) successfully. The KV data at
-        // these positions is not written (batched prefill uses legacy_kv_caches), so
-        // attention output during a subsequent trace decode step will be approximate,
-        // but at least it won't panic. Functional correctness is verified by text output.
-        let has_attention = self.config.layers.iter()
-            .any(|l| l.layer_type == LayerType::Attention);
-        if has_attention {
-            self.ensure_paged_decode_state(false)?;
-            let seq_mut = self.paged_seq.as_mut().unwrap();
-            let alloc_mut = self.page_allocator.as_mut().unwrap();
-            for i in 0..total {
-                let pos = self.seq_len + i as u32;
-                seq_mut.append_token(pos as i32, alloc_mut).map_err(|e| ModelError::Hip(e))?;
-            }
-        }
-
         self.seq_len += total as u32;
         self.activations.logits.copy_to_host(&mut logits)?;
         Ok(logits)
