@@ -118,7 +118,9 @@ async fn main() {
     let free_per_gpu = vram_free_per_gpu();
     let single_gpu_vram = free_per_gpu.first().copied().unwrap_or(0);
     let multi_gpu = std::env::var("MULTI_GPU").is_ok()
-        || (bqnt_size_bytes > 0 && bqnt_size_bytes as usize > single_gpu_vram * 85 / 100);
+        || (bqnt_size_bytes > 0
+            && bqnt_size_bytes as usize > single_gpu_vram * 85 / 100
+            && free_per_gpu.len() > 1);
     if multi_gpu && std::env::var("MULTI_GPU").is_err() {
         eprintln!(
             "Auto: MULTI_GPU enabled (model {:.1}GB > single-GPU {:.1}GB free)",

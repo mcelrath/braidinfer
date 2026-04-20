@@ -1141,6 +1141,21 @@ impl Model {
         let mut ctx = match ctx {
             Some(c) => c,
             None => {
+                // Only 1 GPU available. If expert weights were loaded lite (skipped because
+                // MULTI_GPU was set), inference will silently produce wrong output or fault.
+                // Callers should check GPU count BEFORE setting MULTI_GPU to avoid this.
+                let experts_missing = self.moe_weights.iter().any(|m| {
+                    m.as_ref().map_or(false, |moe| {
+                        moe.expert_gate_up.raw_data_ptr() == std::ptr::null()
+                    })
+                });
+                if experts_missing {
+                    return Err(ModelError::MissingWeight(
+                        "MULTI_GPU=1 but only 1 GPU available: expert weights were skipped at \
+                         load time and cannot be used. Do not set MULTI_GPU=1 with a single GPU."
+                            .into(),
+                    ));
+                }
                 eprintln!("Multi-GPU: only 1 device, skipping");
                 return Ok(());
             }
