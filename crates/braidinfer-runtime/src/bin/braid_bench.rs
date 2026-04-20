@@ -139,12 +139,14 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
         idx
     };
 
-    // Sequential reference: use paged path directly so persistent worker is NOT launched,
-    // allowing reset_state() afterward without deadlock.
+    // Sequential reference: single-token prefill per step. Uses the full MoE dispatch path
+    // (including P2P workers for multi-GPU), so the reference is correct for all model types.
+    // decode_step_paged is NOT used because for multi-GPU MoE models it skips expert computation
+    // (experts are lite-loaded on GPU 0 when MULTI_GPU=1).
     model.reset_state().expect("reset");
     let mut seq_logits = vec![];
-    for (i, &tok) in prompt.iter().enumerate() {
-        seq_logits = model.decode_step_paged(tok, i as u32).expect("seq decode");
+    for &tok in prompt.iter() {
+        seq_logits = model.prefill(&[tok]).expect("seq prefill");
     }
     let seq_top = top10(&seq_logits);
 
@@ -205,11 +207,10 @@ fn bench_coherence_multi_gpu(model_dir: &Path, prompt_len: usize) {
         return;
     }
 
+    // Use flat-KV prefill (not paged decode) as reference so both paths use the same
+    // KV cache layout. paged vs flat KV disagreement is a separate issue.
     ref_model.reset_state().expect("reset");
-    let mut ref_logits = vec![];
-    for (i, &tok) in prompt.iter().enumerate() {
-        ref_logits = ref_model.decode_step_paged(tok, i as u32).expect("ref decode");
-    }
+    let ref_logits = ref_model.prefill(&prompt).expect("ref prefill");
     let ref_top = top10(&ref_logits);
     ref_model.reset_state().expect("reset ref");
     drop(ref_model); // Free VRAM before loading multi-GPU model

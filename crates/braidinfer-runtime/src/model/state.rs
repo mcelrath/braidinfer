@@ -169,16 +169,21 @@ impl Model {
                 && (lt == LayerType::Attention || lt == LayerType::Gdn) {
                 // Attention/GDN + MoE FFN layer: run mixer via 1-layer segment,
                 // then dispatch MoE FFN separately.
+                // Never set is_last=true here: the segment would emit final_norm+LM_head
+                // BEFORE the MoE FFN runs, producing logits from the pre-MoE hidden state.
+                // Instead, we handle is_last after MoE below.
                 let span_start = layer_i;
                 let span_end = layer_i + 1;
-                let is_last = span_end == num_layers;
+                let is_truly_last = span_end == num_layers;
 
-                let key = (span_start, span_end, n);
+                // start_pos encodes RoPE positions baked into the compiled program.
+                // Must be part of the key to avoid wrong positions on sequential calls.
+                let key = (span_start, span_end, n, start_pos as usize);
                 let mut bufs = self.prefill_bufs.take().unwrap();
                 if !self.megakernel_prefill_segments.contains_key(&key) {
                     let mk = MegakernelProgram::compile_prefill_segment_with_module(
                         self, std::sync::Arc::clone(&megakernel_module), chunk, start_pos,
-                        span_start, span_end, is_last,
+                        span_start, span_end, false, // never is_last: LM head runs after MoE below
                         &mut bufs,
                     ).map_err(ModelError::Hip)?;
                     self.megakernel_prefill_segments.insert(key, mk);
@@ -200,6 +205,17 @@ impl Model {
                         .map_err(ModelError::Hip)?;
                     self.prefill_bufs = Some(bufs);
                 }
+
+                // If this is the last layer, emit final norm + LM head now (post-MoE).
+                if is_truly_last {
+                    let bufs = self.prefill_bufs.take().unwrap();
+                    let mk = MegakernelProgram::compile_final_norm_lm_head(
+                        self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
+                    ).map_err(ModelError::Hip)?;
+                    self.prefill_bufs = Some(bufs);
+                    mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                    self.stream.synchronize().map_err(ModelError::Hip)?;
+                }
                 layer_i += 1;
             } else {
                 // Dense non-MoE span: accumulate contiguous dense layers
@@ -214,7 +230,7 @@ impl Model {
                 let span_end = layer_i;
                 let is_last = span_end == num_layers;
 
-                let key = (span_start, span_end, n);
+                let key = (span_start, span_end, n, start_pos as usize);
                 let mut bufs = self.prefill_bufs.take().unwrap();
 
                 if !self.megakernel_prefill_segments.contains_key(&key) {
