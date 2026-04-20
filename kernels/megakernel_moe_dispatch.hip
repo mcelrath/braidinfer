@@ -105,10 +105,11 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
         const unsigned char* down_data = (const unsigned char*)entry.down_ptr;
 
         if (has_gate) {
-            coop_gemv_pcg32(scratch_gate, gate_up_data, activation, eis, gupd, grid);
             const unsigned char* up_data = gate_up_data +
                 (long long)eis * gpu0_config->gate_up_row_stride;
-            coop_gemv_pcg32(scratch_up, up_data, activation, eis, gupd, grid);
+            coop_gemv_pcg32_fused_gate_up(scratch_gate, gate_up_data,
+                                           scratch_up, up_data,
+                                           activation, eis, gupd, grid);
             coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
         } else {
             coop_gemv_pcg32(scratch_up, gate_up_data, activation, eis, gupd, grid);

@@ -67,6 +67,69 @@ __device__ inline void coop_gemv_pcg32(
     grid.sync();
 }
 
+// Fused gate+up GEMV: compute gate_proj and up_proj simultaneously using all blocks.
+// Odd-indexed blocks handle gate rows; even-indexed blocks handle up rows.
+// This eliminates one grid.sync() vs sequential coop_gemv_pcg32 calls.
+// gate_weight and up_weight must be the same shape (eis × gupd).
+__device__ inline void coop_gemv_pcg32_fused_gate_up(
+    float* gate_out, const unsigned char* gate_weight,
+    float* up_out,   const unsigned char* up_weight,
+    const float* input, int out_dim, int in_dim,
+    cooperative_groups::grid_group& grid
+) {
+    const int group_size = 32;
+    const int group_bytes = 20;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    int raw_tpg = blockDim.x / max(num_groups, 1);
+    raw_tpg = min(raw_tpg, 16);
+    int tpg = 1;
+    while (tpg * 2 <= raw_tpg) tpg <<= 1;
+    const int groups_per_block = blockDim.x / tpg;
+    const int lane = threadIdx.x % tpg;
+    const int group_in_block = threadIdx.x / tpg;
+    const int elems_per_thread = group_size / tpg;
+    const int bytes_per_thread = elems_per_thread / 2;
+    const int byte_off = lane * bytes_per_thread;
+    extern __shared__ float shared[];
+
+    // Split blocks: even → gate, odd → up. Each block processes every 2nd row (stride 2 in block space).
+    const bool is_gate = (blockIdx.x & 1) == 0;
+    const int half_grid = max(gridDim.x / 2, 1);
+    const int half_block = blockIdx.x / 2;
+    float* my_out = is_gate ? gate_out : up_out;
+    const unsigned char* my_weight = is_gate ? gate_weight : up_weight;
+
+    for (int row = half_block; row < out_dim; row += half_grid) {
+        const unsigned char* row_data = my_weight + (long long)row * num_groups * group_bytes;
+        float acc = 0.0f;
+        for (int g = group_in_block; g < num_groups; g += groups_per_block) {
+            const unsigned char* gp = row_data + g * group_bytes;
+            float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
+            float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+            int elem_base = g * group_size + lane * elems_per_thread;
+            int count = min(elems_per_thread, in_dim - elem_base);
+            for (int b = 0; b < bytes_per_thread && b * 2 < count; b++) {
+                unsigned char byte = gp[byte_off + b];
+                float v0 = (float)(byte & 0xF) * sc + mn;
+                float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                acc += v0 * input[elem_base + b * 2];
+                if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
+            }
+        }
+        for (int offset = tpg / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if (lane == 0) shared[group_in_block] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            for (int g = 0; g < groups_per_block; g++) total += shared[g];
+            my_out[row] = total;
+        }
+        __syncthreads();
+    }
+    grid.sync();
+}
+
 __device__ inline void coop_silu_mul(
     float* output, const float* gate, const float* up, int size,
     cooperative_groups::grid_group& grid

@@ -148,12 +148,11 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
                 const unsigned char* down_data = (const unsigned char*)entry.down_ptr;
 
                 if (has_gate) {
-                    coop_gemv_pcg32(scratch_gate, gate_up_data,
-                                    local_activation, eis, gupd, grid);
                     const unsigned char* up_data = gate_up_data +
                         (long long)eis * config->gate_up_row_stride;
-                    coop_gemv_pcg32(scratch_up, up_data,
-                                    local_activation, eis, gupd, grid);
+                    coop_gemv_pcg32_fused_gate_up(scratch_gate, gate_up_data,
+                                                   scratch_up, up_data,
+                                                   local_activation, eis, gupd, grid);
                     coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
                 } else {
                     coop_gemv_pcg32(scratch_up, gate_up_data,
