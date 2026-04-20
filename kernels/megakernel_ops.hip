@@ -4,6 +4,37 @@
 // threadIdx.x is the thread within the block (0..255).
 // ============================================================
 
+// Wave32 warp-reduce sum (RDNA3/gfx1100). Works within a 32-thread wavefront.
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    val += __shfl_down(val, 16);
+    val += __shfl_down(val, 8);
+    val += __shfl_down(val, 4);
+    val += __shfl_down(val, 2);
+    val += __shfl_down(val, 1);
+    return val;
+}
+
+// Block-reduce sum across 256 threads (8 warps × 32 lanes).
+// Uses shared[0..7] for warp partial sums. Ends with __syncthreads() so callers
+// can safely do sequential block_reduce_sum calls or reuse shared immediately.
+// Returns total sum to thread 0; other threads return their warp's partial sum.
+__device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
+    val = warp_reduce_sum(val);
+    int lane    = threadIdx.x & 31;
+    int warp_id = threadIdx.x >> 5;
+    if (lane == 0) shared[warp_id] = val;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        val = 0.0f;
+        // blockDim.x == 256 → 8 warps; unroll manually
+        val += shared[0]; val += shared[1]; val += shared[2]; val += shared[3];
+        val += shared[4]; val += shared[5]; val += shared[6]; val += shared[7];
+        shared[0] = val;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
 // OP_RMSNORM: y = x * rsqrt(mean(x²)+eps) * (1+weight)
 // args: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 // grid_x = batch (default 1). vblock = batch index. Each block normalizes one row.
@@ -28,13 +59,7 @@ __device__ __attribute__((noinline)) void op_rmsnorm(const u64* inst, u32 vblock
         float v = input[i];
         sum_sq += v * v;
     }
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(shared[0] / (float)hidden_size + eps);
+    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
 
     for (int i = tid; i < hidden_size; i += stride) {
         output[i] = input[i] * rms * (1.0f + bf16_to_f32(weight[i]));
@@ -84,15 +109,8 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
         for (int i = rem + tid; i < in_dim; i += stride) acc += bf16_to_f32(w[i]) * input_base[i];
 
         extern __shared__ float shared[];
-        shared[tid] = acc;
-        __syncthreads();
-        for (int s = stride / 2; s > 0; s >>= 1) {
-            if (tid < s) shared[tid] += shared[tid + s];
-            __syncthreads();
-        }
-        if (tid == 0) {
-            output_base[row] = shared[0];
-        }
+        float total = block_reduce_sum(acc, shared);
+        if (tid == 0) output_base[row] = total;
         return;
     }
 
@@ -132,14 +150,8 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
         }
 
         for (int t = 0; t < tile_size; t++) {
-            shared[tid] = acc[t];
-            __syncthreads();
-            for (int s = stride / 2; s > 0; s >>= 1) {
-                if (tid < s) shared[tid] += shared[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
-            __syncthreads();
+            float total = block_reduce_sum(acc[t], shared);
+            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = total;
         }
     }
 }
@@ -289,14 +301,8 @@ __device__ __attribute__((noinline)) void op_linear_proj_rnf4_full(const u64* in
                 }
             }
             for (int t = 0; t < tile_size; t++) {
-                shared[tid] = acc[t];
-                __syncthreads();
-                for (int s = stride / 2; s > 0; s >>= 1) {
-                    if (tid < s) shared[tid] += shared[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
-                __syncthreads();
+                float total = block_reduce_sum(acc[t], shared);
+                if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = total;
             }
         }
     }
@@ -388,14 +394,8 @@ __device__ __attribute__((noinline)) void op_linear_proj_rnf4(const u64* inst, u
 
         // Reduce via shared memory (same pattern as bf16 batched path)
         for (int t = 0; t < tile_size; t++) {
-            shared[tid] = acc[t];
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared[tid] += shared[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = shared[0];
-            __syncthreads();
+            float total = block_reduce_sum(acc[t], shared);
+            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = total;
         }
     }
 }
@@ -499,14 +499,8 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32_full(const u64* i
                     acc += v0 * input[base + i] + v1 * input[base + i + 1];
                 }
             }
-            shared[tid] = acc;
-            __syncthreads();
-            for (int s = stride / 2; s > 0; s >>= 1) {
-                if (tid < s) shared[tid] += shared[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) output_base[(long long)b * out_dim + row] = shared[0];
-            __syncthreads();
+            float total = block_reduce_sum(acc, shared);
+            if (tid == 0) output_base[(long long)b * out_dim + row] = total;
         }
     }
 }
@@ -583,15 +577,8 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32(const u64* inst, 
                 acc += v0 * input[base + i] + v1 * input[base + i + 1];
             }
         }
-        // Reduce via shared memory
-        shared[tid] = acc;
-        __syncthreads();
-        for (int s = stride / 2; s > 0; s >>= 1) {
-            if (tid < s) shared[tid] += shared[tid + s];
-            __syncthreads();
-        }
-        if (tid == 0) output_base[(long long)b * out_dim + row] = shared[0];
-        __syncthreads();
+        float total = block_reduce_sum(acc, shared);
+        if (tid == 0) output_base[(long long)b * out_dim + row] = total;
     }
 }
 
@@ -619,13 +606,7 @@ __device__ __attribute__((noinline)) void op_rmsnorm_wx(const u64* inst, u32 vbl
         sum_sq += val * val;
     }
     extern __shared__ float shared[];
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(shared[0] / (float)hidden_size + eps);
+    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
 
     for (int i = tid; i < hidden_size; i += stride) {
         output[i] = input[i] * rms * bf16_to_f32(weight[i]);
@@ -737,15 +718,8 @@ __device__ __attribute__((noinline)) void op_gdn_recurrent(const u64* inst, u32 
         sq_acc += qh[ii] * qh[ii];
         sk_acc += kh[ii] * kh[ii];
     }
-    sq[tid] = sq_acc;
-    sk[tid] = sk_acc;
-    __syncthreads();
-    for (int s = block_size / 2; s > 0; s >>= 1) {
-        if (tid < s) { sq[tid] += sq[tid + s]; sk[tid] += sk[tid + s]; }
-        __syncthreads();
-    }
-    float q_inv_norm = rsqrtf(sq[0] + 1e-6f);
-    float k_inv_norm = rsqrtf(sk[0] + 1e-6f);
+    float q_inv_norm = rsqrtf(block_reduce_sum(sq_acc, sq) + 1e-6f);
+    float k_inv_norm = rsqrtf(block_reduce_sum(sk_acc, sk) + 1e-6f);
     float q_scale = q_inv_norm * rsqrtf((float)key_dim);
 
     for (int ii = tid; ii < key_dim; ii += block_size) k_sh[ii] = kh[ii] * k_inv_norm;
@@ -803,13 +777,7 @@ __device__ __attribute__((noinline)) void op_rmsnorm_gated(const u64* inst, u32 
     extern __shared__ float shared[];
     float sum_sq = 0.0f;
     for (int i = tid; i < value_dim; i += stride) { float v = xh[i]; sum_sq += v * v; }
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(shared[0] / (float)value_dim + eps);
+    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
 
     for (int i = tid; i < value_dim; i += stride) {
         float normed = xh[i] * rms * weight[i];
@@ -975,13 +943,7 @@ __device__ __attribute__((noinline)) void op_mamba2_norm_gated(const u64* inst, 
         float v = xh[i] * silu_z;
         sum_sq += v * v;
     }
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(shared[0] / (float)value_dim + eps);
+    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
 
     for (int i = tid; i < value_dim; i += stride) {
         float zi = zh[i];
@@ -1033,14 +995,7 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up(const u64* inst, u32 vb
 
     float sum_sq = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) { float v = input[i]; sum_sq += v * v; }
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms_scale = rsqrtf(shared[0] / (float)hidden_size + eps);
-    __syncthreads();
+    float rms_scale = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
 
     const unsigned short* wg = w_gate + (long long)row * hidden_size;
     const unsigned short* wu = w_up + (long long)row * hidden_size;
@@ -1072,22 +1027,8 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up(const u64* inst, u32 vb
         acc_up += bf16_to_f32(wu[i]) * normed;
     }
 
-    shared[tid] = acc_gate;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float gate_val = shared[0];
-    __syncthreads();
-
-    shared[tid] = acc_up;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float up_val = shared[0];
+    float gate_val = block_reduce_sum(acc_gate, shared);
+    float up_val = block_reduce_sum(acc_up, shared);
 
     if (tid == 0) {
         float silu_g = gate_val / (1.0f + expf(-gate_val));
@@ -1140,13 +1081,8 @@ __device__ __attribute__((noinline)) void op_ffn_down_res(const u64* inst, u32 v
     for (int i = rem + tid; i < intermediate_size; i += stride) acc += bf16_to_f32(w[i]) * scratch[i];
 
     extern __shared__ float shared[];
-    shared[tid] = acc;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) output[row] = shared[0] + residual[row];
+    float total = block_reduce_sum(acc, shared);
+    if (tid == 0) output[row] = total + residual[row];
 }
 
 // OP_FFN_GATE_UP_RNF4: fused RMSNorm + gate_proj + up_proj + SiLU*up (rnf4 weights)
@@ -1185,14 +1121,7 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4(const u64* inst, u
     // RMSNorm: compute sum of squares
     float sum_sq = 0.0f;
     for (int i = tid; i < hidden_size; i += stride) { float v = input[i]; sum_sq += v * v; }
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms_scale = rsqrtf(shared[0] / (float)hidden_size + eps);
-    __syncthreads();
+    float rms_scale = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
 
     const unsigned char* wg_row = w_gate + (long long)row * num_groups * group_bytes;
     const unsigned char* wu_row = w_up  + (long long)row * num_groups * group_bytes;
@@ -1231,22 +1160,8 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4(const u64* inst, u
         }
     }
 
-    shared[tid] = acc_gate;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float gate_val = shared[0];
-    __syncthreads();
-
-    shared[tid] = acc_up;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float up_val = shared[0];
+    float gate_val = block_reduce_sum(acc_gate, shared);
+    float up_val = block_reduce_sum(acc_up, shared);
 
     if (tid == 0) {
         float silu_g = gate_val / (1.0f + expf(-gate_val));
@@ -1304,13 +1219,8 @@ __device__ __attribute__((noinline)) void op_ffn_down_res_rnf4(const u64* inst, 
     }
 
     extern __shared__ float shared[];
-    shared[tid] = acc;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    if (tid == 0) output[row] = shared[0] + residual[row];
+    float total = block_reduce_sum(acc, shared);
+    if (tid == 0) output[row] = total + residual[row];
 }
 
 // OP_EMBEDDING: output[i] = table[token_id * hidden_size + i]
@@ -1369,13 +1279,7 @@ __device__ __attribute__((noinline)) void op_qk_norm(const u64* inst, u32 vblock
 
     float sum_sq = 0.0f;
     for (int i = tid; i < head_dim; i += stride) { float v = head_ptr[i]; sum_sq += v * v; }
-    shared[tid] = sum_sq;
-    __syncthreads();
-    for (int s = stride / 2; s > 0; s >>= 1) {
-        if (tid < s) shared[tid] += shared[tid + s];
-        __syncthreads();
-    }
-    float rms = rsqrtf(shared[0] / (float)head_dim + eps);
+    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)head_dim + eps);
 
     for (int i = tid; i < head_dim; i += stride) {
         head_ptr[i] = head_ptr[i] * rms * (1.0f + bf16_to_f32(weight_ptr[i]));
@@ -1476,13 +1380,7 @@ __device__ __attribute__((noinline)) void op_gqa_attn(const u64* inst, u32 vbloc
         const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
-        partial[tid] = dot;
-        __syncthreads();
-        for (int s = block_size / 2; s > 0; s >>= 1) {
-            if (tid < s) partial[tid] += partial[tid + s];
-            __syncthreads();
-        }
-        float score = partial[0] * scale;
+        float score = block_reduce_sum(dot, partial) * scale;
         float m_new = fmaxf(m, score);
         float correction = expf(m - m_new);
         float w = expf(score - m_new);
@@ -1494,7 +1392,6 @@ __device__ __attribute__((noinline)) void op_gqa_attn(const u64* inst, u32 vbloc
             slot++;
         }
         m = m_new;
-        __syncthreads();
     }
 
     // Write output once (normalize by d)
@@ -1614,18 +1511,11 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
                 const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
-                    partial[tid] = my_k * my_k;  // overwrites sh_k via alias
-                    __syncthreads();
-                    for (int s = block_size / 2; s > 0; s >>= 1) {
-                        if (tid < s) partial[tid] += partial[tid + s];
-                        __syncthreads();
-                    }
-                    float k_rms = rsqrtf(partial[0] / (float)head_dim + 1e-6f);
+                    float k_rms = rsqrtf(block_reduce_sum(my_k * my_k, partial) / (float)head_dim + 1e-6f);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
                         sh_k[tid] = my_k * k_rms * w;  // use saved register value
                     }
-                    __syncthreads();
                 }
             }
 
@@ -1651,13 +1541,7 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
                 dot = q_ptr[tid] * sh_k[tid];
             }
             // Reduce dot via shared memory (reuse sh_k alias partial)
-            partial[tid] = dot;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) partial[tid] += partial[tid + s];
-                __syncthreads();
-            }
-            float score = partial[0] * scale;
+            float score = block_reduce_sum(dot, partial) * scale;
 
             // Online softmax update
             float m_new = fmaxf(m, score);
@@ -1806,18 +1690,11 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
                 const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
-                    partial[tid] = my_k * my_k;
-                    __syncthreads();
-                    for (int s = block_size / 2; s > 0; s >>= 1) {
-                        if (tid < s) partial[tid] += partial[tid + s];
-                        __syncthreads();
-                    }
-                    float k_rms = rsqrtf(partial[0] / (float)head_dim + 1e-6f);
+                    float k_rms = rsqrtf(block_reduce_sum(my_k * my_k, partial) / (float)head_dim + 1e-6f);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
                         sh_k[tid] = my_k * k_rms * w;
                     }
-                    __syncthreads();
                 }
             }
 
@@ -1839,13 +1716,7 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
             // Q·K dot product
             float dot = 0.0f;
             if (tid < head_dim) dot = q_ptr[tid] * sh_k[tid];
-            partial[tid] = dot;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) partial[tid] += partial[tid + s];
-                __syncthreads();
-            }
-            float score = partial[0] * attn_scale;
+            float score = block_reduce_sum(dot, partial) * attn_scale;
 
             // Online softmax
             float m_new = fmaxf(m, score);
@@ -1934,13 +1805,7 @@ __device__ __attribute__((noinline)) void op_attn_prefill(const u64* inst, u32 v
         const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
-        partial[tid] = dot;
-        __syncthreads();
-        for (int s = block_size / 2; s > 0; s >>= 1) {
-            if (tid < s) partial[tid] += partial[tid + s];
-            __syncthreads();
-        }
-        float score = partial[0] * scale;
+        float score = block_reduce_sum(dot, partial) * scale;
         float m_new = fmaxf(m, score);
         float correction = expf(m - m_new);
         float w = expf(score - m_new);
@@ -1952,7 +1817,6 @@ __device__ __attribute__((noinline)) void op_attn_prefill(const u64* inst, u32 v
             slot++;
         }
         m = m_new;
-        __syncthreads();
     }
 
     float* out_ptr = output + (token_idx * num_q_heads + q_head) * head_dim;
