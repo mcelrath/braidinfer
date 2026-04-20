@@ -13,7 +13,7 @@ use super::{
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT,
     OP_KV_QUANTIZE, OP_LM_HEAD, OP_MAMBA2_CONV1D, OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH,
     OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM, OP_RELU_SQ,
-    OP_RESIDUAL_ADD, OP_RMSNORM_GATE, OP_SCALE_ADD,
+    OP_CONV1D_3X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE, OP_SCALE_ADD,
     OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
 
@@ -926,6 +926,18 @@ pub(crate) struct ScaleAddInst {
 assert_inst_size!(ScaleAddInst);
 impl_inst!(ScaleAddInst);
 
+impl ScaleAddInst {
+    pub(crate) fn new(grid_x: u32, output: *mut f32, src: *const f32, scale: f32, size: i32) -> Self {
+        let scale_bits = scale.to_bits() as u64;
+        ScaleAddInst {
+            opcode_gridx: make_opcode_gridx(OP_SCALE_ADD, grid_x),
+            output, src, scale_bits,
+            size: size as u64,
+            _pad: [0; 13],
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // OP_RELU_SQ (opcode 37)
 // output[i] = relu(input[i])^2; args: [1]=output, [2]=input, [3]=size
@@ -1111,6 +1123,60 @@ impl BarrierInst {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_CONV1D_3X (opcode 40) — fused Q+K+V causal conv1d
+// grid_x = 2*blocks_qk + blocks_v
+// vb routing: < blocks_qk → Q, < 2*blocks_qk → K, else → V
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct Conv1d3xInst {
+    pub opcode_gridx: u64,
+    pub q_state:  *mut f32,
+    pub q_input:  *const f32,
+    pub q_weight: *const u16,
+    pub q_output: *mut f32,
+    pub k_state:  *mut f32,
+    pub k_input:  *const f32,
+    pub k_weight: *const u16,
+    pub k_output: *mut f32,
+    pub v_state:  *mut f32,
+    pub v_input:  *const f32,
+    pub v_weight: *const u16,
+    pub v_output: *mut f32,
+    pub qk_dim:     i64,
+    pub v_dim:      i64,
+    pub kernel_size: i64,
+    pub blocks_qk_v: u64, // low32=blocks_qk, high32=blocks_v
+    pub _pad: u64,
+}
+assert_inst_size!(Conv1d3xInst);
+impl_inst!(Conv1d3xInst);
+
+impl Conv1d3xInst {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        q_state: *mut f32, q_input: *const f32, q_weight: *const u16, q_output: *mut f32,
+        k_state: *mut f32, k_input: *const f32, k_weight: *const u16, k_output: *mut f32,
+        v_state: *mut f32, v_input: *const f32, v_weight: *const u16, v_output: *mut f32,
+        qk_dim: i32, v_dim: i32, kernel_size: i32,
+    ) -> Self {
+        let blocks_qk = (qk_dim as u32).div_ceil(256);
+        let blocks_v  = (v_dim as u32).div_ceil(256);
+        let grid_x = 2 * blocks_qk + blocks_v;
+        Conv1d3xInst {
+            opcode_gridx: make_opcode_gridx(OP_CONV1D_3X, grid_x),
+            q_state, q_input, q_weight, q_output,
+            k_state, k_input, k_weight, k_output,
+            v_state, v_input, v_weight, v_output,
+            qk_dim: qk_dim as i64,
+            v_dim: v_dim as i64,
+            kernel_size: kernel_size as i64,
+            blocks_qk_v: (blocks_qk as u64) | ((blocks_v as u64) << 32),
+            _pad: 0,
+        }
+    }
+}
+
 // Suppress unused import warnings for opcodes used only in assertions/macros
 const _: () = {
     let _ = OP_LM_HEAD;
@@ -1118,4 +1184,5 @@ const _: () = {
     let _ = OP_MOE_FFN;
     let _ = OP_SCALE_ADD;
     let _ = OP_MOE_DISPATCH;
+    let _ = OP_CONV1D_3X;
 };

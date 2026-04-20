@@ -512,6 +512,31 @@ typedef struct {
 } MoeDispatchInst;
 static_assert(sizeof(MoeDispatchInst) == INST_SIZE_WORDS * 8, "MoeDispatchInst size mismatch");
 
+// OP_CONV1D_3X (opcode 40) — fused Q+K+V causal conv1d in one instruction
+// grid_x = 2*blocks_qk + blocks_v; vb < blocks_qk → Q, < 2*blocks_qk → K, else → V
+typedef struct {
+    uint64_t opcode_gridx;
+    float* q_state;
+    const float* q_input;
+    const uint16_t* q_weight;
+    float* q_output;
+    float* k_state;
+    const float* k_input;
+    const uint16_t* k_weight;
+    float* k_output;
+    float* v_state;
+    const float* v_input;
+    const uint16_t* v_weight;
+    float* v_output;
+    int64_t qk_dim;
+    int64_t v_dim;
+    int64_t kernel_size;
+    uint64_t blocks_qk_v;  // low32=blocks_qk, high32=blocks_v
+    uint64_t _pad;
+} Conv1d3xInst;
+static_assert(sizeof(Conv1d3xInst) == INST_SIZE_WORDS * 8, "Conv1d3xInst size mismatch");
+static_assert(offsetof(Conv1d3xInst, q_state) == 8, "Conv1d3xInst.q_state offset");
+
 // OP_BARRIER (opcode 33)
 typedef struct {
     uint64_t opcode_gridx;

@@ -42,3 +42,4 @@
 #define OP_RELU_SQ      37  // output[i] = relu(input[i])^2; args: [1]=output, [2]=input, [3]=size
 #define OP_MAMBA2_CONV1D    38  // causal conv1d with f32 bias + SiLU; args: [1]=state(w), [2]=input, [3]=weight(u16), [4]=bias(f32), [5]=output(w), [6]=conv_dim, [7]=kernel_size
 #define OP_MAMBA2_NORM_GATED 39 // rms_norm(x*silu(z))*weight; args: [1]=output(w), [2]=x, [3]=z, [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
+#define OP_CONV1D_3X         40 // fused Q+K+V causal conv1d; args: see Conv1d3xInst

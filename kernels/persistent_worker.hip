@@ -128,6 +128,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     case OP_MAMBA2_CONV1D:    op_mamba2_conv1d(inst, vb); break;
                     case OP_SSM_UPDATE:       op_ssm_update(inst, vb); break;
                     case OP_MAMBA2_NORM_GATED: op_mamba2_norm_gated(inst, vb); break;
+                    case OP_CONV1D_3X:         op_conv1d_3x(inst, vb); break;
                     default: break;
                 }
             }

@@ -644,6 +644,52 @@ __device__ __attribute__((noinline)) void op_conv1d(const u64* inst, u32 vblock)
     s[hist - 1] = input[ch];
 }
 
+// OP_CONV1D_3X: fused Q+K+V causal conv1d; vb routing: <blocks_qk→Q, <2*blocks_qk→K, else→V
+__device__ __attribute__((noinline)) void op_conv1d_3x(const u64* inst, u32 vblock) {
+    const Conv1d3xInst* i = (const Conv1d3xInst*)inst;
+    u32 blocks_qk = (u32)(i->blocks_qk_v & 0xFFFFFFFFu);
+    u32 blocks_v  = (u32)(i->blocks_qk_v >> 32);
+
+    float* state;
+    const float* input;
+    const uint16_t* weight;
+    float* output;
+    int conv_dim;
+
+    if (vblock < blocks_qk) {
+        state = i->q_state; input = i->q_input; weight = i->q_weight; output = i->q_output;
+        conv_dim = (int)i->qk_dim;
+    } else if (vblock < 2u * blocks_qk) {
+        vblock -= blocks_qk;
+        state = i->k_state; input = i->k_input; weight = i->k_weight; output = i->k_output;
+        conv_dim = (int)i->qk_dim;
+    } else {
+        vblock -= 2u * blocks_qk;
+        state = i->v_state; input = i->v_input; weight = i->v_weight; output = i->v_output;
+        conv_dim = (int)i->v_dim;
+    }
+
+    int kernel_size = (int)i->kernel_size;
+    int ch = vblock * blockDim.x + threadIdx.x;
+    if (ch >= conv_dim) return;
+
+    int hist = kernel_size - 1;
+    float* s = state + ch * hist;
+    const unsigned short* w = weight + ch * kernel_size;
+
+    float acc = 0.0f;
+    for (int k = 0; k < hist; k++) {
+        acc += s[k] * bf16_to_f32(w[k]);
+    }
+    acc += input[ch] * bf16_to_f32(w[hist]);
+    output[ch] = acc / (1.0f + expf(-acc)); // SiLU
+
+    for (int k = 0; k < hist - 1; k++) {
+        s[k] = s[k + 1];
+    }
+    s[hist - 1] = input[ch];
+}
+
 // OP_GDN_GATE: gate = exp(-exp(A_log) * softplus(a + dt_bias))
 // args: [1]=gate_out, [2]=a_input, [3]=A_log, [4]=dt_bias, [5]=num_heads
 __device__ __attribute__((noinline)) void op_gdn_gate(const u64* inst, u32 vblock) {

@@ -58,30 +58,24 @@ impl MegakernelProgram {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_z);
             instructions.push(LinearProjInst::new(op, (nvh * vd) as u32, act.z_proj.as_write_ptr(), wp, act.normed.as_ptr(), (nvh * vd) as i32, hs as i32, 0).into_inst());
         }
-        // 4. Causal conv1d on QKV (3 separate calls for q, k, v slices)
+        // 4. Fused causal conv1d on Q+K+V in one instruction (saves 2 grid.sync()s per GDN layer)
         let q_dim = nh * kd;
         let k_dim = nh * kd;
         let v_dim = nvh * vd;
-
-        // Conv on Q/K/V (parallel: read different slices of qkv)
-        instructions.push(Conv1dInst::new(
-            div_ceil(q_dim as u32, 256),
-            conv_state.as_write_ptr(), act.qkv.as_ptr(), w.conv1d_weight_q.as_ptr(), act.q_gdn.as_write_ptr(),
-            q_dim as i32, ck as i32,
-        ).into_inst());
-        instructions.push(Conv1dInst::new(
-            div_ceil(k_dim as u32, 256),
+        instructions.push(Conv1d3xInst::new(
+            conv_state.as_write_ptr(),
+            act.qkv.as_ptr(),
+            w.conv1d_weight_q.as_ptr(),
+            act.q_gdn.as_write_ptr(),
             unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) },
             unsafe { act.qkv.as_ptr().add(q_dim) },
-            w.conv1d_weight_k.as_ptr(), act.k_gdn.as_write_ptr(),
-            k_dim as i32, ck as i32,
-        ).into_inst());
-        instructions.push(Conv1dInst::new(
-            div_ceil(v_dim as u32, 256),
+            w.conv1d_weight_k.as_ptr(),
+            act.k_gdn.as_write_ptr(),
             unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) },
             unsafe { act.qkv.as_ptr().add(q_dim + k_dim) },
-            w.conv1d_weight_v.as_ptr(), act.v_gdn.as_write_ptr(),
-            v_dim as i32, ck as i32,
+            w.conv1d_weight_v.as_ptr(),
+            act.v_gdn.as_write_ptr(),
+            q_dim as i32, v_dim as i32, ck as i32,
         ).into_inst());
 
         // 5. GDN gate (reads a_proj)
@@ -113,9 +107,8 @@ impl MegakernelProgram {
             instructions.push(LinearProjInst::new(op, hs as u32, act.out_proj.as_write_ptr(), wp, act.normed_gated.as_ptr(), hs as i32, (nvh * vd) as i32, 0).into_inst());
         }
 
-        // 9. Residual
-        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
-        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.out_proj.as_ptr(), act.residual.as_ptr(), hs as i32).into_inst());
+        // 9. Residual: in-place add eliminates D2D_COPY + RESIDUAL_ADD (saves 1 grid.sync)
+        instructions.push(ScaleAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.out_proj.as_ptr(), 1.0f32, hs as i32).into_inst());
     }
 
     pub(super) fn compile_mamba2_layer(
