@@ -52,24 +52,10 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
     // GPU 0's output slot is at index 0 in output_slots (stride = hs for consistent slot layout)
     float* gpu0_output = output_slots; // [0..gupd)
 
-    // 1. Zero GPU 0's output slot and copy activation to work queue (GART).
+    // 1. Zero GPU 0's output slot.
     // Do NOT zero final_output — the sum loop overwrites it completely.
     // Do NOT zero worker output slots — GPU 0 would cache those in L2.
-    //
-    // CRITICAL: activation (moe_latent) lives in GPU 0's L2 cache after fc1.
-    // Workers cannot P2P-read GPU 0 L2 directly — they see stale HBM (zeros).
-    // Solution: copy activation to wq->activation_cache (GART/host-mapped).
-    // GPU 0 GART writes (MTYPE_UC) bypass L2 → go directly to system memory →
-    // immediately visible to workers via their GART device pointers.
     coop_zero(gpu0_output, gupd, grid);
-
-    // Copy activation from GPU 0 VRAM to GART cache (all threads cooperate).
-    // GART writes are uncached (bypass GPU 0's L2), so workers see them immediately.
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < gupd;
-         i += gridDim.x * blockDim.x) {
-        wq->activation_cache[i] = activation[i];
-    }
-    grid.sync();
 
     // 2. Block 0 thread 0: populate work queue and trigger workers
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -84,7 +70,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
         wq->expert_intermediate_size = eis;
         wq->has_gate_proj = has_gate;
         wq->gate_up_in_dim = gupd;
-        wq->activation_ptr = (uint64_t)activation;  // kept for reference
+        wq->activation_ptr = (uint64_t)activation;  // GPU 0 VRAM; workers P2P-read after __threadfence_system()
         wq->output_slots_ptr = (uint64_t)output_slots;
         wq->num_workers = num_workers;
 
@@ -92,7 +78,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
         for (int w = 1; w <= num_workers; w++)
             wq->ack_flags[w] = 0;
 
-        // GART writes above (activation_cache) are uncached — no extra fence needed.
+        // Flush GPU 0 L2 to HBM so workers can P2P-read activation_ptr (VRAM) directly.
         // wq field writes (GART) also bypass L2 → visible before seq_num write.
         __threadfence_system();
 

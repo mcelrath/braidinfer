@@ -115,7 +115,8 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         float* output_slots = (float*)work_queue->output_slots_ptr;
 
         for (uint32_t t = 0; t < bs; t++) {
-            const float* activation_src = (const float*)work_queue->activation_cache + (size_t)t * gupd;
+            // P2P-read activation from GPU 0 VRAM (flushed to HBM by __threadfence_system() before seq_num).
+            const float* activation_src = (const float*)(uintptr_t)work_queue->activation_ptr + (size_t)t * gupd;
             uint32_t total_gpus = work_queue->num_workers + 1;
             float* my_output_slot = output_slots + ((size_t)t * total_gpus + my_gpu) * hs;
 

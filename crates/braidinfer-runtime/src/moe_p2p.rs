@@ -99,6 +99,10 @@ pub struct MoeP2pContext {
     pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
     /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
     _gpu0_config_storage: Vec<DeviceBuffer<u8>>,
+    /// GPU 0 VRAM activation staging buffer: [MAX_PREFILL_BATCH × gate_up_in_dim].
+    /// Prefill path copies activations here via hipMemcpy; decode path uses activation directly.
+    /// Workers P2P-read via activation_ptr field (set to VRAM ptr) after __threadfence_system().
+    pub activation_staging: DeviceBuffer<f32>,
     /// GPU 0 scratch buffers for expert computation.
     pub gpu0_scratch_gate: DeviceBuffer<f32>,
     pub gpu0_scratch_up: DeviceBuffer<f32>,
@@ -186,6 +190,8 @@ impl MoeP2pContext {
             },
         )?;
 
+        // Activation staging: GPU 0 VRAM for prefill batches (workers P2P-read after __threadfence_system).
+        let activation_staging = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim).
         let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
@@ -319,6 +325,7 @@ impl MoeP2pContext {
             output_slots,
             gpu0_layer_config_ptrs,
             _gpu0_config_storage: gpu0_config_storage,
+            activation_staging,
             gpu0_scratch_gate,
             gpu0_scratch_up,
             gpu0_scratch_act,
@@ -348,10 +355,10 @@ impl MoeP2pContext {
     const OFF_GATE_UP_IN_DIM: usize = 32;
     const OFF_EXPERT_IDS: usize = 36;
     const OFF_EXPERT_WEIGHTS: usize = Self::OFF_EXPERT_IDS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4;
-    // +4 for _pad_align, +8 for activation_ptr, then output_slots_ptr
-    const OFF_OUTPUT_SLOTS_PTR: usize = Self::OFF_EXPERT_WEIGHTS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4 + 4 + 8;
+    // +4 for _pad_align, then activation_ptr (8 bytes), then output_slots_ptr
+    const OFF_ACTIVATION_PTR: usize = Self::OFF_EXPERT_WEIGHTS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4 + 4;
+    const OFF_OUTPUT_SLOTS_PTR: usize = Self::OFF_ACTIVATION_PTR + 8;
     const OFF_ACK_FLAGS: usize = Self::OFF_OUTPUT_SLOTS_PTR + 8;
-    const OFF_ACTIVATION_CACHE: usize = MOE_WORK_QUEUE_FIXED;
 
     /// CPU-initiated batched MoE dispatch for prefill.
     ///
@@ -378,6 +385,12 @@ impl MoeP2pContext {
         assert!(batch_size <= MAX_PREFILL_BATCH);
         assert!(k <= MAX_ACTIVE_EXPERTS);
         let num_workers = self.workers.len();
+        // Copy activations to GPU 0 VRAM staging buffer. Workers P2P-read via activation_ptr
+        // after GPU 0's __threadfence_system() flushes L2 before seq_num write.
+        // Safe: GPU 0's persistent worker is NOT running during prefill.
+        self.activation_staging
+            .copy_from_host(&activations[..batch_size * gate_up_in_dim])
+            .expect("activation_staging hipMemcpy failed");
         let wq_ptr = self.work_queue.host_ptr() as *mut u8;
         unsafe {
             (wq_ptr.add(Self::OFF_BATCH_SIZE) as *mut u32).write_volatile(batch_size as u32);
@@ -400,11 +413,10 @@ impl MoeP2pContext {
                     wts_dst.add(t * MAX_ACTIVE_EXPERTS + j).write_volatile(expert_weights[t * k + j]);
                 }
             }
-            // activation cache: [batch_size × gate_up_in_dim]
-            let act_dst = wq_ptr.add(Self::OFF_ACTIVATION_CACHE) as *mut f32;
-            for i in 0..batch_size * gate_up_in_dim {
-                act_dst.add(i).write_volatile(activations[i]);
-            }
+            // Write activation_ptr: GPU 0 VRAM staging (workers P2P-read after __threadfence_system).
+            // GPU 0's persistent worker is NOT running during prefill, so hipMemcpy is safe.
+            (wq_ptr.add(Self::OFF_ACTIVATION_PTR) as *mut u64)
+                .write_volatile(self.activation_staging.as_ptr() as u64);
             // clear ack flags
             let ack_ptr = wq_ptr.add(Self::OFF_ACK_FLAGS) as *mut u32;
             for w in 1..=num_workers {

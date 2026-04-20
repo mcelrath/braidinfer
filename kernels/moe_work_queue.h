@@ -44,10 +44,10 @@ struct MoeWorkItem {
     // Per-worker ack flags. Worker writes seq_num here when done (single ack covers full batch).
     volatile uint32_t ack_flags[MOE_MAX_GPUS];
 
-    // Activation cache: GPU 0 writes batch_size × gate_up_in_dim floats here (GART, bypasses L2).
+    // Activation cache: used ONLY for prefill path (batch_size > 1) where hipMemcpy to staging VRAM
+    // is not yet wired. Decode path uses activation_ptr (GPU 0 VRAM, P2P-readable after __threadfence_system).
     // Layout: activation_cache[t * gate_up_in_dim + d] for token t, dimension d.
     // Flexible array — allocation is sizeof(MoeWorkItem) + batch_size * gate_up_in_dim * sizeof(float).
-    // Each GPU accesses this via its own per-GPU device VA (from hipHostGetDevicePointer).
     float activation_cache[];
 };
 
