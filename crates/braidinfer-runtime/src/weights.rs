@@ -201,6 +201,19 @@ pub struct ActivationBuffers {
     pub moe_expert_act: DeviceBuffer<f32>,     // [max_expert_intermediate_size]
     pub moe_expert_out: DeviceBuffer<f32>,     // [hidden_size]
     pub moe_latent: DeviceBuffer<f32>,         // [moe_latent_size or hidden_size] — fc1/fc2 staging
+    // Prefill MoE batched scratch (CHUNK_TOKENS × max dims) — avoids hipMalloc per layer call
+    pub prefill_moe_normed: DeviceBuffer<f32>,        // [CHUNK_TOKENS × max_latent_size]
+    pub prefill_moe_expert_input: DeviceBuffer<f32>,  // [CHUNK_TOKENS × max_latent_size]
+    pub prefill_moe_gate_out: DeviceBuffer<f32>,      // [CHUNK_TOKENS × max_eis]
+    pub prefill_moe_up_out: DeviceBuffer<f32>,        // [CHUNK_TOKENS × max_eis]
+    pub prefill_moe_act_out: DeviceBuffer<f32>,       // [CHUNK_TOKENS × max_eis]
+    pub prefill_moe_down_out: DeviceBuffer<f32>,      // [CHUNK_TOKENS × max_hs]
+    pub prefill_moe_ffn_out: DeviceBuffer<f32>,       // [CHUNK_TOKENS × max_hs]
+    pub prefill_moe_residual: DeviceBuffer<f32>,      // [CHUNK_TOKENS × max_hs]
+    pub prefill_moe_ids_dev: DeviceBuffer<i32>,       // [CHUNK_TOKENS × max_k]
+    pub prefill_moe_weights_dev: DeviceBuffer<f32>,   // [CHUNK_TOKENS × max_k]
+    pub prefill_moe_token_indices: DeviceBuffer<i32>, // [CHUNK_TOKENS]
+    pub prefill_moe_token_weights: DeviceBuffer<f32>, // [CHUNK_TOKENS]
     // Mamba2 scratch buffers
     pub mamba2_in_proj: DeviceBuffer<f32>, // [in_proj_size] (gate + xBC + dt)
     pub mamba2_conv_out: DeviceBuffer<f32>, // [conv_dim] (after conv1d + activation)

@@ -805,4 +805,378 @@ impl Model {
         self.stream.synchronize()?;
         Ok(())
     }
+
+    /// Single-GPU batched MoE prefill: processes n tokens with one sync instead of n.
+    /// For PCG32Q4 weights: uses batched GEMM per expert (loads weights once for all routed tokens).
+    /// For other formats or models with fc2_latent_proj: falls back to per-token.
+    pub(crate) fn moe_ffn_forward_prefill_single_gpu_batched(
+        &mut self,
+        layer_idx: usize,
+        prefill_hidden: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> HipResult<()> {
+        let hs = self.config.hidden_size;
+
+        // Fall back to per-token for Nemotron models with fc2_latent_proj (rare path)
+        let has_fc2 = self.moe_weights[layer_idx].as_ref().unwrap().fc2_latent_proj.is_some();
+        // Fall back for non-PCG32Q4 expert weights
+        let use_batched_gemm = match &self.moe_weights[layer_idx].as_ref().unwrap().expert_gate_up {
+            LinearWeight::Packed(pw) => pw.format == WeightFormat::PcG32Q4,
+            _ => false,
+        };
+        // Fall back if expert weights are lite-loaded stubs (multi-GPU path where weights
+        // were not transferred to GPU 0, e.g. MULTI_GPU auto-enabled but only 1 device available)
+        let experts_loaded = self.moe_weights[layer_idx].as_ref().unwrap()
+            .expert_gate_up.raw_data_ptr() != std::ptr::null();
+        if has_fc2 || !use_batched_gemm || !experts_loaded {
+            for t in 0..n {
+                unsafe {
+                    d2d_copy_f32(&mut self.activations.hidden, 0, prefill_hidden, t * hs, hs, &self.stream)?;
+                }
+                self.moe_ffn_forward(layer_idx)?;
+                unsafe {
+                    d2d_copy_f32(prefill_hidden, t * hs, &self.activations.hidden, 0, hs, &self.stream)?;
+                }
+            }
+            return Ok(());
+        }
+
+        // SAFETY: raw ptr breaks borrow on moe_weights to allow mutable access to self.activations.
+        let moe_ptr = self.moe_weights[layer_idx].as_ref().unwrap() as *const MoeWeights;
+        let moe = unsafe { &*moe_ptr };
+        let eis = moe.expert_intermediate_size;
+        let ne = moe.num_experts;
+        let eps = self.config.rms_norm_eps;
+        let latent_size = moe.gate_up_in_dim;
+        let has_gate = moe.has_gate_proj;
+
+        let (k, gate_type) = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { num_active, gate_type, .. } => (*num_active, gate_type.clone()),
+            _ => unreachable!(),
+        };
+        let (gate_mode, rsf) = match &gate_type {
+            GateType::Softmax => (0u32, 1.0f32),
+            GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
+            GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
+        };
+        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
+            .map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        let norm_weight_ptr = match &self.layers[layer_idx] {
+            LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
+            LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
+            LayerWeights::MoeFfn(w) => &w.input_norm as *const DeviceBuffer<u16>,
+            _ => panic!("no norm weight for layer {layer_idx}"),
+        };
+
+        // Raw pointers for weight buffers (avoid reborrowing moe_weights in expert loop)
+        let gu_base: *const u8 = match &moe.expert_gate_up {
+            LinearWeight::Packed(pw) => pw.data.as_ptr(),
+            _ => unreachable!(),
+        };
+        let dn_base: *const u8 = match &moe.expert_down {
+            LinearWeight::Packed(pw) => pw.data.as_ptr(),
+            LinearWeight::Bf16(buf) => buf.as_ptr() as *const u8,
+        };
+
+        // PHASE 1: Queue all gate computations asynchronously (no per-token sync).
+        // Saves residual + normed activations per token for use in expert phase.
+        for t in 0..n {
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    self.activations.hidden.as_mut_ptr() as *mut std::ffi::c_void,
+                    prefill_hidden.as_ptr().add(t * hs) as *const std::ffi::c_void,
+                    hs * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                );
+                // Save residual
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    self.activations.prefill_moe_residual.as_mut_ptr().add(t * hs) as *mut std::ffi::c_void,
+                    self.activations.hidden.as_ptr() as *const std::ffi::c_void,
+                    hs * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                );
+            }
+            unsafe {
+                self.kernels.rmsnorm.forward(
+                    &mut self.activations.normed,
+                    &self.activations.hidden,
+                    &*norm_weight_ptr,
+                    1, hs as u32, eps,
+                    self.config.rms_norm_one_plus_w,
+                    &self.stream,
+                )?;
+            }
+            // Save normed for expert phase (latent_size == hs when no fc1)
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    self.activations.prefill_moe_normed.as_mut_ptr().add(t * latent_size) as *mut std::ffi::c_void,
+                    self.activations.normed.as_ptr() as *const std::ffi::c_void,
+                    latent_size * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                );
+            }
+            // Gate projection: normed → moe_scores
+            self.kernels.linear_proj.forward(
+                &mut self.activations.moe_scores,
+                &moe.gate,
+                &self.activations.normed,
+                ne as u32, hs as u32,
+                &self.stream,
+            )?;
+            // Top-k selection: write to per-token slots in device buffer
+            self.kernels.moe_gate.forward(
+                &self.activations.moe_scores,
+                unsafe { self.activations.prefill_moe_ids_dev.as_mut_ptr().add(t * k) },
+                unsafe { self.activations.prefill_moe_weights_dev.as_mut_ptr().add(t * k) },
+                bias_ptr,
+                ne as u32, k as u32, gate_mode, rsf,
+                &self.stream,
+            )?;
+        }
+
+        // ONE sync for all gate computations
+        self.stream.synchronize()?;
+
+        // D2H: read all expert IDs and routing weights
+        let mut all_ids = vec![0i32; n * k];
+        let mut all_weights_host = vec![0.0f32; n * k];
+        braidinfer_hip::memory::memcpy_d2h(
+            unsafe { std::slice::from_raw_parts_mut(all_ids.as_mut_ptr() as *mut u8, n * k * 4) },
+            self.activations.prefill_moe_ids_dev.as_ptr() as *const u8,
+            n * k * 4,
+        )?;
+        braidinfer_hip::memory::memcpy_d2h(
+            unsafe { std::slice::from_raw_parts_mut(all_weights_host.as_mut_ptr() as *mut u8, n * k * 4) },
+            self.activations.prefill_moe_weights_dev.as_ptr() as *const u8,
+            n * k * 4,
+        )?;
+
+        // PHASE 2: Batched expert computation — load each expert's weights once for all routed tokens.
+        // Zero the output accumulator [n × hs]
+        self.kernels.moe_prefill.zero_batch(
+            self.activations.prefill_moe_ffn_out.as_mut_ptr(),
+            (n * hs) as i32,
+            &self.stream,
+        )?;
+
+        for eid in 0..ne {
+            // Collect tokens routed to expert eid
+            let mut token_indices: Vec<i32> = Vec::new();
+            let mut token_weights_vec: Vec<f32> = Vec::new();
+            for t in 0..n {
+                for j in 0..k {
+                    if all_ids[t * k + j] == eid as i32 {
+                        token_indices.push(t as i32);
+                        token_weights_vec.push(all_weights_host[t * k + j]);
+                    }
+                }
+            }
+            let count = token_indices.len();
+            if count == 0 { continue; }
+
+            // H2D: upload indices and per-token routing weights for scatter
+            braidinfer_hip::memory::memcpy_h2d(
+                self.activations.prefill_moe_token_indices.as_mut_ptr() as *mut u8,
+                unsafe { std::slice::from_raw_parts(token_indices.as_ptr() as *const u8, count * 4) },
+                count * 4,
+            )?;
+            braidinfer_hip::memory::memcpy_h2d(
+                self.activations.prefill_moe_token_weights.as_mut_ptr() as *mut u8,
+                unsafe { std::slice::from_raw_parts(token_weights_vec.as_ptr() as *const u8, count * 4) },
+                count * 4,
+            )?;
+
+            // Gather token activations: prefill_moe_expert_input[0..count×latent_size]
+            self.kernels.moe_prefill.gather(
+                self.activations.prefill_moe_expert_input.as_mut_ptr(),
+                self.activations.prefill_moe_normed.as_ptr(),
+                self.activations.prefill_moe_token_indices.as_ptr(),
+                count as i32, latent_size as i32,
+                &self.stream,
+            )?;
+
+            // Byte offsets into packed weight buffers for expert eid
+            let (gate_off, up_off) = if has_gate {
+                (
+                    moe.expert_gate_up.row_byte_offset_dim(eid * 2 * eis, latent_size),
+                    moe.expert_gate_up.row_byte_offset_dim(eid * 2 * eis + eis, latent_size),
+                )
+            } else {
+                (0, moe.expert_gate_up.row_byte_offset_dim(eid * eis, latent_size))
+            };
+            let dn_off = moe.expert_down.row_byte_offset_dim(eid * latent_size, eis);
+
+            if has_gate {
+                self.kernels.moe_prefill.linear_proj_pcg32_batched(
+                    self.activations.prefill_moe_gate_out.as_mut_ptr(),
+                    unsafe { gu_base.add(gate_off) },
+                    self.activations.prefill_moe_expert_input.as_ptr(),
+                    eis as i32, latent_size as i32, count as i32,
+                    &self.stream,
+                )?;
+                self.kernels.moe_prefill.linear_proj_pcg32_batched(
+                    self.activations.prefill_moe_up_out.as_mut_ptr(),
+                    unsafe { gu_base.add(up_off) },
+                    self.activations.prefill_moe_expert_input.as_ptr(),
+                    eis as i32, latent_size as i32, count as i32,
+                    &self.stream,
+                )?;
+                self.kernels.moe_prefill.silu_mul_batched(
+                    self.activations.prefill_moe_act_out.as_mut_ptr(),
+                    self.activations.prefill_moe_gate_out.as_ptr(),
+                    self.activations.prefill_moe_up_out.as_ptr(),
+                    (count * eis) as i32,
+                    &self.stream,
+                )?;
+            } else {
+                self.kernels.moe_prefill.linear_proj_pcg32_batched(
+                    self.activations.prefill_moe_up_out.as_mut_ptr(),
+                    unsafe { gu_base.add(up_off) },
+                    self.activations.prefill_moe_expert_input.as_ptr(),
+                    eis as i32, latent_size as i32, count as i32,
+                    &self.stream,
+                )?;
+                self.kernels.moe_prefill.relu_sq_batched(
+                    self.activations.prefill_moe_act_out.as_mut_ptr(),
+                    self.activations.prefill_moe_up_out.as_ptr(),
+                    (count * eis) as i32,
+                    &self.stream,
+                )?;
+            }
+
+            // Down projection: [count × latent_size] (expert_down out_dim = latent_size = hs here)
+            self.kernels.moe_prefill.linear_proj_pcg32_batched(
+                self.activations.prefill_moe_down_out.as_mut_ptr(),
+                unsafe { dn_base.add(dn_off) },
+                self.activations.prefill_moe_act_out.as_ptr(),
+                latent_size as i32, eis as i32, count as i32,
+                &self.stream,
+            )?;
+
+            // Scatter-add: prefill_moe_ffn_out[token_indices[j]*hs..] += token_weights[j] * down[j*hs..]
+            self.kernels.moe_prefill.scatter_add_weighted(
+                self.activations.prefill_moe_ffn_out.as_mut_ptr(),
+                self.activations.prefill_moe_down_out.as_ptr(),
+                self.activations.prefill_moe_token_indices.as_ptr(),
+                self.activations.prefill_moe_token_weights.as_ptr(),
+                count as i32, latent_size as i32,
+                &self.stream,
+            )?;
+        }
+
+        // PHASE 3: Per-token shared expert + residual add.
+        let has_shared = moe.shared_expert.is_some();
+        let se_is = if has_shared {
+            match &self.config.layers[layer_idx].ffn_type {
+                FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                    if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
+                }
+                _ => eis,
+            }
+        } else { 0 };
+        // Raw pointers for shared expert weights to avoid borrow issues
+        let se_up_ptr = moe.shared_expert.as_ref().map(|se| &se.up_proj as *const LinearWeight);
+        let se_gate_proj_ptr = if has_gate {
+            moe.shared_expert.as_ref().map(|se| &se.gate_proj as *const LinearWeight)
+        } else { None };
+        let se_down_ptr = moe.shared_expert.as_ref().map(|se| &se.down_proj as *const LinearWeight);
+        let se_gate_buf_ptr = moe.shared_expert_gate.as_ref().map(|g| g as *const DeviceBuffer<u16>);
+
+        for t in 0..n {
+            // Load batched expert output into ffn_down
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.activations.prefill_moe_ffn_out.as_ptr().add(t * hs) as *const std::ffi::c_void,
+                    hs * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                );
+            }
+
+            if has_shared {
+                // Restore normed for shared expert input
+                unsafe {
+                    braidinfer_hip::ffi::hipMemcpyAsync(
+                        self.activations.normed.as_mut_ptr() as *mut std::ffi::c_void,
+                        self.activations.prefill_moe_normed.as_ptr().add(t * hs) as *const std::ffi::c_void,
+                        hs * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                    );
+                }
+                let se_up = unsafe { &*se_up_ptr.unwrap() };
+                let se_down = unsafe { &*se_down_ptr.unwrap() };
+                se_up.forward(
+                    &self.kernels.linear_proj,
+                    &mut self.activations.moe_expert_up,
+                    &self.activations.normed,
+                    se_is as u32, hs as u32,
+                    &self.stream,
+                )?;
+                if let Some(gp) = se_gate_proj_ptr {
+                    unsafe { &*gp }.forward(
+                        &self.kernels.linear_proj,
+                        &mut self.activations.moe_expert_gate,
+                        &self.activations.normed,
+                        se_is as u32, hs as u32,
+                        &self.stream,
+                    )?;
+                    self.kernels.silu_mul.forward(
+                        &mut self.activations.moe_expert_act,
+                        &self.activations.moe_expert_gate,
+                        &self.activations.moe_expert_up,
+                        se_is as u32, &self.stream,
+                    )?;
+                } else {
+                    self.kernels.silu_mul.relu_squared(
+                        &mut self.activations.moe_expert_act,
+                        &self.activations.moe_expert_up,
+                        se_is as u32, &self.stream,
+                    )?;
+                }
+                se_down.forward(
+                    &self.kernels.linear_proj,
+                    &mut self.activations.moe_expert_out,
+                    &self.activations.moe_expert_act,
+                    hs as u32, se_is as u32,
+                    &self.stream,
+                )?;
+                if let Some(gb) = se_gate_buf_ptr {
+                    self.kernels.dot_sigmoid_scale_add.forward(
+                        &mut self.activations.ffn_down,
+                        &self.activations.moe_expert_out,
+                        &self.activations.normed,
+                        unsafe { &*gb },
+                        hs as u32, &self.stream,
+                    )?;
+                } else {
+                    self.kernels.residual_add.weighted_accumulate(
+                        &mut self.activations.ffn_down,
+                        &self.activations.moe_expert_out,
+                        1.0, hs as u32, &self.stream,
+                    )?;
+                }
+            }
+
+            // Restore residual and add FFN output
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    self.activations.residual.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.activations.prefill_moe_residual.as_ptr().add(t * hs) as *const std::ffi::c_void,
+                    hs * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                );
+            }
+            self.kernels.residual_add.forward(
+                &mut self.activations.hidden,
+                &self.activations.residual,
+                &self.activations.ffn_down,
+                hs as u32, &self.stream,
+            )?;
+            // Write back to prefill_hidden
+            unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    prefill_hidden.as_mut_ptr().add(t * hs) as *mut std::ffi::c_void,
+                    self.activations.hidden.as_ptr() as *const std::ffi::c_void,
+                    hs * 4, braidinfer_hip::ffi::hipMemcpyDeviceToDevice, self.stream.raw(),
+                );
+            }
+        }
+
+        self.stream.synchronize()?;
+        Ok(())
+    }
 }

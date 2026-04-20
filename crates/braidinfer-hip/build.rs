@@ -36,6 +36,7 @@ fn main() {
         "selective_state_update",
         "argmax",
         "moe_gate",
+        "moe_prefill",
         "dot_sigmoid_scale_add",
         "megakernel",
         "peer_copy",

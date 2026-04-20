@@ -1013,6 +1013,55 @@ impl Model {
                 DeviceBuffer::<f32>::alloc(device, size)?
             },
             argmax_result: DeviceBuffer::<i32>::alloc(device, 1)?,
+            // Prefill MoE batched scratch
+            prefill_moe_normed: {
+                let latent = config.moe_latent_size.unwrap_or(hs);
+                DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * latent)?
+            },
+            prefill_moe_expert_input: {
+                let latent = config.moe_latent_size.unwrap_or(hs);
+                DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * latent)?
+            },
+            prefill_moe_gate_out: {
+                let max_eis = config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size),
+                    _ => None,
+                }).max().unwrap_or(1);
+                DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * max_eis)?
+            },
+            prefill_moe_up_out: {
+                let max_eis = config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size),
+                    _ => None,
+                }).max().unwrap_or(1);
+                DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * max_eis)?
+            },
+            prefill_moe_act_out: {
+                let max_eis = config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { expert_intermediate_size, .. } => Some(*expert_intermediate_size),
+                    _ => None,
+                }).max().unwrap_or(1);
+                DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * max_eis)?
+            },
+            prefill_moe_down_out: DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * hs)?,
+            prefill_moe_ffn_out: DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * hs)?,
+            prefill_moe_residual: DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * hs)?,
+            prefill_moe_ids_dev: {
+                let max_k = config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { num_active, .. } => Some(*num_active),
+                    _ => None,
+                }).max().unwrap_or(1);
+                DeviceBuffer::<i32>::alloc(device, crate::megakernel::CHUNK_TOKENS * max_k)?
+            },
+            prefill_moe_weights_dev: {
+                let max_k = config.layers.iter().filter_map(|l| match &l.ffn_type {
+                    FfnType::MoE { num_active, .. } => Some(*num_active),
+                    _ => None,
+                }).max().unwrap_or(1);
+                DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS * max_k)?
+            },
+            prefill_moe_token_indices: DeviceBuffer::<i32>::alloc(device, crate::megakernel::CHUNK_TOKENS)?,
+            prefill_moe_token_weights: DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS)?,
         };
 
         let has_moe = config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));

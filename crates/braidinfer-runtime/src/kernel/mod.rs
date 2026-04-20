@@ -513,6 +513,7 @@ pub struct AllKernels {
     pub ssm_update: SelectiveStateUpdateKernel,
     pub argmax: ArgmaxKernel,
     pub moe_gate: MoeGateKernel,
+    pub moe_prefill: MoePrefillKernel,
     pub dot_sigmoid_scale_add: DotSigmoidScaleAddKernel,
 }
 
@@ -538,6 +539,7 @@ impl AllKernels {
             ssm_update: SelectiveStateUpdateKernel::load(device)?,
             argmax: ArgmaxKernel::load(device)?,
             moe_gate: MoeGateKernel::load(device)?,
+            moe_prefill: MoePrefillKernel::load(device)?,
             dot_sigmoid_scale_add: DotSigmoidScaleAddKernel::load(device)?,
         })
     }

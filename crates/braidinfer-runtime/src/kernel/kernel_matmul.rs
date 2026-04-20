@@ -241,3 +241,159 @@ impl MoeGateKernel {
         func.launch((1, 1, 1), (256, 1, 1), shared_mem, stream, &mut args)
     }
 }
+
+pub struct MoePrefillKernel {
+    module: Module,
+    device: DeviceId,
+}
+
+impl MoePrefillKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let path = super::kernel_dir().join("moe_prefill.hsaco");
+        let module = Module::load(device, &path)?;
+        Ok(Self { module, device })
+    }
+
+    pub fn gather(
+        &self,
+        output: *mut f32,
+        input: *const f32,
+        indices: *const i32,
+        count: i32,
+        in_dim: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("moe_gather_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut in_ptr: *const c_void = input.cast();
+        let mut idx_ptr: *const c_void = indices.cast();
+        let mut c = count;
+        let mut d = in_dim;
+        let mut args: [*mut c_void; 5] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(idx_ptr).cast(),
+            std::ptr::addr_of_mut!(c).cast(),
+            std::ptr::addr_of_mut!(d).cast(),
+        ];
+        func.launch((count as u32, 1, 1), (256, 1, 1), 0, stream, &mut args)
+    }
+
+    pub fn scatter_add_weighted(
+        &self,
+        output: *mut f32,
+        input: *const f32,
+        indices: *const i32,
+        weights: *const f32,
+        count: i32,
+        out_dim: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("moe_scatter_add_weighted_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut in_ptr: *const c_void = input.cast();
+        let mut idx_ptr: *const c_void = indices.cast();
+        let mut w_ptr: *const c_void = weights.cast();
+        let mut c = count;
+        let mut d = out_dim;
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(idx_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(c).cast(),
+            std::ptr::addr_of_mut!(d).cast(),
+        ];
+        func.launch((count as u32, 1, 1), (256, 1, 1), 0, stream, &mut args)
+    }
+
+    pub fn zero_batch(
+        &self,
+        output: *mut f32,
+        total_elems: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("moe_zero_batch_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut n = total_elems;
+        let mut args: [*mut c_void; 2] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(n).cast(),
+        ];
+        let grid = ((total_elems as u32) + 255) / 256;
+        func.launch((grid, 1, 1), (256, 1, 1), 0, stream, &mut args)
+    }
+
+    pub fn linear_proj_pcg32_batched(
+        &self,
+        output: *mut f32,
+        weight: *const u8,
+        input: *const f32,
+        out_dim: i32,
+        in_dim: i32,
+        batch: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("linear_proj_pcg32_batched")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut w_ptr: *const c_void = weight.cast();
+        let mut in_ptr: *const c_void = input.cast();
+        let mut od = out_dim;
+        let mut id = in_dim;
+        let mut bs = batch;
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(w_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(od).cast(),
+            std::ptr::addr_of_mut!(id).cast(),
+            std::ptr::addr_of_mut!(bs).cast(),
+        ];
+        let shared_mem = 256 * 4;
+        let grid = out_dim.min(96 * 4) as u32;
+        func.launch((grid, 1, 1), (256, 1, 1), shared_mem, stream, &mut args)
+    }
+
+    pub fn silu_mul_batched(
+        &self,
+        output: *mut f32,
+        gate: *const f32,
+        up: *const f32,
+        total_size: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("silu_mul_batched_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut g_ptr: *const c_void = gate.cast();
+        let mut u_ptr: *const c_void = up.cast();
+        let mut sz = total_size;
+        let mut args: [*mut c_void; 4] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(g_ptr).cast(),
+            std::ptr::addr_of_mut!(u_ptr).cast(),
+            std::ptr::addr_of_mut!(sz).cast(),
+        ];
+        let grid = ((total_size as u32) + 255) / 256;
+        func.launch((grid, 1, 1), (256, 1, 1), 0, stream, &mut args)
+    }
+
+    pub fn relu_sq_batched(
+        &self,
+        output: *mut f32,
+        input: *const f32,
+        total_size: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module.get_function("relu_sq_batched_f32")?;
+        let mut out_ptr: *mut c_void = output.cast();
+        let mut in_ptr: *const c_void = input.cast();
+        let mut sz = total_size;
+        let mut args: [*mut c_void; 3] = [
+            std::ptr::addr_of_mut!(out_ptr).cast(),
+            std::ptr::addr_of_mut!(in_ptr).cast(),
+            std::ptr::addr_of_mut!(sz).cast(),
+        ];
+        let grid = ((total_size as u32) + 255) / 256;
+        func.launch((grid, 1, 1), (256, 1, 1), 0, stream, &mut args)
+    }
+}
