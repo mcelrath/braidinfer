@@ -425,10 +425,20 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                 );
 
-                // Scan emitted instructions for D2dCopy (KV writes) and AttnPrefillInst
+                // Scan emitted instructions for KV-write D2dCopy and AttnPrefillInst.
+                // KV writes are emitted by the Prefill variant AFTER the MROPE instruction
+                // (compile_attention.rs:283-309). Scanning from `attn_start` would mis-identify
+                // the leading q_gate→q_attn D2dCopy emitted at compile_attention.rs:87-89 when
+                // !cfg.has_output_gate (Mistral/Llama) as the first KV-write — corrupting it
+                // (and offsetting all subsequent KV-write entries by one) when update_prefill_chunk
+                // patches the cached program for sequential N=1 prefill calls.
                 let nkh = cfg.num_kv_heads;
+                let kv_scan_start = (attn_start..instructions.len())
+                    .find(|&idx| instructions[idx].words[0] as u32 == OP_MROPE)
+                    .map(|i| i + 1)
+                    .unwrap_or(attn_start);
                 let mut kv_pair_count = 0usize;
-                for idx in attn_start..instructions.len() {
+                for idx in kv_scan_start..instructions.len() {
                     let opcode = instructions[idx].words[0] as u32;
                     if opcode == OP_D2D_COPY && kv_pair_count < n * nkh * 2 {
                         // KV writes: laid out as [t0h0K, t0h0V, t0h1K, t0h1V, ..., tnhkK, tnhkV]
