@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
 
 use crate::paged_kv::{PageAllocator, SequenceState};
@@ -284,42 +284,34 @@ impl MegakernelProgram {
                     (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, 0);
                 }
             }
-            // OP_ATTN_PAGED sees all chunks, no partial_state
+            // OP_ATTN_PAGED sees all chunks. Always zero partial_state in this branch:
+            // either quantized_kv is off (no quant pass), OR quantized_kv is on but no
+            // chunks have sealed yet (so no quant pass output exists). Reading from
+            // uninitialized scratch in the latter case produced NaN on a fresh allocator
+            // (m=d=v_acc=0 -> 0/0 = NaN in online softmax).
             for &idx in &attn_paged_inst_indices {
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
                     (*inst).page_table = page_table_ptr;
                     (*inst).pos_table = pos_table_ptr;
                     (*inst).seq_len = total_seq_len as u64;
-                }
-                if !self.quantized_kv {
-                    unsafe {
-                        let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
-                        (*inst).partial_state = 0;
-                    }
+                    (*inst).partial_state = 0;
                 }
             }
         }
 
-        // 5. Upload page_table if chunk list changed
+        // 5. Upload page_table if chunk list changed.
+        // Host-mapped buffer: write via host_ptr, GPU reads through device_ptr without
+        // any HIP API call (no hipMemcpyAsync — safe under persistent cooperative kernel).
         if seq.chunks.len() != self.paged_kv.as_ref().unwrap().last_page_table_len {
-            let page_table_dev = self.paged_kv.as_mut().unwrap().page_table.as_mut().expect("page_table not allocated");
-            let host_ptrs: Vec<u64> = seq
-                .chunks
-                .iter()
-                .map(|c| allocator.slot_ptr(c.slot_index()) as u64)
-                .collect();
-            let dst = page_table_dev.as_mut_ptr() as *mut u8;
-            let bytes = host_ptrs.len() * std::mem::size_of::<u64>();
-            braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpyAsync(
-                    dst.cast(),
-                    host_ptrs.as_ptr().cast(),
-                    bytes,
-                    braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                    stream.raw(),
-                )
-            })?;
+            let page_table_buf = self.paged_kv.as_ref().unwrap().page_table.as_ref().expect("page_table not allocated");
+            let host_ptr = page_table_buf.host_ptr();
+            for (i, chunk) in seq.chunks.iter().enumerate() {
+                let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
+                unsafe {
+                    host_ptr.add(i).write_volatile(addr);
+                }
+            }
             self.paged_kv.as_mut().unwrap().last_page_table_len = seq.chunks.len();
         }
 
@@ -380,7 +372,9 @@ impl MegakernelProgram {
                     // Track slot for cleanup
                     seq.quant_slots.push(q_slot);
 
-                    // Upload quantized page table
+                    // Upload quantized page table.
+                    // TODO(paged-primary follow-up): convert to host-mapped write_volatile
+                    // pattern (matching page_table) once the NaN regression is understood.
                     let num_sealed = seq.chunks.len();
                     let quant_kv = self.quant_kv.as_mut().expect("quant_kv not initialized");
                     let quant_pt = quant_kv
@@ -409,7 +403,9 @@ impl MegakernelProgram {
     pub fn init_paged_buffers(&mut self, max_chunks: usize) -> HipResult<()> {
         let paged_kv = self.paged_kv.as_mut().expect("init_paged_buffers called on non-paged program");
         if paged_kv.page_table.is_none() {
-            paged_kv.page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
+            // Host-mapped: GPU reads via device_ptr; CPU writes via host_ptr without
+            // hipMemcpyAsync. Required for persistent cooperative-kernel safety.
+            paged_kv.page_table = Some(MappedHostBuffer::alloc(max_chunks)?);
         }
         if paged_kv.position_table.is_none() {
             paged_kv.position_table =

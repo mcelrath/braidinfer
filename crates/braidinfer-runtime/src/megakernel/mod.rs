@@ -53,7 +53,10 @@ pub(crate) struct KvConfig {
 /// `update_step_paged` iterates it unconditionally on all paged programs
 /// (to disable OP_ATTN_PAGED_Q when quantized_kv=false).
 pub(crate) struct PagedKvState {
-    pub page_table: Option<DeviceBuffer<u64>>,
+    /// page_table is host-mapped so updates from CPU are immediately visible to the
+    /// persistent cooperative kernel without hipMemcpyAsync (which would deadlock
+    /// per the HIP API prohibition documented in persistent_dispatch.rs).
+    pub page_table: Option<MappedHostBuffer<u64>>,
     pub position_table: Option<MappedHostBuffer<i32>>,
     pub attn_paged_inst_indices: Vec<usize>,
     pub attn_quant_inst_indices: Vec<usize>,
@@ -65,6 +68,12 @@ pub(crate) struct PagedKvState {
 pub(crate) struct QuantizedKvState {
     #[allow(dead_code)]
     pub quant_scratch: Option<DeviceBuffer<f32>>,
+    /// Stays as DeviceBuffer for now — host-mapped conversion deferred to a separate
+    /// phase. Initial Phase 1 validation showed converting quant_page_table to
+    /// MappedHostBuffer breaks quant decode (NaN logits on step 0); needs separate
+    /// investigation. The quant_page_table is only written when chunks seal (every
+    /// CHUNK_TOKENS=64 tokens), so the persistent-kernel-deadlock concern is less
+    /// acute than for page_table (which updates more frequently).
     pub quant_page_table: Option<DeviceBuffer<u64>>,
     pub last_quant_page_table_len: usize,
 }
