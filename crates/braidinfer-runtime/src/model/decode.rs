@@ -1212,6 +1212,13 @@ impl Model {
         position: u32,
         quantized: bool,
     ) -> Result<Vec<f32>, ModelError> {
+        // KV quantization is single-GPU only: multi-GPU paged dispatch not yet implemented.
+        if quantized && self.multi_gpu.is_some() {
+            return Err(ModelError::InvalidConfig(
+                "KV_QUANT is not supported in multi-GPU mode".into(),
+            ));
+        }
+
         let max_chunks = self.max_paged_chunks();
 
         // Lazy-init: compile paged megakernel

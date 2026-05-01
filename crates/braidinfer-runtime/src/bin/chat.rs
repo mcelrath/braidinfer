@@ -130,6 +130,16 @@ async fn main() {
         unsafe { std::env::set_var("MULTI_GPU", "1") };
     }
 
+    let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
+
+    // KV quantization is not yet supported in multi-GPU mode.
+    // Both require the paged KV path, but multi-GPU paged dispatch is not implemented.
+    if kv_quant && multi_gpu {
+        eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");
+        eprintln!("  KV quantization only works in single-GPU mode.");
+        std::process::exit(1);
+    }
+
     let persistent = std::env::var("PERSISTENT").as_deref() == Ok("1")
         || multi_gpu
         || !has_moe;
