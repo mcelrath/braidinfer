@@ -94,6 +94,22 @@ impl Model {
         }
         .to_vec();
 
+        // Post-step: handle chunk-seal lifecycle. For unquantized persistent, this is
+        // a no-op (post_step_paged early-returns when self.quantized_kv is false).
+        // For future persistent+quant wiring, this is where quantization would fire —
+        // but quantize_sealed_chunk + stream.synchronize() are HIP API calls that would
+        // deadlock under the cooperative kernel. The PERSISTENT+KV_QUANT combination
+        // is therefore guarded with InvalidConfig in decode_step (mod.rs); when that
+        // combination is properly wired, this call site will be the integration point
+        // (and quantize_sealed_chunk will need a cooperative-safe variant).
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let seq_mut = self.paged_seq.as_mut().unwrap();
+            let alloc_mut = self.page_allocator.as_mut().unwrap();
+            mk.post_step_paged(position, seq_mut, alloc_mut, None, &self.config, &self.stream)
+                .map_err(ModelError::Hip)?;
+        }
+
         self.seq_len = position + 1;
         Ok(logits)
     }
