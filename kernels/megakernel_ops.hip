@@ -156,6 +156,96 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
     }
 }
 
+// OP_LINEAR_PROJ_2X: bf16 fused two linear projections sharing the same input.
+// vb < out_dim → write to output_a using weight_a; vb < 2*out_dim → write to output_b using
+// weight_b. Same input/in_dim/out_dim/batch for both. Used by GDN w_a + w_b (always bf16).
+// Saves one grid.sync vs two sequential OP_LINEAR_PROJ instructions.
+__device__ __attribute__((noinline)) void op_linear_proj_2x(const u64* inst, u32 vblock) {
+    const LinearProj2xInst* i = (const LinearProj2xInst*)inst;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
+    if (batch <= 1) batch = 1;
+
+    // Block routing: which sub-projection is this block working on?
+    float* output_base;
+    const uint16_t* weight;
+    int row;
+    if ((int)vblock < out_dim) {
+        output_base = i->output_a;
+        weight = i->weight_a;
+        row = (int)vblock;
+    } else if ((int)vblock < 2 * out_dim) {
+        output_base = i->output_b;
+        weight = i->weight_b;
+        row = (int)vblock - out_dim;
+    } else {
+        return;
+    }
+
+    const float* input_base = i->input;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    const unsigned short* w = weight + (long long)row * in_dim;
+    extern __shared__ float shared[];
+
+    if (batch == 1) {
+        float acc = 0.0f;
+        const int vec_elements = 8;
+        const int vec_count = in_dim / vec_elements;
+        const ull2* w_vec = (const ull2*)w;
+        for (int vi = tid; vi < vec_count; vi += stride) {
+            ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
+            unsigned short ws[8];
+            __builtin_memcpy(ws, &wv, 16);
+            int base = vi * vec_elements;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) acc += bf16_to_f32(ws[j]) * input_base[base + j];
+        }
+        int rem = vec_count * vec_elements;
+        for (int k = rem + tid; k < in_dim; k += stride) acc += bf16_to_f32(w[k]) * input_base[k];
+        float total = block_reduce_sum(acc, shared);
+        if (tid == 0) output_base[row] = total;
+        return;
+    }
+
+    // Batched: tile B_TILE batch rows at a time
+    const int vec_elements = 8;
+    const int vec_count = in_dim / vec_elements;
+    const ull2* w_vec = (const ull2*)w;
+    for (int b0 = 0; b0 < batch; b0 += B_TILE) {
+        int tile_end = (b0 + B_TILE < batch) ? b0 + B_TILE : batch;
+        int tile_size = tile_end - b0;
+        float acc[B_TILE];
+        #pragma unroll
+        for (int t = 0; t < B_TILE; t++) acc[t] = 0.0f;
+
+        for (int vi = tid; vi < vec_count; vi += stride) {
+            ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
+            unsigned short ws[8];
+            __builtin_memcpy(ws, &wv, 16);
+            float wf[8];
+            #pragma unroll
+            for (int j = 0; j < 8; j++) wf[j] = bf16_to_f32(ws[j]);
+            int base = vi * vec_elements;
+            for (int t = 0; t < tile_size; t++) {
+                const float* inp = input_base + (long long)(b0 + t) * in_dim + base;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) acc[t] += wf[j] * inp[j];
+            }
+        }
+        int rem = vec_count * vec_elements;
+        for (int k = rem + tid; k < in_dim; k += stride) {
+            float wf = bf16_to_f32(w[k]);
+            for (int t = 0; t < tile_size; t++) acc[t] += wf * input_base[(long long)(b0 + t) * in_dim + k];
+        }
+        for (int t = 0; t < tile_size; t++) {
+            float total = block_reduce_sum(acc[t], shared);
+            if (tid == 0) output_base[(long long)(b0 + t) * out_dim + row] = total;
+        }
+    }
+}
+
 // OP_SILU_MUL: output[i] = silu(gate[i]) * up[i]
 // args: [1]=output, [2]=gate, [3]=up, [4]=size
 __device__ __attribute__((noinline)) void op_silu_mul(const u64* inst, u32 vblock) {

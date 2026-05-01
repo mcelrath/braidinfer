@@ -408,6 +408,7 @@ fn opcode_name(op: u32) -> &'static str {
         OP_CONV1D_3X => "CONV1D_3X",
         OP_FFN_GATE_UP_WX => "FFN_GATE_UP_WX",
         OP_FFN_GATE_UP_RNF4_WX => "FFN_GATE_UP_RNF4_WX",
+        OP_LINEAR_PROJ_2X => "LINEAR_PROJ_2X",
         _ => "UNKNOWN",
     }
 }

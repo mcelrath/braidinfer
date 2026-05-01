@@ -57,6 +57,27 @@ typedef struct {
 static_assert(sizeof(LinearProjInst) == INST_SIZE_WORDS * 8, "LinearProjInst size mismatch");
 static_assert(offsetof(LinearProjInst, output) == 8, "LinearProjInst.output offset");
 
+// OP_LINEAR_PROJ_2X (opcode 43): bf16 fused two linear projections sharing the same input.
+// Used for GDN w_a + w_b which are always bf16 (excluded from quantization in bqnt_quantize.rs)
+// and have the same out_dim (= num_value_heads). Block partitioning: vb in [0..out_dim) → A,
+// vb in [out_dim..2*out_dim) → B. Saves 1 grid.sync per GDN layer vs two separate LINEAR_PROJ.
+// Decode-only: batch_size encoded in struct so prefill batched path can also use it (one row per
+// (token, head)).
+typedef struct {
+    uint64_t opcode_gridx;
+    float* output_a;
+    float* output_b;
+    const uint16_t* weight_a;
+    const uint16_t* weight_b;
+    const float* input;
+    int64_t out_dim;   // same for A and B
+    int64_t in_dim;
+    int64_t batch;     // 0 or 1 → single token; >1 → batched
+    uint64_t _pad[9];
+} LinearProj2xInst;
+static_assert(sizeof(LinearProj2xInst) == INST_SIZE_WORDS * 8, "LinearProj2xInst size mismatch");
+static_assert(offsetof(LinearProj2xInst, output_a) == 8, "LinearProj2xInst.output_a offset");
+
 // OP_CONV1D (opcode 3)
 typedef struct {
     uint64_t opcode_gridx;

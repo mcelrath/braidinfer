@@ -45,12 +45,23 @@ impl MegakernelProgram {
             instructions.push(LinearProjInst::new(op, qkv_dim as u32, act.qkv.as_write_ptr(), wp, act.normed.as_ptr(), qkv_dim as i32, hs as i32, 0).into_inst());
         }
 
-        // 3. Project a, b, z
-        {
+        // 3. Project a, b, z. w_a + w_b are always bf16 (excluded from quantization in
+        //    bqnt_quantize.rs SKIP_PATTERNS) and have the same out_dim=nvh. Fuse them into
+        //    OP_LINEAR_PROJ_2X to save one grid.sync per GDN layer.
+        let wa_bf16 = matches!(w.w_a, crate::model::LinearWeight::Bf16(_));
+        let wb_bf16 = matches!(w.w_b, crate::model::LinearWeight::Bf16(_));
+        if wa_bf16 && wb_bf16 {
+            instructions.push(LinearProj2xInst::new(
+                act.a_proj.as_write_ptr(),
+                act.b_proj.as_write_ptr(),
+                w.w_a.as_bf16_ptr(),
+                w.w_b.as_bf16_ptr(),
+                act.normed.as_ptr(),
+                nvh as i32, hs as i32, 0,
+            ).into_inst());
+        } else {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_a);
             instructions.push(LinearProjInst::new(op, nvh as u32, act.a_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).into_inst());
-        }
-        {
             let (op, wp) = linear_proj_opcode_ptr(&w.w_b);
             instructions.push(LinearProjInst::new(op, nvh as u32, act.b_proj.as_write_ptr(), wp, act.normed.as_ptr(), nvh as i32, hs as i32, 0).into_inst());
         }

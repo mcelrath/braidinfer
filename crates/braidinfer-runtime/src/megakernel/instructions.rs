@@ -13,7 +13,7 @@ use super::{
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT,
     OP_KV_QUANTIZE, OP_LM_HEAD, OP_MAMBA2_CONV1D, OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH,
     OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM, OP_RELU_SQ,
-    OP_CONV1D_3X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE, OP_SCALE_ADD,
+    OP_CONV1D_3X, OP_LINEAR_PROJ_2X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE, OP_SCALE_ADD,
     OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
 
@@ -1177,6 +1177,55 @@ impl Conv1d3xInst {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_LINEAR_PROJ_2X (opcode 43) — bf16 fused two linear projections sharing input.
+// grid_x = 2 * out_dim. vb < out_dim → A; vb < 2*out_dim → B.
+// Used for GDN w_a + w_b (always bf16; see bqnt_quantize.rs SKIP_PATTERNS).
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct LinearProj2xInst {
+    pub opcode_gridx: u64,
+    pub output_a: *mut f32,
+    pub output_b: *mut f32,
+    pub weight_a: *const u16,
+    pub weight_b: *const u16,
+    pub input: *const f32,
+    pub out_dim: i64, // same for A and B
+    pub in_dim: i64,
+    pub batch: i64, // 0 or 1 → single token
+    pub _pad: [u64; 9],
+}
+assert_inst_size!(LinearProj2xInst);
+impl_inst!(LinearProj2xInst);
+
+impl LinearProj2xInst {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        output_a: *mut f32,
+        output_b: *mut f32,
+        weight_a: *const u16,
+        weight_b: *const u16,
+        input: *const f32,
+        out_dim: i32,
+        in_dim: i32,
+        batch: i32,
+    ) -> Self {
+        let grid_x = 2 * (out_dim as u32);
+        LinearProj2xInst {
+            opcode_gridx: make_opcode_gridx(OP_LINEAR_PROJ_2X, grid_x),
+            output_a,
+            output_b,
+            weight_a,
+            weight_b,
+            input,
+            out_dim: out_dim as i64,
+            in_dim: in_dim as i64,
+            batch: batch as i64,
+            _pad: [0; 9],
+        }
+    }
+}
+
 // Suppress unused import warnings for opcodes used only in assertions/macros
 const _: () = {
     let _ = OP_LM_HEAD;
@@ -1185,4 +1234,5 @@ const _: () = {
     let _ = OP_SCALE_ADD;
     let _ = OP_MOE_DISPATCH;
     let _ = OP_CONV1D_3X;
+    let _ = OP_LINEAR_PROJ_2X;
 };

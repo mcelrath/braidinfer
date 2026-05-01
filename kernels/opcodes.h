@@ -45,3 +45,4 @@
 #define OP_CONV1D_3X         40 // fused Q+K+V causal conv1d; args: see Conv1d3xInst
 #define OP_FFN_GATE_UP_WX    41 // bf16 fused FFN gate+up with plain w*x RMSNorm (Llama/Mistral); same args as OP_FFN_GATE_UP
 #define OP_FFN_GATE_UP_RNF4_WX 42 // rnf4 fused FFN gate+up with plain w*x RMSNorm (Llama/Mistral); same args as OP_FFN_GATE_UP_RNF4
+#define OP_LINEAR_PROJ_2X    43 // bf16 fused two linear projections (e.g. GDN w_a + w_b: same input, same in_dim, same out_dim); see LinearProj2xInst

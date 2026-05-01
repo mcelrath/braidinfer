@@ -44,6 +44,10 @@ __device__ void dump_instruction_output(
         case OP_LINEAR_PROJ: case OP_LINEAR_PROJ_RNF4: case OP_LINEAR_PROJ_PCG32:
             size = (int)((const LinearProjInst*)inst)->out_dim;
             break;
+        case OP_LINEAR_PROJ_2X:
+            // grid_x covers both A and B regions; size used only for dump/trace bounds.
+            size = (int)((const LinearProj2xInst*)inst)->out_dim * 2;
+            break;
         case OP_RMSNORM_GATE: {
             const RmsNormGateInst* g = (const RmsNormGateInst*)inst;
             size = (int)g->num_heads * (int)g->vd;
@@ -224,6 +228,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_CONV1D_3X:         op_conv1d_3x(inst, vb); break;
                 case OP_FFN_GATE_UP_WX:    op_ffn_gate_up_wx(inst, vb); break;
                 case OP_FFN_GATE_UP_RNF4_WX: op_ffn_gate_up_rnf4_wx(inst, vb); break;
+                case OP_LINEAR_PROJ_2X:    op_linear_proj_2x(inst, vb); break;
                 default:
                     if (threadIdx.x == 0 && blockIdx.x == 0)
                         printf("MEGAKERNEL: unknown opcode %u at pc %d\n", opcode, pc);
