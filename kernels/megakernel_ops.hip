@@ -1009,12 +1009,12 @@ __device__ __attribute__((noinline)) void op_relu_sq(const u64* inst, u32 vblock
     if (idx < size) { float x = input[idx]; float r = x > 0.0f ? x : 0.0f; output[idx] = r * r; }
 }
 
-// OP_FFN_GATE_UP: fused RMSNorm + gate_proj + up_proj + SiLU*up
+// OP_FFN_GATE_UP / OP_FFN_GATE_UP_WX: fused RMSNorm + gate_proj + up_proj + SiLU*up
 // args: [1]=scratch, [2]=input, [3]=rms_weight, [4]=w_gate, [5]=w_up,
 //       [6]=hidden_size, [7]=intermediate_size, [8]=eps, [9]=batch_size (0/1=single)
-// When batch > 1: input is [batch × hidden_size], scratch is [batch × intermediate_size].
-// vblock = batch_idx * intermediate_size + row.
-__device__ __attribute__((noinline)) void op_ffn_gate_up(const u64* inst, u32 vblock) {
+// ONE_PLUS_W=true: (1+w)*x normalization (Qwen3.5). false: w*x (Llama/Mistral).
+template<bool ONE_PLUS_W>
+__device__ __attribute__((always_inline)) void op_ffn_gate_up_impl(const u64* inst, u32 vblock) {
     const FfnGateUpInst* i = (const FfnGateUpInst*)inst;
     float* scratch_base = i->output;
     const float* input_base = i->hidden;
@@ -1061,14 +1061,18 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up(const u64* inst, u32 vb
         int base = vi * vec_elements;
         #pragma unroll
         for (int j = 0; j < 8; j++) {
-            float normed = input[base + j] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + j]));
+            float w_factor = ONE_PLUS_W ? (1.0f + bf16_to_f32(rms_weight[base + j]))
+                                        : bf16_to_f32(rms_weight[base + j]);
+            float normed = input[base + j] * rms_scale * w_factor;
             acc_gate += bf16_to_f32(gs[j]) * normed;
             acc_up += bf16_to_f32(us[j]) * normed;
         }
     }
     int rem = vec_count * vec_elements;
     for (int i = rem + tid; i < hidden_size; i += stride) {
-        float normed = input[i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[i]));
+        float w_factor = ONE_PLUS_W ? (1.0f + bf16_to_f32(rms_weight[i]))
+                                    : bf16_to_f32(rms_weight[i]);
+        float normed = input[i] * rms_scale * w_factor;
         acc_gate += bf16_to_f32(wg[i]) * normed;
         acc_up += bf16_to_f32(wu[i]) * normed;
     }
@@ -1080,6 +1084,14 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up(const u64* inst, u32 vb
         float silu_g = gate_val / (1.0f + expf(-gate_val));
         scratch[row] = silu_g * up_val;
     }
+}
+
+__device__ __attribute__((noinline)) void op_ffn_gate_up(const u64* inst, u32 vblock) {
+    op_ffn_gate_up_impl<true>(inst, vblock);
+}
+
+__device__ __attribute__((noinline)) void op_ffn_gate_up_wx(const u64* inst, u32 vblock) {
+    op_ffn_gate_up_impl<false>(inst, vblock);
 }
 
 // OP_FFN_DOWN_RES: down_proj(scratch) + residual
@@ -1136,7 +1148,8 @@ __device__ __attribute__((noinline)) void op_ffn_down_res(const u64* inst, u32 v
 //       [6]=hidden_size, [7]=intermediate_size, [8]=eps, [9]=batch_size (0/1=single)
 // When batch > 1: input is [batch × hidden_size], scratch is [batch × intermediate_size].
 // vblock = batch_idx * intermediate_size + row.
-__device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
+template<bool ONE_PLUS_W>
+__device__ __attribute__((always_inline)) void op_ffn_gate_up_rnf4_impl(const u64* inst, u32 vblock) {
     const FfnGateUpInst* i = (const FfnGateUpInst*)inst;
     float* scratch_base = i->output;
     const float* input_base = i->hidden;
@@ -1190,14 +1203,18 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4(const u64* inst, u
             unsigned char bu1 = gp_u[i / 2];
             unsigned char bu2 = (gp_u + 66)[i / 2];
 
-            float normed0 = input[base + i] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + i]));
+            float w_factor0 = ONE_PLUS_W ? (1.0f + bf16_to_f32(rms_weight[base + i]))
+                                         : bf16_to_f32(rms_weight[base + i]);
+            float normed0 = input[base + i] * rms_scale * w_factor0;
             float wg0 = NF4_TABLE[bg1 & 0xF] * absmax_g1 + NF4_TABLE[bg2 & 0xF] * absmax_g2;
             float wu0 = NF4_TABLE[bu1 & 0xF] * absmax_u1 + NF4_TABLE[bu2 & 0xF] * absmax_u2;
             acc_gate += wg0 * normed0;
             acc_up   += wu0 * normed0;
 
             if (i + 1 < count) {
-                float normed1 = input[base + i + 1] * rms_scale * (1.0f + bf16_to_f32(rms_weight[base + i + 1]));
+                float w_factor1 = ONE_PLUS_W ? (1.0f + bf16_to_f32(rms_weight[base + i + 1]))
+                                             : bf16_to_f32(rms_weight[base + i + 1]);
+                float normed1 = input[base + i + 1] * rms_scale * w_factor1;
                 float wg1 = NF4_TABLE[(bg1 >> 4) & 0xF] * absmax_g1 + NF4_TABLE[(bg2 >> 4) & 0xF] * absmax_g2;
                 float wu1 = NF4_TABLE[(bu1 >> 4) & 0xF] * absmax_u1 + NF4_TABLE[(bu2 >> 4) & 0xF] * absmax_u2;
                 acc_gate += wg1 * normed1;
@@ -1213,6 +1230,14 @@ __device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4(const u64* inst, u
         float silu_g = gate_val / (1.0f + expf(-gate_val));
         scratch[row] = silu_g * up_val;
     }
+}
+
+__device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4(const u64* inst, u32 vblock) {
+    op_ffn_gate_up_rnf4_impl<true>(inst, vblock);
+}
+
+__device__ __attribute__((noinline)) void op_ffn_gate_up_rnf4_wx(const u64* inst, u32 vblock) {
+    op_ffn_gate_up_rnf4_impl<false>(inst, vblock);
 }
 
 // OP_FFN_DOWN_RES_RNF4: down_proj(scratch) + residual (rnf4 weights)

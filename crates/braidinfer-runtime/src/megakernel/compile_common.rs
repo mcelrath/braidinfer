@@ -2,7 +2,10 @@
 
 use super::instructions::*;
 use super::Instruction;
-use super::{OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_RMSNORM, OP_RMSNORM_WX};
+use super::{
+    OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4, OP_FFN_GATE_UP_RNF4_WX, OP_FFN_GATE_UP_WX,
+    OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_RMSNORM, OP_RMSNORM_WX,
+};
 use crate::model::{KvCache, LinearWeight, WeightFormat};
 
 /// Emit a batched linear projection. For bf16, uses single batched instruction.
@@ -39,6 +42,16 @@ pub(super) fn linear_proj_opcode_ptr(weight: &LinearWeight) -> (u32, *const u8) 
 /// Choose RMSNorm opcode based on model config.
 pub(super) fn rmsnorm_opcode(one_plus_w: bool) -> u32 {
     if one_plus_w { OP_RMSNORM } else { OP_RMSNORM_WX }
+}
+
+/// Choose fused FFN gate+up opcode based on weight format and RMSNorm convention.
+pub(super) fn ffn_gate_up_opcode(rnf4: bool, one_plus_w: bool) -> u32 {
+    match (rnf4, one_plus_w) {
+        (false, true)  => OP_FFN_GATE_UP,
+        (false, false) => OP_FFN_GATE_UP_WX,
+        (true,  true)  => OP_FFN_GATE_UP_RNF4,
+        (true,  false) => OP_FFN_GATE_UP_RNF4_WX,
+    }
 }
 
 pub(super) fn div_ceil(a: u32, b: u32) -> u32 {

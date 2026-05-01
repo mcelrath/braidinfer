@@ -59,7 +59,9 @@ __device__ void dump_instruction_output(
             size = (int)((const EmbeddingInst*)inst)->hs;
             break;
         case OP_FFN_GATE_UP:
+        case OP_FFN_GATE_UP_WX:
         case OP_FFN_GATE_UP_RNF4:
+        case OP_FFN_GATE_UP_RNF4_WX:
             size = (int)((const FfnGateUpInst*)inst)->intermediate;
             break;
         case OP_FFN_DOWN_RES:
@@ -220,6 +222,8 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_SSM_UPDATE:       op_ssm_update(inst, vb); break;
                 case OP_MAMBA2_NORM_GATED: op_mamba2_norm_gated(inst, vb); break;
                 case OP_CONV1D_3X:         op_conv1d_3x(inst, vb); break;
+                case OP_FFN_GATE_UP_WX:    op_ffn_gate_up_wx(inst, vb); break;
+                case OP_FFN_GATE_UP_RNF4_WX: op_ffn_gate_up_rnf4_wx(inst, vb); break;
                 default:
                     if (threadIdx.x == 0 && blockIdx.x == 0)
                         printf("MEGAKERNEL: unknown opcode %u at pc %d\n", opcode, pc);

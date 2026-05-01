@@ -1,10 +1,10 @@
 //! GDN, Mamba2, and FFN layer compilation.
 
-use super::compile_common::{div_ceil, linear_proj_opcode_ptr, rmsnorm_opcode};
+use super::compile_common::{div_ceil, ffn_gate_up_opcode, linear_proj_opcode_ptr, rmsnorm_opcode};
 use crate::quant::WeightFormat;
 use super::instructions::*;
 use super::{Instruction, MegakernelProgram, PrefillBuffers};
-use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4};
+use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4};
 #[allow(unused_imports)]
 use crate::model::{
     ActivationBuffers, GdnState, LayerWeights, Mamba2State, ModelConfig, RecurrentLayerKind,
@@ -230,9 +230,9 @@ impl MegakernelProgram {
             && matches!(w_down, LinearWeight::Packed(pw) if pw.format == WeightFormat::Rnf4G128);
 
         if all_bf16 {
-            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16, processes all N tokens)
+            // Fused path: OP_FFN_GATE_UP[_WX] + OP_FFN_DOWN_RES (bf16, processes all N tokens)
             instructions.push(FfnGateUpInst::new(
-                OP_FFN_GATE_UP, (is * n) as u32,
+                ffn_gate_up_opcode(false, cfg.rms_norm_one_plus_w), (is * n) as u32,
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
                 hs as i32, is as i32, eps, n as i32,
@@ -253,7 +253,7 @@ impl MegakernelProgram {
             let wu_ptr = match w_up   { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
             let wd_ptr = match w_down { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
             instructions.push(FfnGateUpInst::new(
-                OP_FFN_GATE_UP_RNF4, (is * n) as u32,
+                ffn_gate_up_opcode(true, cfg.rms_norm_one_plus_w), (is * n) as u32,
                 bufs.ffn_act.as_write_ptr(), bufs.hidden.as_ptr(), post_norm.as_ptr(),
                 wg_ptr, wu_ptr,
                 hs as i32, is as i32, eps, n as i32,
@@ -359,9 +359,9 @@ impl MegakernelProgram {
             && matches!(w_down, LinearWeight::Packed(pw) if pw.format == crate::quant::WeightFormat::Rnf4G128);
 
         if all_bf16 {
-            // Fused path: OP_FFN_GATE_UP + OP_FFN_DOWN_RES (bf16 only, batch=0=single token)
+            // Fused path: OP_FFN_GATE_UP[_WX] + OP_FFN_DOWN_RES (bf16 only, batch=0=single token)
             instructions.push(FfnGateUpInst::new(
-                OP_FFN_GATE_UP, is as u32,
+                ffn_gate_up_opcode(false, cfg.rms_norm_one_plus_w), is as u32,
                 act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate.as_bf16_ptr() as *const u8, w_up.as_bf16_ptr() as *const u8,
                 hs as i32, is as i32, eps, 0,
@@ -377,7 +377,7 @@ impl MegakernelProgram {
             let w_up_ptr   = match w_up   { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
             let w_down_ptr = match w_down { LinearWeight::Packed(pw) => pw.data.as_ptr(), _ => unreachable!() };
             instructions.push(FfnGateUpInst::new(
-                OP_FFN_GATE_UP_RNF4, is as u32,
+                ffn_gate_up_opcode(true, cfg.rms_norm_one_plus_w), is as u32,
                 act.ffn_act.as_write_ptr(), act.hidden.as_ptr(), post_norm.as_ptr(),
                 w_gate_ptr, w_up_ptr,
                 hs as i32, is as i32, eps, 0,

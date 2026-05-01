@@ -43,3 +43,5 @@
 #define OP_MAMBA2_CONV1D    38  // causal conv1d with f32 bias + SiLU; args: [1]=state(w), [2]=input, [3]=weight(u16), [4]=bias(f32), [5]=output(w), [6]=conv_dim, [7]=kernel_size
 #define OP_MAMBA2_NORM_GATED 39 // rms_norm(x*silu(z))*weight; args: [1]=output(w), [2]=x, [3]=z, [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
 #define OP_CONV1D_3X         40 // fused Q+K+V causal conv1d; args: see Conv1d3xInst
+#define OP_FFN_GATE_UP_WX    41 // bf16 fused FFN gate+up with plain w*x RMSNorm (Llama/Mistral); same args as OP_FFN_GATE_UP
+#define OP_FFN_GATE_UP_RNF4_WX 42 // rnf4 fused FFN gate+up with plain w*x RMSNorm (Llama/Mistral); same args as OP_FFN_GATE_UP_RNF4

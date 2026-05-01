@@ -392,6 +392,8 @@ fn opcode_name(op: u32) -> &'static str {
         OP_FFN_DOWN_RES_RNF4 => "FFN_DOWN_RES_RNF4",
         OP_SIGMOID_WEIGHTED_ADD => "SIGMOID_WEIGHTED_ADD",
         OP_CONV1D_3X => "CONV1D_3X",
+        OP_FFN_GATE_UP_WX => "FFN_GATE_UP_WX",
+        OP_FFN_GATE_UP_RNF4_WX => "FFN_GATE_UP_RNF4_WX",
         _ => "UNKNOWN",
     }
 }
