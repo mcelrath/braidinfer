@@ -7,6 +7,93 @@ use std::ffi::c_void;
 
 use super::kernel_dir;
 
+/// WMMA-accelerated batched GEMM for gfx1100 RDNA3 (wave32).
+/// Supports bf16 activations × bf16 weights → f32 output,
+/// and f32 activations × RNF4G128 weights → f32 output (fused dequant).
+pub struct WmmaGemmKernel {
+    module_bf16: Module,
+    module_rnf4: Module,
+    device: DeviceId,
+}
+
+impl WmmaGemmKernel {
+    pub fn load(device: DeviceId) -> HipResult<Self> {
+        let bf16_path = kernel_dir().join("wmma_gemm_bf16.hsaco");
+        let rnf4_path = kernel_dir().join("wmma_gemm_rnf4g128.hsaco");
+        let module_bf16 = Module::load(device, &bf16_path)?;
+        let module_rnf4 = Module::load(device, &rnf4_path)?;
+        Ok(Self { module_bf16, module_rnf4, device })
+    }
+
+    pub fn device(&self) -> DeviceId {
+        self.device
+    }
+
+    /// C = A @ B^T, A[M,K] bf16, B[N,K] bf16, C[M,N] f32.
+    /// K must be a multiple of 16.
+    pub fn gemm_bf16(
+        &self,
+        c: &mut DeviceBuffer<f32>,
+        a: &DeviceBuffer<u16>,
+        b: &DeviceBuffer<u16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module_bf16.get_function("wmma_gemm_bf16")?;
+        let mut c_ptr: *mut c_void = c.as_mut_ptr().cast();
+        let mut a_ptr: *const c_void = a.as_ptr().cast();
+        let mut b_ptr: *const c_void = b.as_ptr().cast();
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(c_ptr).cast(),
+            std::ptr::addr_of_mut!(a_ptr).cast(),
+            std::ptr::addr_of_mut!(b_ptr).cast(),
+            std::ptr::addr_of_mut!(mm).cast(),
+            std::ptr::addr_of_mut!(nn).cast(),
+            std::ptr::addr_of_mut!(kk).cast(),
+        ];
+        let grid_x = (m + 15) / 16;
+        let grid_y = (n + 15) / 16;
+        func.launch((grid_x, grid_y, 1), (32, 1, 1), 0, stream, &mut args)
+    }
+
+    /// C = A @ B^T, A[M,K] f32, B[N,K] RNF4G128, C[M,N] f32.
+    /// K must be a multiple of 128 (group size).
+    pub fn gemm_rnf4g128(
+        &self,
+        c: &mut DeviceBuffer<f32>,
+        a: &DeviceBuffer<f32>,
+        b: &DeviceBuffer<u8>,
+        m: u32,
+        n: u32,
+        k: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = self.module_rnf4.get_function("wmma_gemm_rnf4g128")?;
+        let mut c_ptr: *mut c_void = c.as_mut_ptr().cast();
+        let mut a_ptr: *const c_void = a.as_ptr().cast();
+        let mut b_ptr: *const c_void = b.as_ptr().cast();
+        let mut mm = m as i32;
+        let mut nn = n as i32;
+        let mut kk = k as i32;
+        let mut args: [*mut c_void; 6] = [
+            std::ptr::addr_of_mut!(c_ptr).cast(),
+            std::ptr::addr_of_mut!(a_ptr).cast(),
+            std::ptr::addr_of_mut!(b_ptr).cast(),
+            std::ptr::addr_of_mut!(mm).cast(),
+            std::ptr::addr_of_mut!(nn).cast(),
+            std::ptr::addr_of_mut!(kk).cast(),
+        ];
+        let grid_x = (m + 15) / 16;
+        let grid_y = (n + 15) / 16;
+        func.launch((grid_x, grid_y, 1), (32, 1, 1), 0, stream, &mut args)
+    }
+}
+
 pub struct LinearProjKernel {
     module: Module,
     device: DeviceId,

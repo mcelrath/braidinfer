@@ -74,6 +74,41 @@ fn main() {
         println!("cargo:rerun-if-changed={}", src.display());
     }
 
+    // WMMA kernels require wave32 (-mno-wavefrontsize64), compiled separately.
+    let wmma_kernels = [
+        "wmma_gemm_bf16",
+        "wmma_gemm_rnf4g128",
+    ];
+
+    for kernel in &wmma_kernels {
+        let src = kernel_dir.join(format!("{kernel}.hip"));
+        let hsaco = out_dir.join(format!("{kernel}.hsaco"));
+
+        let output = Command::new(&hipcc)
+            .args([
+                "--offload-arch=gfx1100",
+                "--genco",
+                "-O3",
+                "-std=c++17",
+                "-ffp-contract=fast",
+                "-mno-wavefrontsize64", // WMMA _w32 intrinsics require wave32
+                "-DHIP_API_PER_THREAD_DEFAULT_STREAM",
+                &format!("-I{}", kernel_dir.display()),
+                "-o",
+            ])
+            .arg(&hsaco)
+            .arg(&src)
+            .output()
+            .expect("failed to run hipcc");
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            panic!("hipcc failed to compile {}: {stderr}", src.display());
+        }
+
+        println!("cargo:rerun-if-changed={}", src.display());
+    }
+
     // Track all .hip include files so changes trigger recompile
     for entry in std::fs::read_dir(&kernel_dir).expect("read kernel dir") {
         let entry = entry.expect("dir entry");
