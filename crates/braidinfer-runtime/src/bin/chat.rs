@@ -131,6 +131,9 @@ async fn main() {
     }
 
     let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
+    if kv_quant {
+        eprintln!("KV_QUANT enabled (residual_pc int4)");
+    }
 
     // KV quantization is not yet supported in multi-GPU mode.
     // Both require the paged KV path, but multi-GPU paged dispatch is not implemented.

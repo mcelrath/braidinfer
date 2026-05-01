@@ -66,6 +66,7 @@ pub struct Model {
     pub(crate) debug_nan: bool,
     pub(crate) has_moe: bool,          // cached at load time: any layer has FfnType::MoE
     pub(crate) persistent: bool,       // cached from PERSISTENT env var at load time
+    pub(crate) kv_quant: bool,         // cached from KV_QUANT env var at load time
     pub(crate) sync_debug: bool,       // cached from SYNC_DEBUG env var at load time
     pub(crate) debug_p2p_hidden: bool, // cached from DEBUG_P2P_HIDDEN env var at load time
     pub(crate) moe_timing: bool,       // cached from MOE_TIMING env var at load time
@@ -200,6 +201,9 @@ impl Model {
         }
         if self.persistent {
             return self.decode_step_persistent(token_id, position);
+        }
+        if self.kv_quant {
+            return self.decode_step_paged_quantized(token_id, position);
         }
         self.decode_step_paged(token_id, position)
     }
