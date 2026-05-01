@@ -11,3 +11,24 @@ __pycache__
 
 # Models
 *.bqnt
+
+# hipcc compiler intermediates (left behind from manual / interrupted builds)
+*-hip-amdgcn-amd-amdhsa-gfx1100.bc
+*-hip-amdgcn-amd-amdhsa-gfx1100.bc.tmp
+*-hip-amdgcn-amd-amdhsa-gfx1100.hipi
+*-hip-amdgcn-amd-amdhsa-gfx1100.o
+*-hip-amdgcn-amd-amdhsa-gfx1100.out
+*-hip-amdgcn-amd-amdhsa-gfx1100.out.resolution.txt
+*-hip-amdgcn-amd-amdhsa-gfx1100.s
+*-host-x86_64-pc-linux-gnu.bc
+*-host-x86_64-pc-linux-gnu.hipi
+*-host-x86_64-pc-linux-gnu.s
+*.hip-hip-amdgcn-amd-amdhsa.hipfb
+
+# Activation traces (regenerated via TRACE=... target/release/generate)
+*.bin
+
+# Profiling / benchmark outputs
+profile_results/
+benchmark_results/
+.rocprofv3/
