@@ -175,8 +175,13 @@ impl PrefillBuffers {
             hidden: DeviceBuffer::alloc(device, n * hs)?,
             normed: DeviceBuffer::alloc(device, n * hs)?,
             qkv: DeviceBuffer::alloc(device, n * conv_dim)?,
-            a_proj: DeviceBuffer::alloc(device, n * nh)?,
-            b_proj: DeviceBuffer::alloc(device, n * nh)?,
+            // a_proj/b_proj are written by w_a/w_b linear projections in compile_prefill
+            // with output_dim = nvh (one log-decay per value head, then GQA-expanded).
+            // Allocating n*nh here was a latent OOB whenever nvh > nh (e.g. Qwen3.5-A3B,
+            // 4B: nvh=32 vs nh=16). The batched linear_proj wrote n*(nvh-nh) floats past
+            // the end of the buffer, faulting at the first unmapped page.
+            a_proj: DeviceBuffer::alloc(device, n * nvh)?,
+            b_proj: DeviceBuffer::alloc(device, n * nvh)?,
             z_proj: DeviceBuffer::alloc(device, n * nvh * vd)?,
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
