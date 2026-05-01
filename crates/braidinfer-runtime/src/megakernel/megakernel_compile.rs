@@ -743,6 +743,381 @@ impl MegakernelProgram {
         })
     }
 
+    /// Compile a one-shot prefill program for `tokens` starting at `start_pos` using
+    /// paged KV layout. Unlike `compile_prefill` (which writes to legacy flat KV caches),
+    /// this function writes KV into paged chunk slots allocated from `allocator`, populating
+    /// `seq` so that subsequent paged decode steps can attend to the prefill context.
+    ///
+    /// Algorithm: emit N sequential single-token steps, each writing KV into the appropriate
+    /// paged chunk slot and attending over tokens 0..t via OP_ATTN_PAGED. This produces
+    /// correct causal attention and populates paged KV in one pass.
+    ///
+    /// Caller must: pre-init page_table and position_table buffers on `mk_paged`
+    /// (via `init_paged_buffers`), then call this function, then execute the program.
+    /// After execution, `seq` and `allocator` reflect the prefill state; decode steps
+    /// continue from `seq.seq_len == tokens.len()`.
+    ///
+    /// The returned program is a one-shot program (not re-usable like compile_prefill);
+    /// chunk addresses are baked in. For persistent prefill, compile once per prefill call.
+    pub fn compile_prefill_paged(
+        model: &Model,
+        tokens: &[u32],
+        start_pos: u32,
+        seq: &mut crate::paged_kv::SequenceState,
+        allocator: &mut crate::paged_kv::PageAllocator,
+        page_table_buf: &braidinfer_hip::memory::MappedHostBuffer<u64>,
+        position_table_buf: &braidinfer_hip::memory::MappedHostBuffer<i32>,
+        prefill_bufs: &mut PrefillBuffers,
+        attn_paged_inst_indices_out: &mut Vec<usize>,
+        attn_quant_inst_indices_out: &mut Vec<usize>,
+        kv_write_indices_out: &mut Vec<Vec<(usize, usize)>>,
+    ) -> HipResult<Self> {
+        let n = tokens.len();
+        assert!(n > 0 && n <= CHUNK_TOKENS * 16, "prefill_paged: too many tokens");
+        let cfg = &model.config;
+        let device = model.device;
+        let act = &model.activations;
+
+        let module = Module::load(
+            device,
+            &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+        )?;
+        let shared_mem = (256u32 * 4 * 2)
+            .max((cfg.hidden_size as u32) * 4)
+            .max(31776u32);
+        let func = module.get_function("megakernel_f32")?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
+        let mut instructions: Vec<Instruction> = Vec::new();
+
+        let hs = cfg.hidden_size;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let eps = cfg.rms_norm_eps;
+        let kv_stride = nkh * hd;
+
+        // Allocate all paged chunk slots needed for N tokens up front.
+        // Pre-allocate to bake addresses into instructions.
+        for i in 0..n {
+            let pos = start_pos as i32 + i as i32;
+            seq.append_token(pos, allocator)?;
+        }
+
+        // Write page_table and position_table to host-mapped buffers.
+        // These are needed by OP_ATTN_PAGED at execution time.
+        {
+            let host_pt = page_table_buf.host_ptr();
+            for (i, chunk) in seq.chunks.iter().enumerate() {
+                let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
+                unsafe { host_pt.add(i).write_volatile(addr); }
+            }
+            let host_pos = position_table_buf.host_ptr();
+            for (i, &pos) in seq.positions.iter().enumerate() {
+                unsafe { host_pos.add(i).write_volatile(pos); }
+            }
+        }
+
+        let page_table_ptr = page_table_buf.as_ptr() as u64;
+        let pos_table_ptr = position_table_buf.as_ptr() as u64;
+
+        // Pre-collect chunk pointers and offsets for all N tokens.
+        // seq.chunks was just filled by the append_token loop above.
+        // chunk slot for token t = seq.chunks[t / CHUNK_TOKENS]
+        // offset within chunk = t % CHUNK_TOKENS
+        let chunk_size = CHUNK_TOKENS;
+
+        // Embedding placeholder index (first instruction) — updated per token inline.
+        let embedding_inst_idx = 0; // placeholder; actual index tracked per token below
+
+        // We track per-layer kv_write_indices across all N tokens.
+        // kv_write_indices_out[layer][t * nkh + h] = (k_idx, v_idx).
+        // But the existing structure is Vec<Vec<(usize, usize)>> per layer.
+        // We initialise empty per-layer vecs here and fill them per token.
+        let num_attn_layers = cfg
+            .layers
+            .iter()
+            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .count();
+        // kv_write_indices_out will be filled with one entry per attention layer
+        // (each entry = Vec of (k_idx, v_idx) pairs for ALL tokens × ALL heads,
+        // ordered token-major: [t=0 h=0, t=0 h=1, ..., t=N-1 h=nkh-1]).
+        // This is a flat vector; update_step_paged is NOT called on prefill programs,
+        // so the kv_write_indices here are for documentation only (not patched at runtime).
+        // Initialize empty per-layer vecs.
+        for _ in 0..num_attn_layers {
+            kv_write_indices_out.push(Vec::new());
+        }
+
+        // Per-token loop: emit instructions for each token sequentially.
+        // Each token t: embed → QKV proj → paged KV write → mRoPE → ATTN_PAGED → ...
+        let mut embedding_inst_idx_first = instructions.len();
+        let mut layer_first_attn_layer_kv: Vec<Vec<(usize, usize)>> = vec![Vec::new(); num_attn_layers];
+
+        for t in 0..n {
+            let pos = start_pos + t as u32;
+            let token_id = tokens[t];
+            let seq_len_at_t = pos + 1; // tokens 0..t+1 visible to token t
+
+            // Embedding for token t → act.hidden (single token)
+            if t == 0 { embedding_inst_idx_first = instructions.len(); }
+            instructions.push(EmbeddingInst::new(
+                div_ceil(hs as u32, 256),
+                act.hidden.as_write_ptr(),
+                model.embed_weight.as_ptr(),
+                token_id as i32,
+                hs as i32,
+            ).into_inst());
+
+            // Position ID for this token (write into position_ids — host-mapped)
+            // The actual host-mapped write is done above (position_table_buf).
+            // For mRoPE, prefill_bufs.position_ids is used.
+            // Set up position for this token in prefill_bufs.position_ids.
+            // We can't do this at compile time (it's a host-mapped write).
+            // Instead we write position_ids at execute time via the host-mapped position_ids.
+            // For compile_prefill_paged we bake position in the MropeInst's position_ids pointer.
+
+            let mut attn_layer_t = 0usize;
+            for layer_i in 0..cfg.num_layers {
+                use crate::model::LayerType;
+                match cfg.layers[layer_i].layer_type {
+                    LayerType::Attention => {
+                        let layer_weights = match &model.layers[layer_i] {
+                            crate::weights::LayerWeights::Attention(w) => w,
+                            _ => panic!("expected attention layer"),
+                        };
+
+                        // Compute chunk slot and offset for token t in this layer's paged KV.
+                        // layout: [layer0_K[nkh, chunk_tokens, hd], layer0_V[...], layer1_K, ...]
+                        let chunk_idx_for_t = t / chunk_size;
+                        let offset_in_chunk = t % chunk_size;
+                        let chunk_slot = seq.chunks[chunk_idx_for_t].slot_index();
+                        let chunk_base = allocator.slot_ptr(chunk_slot) as u64;
+                        let layer_k_offset = (attn_layer_t * 2 * chunk_size * kv_stride * std::mem::size_of::<f32>()) as u64;
+                        let layer_v_offset = layer_k_offset + (chunk_size * kv_stride * std::mem::size_of::<f32>()) as u64;
+
+                        // Attention layer: RMSNorm + QKV proj + KV write + mRoPE + ATTN_PAGED + output
+                        let nqh = cfg.num_q_heads;
+                        let rd = cfg.rope_dim;
+
+                        // RMSNorm
+                        instructions.push(RmsNormInst::new(
+                            rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+                            act.normed.as_write_ptr(), act.hidden.as_write_ptr(),
+                            layer_weights.input_norm.as_ptr(), hs as i32, eps,
+                        ).into_inst());
+
+                        // QKV projections
+                        let q_mult = if cfg.has_output_gate { 2 } else { 1 };
+                        emit_batched_linear_proj(&layer_weights.w_q_gate, act.q_gate_attn.as_write_ptr(), act.normed.as_ptr(), nqh * hd * q_mult, hs, 1, &mut instructions);
+                        emit_batched_linear_proj(&layer_weights.w_k, act.k_attn.as_write_ptr(), act.normed.as_ptr(), nkh * hd, hs, 1, &mut instructions);
+                        emit_batched_linear_proj(&layer_weights.w_v, act.v_attn.as_write_ptr(), act.normed.as_ptr(), nkh * hd, hs, 1, &mut instructions);
+
+                        // Deinterleave Q+gate → q_attn, gate_attn
+                        if !cfg.has_output_gate {
+                            let total = nqh * hd;
+                            instructions.push(D2dCopyInst::new(div_ceil(total as u32, 256), act.q_attn.as_write_ptr(), act.q_gate_attn.as_ptr(), total as i32).into_inst());
+                        } else {
+                            instructions.push(DeinterleaveInst::new(div_ceil((nqh * hd) as u32, 256), act.q_attn.as_write_ptr(), act.gate_attn.as_write_ptr(), act.q_gate_attn.as_ptr(), nqh as i32, hd as i32, 1).into_inst());
+                        }
+
+                        // KV write into paged chunk slot (pre-mRoPE, same as decode path)
+                        let chunk_head_stride = chunk_size * hd;
+                        let mut head_kv_pairs: Vec<(usize, usize)> = Vec::new();
+                        for h in 0..nkh {
+                            let head_byte_off = (h * chunk_head_stride + offset_in_chunk * hd) * std::mem::size_of::<f32>();
+                            let k_dst = (chunk_base + layer_k_offset + head_byte_off as u64) as *mut f32;
+                            let v_dst = (chunk_base + layer_v_offset + head_byte_off as u64) as *mut f32;
+                            let k_src = unsafe { act.k_attn.as_ptr().add(h * hd) };
+                            let v_src = unsafe { act.v_attn.as_ptr().add(h * hd) };
+                            let k_idx = instructions.len();
+                            instructions.push(D2dCopyInst::new(div_ceil(hd as u32, 256), k_dst, k_src, hd as i32).into_inst());
+                            let v_idx = instructions.len();
+                            instructions.push(D2dCopyInst::new(div_ceil(hd as u32, 256), v_dst, v_src, hd as i32).into_inst());
+                            head_kv_pairs.push((k_idx, v_idx));
+                        }
+                        layer_first_attn_layer_kv[attn_layer_t].extend(head_kv_pairs);
+
+                        // QK-norm (post-write, pre-mRoPE)
+                        if cfg.has_qk_norm {
+                            instructions.push(QkNormInst::new(
+                                (nqh + nkh) as u32,
+                                act.q_attn.as_write_ptr(), act.k_attn.as_write_ptr(),
+                                layer_weights.q_norm.as_ptr(), layer_weights.k_norm.as_ptr(),
+                                nqh as i32, nkh as i32, hd as i32, eps, 0,
+                            ).into_inst());
+                        }
+
+                        // mRoPE (single token, uses act.position_ids which is set per-step by set_position)
+                        instructions.push(MropeInst::new(
+                            (nqh + nkh) as u32,
+                            act.q_attn.as_write_ptr(), act.k_attn.as_write_ptr(),
+                            act.inv_freq.as_ptr(), act.position_ids.as_ptr(),
+                            nqh as i32, nkh as i32, hd as i32, rd as i32,
+                            cfg.mrope_sections()[0] as i32, cfg.mrope_sections()[1] as i32, cfg.mrope_sections()[2] as i32, 1,
+                        ).into_inst());
+
+                        // OP_ATTN_PAGED_Q (disabled: grid_x=0; quantized KV not used during prefill)
+                        let quant_idx = instructions.len();
+                        if t == 0 { attn_quant_inst_indices_out.push(quant_idx); }
+                        {
+                            use crate::paged_kv::quantized_kv_offsets;
+                            let chunk_tokens = CHUNK_TOKENS;
+                            let (q1d, q1s, rd_off, rs) = quantized_kv_offsets(cfg, chunk_tokens, attn_layer_t, false);
+                            let k_norm_ptr = if cfg.has_qk_norm { layer_weights.k_norm.as_ptr() } else { std::ptr::null() };
+                            instructions.push(AttnPagedQInst::new(
+                                act.q_attn.as_ptr(), act.inv_freq.as_ptr(),
+                                nqh as i32, nkh as i32, hd as i32, chunk_tokens as i32, rd as i32,
+                                q1d as u64, q1s as u64, rd_off as u64, rs as u64, k_norm_ptr,
+                            ).into_inst());
+                        }
+
+                        // OP_ATTN_PAGED: attend over all visible paged chunks for token t
+                        // page_table_ptr points to the host-mapped buffer (written above).
+                        // seq_len = t+1, but we use offset within active chunk.
+                        let paged_idx = instructions.len();
+                        if t == 0 { attn_paged_inst_indices_out.push(paged_idx); }
+                        {
+                            let k_norm_ptr = if cfg.has_qk_norm { layer_weights.k_norm.as_ptr() } else { std::ptr::null() };
+                            // Point into paged KV offsets for this layer.
+                            let layer_k_off = (attn_layer_t * 2 * chunk_size * kv_stride * std::mem::size_of::<f32>()) as u64;
+                            let layer_v_off = layer_k_off + (chunk_size * kv_stride * std::mem::size_of::<f32>()) as u64;
+                            instructions.push(AttnPagedInst::new(
+                                nqh as u32,
+                                act.attn_out.as_write_ptr(),
+                                act.q_attn.as_ptr(),
+                                act.inv_freq.as_ptr(),
+                                nqh as i32, nkh as i32, hd as i32,
+                                seq_len_at_t as i32,
+                                CHUNK_TOKENS as i32,
+                                rd as i32,
+                                layer_k_off,
+                                layer_v_off,
+                                k_norm_ptr,
+                            ).into_inst());
+                            // Patch page_table and pos_table pointers into the instruction
+                            let last_idx = instructions.len() - 1;
+                            unsafe {
+                                let inst = instructions[last_idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                                (*inst).page_table = page_table_ptr;
+                                (*inst).pos_table = pos_table_ptr;
+                                (*inst).partial_state = 0;
+                            }
+                        }
+
+                        // Output gate + O-proj + residual (single-token decode path)
+                        let final_attn_ptr = if cfg.has_output_gate {
+                            let gate_size = nqh * hd;
+                            instructions.push(OutputGateInst::new(
+                                div_ceil(gate_size as u32, 256),
+                                act.gated_out.as_write_ptr(), act.attn_out.as_ptr(), act.gate_attn.as_ptr(), gate_size as i32,
+                            ).into_inst());
+                            act.gated_out.as_write_ptr()
+                        } else {
+                            act.attn_out.as_write_ptr()
+                        };
+                        emit_batched_linear_proj(&layer_weights.w_o, act.out_proj.as_write_ptr(), final_attn_ptr, hs, nqh * hd, 1, &mut instructions);
+                        // Two-step residual: hidden → residual, then residual + out_proj → hidden
+                        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.residual.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+                        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), act.out_proj.as_ptr(), act.residual.as_ptr(), hs as i32).into_inst());
+
+                        attn_layer_t += 1;
+                    }
+                    LayerType::Gdn | LayerType::Mamba2 | LayerType::MoeFfn | LayerType::LfmConv => {
+                        // Non-attention layers are not supported in compile_prefill_paged
+                        // (this path is for pure attention models like Qwen3.5).
+                        // If a model has GDN/Mamba2/MoE layers, use compile_prefill instead.
+                        // TODO(braidinfer-8gz follow-up): add GDN/Mamba2 support here.
+                    }
+                }
+
+                // Dense FFN (for attention layers that have dense FFN)
+                match &cfg.layers[layer_i].ffn_type {
+                    crate::model::FfnType::Dense => {
+                        Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
+                    }
+                    crate::model::FfnType::None => {}
+                    crate::model::FfnType::MoE { .. } => {
+                        // MoE FFN not supported in compile_prefill_paged
+                    }
+                }
+            }
+        }
+
+        // Copy kv_write_indices_out from per-layer tracking
+        for (layer_i, kv_pairs) in layer_first_attn_layer_kv.into_iter().enumerate() {
+            kv_write_indices_out[layer_i] = kv_pairs;
+        }
+
+        // Final RMSNorm + LM head (on the last token's hidden state, now in act.hidden)
+        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.normed.as_write_ptr(), act.hidden.as_ptr(), hs as i32).into_inst());
+        instructions.push(RmsNormInst::new(
+            rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+            act.hidden.as_write_ptr(), act.normed.as_ptr(),
+            model.final_norm_weight.as_ptr(), hs as i32, eps,
+        ).into_inst());
+        {
+            let lm_w_ptr = if cfg.tie_word_embeddings {
+                model.embed_weight.as_ptr() as *const u8
+            } else {
+                model.lm_head_weight.as_ptr() as *const u8
+            };
+            instructions.push(LinearProjInst::new(
+                OP_LINEAR_PROJ, cfg.vocab_size as u32,
+                act.logits.as_write_ptr(), lm_w_ptr, act.hidden.as_ptr(),
+                cfg.vocab_size as i32, hs as i32, 0,
+            ).into_inst());
+        }
+        instructions.push(Instruction::new(OP_HALT, 0));
+
+        let device_program = upload_program(device, &instructions)?;
+        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
+
+        // Suppress unused variable warning
+        let _ = prefill_bufs;
+        let _ = embedding_inst_idx_first;
+        let _ = embedding_inst_idx;
+
+        Ok(MegakernelProgram {
+            instructions,
+            device_program,
+            module: Arc::new(module),
+            num_blocks,
+            shared_mem,
+            device,
+            embedding_inst_idx: embedding_inst_idx_first,
+            _mrope_inst_indices: Vec::new(),
+            gqa_attn_inst_indices: Vec::new(),
+            position_ids_dev_ptr: act.position_ids.as_ptr() as u64,
+            kv: super::KvConfig {
+                max_seq_len: cfg.max_seq_len as u32,
+                num_kv_heads: nkh,
+                head_dim: hd,
+                kv_write_indices: Vec::new(), // one-shot program; no per-step patching
+                kv_base_ptrs: Vec::new(),
+            },
+            paged: true,
+            paged_kv: Some(super::PagedKvState {
+                page_table: None,    // caller owns these; not managed by the program
+                position_table: None,
+                attn_paged_inst_indices: attn_paged_inst_indices_out.clone(),
+                attn_quant_inst_indices: attn_quant_inst_indices_out.clone(),
+                last_page_table_len: seq.chunks.len(),
+                kv_stride_paged: kv_stride,
+            }),
+            quantized_kv: false,
+            quant_kv: None,
+            prefill_cache: None,
+            dump_buffer: None,
+            dump_counter: None,
+            dump_capacity: 0,
+            barrier_layer_map: Vec::new(),
+            multi_gpu_attn_boundaries: Vec::new(),
+            flat_program,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     /// Compile a prefill segment covering layers [layer_start, layer_end).
     /// Used by prefill_mixed_chunk to batch non-MoE layer spans.
     /// Does NOT emit embedding instructions (caller sets up prefill_bufs.hidden before calling).

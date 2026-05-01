@@ -37,8 +37,13 @@ impl Model {
         if tokens.is_empty() {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
-        // Batched path: persistent mode or MoE model, worker not yet started (can still do hipMemcpy).
-        if (self.persistent || self.has_moe) && self.persistent_workers.is_none() {
+        // Persistent + paged (non-MoE): use paged prefill so decode sees KV in paged chunks.
+        // Worker not yet started so hipMemcpy is still allowed.
+        if self.persistent && !self.has_moe && self.persistent_workers.is_none() {
+            return self.prefill_paged(tokens);
+        }
+        // MoE + persistent: mixed batched path (compile_prefill_segment + moe_ffn_forward).
+        if self.has_moe && self.persistent_workers.is_none() {
             return self.prefill_batched(tokens);
         }
         // Sequential fallback: use paged path if worker not started (coherent with decode_step_paged reference).
@@ -52,6 +57,28 @@ impl Model {
                 self.decode_step(tok, pos)?
             };
         }
+        Ok(logits)
+    }
+
+    /// Prefill using paged KV cache (for persistent single-GPU non-MoE models).
+    /// Populates paged chunks via sequential decode_step_paged so that
+    /// decode_step_persistent can attend to the full prefill context.
+    ///
+    /// Note: this is O(N^2) decode steps (not batched). Batched paged prefill
+    /// is tracked as a follow-up optimization (TODO: braidinfer-8gz follow-up).
+    fn prefill_paged(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
+        let start_pos = self.seq_len;
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = start_pos + i as u32;
+            logits = self.decode_step_paged(tok, pos)?;
+        }
+
+        // seq_len is incremented by each decode_step_paged call internally,
+        // so we don't need to increment it again here.
+        // But decode_step_paged calls set seq_len = position + 1 after each step,
+        // so after the last step it should equal start_pos + total.
         Ok(logits)
     }
 

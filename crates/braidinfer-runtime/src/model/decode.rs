@@ -1,7 +1,6 @@
 use braidinfer_hip::memory::DeviceBuffer;
 
 use crate::megakernel::{MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
-use crate::megakernel::instructions::{EmbeddingInst, GqaAttnInst};
 
 use super::Model;
 use super::ModelError;
@@ -10,7 +9,9 @@ use crate::weights::*;
 use crate::gpu_utils::d2d_copy_f32;
 
 impl Model {
-    /// Persistent worker decode: compile megakernel program, replay via CPU-scheduled dispatch.
+    /// Persistent worker decode using paged KV cache.
+    /// On first call: compiles paged megakernel, initializes page allocator + sequence,
+    /// then launches persistent worker.
     pub(super) fn decode_step_persistent(
         &mut self,
         token_id: u32,
@@ -18,17 +19,33 @@ impl Model {
     ) -> Result<Vec<f32>, ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
 
-        // Lazy-init: compile megakernel program FIRST (needs GPU queries),
+        // Lazy-init: compile PAGED megakernel FIRST (needs GPU queries),
         // then launch persistent worker (occupies all SMs).
         if self.persistent_workers.is_none() {
-            if self.megakernel.is_none() {
-                let mk = MegakernelProgram::compile(self)?;
-                self.megakernel = Some(mk);
+            let max_chunks = self.max_paged_chunks();
+
+            if self.megakernel_paged.is_none() {
+                let mut mk = MegakernelProgram::compile_paged(self)?;
+                mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
+                self.megakernel_paged = Some(mk);
             }
 
+            // Patch LM head instruction to write to logits_mapped (host-mapped)
+            // so CPU can read without hipMemcpy (which deadlocks the cooperative kernel).
+            // This must be done whether megakernel_paged was just compiled or
+            // pre-compiled by prefill_paged (which doesn't patch logits_mapped).
+            {
+                let mk = self.megakernel_paged.as_mut().unwrap();
+                let n_inst = mk.instructions.len();
+                let lm_head_idx = n_inst - 2; // second-to-last (before HALT)
+                mk.instructions[lm_head_idx].words[1] =
+                    self.activations.logits_mapped.as_write_ptr() as u64;
+            }
+
+            // Ensure paged decode state (page_allocator + paged_seq) is initialized.
+            self.ensure_paged_decode_state(false)?;
+
             // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
-            // Use this for all models regardless of MoE — MoE models need less but
-            // allocating more is always safe (just wastes a little shared mem).
             let shared_mem = SHARED_LPROJ_TOTAL as u32;
             let dispatch =
                 PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size).map_err(ModelError::Hip)?;
@@ -38,51 +55,35 @@ impl Model {
         // Write position_ids directly to host-mapped memory (no hipMemcpy)
         self.set_position(position).map_err(ModelError::Hip)?;
 
-        let mk = self.megakernel.as_mut().unwrap();
-        unsafe {
-            let inst = mk.instructions[mk.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
-            (*inst).token_id = token_id as u64;
+        // Append token to paged sequence state (allocates chunk slot if needed).
+        {
+            let seq_mut = self.paged_seq.as_mut().unwrap();
+            let alloc_mut = self.page_allocator.as_mut().unwrap();
+            seq_mut.append_token(position as i32, alloc_mut).map_err(ModelError::Hip)?;
         }
-        let hd = mk.kv.head_dim;
-        let max_sl = mk.kv.max_seq_len as usize;
-        let head_stride = max_sl * hd;
-        for (layer_i, head_indices) in mk.kv.kv_write_indices.iter().enumerate() {
-            let (k_base, v_base) = mk.kv.kv_base_ptrs[layer_i];
-            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
-                let offset =
-                    (h * head_stride + position as usize * hd) * std::mem::size_of::<f32>();
-                mk.instructions[k_idx].words[1] = k_base + offset as u64;
-                mk.instructions[v_idx].words[1] = v_base + offset as u64;
-            }
-        }
-        let seq_len = position + 1;
-        for &idx in &mk.gqa_attn_inst_indices {
-            unsafe {
-                let inst = mk.instructions[idx].words.as_mut_ptr() as *mut GqaAttnInst;
-                (*inst).seq_len = seq_len as u64;
-            }
-        }
-        // dispatch instructions via persistent worker
 
-        // Patch LM head instruction to write to logits_mapped (host-mapped)
-        // so CPU can read without hipMemcpy (which deadlocks cooperative kernel).
-        let n_inst = mk.instructions.len();
-        let lm_head_idx = n_inst - 2; // second-to-last (before HALT)
-        mk.instructions[lm_head_idx].words[1] =
-            self.activations.logits_mapped.as_write_ptr() as u64;
+        // Host-side patching only: update instructions without hipMemcpyAsync.
+        // Persistent caller will dispatch via dispatch_batch_slice instead.
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let seq = self.paged_seq.as_ref().unwrap();
+            let allocator = self.page_allocator.as_ref().unwrap();
+            mk.update_step_paged_no_upload(token_id, position, seq, allocator)
+                .map_err(ModelError::Hip)?;
+        }
 
-        // Batch dispatch: send all instructions as batches of up to MAX_BATCH_INSTRUCTIONS.
-        // Worker processes all with grid.sync() between them, acks once per batch.
-        let batch: Vec<_> = mk
+        // Dispatch: send all instructions (excluding HALT) via persistent worker mailbox.
+        // HALT EXCLUSION (CRITICAL): the persistent cooperative kernel loops forever
+        // waiting for the next batch; HALT would cause it to exit. We must never
+        // send HALT over the mailbox — only send to halt_idx (exclusive).
+        let mk = self.megakernel_paged.as_ref().unwrap();
+        let halt_idx = mk
             .instructions
             .iter()
-            .take_while(|inst| (inst.words[0] as u32 as u64) != OP_HALT as u64)
-            .cloned()
-            .collect();
+            .position(|inst| (inst.words[0] as u32 as u64) == OP_HALT as u64)
+            .unwrap_or(mk.instructions.len());
         let dispatch = self.persistent_workers.as_mut().unwrap();
-        for chunk in batch.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-            dispatch.dispatch_batch(0, chunk);
-        }
+        dispatch.dispatch_batch_slice(0, &mk.instructions[..halt_idx]);
 
         // Read logits directly from host-mapped memory (no hipMemcpy needed)
         let logits = unsafe {
