@@ -340,6 +340,178 @@ impl MegakernelProgram {
         Ok(())
     }
 
+    /// Host-side-only variant of update_step_paged for the persistent worker path.
+    /// Performs steps 1-5 (host-side instruction patching + host-mapped page_table writes)
+    /// but skips step 6 (hipMemcpyAsync instruction upload to device).
+    ///
+    /// The persistent caller dispatches the patched instructions via dispatch_batch_slice,
+    /// which writes them directly to the host-mapped worker queue — no hipMemcpyAsync needed
+    /// and no deadlock risk under the cooperative kernel.
+    pub fn update_step_paged_no_upload(
+        &mut self,
+        token_id: u32,
+        position: u32,
+        seq: &SequenceState,
+        allocator: &PageAllocator,
+    ) -> HipResult<()> {
+        assert!(
+            position < self.kv.max_seq_len,
+            "position {position} >= max_seq_len {}",
+            self.kv.max_seq_len
+        );
+        assert!(self.paged, "update_step_paged_no_upload called on non-paged program");
+
+        // 1. Patch embedding token_id
+        unsafe {
+            let inst = self.instructions[self.embedding_inst_idx].words.as_mut_ptr() as *mut EmbeddingInst;
+            (*inst).token_id = token_id as u64;
+        }
+
+        // 2. Append scalar logical position to position_table in sequence order.
+        {
+            let seq_token_idx = (seq.seq_len as usize).saturating_sub(1);
+            let pos_scalar = *seq
+                .positions
+                .get(seq_token_idx)
+                .expect("position missing for appended paged token");
+            let host_ptr = self
+                .paged_kv
+                .as_ref()
+                .expect("paged_kv not initialized")
+                .position_table
+                .as_ref()
+                .expect("position_table not allocated")
+                .host_ptr();
+            unsafe {
+                host_ptr.add(seq_token_idx).write_volatile(pos_scalar);
+            }
+        }
+
+        // 3. Patch KV write D2D_COPY destinations from paged chunk layout
+        let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
+        let kv_stride = self.paged_kv.as_ref().unwrap().kv_stride_paged;
+        let hd = self.kv.head_dim;
+        let chunk_head_stride = CHUNK_TOKENS * hd;
+
+        for (layer_i, head_indices) in self.kv.kv_write_indices.iter().enumerate() {
+            let chunk_slot = if seq.chunks.is_empty() {
+                0
+            } else {
+                seq.chunks.last().unwrap().slot_index()
+            };
+            let chunk_base = allocator.slot_ptr(chunk_slot) as u64;
+            let layer_k_offset =
+                (layer_i * 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+            let layer_v_offset =
+                layer_k_offset + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+            for (h, &(k_idx, v_idx)) in head_indices.iter().enumerate() {
+                let head_byte_off =
+                    (h * chunk_head_stride + chunk_offset * hd) * std::mem::size_of::<f32>();
+                let k_ptr = chunk_base + layer_k_offset + head_byte_off as u64;
+                let v_ptr = chunk_base + layer_v_offset + head_byte_off as u64;
+                unsafe {
+                    let k_inst = self.instructions[k_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                    (*k_inst).dst = k_ptr as *mut f32;
+                    let v_inst = self.instructions[v_idx].words.as_mut_ptr() as *mut D2dCopyInst;
+                    (*v_inst).dst = v_ptr as *mut f32;
+                }
+            }
+        }
+
+        // 4. Patch attention instructions
+        let total_seq_len = seq.seq_len as i32;
+        let paged_kv = self.paged_kv.as_ref().unwrap();
+        let page_table_ptr = paged_kv
+            .page_table
+            .as_ref()
+            .expect("page_table not allocated")
+            .as_ptr() as u64;
+        let pos_table_ptr = paged_kv
+            .position_table
+            .as_ref()
+            .expect("position_table not allocated")
+            .as_ptr() as u64;
+        let attn_paged_inst_indices = paged_kv.attn_paged_inst_indices.clone();
+        let attn_quant_inst_indices = paged_kv.attn_quant_inst_indices.clone();
+
+        if self.quantized_kv && seq.chunks.len() > 1 {
+            let num_sealed = seq.chunks.len() - 1;
+            let sealed_tokens = (num_sealed * CHUNK_TOKENS) as i32;
+            let active_tokens = total_seq_len - sealed_tokens;
+            let nqh = unsafe {
+                let inst = self.instructions[attn_paged_inst_indices[0]].words.as_ptr() as *const AttnPagedInst;
+                (*inst).nqh as u32
+            };
+
+            let quant_pt_ptr = self
+                .quant_kv
+                .as_ref()
+                .expect("quant_kv not initialized")
+                .quant_page_table
+                .as_ref()
+                .expect("quant_page_table not allocated")
+                .as_ptr() as u64;
+
+            for &idx in &attn_quant_inst_indices {
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                    (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, nqh);
+                }
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                    (*inst).quant_page_table = quant_pt_ptr;
+                    (*inst).pos_table = pos_table_ptr;
+                    (*inst).quant_seq_len = sealed_tokens as u64;
+                }
+            }
+
+            for &idx in &attn_paged_inst_indices {
+                let active_pt_ptr =
+                    page_table_ptr + (num_sealed * std::mem::size_of::<u64>()) as u64;
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                    (*inst).page_table = active_pt_ptr;
+                    (*inst).pos_table = pos_table_ptr + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
+                    (*inst).seq_len = active_tokens as u64;
+                }
+            }
+        } else {
+            for &idx in &attn_quant_inst_indices {
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedQInst;
+                    (*inst).opcode_gridx = make_opcode_gridx(OP_ATTN_PAGED_Q, 0);
+                }
+            }
+            for &idx in &attn_paged_inst_indices {
+                unsafe {
+                    let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
+                    (*inst).page_table = page_table_ptr;
+                    (*inst).pos_table = pos_table_ptr;
+                    (*inst).seq_len = total_seq_len as u64;
+                    (*inst).partial_state = 0;
+                }
+            }
+        }
+
+        // 5. Upload page_table if chunk list changed (host-mapped: no HIP API call).
+        if seq.chunks.len() != self.paged_kv.as_ref().unwrap().last_page_table_len {
+            let page_table_buf = self.paged_kv.as_ref().unwrap().page_table.as_ref().expect("page_table not allocated");
+            let host_ptr = page_table_buf.host_ptr();
+            for (i, chunk) in seq.chunks.iter().enumerate() {
+                let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
+                unsafe {
+                    host_ptr.add(i).write_volatile(addr);
+                }
+            }
+            self.paged_kv.as_mut().unwrap().last_page_table_len = seq.chunks.len();
+        }
+
+        // Step 6 (hipMemcpyAsync upload) intentionally SKIPPED.
+        // The persistent caller dispatches via dispatch_batch_slice, which writes
+        // instructions directly to the host-mapped worker queue.
+        Ok(())
+    }
+
     /// Allocate the next chunk if the current one just filled up.
     /// If quantized_kv is enabled, quantizes the sealed chunk.
     /// Call after execute() + stream sync, before next update_step_paged().
