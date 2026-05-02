@@ -290,9 +290,9 @@ typedef struct {
     uint64_t layer_k_offset;
     uint64_t layer_v_offset;
     uint64_t partial_state;
-    uint64_t _pad1;
+    uint64_t mrope_sections; // packed: low 32 = section0_pairs, high 32 = section1_pairs (section2 implied)
     const uint16_t* k_norm;
-    uint64_t _pad2;
+    uint64_t eps_bits;       // f32 rms_norm_eps stored as u64 (low 32 bits used)
 } AttnPagedInst;
 static_assert(sizeof(AttnPagedInst) == INST_SIZE_WORDS * 8, "AttnPagedInst size mismatch");
 static_assert(offsetof(AttnPagedInst, output) == 8, "AttnPagedInst.output offset");

@@ -605,15 +605,34 @@ pub(crate) struct AttnPagedInst {
     pub layer_k_offset: u64, // raw byte offset for layer within paged buffer
     pub layer_v_offset: u64,
     pub partial_state: u64, // patched when quantized KV enabled
-    pub _pad1: u64,
+    pub mrope_sections: u64, // packed: low 32 = section0_pairs, high 32 = section1_pairs
     pub k_norm: *const u16, // null if no QK-norm
-    pub _pad2: u64,
+    pub eps_bits: u64,       // f32 rms_norm_eps as u64 (low 32 bits)
 }
 assert_inst_size!(AttnPagedInst);
 impl_inst!(AttnPagedInst);
 
 impl AttnPagedInst {
-    pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, seq_len: i32, chunk_tokens: i32, rd: i32, layer_k_offset: u64, layer_v_offset: u64, k_norm: *const u16) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        grid_x: u32,
+        output: *mut f32,
+        q: *const f32,
+        inv_freq: *const f32,
+        nqh: i32,
+        nkh: i32,
+        hd: i32,
+        seq_len: i32,
+        chunk_tokens: i32,
+        rd: i32,
+        layer_k_offset: u64,
+        layer_v_offset: u64,
+        k_norm: *const u16,
+        eps: f32,
+        mrope_section0_pairs: i32,
+        mrope_section1_pairs: i32,
+    ) -> Self {
+        let mrope_sections = (mrope_section0_pairs as u64) | ((mrope_section1_pairs as u64) << 32);
         AttnPagedInst {
             opcode_gridx: make_opcode_gridx(OP_ATTN_PAGED, grid_x),
             output,
@@ -630,9 +649,9 @@ impl AttnPagedInst {
             layer_k_offset,
             layer_v_offset,
             partial_state: 0,
-            _pad1: 0,
+            mrope_sections,
             k_norm,
-            _pad2: 0,
+            eps_bits: eps.to_bits() as u64,
         }
     }
 }

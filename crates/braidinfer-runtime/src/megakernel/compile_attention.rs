@@ -246,6 +246,7 @@ impl MegakernelProgram {
                 attn_paged_indices.push(paged_idx);
                 {
                     let k_norm_ptr = if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() };
+                    let mrope = cfg.mrope_sections();
                     instructions.push(AttnPagedInst::new(
                         nqh as u32,
                         attn_out_ptr,
@@ -258,6 +259,9 @@ impl MegakernelProgram {
                         paged_layer_k_offset,
                         paged_layer_v_offset,
                         k_norm_ptr,
+                        eps,
+                        mrope[0] as i32,
+                        mrope[1] as i32,
                     ).into_inst());
                 }
             }

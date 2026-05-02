@@ -1606,6 +1606,15 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
     long long layer_k_offset = (long long)i->layer_k_offset;
     long long layer_v_offset = (long long)i->layer_v_offset;
     const float* partial_state = (const float*)(i->partial_state); // 0 = none
+    // Source 1: read eps from instruction (was hardcoded 1e-6f, broken for non-Qwen3.5)
+    float eps;
+    {
+        uint32_t eps_bits32 = (uint32_t)i->eps_bits;
+        __builtin_memcpy(&eps, &eps_bits32, 4);
+    }
+    // Source 2: read mRoPE section sizes (low32 = section0_pairs, high32 = section1_pairs)
+    int mrope_section0_pairs = (int)(i->mrope_sections & 0xFFFFFFFFu);
+    int mrope_section1_pairs = (int)(i->mrope_sections >> 32);
 
     int q_head = vblock;
     if (q_head >= num_q_heads) return;
@@ -1668,11 +1677,12 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
             // k[i] = k[i] * rsqrt(sum_sq/head_dim + eps) * (1 + k_norm_weight[i])
             // k_norm_weight is passed as k_norm field of AttnPagedInst
             // NOTE: partial aliases sh_k (both = shmem). Save K to register before reduction.
+            // Source 1 fix: use eps from instruction (was hardcoded 1e-6f).
             {
                 const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
-                    float k_rms = rsqrtf(block_reduce_sum(my_k * my_k, partial) / (float)head_dim + 1e-6f);
+                    float k_rms = rsqrtf(block_reduce_sum(my_k * my_k, partial) / (float)head_dim + eps);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
                         sh_k[tid] = my_k * k_rms * w;  // use saved register value
@@ -1680,10 +1690,25 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
                 }
             }
 
-            // Apply lazy RoPE rotation to sh_k (in-place, rope_dim elements only)
-            // Threads 0..rope_pairs-1 handle pairs (tid*2, tid*2+1)
+            // Apply lazy RoPE rotation to sh_k (in-place, rope_dim elements only).
+            // Source 2 fix: mRoPE sections — each pair belongs to a temporal/height/width
+            // section, and uses the corresponding position from a 3-int per-token table.
+            // For text-only models with mrope_sections=[0,0,0], all pairs fall into
+            // section 2; we read position_table[*3 + 2]. Writers populate all 3 ints
+            // with the same scalar position, so this is equivalent to standard RoPE.
+            // Threads 0..rope_pairs-1 handle pairs (tid*2, tid*2+1).
             if (tid < rope_pairs) {
-                int pos = position_table[c * chunk_tokens + t];
+                int section;
+                if (mrope_section0_pairs == 0 && mrope_section1_pairs == 0) {
+                    // Standard (non-mRoPE) models: use section 0 (cleaner default).
+                    section = 0;
+                } else {
+                    section = (tid < mrope_section0_pairs)
+                        ? 0
+                        : (tid < mrope_section0_pairs + mrope_section1_pairs ? 1 : 2);
+                }
+                // position_table layout: 3 ints per token (temporal, height, width).
+                int pos = position_table[(c * chunk_tokens + t) * 3 + section];
                 float theta = (float)pos * inv_freq[tid];
                 float cos_state = cosf(theta);
                 float sin_state = sinf(theta);
@@ -1859,9 +1884,10 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
                 }
             }
 
-            // Apply lazy RoPE
+            // Apply lazy RoPE — position_table now stores 3 ints per token (mRoPE).
+            // For text models all 3 sections share the same value; section-0 is canonical.
             if (tid < rope_pairs) {
-                int pos = position_table[c * chunk_tokens + t];
+                int pos = position_table[(c * chunk_tokens + t) * 3];
                 float theta = (float)pos * inv_freq[tid];
                 float cos_state = cosf(theta);
                 float sin_state = sinf(theta);

@@ -812,9 +812,17 @@ impl MegakernelProgram {
                 let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
                 unsafe { host_pt.add(i).write_volatile(addr); }
             }
+            // position_table layout: 3 ints per token (mRoPE temporal/height/width).
+            // For text-only models all 3 are written equal — op_attn_paged reads
+            // the section via mrope_section sizes.
             let host_pos = position_table_buf.host_ptr();
             for (i, &pos) in seq.positions.iter().enumerate() {
-                unsafe { host_pos.add(i).write_volatile(pos); }
+                unsafe {
+                    let base = host_pos.add(i * 3);
+                    base.add(0).write_volatile(pos);
+                    base.add(1).write_volatile(pos);
+                    base.add(2).write_volatile(pos);
+                }
             }
         }
 
@@ -982,6 +990,7 @@ impl MegakernelProgram {
                             // Point into paged KV offsets for this layer.
                             let layer_k_off = (attn_layer_t * 2 * chunk_size * kv_stride * std::mem::size_of::<f32>()) as u64;
                             let layer_v_off = layer_k_off + (chunk_size * kv_stride * std::mem::size_of::<f32>()) as u64;
+                            let mrope = cfg.mrope_sections();
                             instructions.push(AttnPagedInst::new(
                                 nqh as u32,
                                 act.attn_out.as_write_ptr(),
@@ -994,6 +1003,9 @@ impl MegakernelProgram {
                                 layer_k_off,
                                 layer_v_off,
                                 k_norm_ptr,
+                                eps,
+                                mrope[0] as i32,
+                                mrope[1] as i32,
                             ).into_inst());
                             // Patch page_table and pos_table pointers into the instruction
                             let last_idx = instructions.len() - 1;

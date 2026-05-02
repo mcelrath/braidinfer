@@ -150,8 +150,11 @@ impl MegakernelProgram {
             (*inst).token_id = token_id as u64;
         }
 
-        // 2. Append scalar logical position to position_table in sequence order.
+        // 2. Append per-token positions to position_table in sequence order.
         // MappedHostBuffer: write via host_ptr (no hipMemcpy — GPU reads through device_ptr).
+        // Layout: 3 ints per token (temporal, height, width) for mRoPE. For text-only
+        // models the caller writes the same scalar to all 3 sections — op_attn_paged uses
+        // mrope_section sizes to pick which section to use per RoPE pair.
         {
             let seq_token_idx = (seq.seq_len as usize).saturating_sub(1);
             let pos_scalar = *seq
@@ -167,7 +170,10 @@ impl MegakernelProgram {
                 .expect("position_table not allocated")
                 .host_ptr();
             unsafe {
-                host_ptr.add(seq_token_idx).write_volatile(pos_scalar);
+                let base = host_ptr.add(seq_token_idx * 3);
+                base.add(0).write_volatile(pos_scalar);
+                base.add(1).write_volatile(pos_scalar);
+                base.add(2).write_volatile(pos_scalar);
             }
         }
 
@@ -271,7 +277,9 @@ impl MegakernelProgram {
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
                     (*inst).page_table = active_pt_ptr;
-                    (*inst).pos_table = pos_table_ptr + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
+                    // pos_table layout is 3 ints per token (mRoPE-compatible).
+                    (*inst).pos_table = pos_table_ptr
+                        + (num_sealed * CHUNK_TOKENS * 3 * std::mem::size_of::<i32>()) as u64;
                     (*inst).seq_len = active_tokens as u64;
                 }
             }
@@ -367,7 +375,7 @@ impl MegakernelProgram {
             (*inst).token_id = token_id as u64;
         }
 
-        // 2. Append scalar logical position to position_table in sequence order.
+        // 2. Append per-token positions (3 ints: temporal, height, width) to position_table.
         {
             let seq_token_idx = (seq.seq_len as usize).saturating_sub(1);
             let pos_scalar = *seq
@@ -383,7 +391,10 @@ impl MegakernelProgram {
                 .expect("position_table not allocated")
                 .host_ptr();
             unsafe {
-                host_ptr.add(seq_token_idx).write_volatile(pos_scalar);
+                let base = host_ptr.add(seq_token_idx * 3);
+                base.add(0).write_volatile(pos_scalar);
+                base.add(1).write_volatile(pos_scalar);
+                base.add(2).write_volatile(pos_scalar);
             }
         }
 
@@ -471,7 +482,9 @@ impl MegakernelProgram {
                 unsafe {
                     let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPagedInst;
                     (*inst).page_table = active_pt_ptr;
-                    (*inst).pos_table = pos_table_ptr + (num_sealed * CHUNK_TOKENS * std::mem::size_of::<i32>()) as u64;
+                    // pos_table layout is 3 ints per token (mRoPE-compatible).
+                    (*inst).pos_table = pos_table_ptr
+                        + (num_sealed * CHUNK_TOKENS * 3 * std::mem::size_of::<i32>()) as u64;
                     (*inst).seq_len = active_tokens as u64;
                 }
             }
@@ -580,8 +593,12 @@ impl MegakernelProgram {
             paged_kv.page_table = Some(MappedHostBuffer::alloc(max_chunks)?);
         }
         if paged_kv.position_table.is_none() {
-            paged_kv.position_table =
-                Some(braidinfer_hip::memory::MappedHostBuffer::alloc(self.kv.max_seq_len as usize)?);
+            // 3 ints per token (temporal, height, width) for mRoPE compatibility.
+            // For text-only models all 3 are written to the same value and op_attn_paged
+            // collapses to standard RoPE via mrope_section sizes.
+            paged_kv.position_table = Some(
+                braidinfer_hip::memory::MappedHostBuffer::alloc(self.kv.max_seq_len as usize * 3)?,
+            );
         }
         Ok(())
     }
