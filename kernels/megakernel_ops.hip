@@ -348,10 +348,15 @@ __device__ __attribute__((noinline)) void op_linear_proj_rnf4_full(const u64* in
                 for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
-                if (tid < 8) {
-                    acc = shared[tid];
-                    for (int offset = 4; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
-                    if (tid == 0) row_partial[ri] += acc;
+                // Reduce 8 warp partials with thread 0 only. The previous code did
+                // __shfl_down inside an `if (tid < 8)` block — on RDNA3 wave32, shfl
+                // from an inactive lane is undefined and observably non-deterministic
+                // (AMD ISA: lane reads source register; if source lane is masked off
+                // its register state is implementation-defined). bz0 Source 3 root cause.
+                if (tid == 0) {
+                    float total = shared[0] + shared[1] + shared[2] + shared[3]
+                                + shared[4] + shared[5] + shared[6] + shared[7];
+                    row_partial[ri] += total;
                 }
                 __syncthreads();
             }
@@ -444,13 +449,12 @@ __device__ __attribute__((noinline)) void op_linear_proj_rnf4(const u64* inst, u
             acc += __shfl_down(acc, offset);
         if ((tid & 31) == 0) shared[tid >> 5] = acc;
         __syncthreads();
-        if (tid < 8) {
-            acc = shared[tid];
-            for (int offset = 4; offset > 0; offset >>= 1)
-                acc += __shfl_down(acc, offset);
-            if (tid == 0) {
-                output_base[row] = acc;
-            }
+        // bz0 fix: see comment in op_linear_proj_rnf4_full above. shfl from inactive
+        // lanes is undefined on RDNA3 wave32; use sequential thread-0 sum.
+        if (tid == 0) {
+            float total = shared[0] + shared[1] + shared[2] + shared[3]
+                        + shared[4] + shared[5] + shared[6] + shared[7];
+            output_base[row] = total;
         }
         return;
     }
@@ -552,10 +556,15 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32_full(const u64* i
                 for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
-                if (tid < 8) {
-                    acc = shared[tid];
-                    for (int offset = 4; offset > 0; offset >>= 1) acc += __shfl_down(acc, offset);
-                    if (tid == 0) row_partial[ri] += acc;
+                // Reduce 8 warp partials with thread 0 only. The previous code did
+                // __shfl_down inside an `if (tid < 8)` block — on RDNA3 wave32, shfl
+                // from an inactive lane is undefined and observably non-deterministic
+                // (AMD ISA: lane reads source register; if source lane is masked off
+                // its register state is implementation-defined). bz0 Source 3 root cause.
+                if (tid == 0) {
+                    float total = shared[0] + shared[1] + shared[2] + shared[3]
+                                + shared[4] + shared[5] + shared[6] + shared[7];
+                    row_partial[ri] += total;
                 }
                 __syncthreads();
             }
@@ -639,13 +648,12 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32(const u64* inst, 
             acc += __shfl_down(acc, offset);
         if ((tid & 31) == 0) shared[tid >> 5] = acc;
         __syncthreads();
-        if (tid < 8) {
-            acc = shared[tid];
-            for (int offset = 4; offset > 0; offset >>= 1)
-                acc += __shfl_down(acc, offset);
-            if (tid == 0) {
-                output_base[row] = acc;
-            }
+        // bz0 fix: see comment in op_linear_proj_rnf4_full above. shfl from inactive
+        // lanes is undefined on RDNA3 wave32; use sequential thread-0 sum.
+        if (tid == 0) {
+            float total = shared[0] + shared[1] + shared[2] + shared[3]
+                        + shared[4] + shared[5] + shared[6] + shared[7];
+            output_base[row] = total;
         }
         return;
     }

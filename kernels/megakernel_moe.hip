@@ -177,11 +177,12 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                 extern __shared__ float shared[];
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
-                if (tid < 8) {
-                    acc = shared[tid];
-                    for (int offset = 4; offset > 0; offset >>= 1)
-                        acc += __shfl_down(acc, offset);
-                    if (tid == 0) scratch_gate[row] = acc;
+                // bz0: sequential thread-0 sum of 8 warp partials. shfl from inactive
+                // lanes is undefined on RDNA3 wave32.
+                if (tid == 0) {
+                    float total = shared[0] + shared[1] + shared[2] + shared[3]
+                                + shared[4] + shared[5] + shared[6] + shared[7];
+                    scratch_gate[row] = total;
                 }
             }
             grid.sync();
@@ -211,11 +212,10 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                 extern __shared__ float shared[];
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
-                if (tid < 8) {
-                    acc = shared[tid];
-                    for (int offset = 4; offset > 0; offset >>= 1)
-                        acc += __shfl_down(acc, offset);
-                    if (tid == 0) scratch_up[row] = acc;
+                if (tid == 0) {
+                    float total = shared[0] + shared[1] + shared[2] + shared[3]
+                                + shared[4] + shared[5] + shared[6] + shared[7];
+                    scratch_up[row] = total;
                 }
             }
             grid.sync();
@@ -252,11 +252,10 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                 extern __shared__ float shared[];
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
-                if (tid < 8) {
-                    acc = shared[tid];
-                    for (int offset = 4; offset > 0; offset >>= 1)
-                        acc += __shfl_down(acc, offset);
-                    if (tid == 0) scratch_up[row] = acc;
+                if (tid == 0) {
+                    float total = shared[0] + shared[1] + shared[2] + shared[3]
+                                + shared[4] + shared[5] + shared[6] + shared[7];
+                    scratch_up[row] = total;
                 }
             }
             grid.sync();
@@ -295,11 +294,10 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
             extern __shared__ float shared[];
             if ((tid & 31) == 0) shared[tid >> 5] = acc;
             __syncthreads();
-            if (tid < 8) {
-                acc = shared[tid];
-                for (int offset = 4; offset > 0; offset >>= 1)
-                    acc += __shfl_down(acc, offset);
-                if (tid == 0) scratch_out[row] = acc;
+            if (tid == 0) {
+                float total = shared[0] + shared[1] + shared[2] + shared[3]
+                            + shared[4] + shared[5] + shared[6] + shared[7];
+                scratch_out[row] = total;
             }
         }
         grid.sync();
