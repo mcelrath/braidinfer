@@ -75,6 +75,7 @@ dependencies = [
  "braidinfer-core",
  "braidinfer-hip",
  "dirs",
+ "libc",
  "memmap2",
  "minijinja",
  "minijinja-contrib",

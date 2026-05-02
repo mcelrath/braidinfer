@@ -297,6 +297,9 @@ impl MoeP2pContext {
             loop {
                 let v = unsafe { std::ptr::read_volatile(done.host_ptr()) };
                 if v >= 0xAA02 { break; }
+                if crate::persistent_dispatch::shutdown_requested() {
+                    panic!("moe_worker GPU {} startup interrupted: SIGINT/SIGTERM", gpu_id);
+                }
                 if t0.elapsed().as_millis() > 5000 {
                     panic!("GPU {} moe_worker_kernel failed to start (done_flag={v:#x})", gpu_id);
                 }
@@ -444,6 +447,9 @@ impl MoeP2pContext {
             loop {
                 let ack = unsafe { ack_ptr.add(w).read_volatile() };
                 if ack == seq { break; }
+                if crate::persistent_dispatch::shutdown_requested() {
+                    panic!("MoE prefill ack interrupted: SIGINT/SIGTERM (gpu={w}, seq={seq})");
+                }
                 if std::time::Instant::now() > deadline {
                     panic!("MoE worker GPU {} prefill batch ack timeout (seq={seq})", w);
                 }
@@ -510,37 +516,50 @@ impl MoeP2pContext {
 
 impl Drop for MoeP2pContext {
     fn drop(&mut self) {
-        // If already panicking (e.g. dispatch timeout), kernel is stuck in grid.sync()
-        // and will never respond to shutdown. Exit immediately.
-        if std::thread::panicking() {
-            std::process::exit(1);
-        }
+        // ALWAYS request shutdown (even on panic). The kernel polls shutdown at the top
+        // of its instruction loop. Use a short timeout on panic, longer on clean exit.
+        // On timeout we leak HIP resources rather than risk hipFree deadlocking against
+        // a still-running cooperative kernel.
+        let panicking = std::thread::panicking();
+        let timeout = if panicking {
+            std::time::Duration::from_secs(2)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
         for worker in &self.workers {
             unsafe {
                 std::ptr::write_volatile(worker.shutdown.host_ptr(), 1u32);
             }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        for worker in &self.workers {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut worker_done = vec![false; self.workers.len()];
+        for (idx, worker) in self.workers.iter().enumerate() {
             loop {
                 let done = unsafe { std::ptr::read_volatile(worker.done.host_ptr()) };
                 if done != 0 {
+                    worker_done[idx] = true;
                     break;
                 }
                 if std::time::Instant::now() > deadline {
                     eprintln!(
-                        "braidinfer: moe_worker shutdown timeout on GPU {}",
-                        worker.device.0
+                        "braidinfer: moe_worker shutdown timeout on GPU {} (leaking) {}",
+                        worker.device.0,
+                        if panicking { "[panic]" } else { "" }
                     );
                     break;
                 }
                 std::hint::spin_loop();
             }
         }
-        for worker in &mut self.workers {
-            unsafe {
-                ManuallyDrop::drop(worker);
+        for (idx, worker) in self.workers.iter_mut().enumerate() {
+            if worker_done[idx] {
+                unsafe {
+                    ManuallyDrop::drop(worker);
+                }
             }
+        }
+        if panicking {
+            std::process::exit(1);
         }
     }
 }

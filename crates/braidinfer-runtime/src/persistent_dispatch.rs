@@ -38,6 +38,42 @@ use crate::megakernel::{INST_SIZE, Instruction};
 /// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 256;
 
+/// Process-global flag set by SIGINT/SIGTERM handler. Polled by dispatch_batch's
+/// ack-spin-loop so an interrupt can break out and trigger Drop-time shutdown of
+/// the persistent worker. Without this, default Rust signal disposition kills the
+/// process immediately, leaving cooperative kernels orphaned on the GPU.
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static SIGNAL_HANDLERS_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn shutdown_signal_handler(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Install SIGINT/SIGTERM handlers that set SHUTDOWN_REQUESTED. Idempotent.
+/// Must be called before launching the persistent worker so a signal between
+/// launch and the first dispatch is observed.
+fn install_signal_handlers_once() {
+    use std::sync::atomic::Ordering;
+    if SIGNAL_HANDLERS_INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, shutdown_signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, shutdown_signal_handler as libc::sighandler_t);
+    }
+}
+
+/// True if a SIGINT/SIGTERM has been received since process start (or last reset).
+/// dispatch_batch checks this to abort an ack-spin and trigger an orderly shutdown.
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
 #[repr(C)]
@@ -101,6 +137,8 @@ impl PersistentDispatch {
     /// Launch persistent workers on specified GPUs.
     /// `hidden_size`: for MoE output slot allocation (0 if no MoE).
     pub fn init(devices: &[DeviceId], shared_mem: u32, _hidden_size: usize) -> HipResult<Self> {
+        // Install before launch so signals between launch and first dispatch are observed.
+        install_signal_handlers_once();
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         let mut workers = Vec::with_capacity(devices.len());
@@ -157,6 +195,9 @@ impl PersistentDispatch {
             if ack == seq {
                 break;
             }
+            if shutdown_requested() {
+                panic!("wait_ack interrupted: SIGINT/SIGTERM (gpu={gpu_idx}, seq={seq})");
+            }
             std::hint::spin_loop();
         }
     }
@@ -202,6 +243,11 @@ impl PersistentDispatch {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
             if ack == seq {
                 break;
+            }
+            if shutdown_requested() {
+                panic!(
+                    "dispatch_batch interrupted: SIGINT/SIGTERM (gpu={gpu_idx}, seq={seq})"
+                );
             }
             if start.elapsed().as_secs() > 30 {
                 let opcode0 = instructions[0].words[0] as u32;
@@ -357,14 +403,24 @@ impl Drop for PersistentDispatch {
     /// write_volatile on host_ptr). The kernel writes `done=1` before returning so we can
     /// poll without any HIP API.
     fn drop(&mut self) {
-        // If we're already panicking (e.g. dispatch_batch timeout), the kernel is stuck
-        // inside grid.sync() and will never see shutdown. Exit immediately.
-        if std::thread::panicking() {
-            std::process::exit(1);
-        }
+        // ALWAYS request shutdown — even on panic. The kernel polls the shutdown flag at
+        // the top of its outer instruction loop. If at least one block reaches the poll
+        // (and writes seq_num=0xFFFFFFFFu), surviving blocks see the sentinel and exit
+        // via the next grid.sync. If blocks are split between "done" and "stuck inside
+        // an instruction", grid.sync deadlocks — that's the case we time out on.
+        //
+        // Use a short timeout on panic (we're already aborting; the user is waiting) and
+        // a longer one on clean exit. Either way, leak (don't free) on timeout to avoid
+        // hipFree deadlocks against a still-running kernel.
+        let panicking = std::thread::panicking();
+        let shutdown_timeout = if panicking {
+            std::time::Duration::from_secs(2)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
+
         self.request_shutdown();
-        // Poll kernel-written `done` flag. Kernel writes done=1 before returning on shutdown.
-        let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let shutdown_deadline = std::time::Instant::now() + shutdown_timeout;
         let mut worker_done = vec![false; self.workers.len()];
         for (idx, worker) in self.workers.iter().enumerate() {
             let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
@@ -376,8 +432,9 @@ impl Drop for PersistentDispatch {
                 }
                 if std::time::Instant::now() > shutdown_deadline {
                     eprintln!(
-                        "braidinfer: persistent worker shutdown timeout on GPU {}",
-                        worker.device.0
+                        "braidinfer: persistent worker shutdown timeout on GPU {} (leaking) {}",
+                        worker.device.0,
+                        if panicking { "[panic]" } else { "" }
                     );
                     break;
                 }
@@ -394,5 +451,12 @@ impl Drop for PersistentDispatch {
             }
         }
         braidinfer_hip::set_persistent_worker_active(false);
+
+        // On panic, terminate the process AFTER the best-effort shutdown above. This
+        // matches the original behavior (panic = abort) but ensures we attempted the
+        // shutdown signal first so the kernel has a chance to release the GPU.
+        if panicking {
+            std::process::exit(1);
+        }
     }
 }
