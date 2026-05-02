@@ -59,14 +59,19 @@ struct MoeExpertEntry {
     uint64_t down_ptr;      // device pointer to packed Q4 down weights
 };
 
+// Weight format codes for MoeWorkerConfig::weight_format.
+#define MOE_WEIGHT_FORMAT_PCG32Q4  0  // PcG32Q4: group_size=32, group_bytes=20, nibble-packed + bf16 min/scale
+#define MOE_WEIGHT_FORMAT_RNF4G128 1  // Rnf4G128: group_size=128, group_bytes=132, double-round NF4
+
 // Worker configuration (device memory, one per worker GPU).
 struct MoeWorkerConfig {
     uint32_t my_gpu_id;
     uint32_t num_experts_local;
-    uint32_t gate_up_row_stride;  // bytes per row in Q4 packed format
+    uint32_t gate_up_row_stride;  // bytes per row in packed format
     uint32_t hidden_size;
     uint32_t expert_intermediate_size;
-    uint32_t _pad[3];
+    uint32_t weight_format;       // MOE_WEIGHT_FORMAT_* constant
+    uint32_t _pad[2];
     // Map: global_expert_id → local entry (or NULL if not on this GPU).
     // Indexed by global expert ID. Only populated entries have valid pointers.
     MoeExpertEntry entries[512];

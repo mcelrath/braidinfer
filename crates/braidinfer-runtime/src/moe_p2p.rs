@@ -31,6 +31,7 @@ use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 use std::mem::ManuallyDrop;
 
+use crate::quant::WeightFormat;
 use crate::weights::DistributedMoeWeights;
 
 /// MoeExpertEntry layout (must match moe_work_queue.h).
@@ -50,7 +51,8 @@ struct MoeWorkerConfig {
     gate_up_row_stride: u32,
     hidden_size: u32,
     expert_intermediate_size: u32,
-    _pad: [u32; 3],
+    weight_format: u32,  // 0=PCG32Q4, 1=RNF4G128 (matches MOE_WEIGHT_FORMAT_* constants)
+    _pad: [u32; 2],
     entries: [MoeExpertEntry; 512],
 }
 
@@ -568,6 +570,12 @@ fn build_layer_configs(
         // which may be moe_latent_size < hidden_size for Nemotron-H).
         let gate_up_row_stride = dist.gate_up_row_stride as u32;
 
+        // Map WeightFormat to MOE_WEIGHT_FORMAT_* constants (must match moe_work_queue.h).
+        let weight_format_code = match dist.weight_format {
+            WeightFormat::Rnf4G128 => 1u32, // MOE_WEIGHT_FORMAT_RNF4G128
+            _ => 0u32,                       // MOE_WEIGHT_FORMAT_PCG32Q4 (default)
+        };
+
         // Build config for this layer
         let mut cfg = MoeWorkerConfig {
             my_gpu_id: gpu_id,
@@ -575,7 +583,8 @@ fn build_layer_configs(
             gate_up_row_stride,
             hidden_size: hidden_size as u32,
             expert_intermediate_size: expert_intermediate_size as u32,
-            _pad: [0; 3],
+            weight_format: weight_format_code,
+            _pad: [0; 2],
             entries: unsafe { std::mem::zeroed() },
         };
         assert!(

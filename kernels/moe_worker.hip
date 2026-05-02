@@ -147,22 +147,38 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
                 const unsigned char* gate_up_data = (const unsigned char*)entry.gate_up_ptr;
                 const unsigned char* down_data = (const unsigned char*)entry.down_ptr;
 
-                if (has_gate) {
-                    const unsigned char* up_data = gate_up_data +
-                        (long long)eis * config->gate_up_row_stride;
-                    coop_gemv_pcg32_fused_gate_up(scratch_gate, gate_up_data,
-                                                   scratch_up, up_data,
-                                                   local_activation, eis, gupd, grid);
-                    coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
+                if (config->weight_format == MOE_WEIGHT_FORMAT_RNF4G128) {
+                    if (has_gate) {
+                        const unsigned char* up_data = gate_up_data +
+                            (long long)eis * config->gate_up_row_stride;
+                        coop_gemv_rnf4_fused_gate_up(scratch_gate, gate_up_data,
+                                                       scratch_up, up_data,
+                                                       local_activation, eis, gupd, grid);
+                        coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
+                    } else {
+                        coop_gemv_rnf4(scratch_up, gate_up_data,
+                                       local_activation, eis, gupd, grid);
+                        coop_relu_squared(scratch_act, scratch_up, eis, grid);
+                    }
+                    coop_gemv_rnf4(scratch_gate, down_data, scratch_act, gupd, eis, grid);
                 } else {
-                    coop_gemv_pcg32(scratch_up, gate_up_data,
-                                    local_activation, eis, gupd, grid);
-                    coop_relu_squared(scratch_act, scratch_up, eis, grid);
+                    // PCG32Q4 (default)
+                    if (has_gate) {
+                        const unsigned char* up_data = gate_up_data +
+                            (long long)eis * config->gate_up_row_stride;
+                        coop_gemv_pcg32_fused_gate_up(scratch_gate, gate_up_data,
+                                                       scratch_up, up_data,
+                                                       local_activation, eis, gupd, grid);
+                        coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
+                    } else {
+                        coop_gemv_pcg32(scratch_up, gate_up_data,
+                                        local_activation, eis, gupd, grid);
+                        coop_relu_squared(scratch_act, scratch_up, eis, grid);
+                    }
+                    coop_gemv_pcg32(scratch_gate, down_data, scratch_act, gupd, eis, grid);
                 }
 
-                // down: eis → gupd (= gate_up_in_dim, not necessarily hidden_size)
-                coop_gemv_pcg32(scratch_gate, down_data,
-                                scratch_act, gupd, eis, grid);
+                // down output accumulated (gupd elements)
                 coop_weighted_acc(local_output, scratch_gate, ew, gupd, grid);
             }
 

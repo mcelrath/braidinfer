@@ -4,6 +4,7 @@
 #pragma once
 #include <hip/hip_cooperative_groups.h>
 #include "bf16_utils.h"
+#include "quant_consts.h"
 
 // Q4 PcG32 GEMV: one row per block in virtual block loop.
 // Thread utilization: tpg (threads-per-group) threads cooperate on each quantization group.
@@ -112,6 +113,129 @@ __device__ inline void coop_gemv_pcg32_fused_gate_up(
                 unsigned char byte = gp[byte_off + b];
                 float v0 = (float)(byte & 0xF) * sc + mn;
                 float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                acc += v0 * input[elem_base + b * 2];
+                if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
+            }
+        }
+        for (int offset = tpg / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if (lane == 0) shared[group_in_block] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            for (int g = 0; g < groups_per_block; g++) total += shared[g];
+            my_out[row] = total;
+        }
+        __syncthreads();
+    }
+    grid.sync();
+}
+
+// Q8 RNF4G128 GEMV: one row per block in virtual block loop.
+// RNF4 layout: group_size=128, group_bytes=132.
+//   Bytes [0..63]:   main NF4 nibbles (128 values, low nibble = even elem, high = odd)
+//   Bytes [64..65]:  bf16 absmax1 (main scale)
+//   Bytes [66..129]: residual NF4 nibbles (128 values)
+//   Bytes [130..131]: bf16 absmax2 (residual scale)
+// Dequant: val = NF4_TABLE[nibble1] * absmax1 + NF4_TABLE[nibble2] * absmax2
+// Thread utilization: 2 threads per group (group_size=128, each thread covers 64 elems = 32 bytes + 32 residual bytes).
+__device__ inline void coop_gemv_rnf4(
+    float* output, const unsigned char* weight, const float* input,
+    int out_dim, int in_dim,
+    cooperative_groups::grid_group& grid
+) {
+    const int group_size = 128;
+    const int group_bytes = 132;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    // tpg: power-of-2, capped at 8 (each thread handles 16 pairs = 32 nibbles from main + 32 residual)
+    int raw_tpg = blockDim.x / max(num_groups, 1);
+    raw_tpg = min(raw_tpg, 8);
+    int tpg = 1;
+    while (tpg * 2 <= raw_tpg) tpg <<= 1;
+    const int groups_per_block = blockDim.x / tpg;
+    const int lane = threadIdx.x % tpg;
+    const int group_in_block = threadIdx.x / tpg;
+    // Each thread covers group_size/tpg elements; packed as group_size/(tpg*2) byte pairs.
+    const int elems_per_thread = group_size / tpg;
+    const int bytes_per_thread = elems_per_thread / 2; // nibble-pairs per thread
+    const int byte_off = lane * bytes_per_thread;      // byte offset into main nibble block
+    extern __shared__ float shared[];
+
+    for (int row = blockIdx.x; row < out_dim; row += gridDim.x) {
+        const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+        float acc = 0.0f;
+        for (int g = group_in_block; g < num_groups; g += groups_per_block) {
+            const unsigned char* gp = row_data + g * group_bytes;
+            float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+            float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+            int elem_base = g * group_size + lane * elems_per_thread;
+            int count = min(elems_per_thread, in_dim - elem_base);
+            for (int b = 0; b < bytes_per_thread && b * 2 < count; b++) {
+                unsigned char m = gp[byte_off + b];            // main nibbles
+                unsigned char r = gp[66 + byte_off + b];      // residual nibbles (offset 66 = 64 main + 2 absmax1)
+                float v0 = NF4_TABLE[m & 0xF] * absmax1 + NF4_TABLE[r & 0xF] * absmax2;
+                float v1 = NF4_TABLE[(m >> 4) & 0xF] * absmax1 + NF4_TABLE[(r >> 4) & 0xF] * absmax2;
+                acc += v0 * input[elem_base + b * 2];
+                if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
+            }
+        }
+        for (int offset = tpg / 2; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if (lane == 0) shared[group_in_block] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            for (int g = 0; g < groups_per_block; g++) total += shared[g];
+            output[row] = total;
+        }
+        __syncthreads();
+    }
+    grid.sync();
+}
+
+// Fused gate+up RNF4 GEMV: same split as coop_gemv_pcg32_fused_gate_up.
+// Even blocks → gate, odd blocks → up.
+__device__ inline void coop_gemv_rnf4_fused_gate_up(
+    float* gate_out, const unsigned char* gate_weight,
+    float* up_out,   const unsigned char* up_weight,
+    const float* input, int out_dim, int in_dim,
+    cooperative_groups::grid_group& grid
+) {
+    const int group_size = 128;
+    const int group_bytes = 132;
+    const int num_groups = (in_dim + group_size - 1) / group_size;
+    int raw_tpg = blockDim.x / max(num_groups, 1);
+    raw_tpg = min(raw_tpg, 8);
+    int tpg = 1;
+    while (tpg * 2 <= raw_tpg) tpg <<= 1;
+    const int groups_per_block = blockDim.x / tpg;
+    const int lane = threadIdx.x % tpg;
+    const int group_in_block = threadIdx.x / tpg;
+    const int elems_per_thread = group_size / tpg;
+    const int bytes_per_thread = elems_per_thread / 2;
+    const int byte_off = lane * bytes_per_thread;
+    extern __shared__ float shared[];
+
+    const bool is_gate = (blockIdx.x & 1) == 0;
+    const int half_grid = max(gridDim.x / 2, 1);
+    const int half_block = blockIdx.x / 2;
+    float* my_out = is_gate ? gate_out : up_out;
+    const unsigned char* my_weight = is_gate ? gate_weight : up_weight;
+
+    for (int row = half_block; row < out_dim; row += half_grid) {
+        const unsigned char* row_data = my_weight + (long long)row * num_groups * group_bytes;
+        float acc = 0.0f;
+        for (int g = group_in_block; g < num_groups; g += groups_per_block) {
+            const unsigned char* gp = row_data + g * group_bytes;
+            float absmax1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+            float absmax2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+            int elem_base = g * group_size + lane * elems_per_thread;
+            int count = min(elems_per_thread, in_dim - elem_base);
+            for (int b = 0; b < bytes_per_thread && b * 2 < count; b++) {
+                unsigned char m = gp[byte_off + b];
+                unsigned char r = gp[66 + byte_off + b];
+                float v0 = NF4_TABLE[m & 0xF] * absmax1 + NF4_TABLE[r & 0xF] * absmax2;
+                float v1 = NF4_TABLE[(m >> 4) & 0xF] * absmax1 + NF4_TABLE[(r >> 4) & 0xF] * absmax2;
                 acc += v0 * input[elem_base + b * 2];
                 if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
             }
