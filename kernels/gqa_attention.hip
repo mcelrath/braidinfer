@@ -73,11 +73,15 @@ extern "C" __global__ void gqa_attention_decode_f32(
         __syncthreads();
     }
 
-    // Write output once (normalize by d)
+    // Write output using non-temporal stores (global_store glc slc dlc on RDNA3).
+    // This bypasses GPU i's L2 entirely and writes directly to HBM.
+    // Required for P2P coherence: GPU 0's persistent worker reads GPU i's attn_out via P2P,
+    // which bypasses GPU i's L2 and reads GPU i's HBM. Without bypass, GPU i's writes stay
+    // in GPU i's L2 (invisible to GPU 0's P2P reads of GPU i's HBM).
     float* out_ptr = output + q_head * head_dim;
     int slot = 0;
     for (int i = tid; i < head_dim; i += block_size) {
-        out_ptr[i] = acc[slot] / d;
+        __builtin_nontemporal_store(acc[slot] / d, out_ptr + i);
         slot++;
     }
 }
