@@ -73,15 +73,15 @@ extern "C" __global__ void gqa_attention_decode_f32(
         __syncthreads();
     }
 
-    // Write output using non-temporal stores (global_store glc slc dlc on RDNA3).
-    // This bypasses GPU i's L2 entirely and writes directly to HBM.
-    // Required for P2P coherence: GPU 0's persistent worker reads GPU i's attn_out via P2P,
-    // which bypasses GPU i's L2 and reads GPU i's HBM. Without bypass, GPU i's writes stay
-    // in GPU i's L2 (invisible to GPU 0's P2P reads of GPU i's HBM).
+    // Plain global stores. Writer-side L2 bypass is no longer needed on this hardware:
+    // hsa-rocr-p2p-mtype-uc-gfx11.patch maps peer-accessible local VRAM as MTYPE_UC
+    // (HSA_CACHING_NONCACHED) on gfx11+, so writes through that mapping bypass L2 by
+    // construction. Prior version used __builtin_nontemporal_store as a workaround for
+    // the absence of buffer_wbl2 on RDNA3+; with the patch the workaround is redundant.
     float* out_ptr = output + q_head * head_dim;
     int slot = 0;
     for (int i = tid; i < head_dim; i += block_size) {
-        __builtin_nontemporal_store(acc[slot] / d, out_ptr + i);
+        out_ptr[i] = acc[slot] / d;
         slot++;
     }
 }
