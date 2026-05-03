@@ -35,6 +35,22 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
     return shared[0];
 }
 
+// bz0 experiment 1: pure sequential reduction, no __shfl_down. All threads
+// write to shared, thread 0 sums sequentially. Diagnostic — eliminates
+// shfl as a possible non-determinism source. Slower than block_reduce_sum.
+__device__ __forceinline__ float sequential_reduce_sum_256(float val, float* shared) {
+    shared[threadIdx.x] = val;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float sum = 0.0f;
+        #pragma unroll 1
+        for (int i = 0; i < 256; i++) sum += shared[i];
+        shared[0] = sum;
+    }
+    __syncthreads();
+    return shared[0];
+}
+
 // OP_RMSNORM: y = x * rsqrt(mean(x²)+eps) * (1+weight)
 // args: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 // grid_x = batch (default 1). vblock = batch index. Each block normalizes one row.
@@ -1704,7 +1720,8 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
                 const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
-                    float k_rms = rsqrtf(block_reduce_sum(my_k * my_k, partial) / (float)head_dim + eps);
+                    // bz0 experiment 1: sequential reduction (no __shfl_down)
+                    float k_rms = rsqrtf(sequential_reduce_sum_256(my_k * my_k, partial) / (float)head_dim + eps);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
                         sh_k[tid] = my_k * k_rms * w;  // use saved register value
@@ -1748,8 +1765,8 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
             if (tid < head_dim) {
                 dot = q_ptr[tid] * sh_k[tid];
             }
-            // Reduce dot via shared memory (reuse sh_k alias partial)
-            float score = block_reduce_sum(dot, partial) * scale;
+            // bz0 experiment 1: sequential reduction (no __shfl_down)
+            float score = sequential_reduce_sum_256(dot, partial) * scale;
 
             // Online softmax update
             float m_new = fmaxf(m, score);
