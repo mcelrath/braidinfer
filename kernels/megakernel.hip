@@ -78,6 +78,40 @@ __device__ void dump_instruction_output(
             size = (int)g->nqh * (int)g->hd;
             break;
         }
+        case OP_ATTN_PAGED: {
+            const AttnPagedInst* g = (const AttnPagedInst*)inst;
+            size = (int)g->nqh * (int)g->hd;
+            break;
+        }
+        // OP_ATTN_PAGED_Q: skipped from dump (scratch field at word[1] is uint64 not pointer;
+        // default `output = inst[1]` would deref a non-pointer value as a float*).
+        // OP_ATTN_PREFILL: skipped from dump (only fires during prefill, not bench_coherence
+        // decode comparison; size n*nqh*hd can be large; not the audit target anyway).
+        case OP_GDN_GATE: {
+            const GdnGateInst* g = (const GdnGateInst*)inst;
+            size = (int)g->num_heads;
+            break;
+        }
+        case OP_QK_NORM: {
+            // dump q only (k is at word 2; we lose K coverage but enough for diagnosis)
+            const QkNormInst* g = (const QkNormInst*)inst;
+            int batch = (int)g->batch; if (batch <= 0) batch = 1;
+            size = batch * (int)g->nqh * (int)g->hd;
+            break;
+        }
+        case OP_MROPE: {
+            // dump q only
+            const MropeInst* g = (const MropeInst*)inst;
+            int batch = (int)g->batch; if (batch <= 0) batch = 1;
+            size = batch * (int)g->nqh * (int)g->hd;
+            break;
+        }
+        case OP_DEINTERLEAVE: {
+            const DeinterleaveInst* g = (const DeinterleaveInst*)inst;
+            int batch = (int)g->batch; if (batch <= 0) batch = 1;
+            size = batch * (int)g->num_heads * (int)g->head_dim;
+            break;
+        }
         case OP_OUTPUT_GATE:
             size = (int)((const OutputGateInst*)inst)->size;
             break;
@@ -98,6 +132,7 @@ __device__ void dump_instruction_output(
     }
 
     if (size <= 0) return;
+    if (output == nullptr) return;  // null-guard: some ops have output @ word[1] = 0 (uninit / unused)
     if (size > DUMP_MAX_FLOATS) size = DUMP_MAX_FLOATS;
 
     // Allocate slot (thread 0 only)
