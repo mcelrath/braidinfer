@@ -34,9 +34,26 @@ struct WatchdogState {
 // TUs; it does NOT apply here and would break device symbol resolution at runtime.
 __device__ bool __watchdog_should_exit;
 
+// COOPERATIVE EXIT GRANULARITY: watchdog_poll_and_check is called ONLY between
+// top-level instructions (opcode dispatch boundaries), NOT inside compute-heavy ops
+// (op_moe_ffn, op_linear_proj_*, op_attn_paged, etc.). A wedge inside a compute
+// op escalates directly to process abort (via the host watchdog thread's grace
+// period expiry), bypassing cooperative exit.
+//
+// This is acceptable for current ops since each compute op is bounded:
+//   - op_linear_proj_*:  O(d²) GEMV, completes in milliseconds
+//   - op_attn_paged:     O(n²) per token, bounded by seq_len
+//   - op_moe_ffn:        bounded by num_active_experts × expert_size
+//
+// If any future op can run longer than the watchdog's no-progress timeout
+// (default 2s), add intra-op watchdog_beat() calls at safe checkpoints.
+// A full watchdog_poll_and_check() inside a compute op requires all blocks to
+// reach the call simultaneously (grid.sync() precondition), which may not be
+// achievable mid-op without significant restructuring.
+//
 // Poll host-mapped force_exit and broadcast decision to all blocks.
 //
-// Call sites: outer poll loop, between major work phases.
+// Call sites: outer poll loop, between major work phases (top-level instructions only).
 // Protocol:
 //   1. Thread 0, block 0 reads force_exit via volatile load (avoids gfx1100 atomic_load hang).
 //   2. Writes decision to __watchdog_should_exit (__device__ global, visible to all blocks).

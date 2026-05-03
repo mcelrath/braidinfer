@@ -191,6 +191,18 @@ __global__ void my_kernel(WatchdogState* watchdog, ...) {
 
 Pass `nullptr` for `watchdog` to disable (null-safe: all primitives check for null).
 
+### Cooperative exit granularity
+
+`watchdog_poll_and_check()` is called only between top-level instructions (at opcode dispatch boundaries), **NOT** inside compute-heavy ops (`op_moe_ffn`, `op_linear_proj_*`, `op_attn_paged`, etc.). A wedge inside a compute op escalates directly to abort (via the host watchdog grace period expiry) rather than cooperative exit.
+
+This is acceptable for current ops since each is bounded in time. If any future op could exceed the no-progress timeout (default 2s), add intra-op `watchdog_beat()` calls. A full `watchdog_poll_and_check()` inside a compute op requires all blocks to arrive simultaneously (grid.sync() precondition), which may require significant restructuring.
+
+### Recovery test reference
+
+The cooperative watchdog recovery test lives in `../exterior_algebra/scripts/watchdog_recovery_test.hip`:
+- Cooperative variant: 100/100 PASS, mean recovery 4.7 ± 0.7 ms
+- Stubborn variant: documented as platform-limited — `hipDeviceReset` blocks indefinitely on RDNA3/gfx1100 (ROCm has no GPU TDR preemption for compute). Process abort is the correct escalation path.
+
 ## Mandatory Review Workflow
 
 Reviews are always approved and expected. Do not ask the user for permission to review.
