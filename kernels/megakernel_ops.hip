@@ -51,6 +51,22 @@ __device__ __forceinline__ float sequential_reduce_sum_256(float val, float* sha
     return shared[0];
 }
 
+// Shared-memory tree reduction: 256 → 1 in 8 parallel stages, no __shfl_down.
+// Confirmed deterministic on gfx1100 wave32 (replaces shfl-based reduction at
+// op_attn_paged K-rms which was source of bz0). Faster than sequential.
+__device__ __forceinline__ float tree_reduce_sum_256(float val, float* shared) {
+    shared[threadIdx.x] = val;
+    __syncthreads();
+    #pragma unroll
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if ((int)threadIdx.x < stride) {
+            shared[threadIdx.x] += shared[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    return shared[0];
+}
+
 // OP_RMSNORM: y = x * rsqrt(mean(x²)+eps) * (1+weight)
 // args: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 // grid_x = batch (default 1). vblock = batch index. Each block normalizes one row.
@@ -1720,8 +1736,10 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
                 const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
-                    // bz0 experiment 1: sequential reduction (no __shfl_down)
-                    float k_rms = rsqrtf(sequential_reduce_sum_256(my_k * my_k, partial) / (float)head_dim + eps);
+                    // bz0 fix: tree reduction (no __shfl_down). A/B test confirmed
+                    // K-rms with block_reduce_sum (shfl) is the source of bz0
+                    // single-GPU non-determinism on gfx1100 wave32.
+                    float k_rms = rsqrtf(tree_reduce_sum_256(my_k * my_k, partial) / (float)head_dim + eps);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
                         sh_k[tid] = my_k * k_rms * w;  // use saved register value
@@ -1765,8 +1783,9 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
             if (tid < head_dim) {
                 dot = q_ptr[tid] * sh_k[tid];
             }
-            // bz0 experiment 1: sequential reduction (no __shfl_down)
-            float score = sequential_reduce_sum_256(dot, partial) * scale;
+            // Q·K dot reduction. A/B test confirmed shfl is fine here (only
+            // K-rms's reduction shows bz0); use the fast block_reduce_sum.
+            float score = block_reduce_sum(dot, partial) * scale;
 
             // Online softmax update
             float m_new = fmaxf(m, score);
