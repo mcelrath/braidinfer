@@ -146,8 +146,11 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
             let counter = unsafe { std::ptr::read_volatile(&state.progress_counter) };
             let op_id  = unsafe { std::ptr::read_volatile(&state.last_op_id) };
 
-            if counter != entry.last_progress {
-                // Kernel is making progress.
+            if counter > entry.last_progress {
+                // Kernel is making progress (strictly monotonic).
+                // Treat backward or equal counter as no-progress: defensive against
+                // WatchdogState reuse across kernel re-launches where a new launch
+                // coincidentally writes the same counter value within the no-progress window.
                 entry.last_progress = counter;
                 entry.last_progress_at = now;
                 entry.force_exit_sent_at = None;
