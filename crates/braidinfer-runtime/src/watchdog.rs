@@ -182,10 +182,14 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
                 continue;
             }
 
-            // Grace expired. Escalate: quiesce all GPUs then hipDeviceReset.
+            // Grace expired. Escalate: quiesce all GPUs then abort.
+            // NOTE: hipDeviceReset blocks indefinitely on RDNA3/gfx1100 when the kernel
+            // is still running (ROCm has no GPU TDR preemption for compute). The only
+            // safe last-resort is process abort, which triggers amdgpu driver context
+            // teardown and releases the GPU. Verified by watchdog_recovery_test --buggy.
             let wedged_device = entry.device;
             eprintln!(
-                "[watchdog] GPU {}: kernel did not honor force_exit after {:?}. Escalating.",
+                "[watchdog] GPU {}: kernel did not honor force_exit after {:?}. Escalating to abort.",
                 wedged_device.0, grace_elapsed
             );
 
@@ -194,66 +198,17 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
                 unsafe { &mut (*e.state.host_ptr()).force_exit as *mut u32 }
             }).collect();
 
-            // Quiesce all registered GPUs first to avoid poisoning P2P TLPs.
+            // Quiesce all registered GPUs first to avoid poisoning P2P TLPs in flight.
             for ptr in &force_exit_ptrs {
                 unsafe { std::ptr::write_volatile(*ptr, 1u32); }
             }
             std::thread::sleep(Duration::from_millis(200));
 
-            // Attempt hipDeviceReset on the wedged GPU.
-            let reset_ok = attempt_device_reset(wedged_device);
-            if reset_ok {
-                eprintln!(
-                    "[watchdog] GPU {}: hipDeviceReset succeeded.",
-                    wedged_device.0
-                );
-            } else {
-                eprintln!(
-                    "[watchdog] GPU {}: hipDeviceReset FAILED. Dumping telemetry and aborting.",
-                    wedged_device.0
-                );
-                dump_telemetry_and_abort(wedged_device, op_id, counter);
-            }
-
-            // After reset, stop the watchdog — the process state is compromised.
-            eprintln!("[watchdog] Stopping after device reset.");
-            return;
+            dump_telemetry_and_abort(wedged_device, op_id, counter);
         }
     }
 
     eprintln!("[watchdog] stopped.");
-}
-
-fn attempt_device_reset(device: DeviceId) -> bool {
-    use braidinfer_hip::ffi;
-    unsafe {
-        let r = ffi::hipSetDevice(device.0 as std::ffi::c_int);
-        if r != ffi::hipSuccess {
-            eprintln!("[watchdog] hipSetDevice({}) failed: {}", device.0, r);
-            return false;
-        }
-        let r = ffi::hipDeviceReset();
-        if r != ffi::hipSuccess {
-            eprintln!("[watchdog] hipDeviceReset() failed: {}", r);
-            return false;
-        }
-        // Verify the GPU is functional: try a small malloc+memcpy round-trip.
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let r = ffi::hipMalloc(&mut ptr, 4);
-        if r != ffi::hipSuccess {
-            eprintln!("[watchdog] post-reset hipMalloc failed: {}", r);
-            return false;
-        }
-        let src: u32 = 0xDEADBEEF;
-        let r = ffi::hipMemcpy(ptr, &src as *const u32 as *const _, 4, ffi::hipMemcpyHostToDevice);
-        if r != ffi::hipSuccess {
-            eprintln!("[watchdog] post-reset hipMemcpy failed: {}", r);
-            ffi::hipFree(ptr);
-            return false;
-        }
-        ffi::hipFree(ptr);
-    }
-    true
 }
 
 fn dump_telemetry_and_abort(device: DeviceId, last_op_id: u32, last_counter: u64) -> ! {
