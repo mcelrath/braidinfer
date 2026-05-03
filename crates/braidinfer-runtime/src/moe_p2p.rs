@@ -266,7 +266,9 @@ impl MoeP2pContext {
             let mut lo_ptr = local_output.as_ptr() as *mut std::ffi::c_void;
             let mut gid = gpu_id;
             let mut tb_ptr = timing_buf.device_ptr() as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 11] = [
+            // watchdog: NULL disables the watchdog (Phase 2 wires a real WatchdogState here).
+            let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut args: [*mut std::ffi::c_void; 12] = [
                 std::ptr::addr_of_mut!(wq_ptr).cast(),
                 std::ptr::addr_of_mut!(sd_ptr).cast(),
                 std::ptr::addr_of_mut!(lc_ptr).cast(),
@@ -278,6 +280,7 @@ impl MoeP2pContext {
                 std::ptr::addr_of_mut!(lo_ptr).cast(),
                 std::ptr::addr_of_mut!(gid).cast(),
                 std::ptr::addr_of_mut!(tb_ptr).cast(),
+                std::ptr::addr_of_mut!(wd_ptr).cast(),
             ];
 
             let num_cus = multiprocessor_count(device)?;

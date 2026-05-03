@@ -10,6 +10,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
+#include "watchdog.h"
 
 // GPU cycle counter. __builtin_readcyclecounter() works on gfx1100 without feature flags.
 // On RDNA3 this reads the shader clock (cycles; divide by GPU MHz to get microseconds).
@@ -42,7 +43,8 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     float* scratch_act,       // [expert_intermediate_size] local VRAM
     float* local_output,      // [hidden_size] local VRAM — accumulated then P2P written
     uint32_t gpu_id,          // this worker's GPU index (explicit, avoids scanning layer_configs)
-    volatile uint64_t* timing_buf  // [N_TIMING_SLOTS * TIMING_FIELDS] GART — NULL to disable
+    volatile uint64_t* timing_buf,  // [N_TIMING_SLOTS * TIMING_FIELDS] GART — NULL to disable
+    WatchdogState* watchdog         // host-mapped watchdog state; NULL to disable
 ) {
     namespace cg = cooperative_groups;
 
@@ -63,6 +65,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     uint32_t my_gpu = gpu_id;
     uint32_t last_seq = 0;
     uint32_t timing_slot = 0;
+    uint32_t watchdog_beat_ctr = 0;
 
     while (true) {
         // Single-thread poll: only block 0 thread 0 checks host-mapped memory.
@@ -79,13 +82,24 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         }
         grid.sync();
 
+        // Watchdog: check force_exit after every outer poll iteration.
+        // watchdog_poll_and_check uses volatile read (avoids gfx1100 atomic_load SYSTEM hang).
+        // Returns true if host set force_exit=1; ALL blocks return together (cooperative exit).
+        if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
+            watchdog_signal_exit(done_flag);
+            return;
+        }
+
+        // Progress beat: signal liveness to host watchdog thread.
+        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
+
         // Acquire fence: ensures all wq field writes from GPU 0 (done before seq_num RELEASE)
         // are visible to this GPU before we read activation_ptr, output_slots_ptr, etc.
         __threadfence_system();
 
         uint32_t seq = work_queue->seq_num;
         if (seq == 0xFFFFFFFFu) {
-            // Signal CPU that kernel has exited
+            // Signal CPU that kernel has exited (clean shutdown path).
             if (threadIdx.x == 0 && blockIdx.x == 0) {
                 *done_flag = 1u;
             }
@@ -180,6 +194,9 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
 
                 // down output accumulated (gupd elements)
                 coop_weighted_acc(local_output, scratch_gate, ew, gupd, grid);
+
+                // Liveness beat between experts: host watchdog sees progress during long GEMV batches.
+                if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
             }
 
             if (t == 0) {
@@ -192,6 +209,9 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
             // 4. P2P write local_output to GPU 0's output_slots.
             __threadfence_system();
             coop_copy(my_output_slot, local_output, gupd, grid);
+
+            // Liveness beat between tokens.
+            if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
         } // end token loop
 
         // t_output_done: after all tokens written.
