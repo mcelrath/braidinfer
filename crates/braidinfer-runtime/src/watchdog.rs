@@ -182,7 +182,21 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
                 continue;
             }
 
-            // Grace expired. Escalate: quiesce all GPUs then abort.
+            // Grace expired. Check if kernel cooperatively exited during grace period.
+            let counter_now = unsafe { std::ptr::read_volatile(&state.progress_counter) };
+            if counter_now != counter {
+                // Kernel advanced its counter after force_exit was sent — it recovered.
+                eprintln!(
+                    "[watchdog] GPU {}: kernel recovered cooperatively during grace period (counter {} → {}).",
+                    entry.device.0, counter, counter_now
+                );
+                entry.last_progress = counter_now;
+                entry.last_progress_at = now;
+                entry.force_exit_sent_at = None;
+                continue;
+            }
+
+            // Kernel did not honor force_exit. Escalate: quiesce all GPUs then abort.
             // NOTE: hipDeviceReset blocks indefinitely on RDNA3/gfx1100 when the kernel
             // is still running (ROCm has no GPU TDR preemption for compute). The only
             // safe last-resort is process abort, which triggers amdgpu driver context
@@ -235,11 +249,14 @@ fn dump_telemetry_and_abort(device: DeviceId, last_op_id: u32, last_counter: u64
         }
     }
 
-    // Capture gpu_reset counter.
+    // Capture per-card sysfs: gpu_reset counter + gpu_busy_percent.
     for entry in std::fs::read_dir("/sys/class/drm").into_iter().flatten().flatten() {
-        let p = entry.path().join("device/gpu_reset");
-        if let Ok(v) = std::fs::read_to_string(&p) {
-            lines.push(format!("{}: {}", p.display(), v.trim()));
+        let base = entry.path();
+        for attr in &["device/gpu_reset", "device/gpu_busy_percent"] {
+            let p = base.join(attr);
+            if let Ok(v) = std::fs::read_to_string(&p) {
+                lines.push(format!("{}: {}", p.display(), v.trim()));
+            }
         }
     }
 
