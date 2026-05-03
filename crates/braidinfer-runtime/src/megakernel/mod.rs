@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::model::ModelConfig;
 use crate::trace::TraceWriter;
+use crate::watchdog::WatchdogThread;
 
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
 pub const CHUNK_TOKENS: usize = 64;
@@ -129,6 +130,10 @@ pub struct MegakernelProgram {
     /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.
     /// Avoids a Vec allocation per decode step.
     pub(crate) flat_program: Vec<u64>,
+    /// Host-side watchdog thread polling this program's WatchdogState page.
+    pub(crate) watchdog: WatchdogThread,
+    /// Device pointer to WatchdogState (host-mapped, owned by watchdog). Passed to kernel.
+    pub(crate) wd_dev_ptr: *mut c_void,
 }
 
 /// One KV-write D2dCopy pair (K and V) for prefill chunk patching.
@@ -347,8 +352,7 @@ impl MegakernelProgram {
         let extra = if self.dump_buffer.is_some() { 1 } else { 0 };
         let mut num_inst = (self.instructions.len() + extra) as i32;
 
-        // watchdog: NULL disables (Phase 2 wires real WatchdogState).
-        let mut wd_ptr: *mut c_void = std::ptr::null_mut();
+        let mut wd_ptr: *mut c_void = self.wd_dev_ptr;
         let mut args: [*mut c_void; 3] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),

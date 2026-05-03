@@ -32,6 +32,7 @@ use braidinfer_hip::stream::Stream;
 use std::mem::ManuallyDrop;
 
 use crate::quant::WeightFormat;
+use crate::watchdog::WatchdogThread;
 use crate::weights::DistributedMoeWeights;
 
 /// MoeExpertEntry layout (must match moe_work_queue.h).
@@ -113,6 +114,8 @@ pub struct MoeP2pContext {
     pub workers: Vec<ManuallyDrop<MoeWorkerGpu>>,
     pub num_gpus: usize,
     pub hidden_size: usize,
+    /// Host-side watchdog thread monitoring all moe_worker_kernel WatchdogState pages.
+    pub watchdog: WatchdogThread,
 }
 
 /// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache[] tail.
@@ -203,6 +206,7 @@ impl MoeP2pContext {
 
         // Launch moe_worker_kernel on each worker GPU
         let mut workers = Vec::with_capacity(num_workers);
+        let watchdog = WatchdogThread::spawn();
         for (w_idx, &device) in worker_devices.iter().enumerate() {
             let gpu_id = (w_idx + 1) as u32;
             Device::set_current(device)?;
@@ -266,8 +270,8 @@ impl MoeP2pContext {
             let mut lo_ptr = local_output.as_ptr() as *mut std::ffi::c_void;
             let mut gid = gpu_id;
             let mut tb_ptr = timing_buf.device_ptr() as *mut std::ffi::c_void;
-            // watchdog: NULL disables the watchdog (Phase 2 wires a real WatchdogState here).
-            let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let wd_state_dev = watchdog.register(device)?;
+            let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
             let mut args: [*mut std::ffi::c_void; 12] = [
                 std::ptr::addr_of_mut!(wq_ptr).cast(),
                 std::ptr::addr_of_mut!(sd_ptr).cast(),
@@ -342,6 +346,7 @@ impl MoeP2pContext {
             workers,
             num_gpus,
             hidden_size,
+            watchdog,
         })
     }
 

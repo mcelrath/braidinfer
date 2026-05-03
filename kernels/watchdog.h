@@ -25,6 +25,13 @@ struct WatchdogState {
 // Device-global broadcast flag. Thread 0/block 0 writes the exit decision here;
 // all blocks read it after grid.sync(). Must be __device__ (not __shared__) so it
 // is visible across all blocks in the cooperative grid.
+//
+// NOTE: Each .hip file is compiled to an independent .hsaco (device code object)
+// and loaded separately at runtime — they are not linked together. Each kernel
+// that includes this header gets its own private copy of the flag, which is
+// correct: each cooperative kernel runs independently and needs its own broadcast.
+// The conventional "extern + separate .hip" pattern applies to statically-linked
+// TUs; it does NOT apply here and would break device symbol resolution at runtime.
 __device__ bool __watchdog_should_exit;
 
 // Poll host-mapped force_exit and broadcast decision to all blocks.

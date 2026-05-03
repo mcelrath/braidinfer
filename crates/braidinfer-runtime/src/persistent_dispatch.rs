@@ -34,6 +34,7 @@ use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
 
 use crate::megakernel::{INST_SIZE, Instruction};
+use crate::watchdog::WatchdogThread;
 
 /// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 256;
@@ -113,6 +114,9 @@ pub struct PersistentDispatch {
     /// Host-mapped buffer for GPU 0 expert FFN output (hidden_size f32 elements).
     /// Allocated on GPU 0 (MTYPE_UC). Valid device_ptr only from GPU 0.
     pub moe_output_slot: MappedHostBuffer<f32>,
+    /// Host-side watchdog thread polling all persistent kernel WatchdogState pages.
+    /// Dropped after workers to ensure the thread stops before the state pages are freed.
+    pub watchdog: WatchdogThread,
 }
 
 fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
@@ -142,6 +146,7 @@ impl PersistentDispatch {
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         let mut workers = Vec::with_capacity(devices.len());
+        let watchdog = WatchdogThread::spawn();
 
         for &device in devices {
             Device::set_current(device)?;
@@ -150,8 +155,8 @@ impl PersistentDispatch {
             let module = Module::load(device, &kernel_dir.join("persistent_worker.hsaco"))?;
             let func = module.get_function("persistent_worker")?;
             let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
-            // watchdog: NULL disables (Phase 2 wires real WatchdogState).
-            let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let wd_state_dev = watchdog.register(device)?;
+            let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
             let mut args: [*mut std::ffi::c_void; 2] = [
                 std::ptr::addr_of_mut!(queue_ptr).cast(),
                 std::ptr::addr_of_mut!(wd_ptr).cast(),
@@ -189,6 +194,7 @@ impl PersistentDispatch {
         Ok(PersistentDispatch {
             workers,
             moe_output_slot,
+            watchdog,
         })
     }
 
@@ -357,8 +363,9 @@ impl PersistentDispatch {
         let num_cus = multiprocessor_count(gpu0)?;
         let num_blocks = (blocks_per_sm * num_cus as u32).max(num_cus as u32);
         let mut q = queue.device_ptr() as *mut std::ffi::c_void;
-        // watchdog: NULL disables (Phase 2 wires real WatchdogState).
-        let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let watchdog = WatchdogThread::spawn();
+        let wd_state_dev = watchdog.register(gpu0)?;
+        let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
         let mut args = [
             std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>(),
             std::ptr::addr_of_mut!(wd_ptr).cast(),
@@ -385,6 +392,7 @@ impl PersistentDispatch {
                 seq_counter: 0,
             })],
             moe_output_slot,
+            watchdog,
         })
     }
 

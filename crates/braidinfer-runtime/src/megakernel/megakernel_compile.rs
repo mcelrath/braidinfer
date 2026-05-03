@@ -21,6 +21,7 @@ use super::{
     OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
 use crate::model::{LayerWeights, Model};
+use crate::watchdog::WatchdogThread;
 
 impl MegakernelProgram {
     pub fn compile(model: &Model) -> HipResult<Self> {
@@ -265,6 +266,10 @@ impl MegakernelProgram {
         let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
+        let watchdog = WatchdogThread::spawn();
+        let wd_state_dev = watchdog.register(device)?;
+        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
+
         Ok(MegakernelProgram {
             instructions,
             device_program,
@@ -305,6 +310,8 @@ impl MegakernelProgram {
             barrier_layer_map,
             multi_gpu_attn_boundaries,
             flat_program,
+            watchdog,
+            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -705,6 +712,10 @@ impl MegakernelProgram {
         let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
+        let watchdog = WatchdogThread::spawn();
+        let wd_state_dev = watchdog.register(device)?;
+        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
+
         Ok(MegakernelProgram {
             instructions,
             device_program,
@@ -739,6 +750,8 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
+            watchdog,
+            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1090,6 +1103,10 @@ impl MegakernelProgram {
         let _ = embedding_inst_idx_first;
         let _ = embedding_inst_idx;
 
+        let watchdog = WatchdogThread::spawn();
+        let wd_state_dev = watchdog.register(device)?;
+        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
+
         Ok(MegakernelProgram {
             instructions,
             device_program,
@@ -1126,6 +1143,8 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
+            watchdog,
+            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1364,6 +1383,10 @@ impl MegakernelProgram {
         let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
+        let watchdog = WatchdogThread::spawn();
+        let wd_state_dev = watchdog.register(device)?;
+        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
+
         Ok(MegakernelProgram {
             instructions,
             device_program,
@@ -1398,6 +1421,8 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
+            watchdog,
+            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1444,6 +1469,10 @@ impl MegakernelProgram {
         let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
+        let watchdog = WatchdogThread::spawn();
+        let wd_state_dev = watchdog.register(device)?;
+        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
+
         Ok(MegakernelProgram {
             instructions,
             device_program,
@@ -1473,6 +1502,8 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
+            watchdog,
+            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }

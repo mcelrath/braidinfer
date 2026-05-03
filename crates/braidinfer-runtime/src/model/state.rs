@@ -153,8 +153,9 @@ impl Model {
 
             let mut prog_ptr: *const std::ffi::c_void = dev_prog.as_ptr().cast();
             let mut num_inst = insts.len() as i32;
-            // watchdog: NULL disables (Phase 2 wires real WatchdogState).
-            let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let wd = crate::watchdog::WatchdogThread::spawn();
+            let wd_state_dev = wd.register(self.device).map_err(ModelError::Hip)?;
+            let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
             let mut args: [*mut std::ffi::c_void; 3] = [
                 std::ptr::addr_of_mut!(prog_ptr).cast(),
                 std::ptr::addr_of_mut!(num_inst).cast(),
