@@ -132,6 +132,65 @@ Single persistent cooperative kernel (384 blocks × 256 threads) replacing ~345 
 128-byte instructions, virtual block loop, grid.sync() between instructions.
 2.1x speedup over naive dispatch (6.4ms vs 13.4ms per token).
 
+## Watchdog for Persistent Kernels
+
+Persistent cooperative kernels (moe_worker, moe_gemv_worker, persistent_worker, megakernel, megakernel_moe_dispatch) include a host-side watchdog that detects wedged kernels.
+
+### How it works
+
+1. Each kernel receives a `WatchdogState*` pointer (host-mapped memory, visible from CPU).
+2. The kernel calls `watchdog_beat()` periodically to increment `progress_counter`.
+3. A host thread (`WatchdogThread` in `crates/braidinfer-runtime/src/watchdog.rs`) polls `progress_counter` every `BRAIDINFER_WATCHDOG_POLL_MS` ms (default 100).
+4. If no progress for `BRAIDINFER_WATCHDOG_NO_PROGRESS_MS` ms (default 2000): host writes `force_exit=1`.
+5. Well-behaved kernels call `watchdog_poll_and_check()` and exit when `force_exit=1`. They have `BRAIDINFER_WATCHDOG_GRACE_MS` ms (default 1000) to exit.
+6. If the kernel still hasn't advanced `progress_counter` after grace: host dumps telemetry and calls `std::process::abort()`.
+
+### Recovery model (RDNA3-specific)
+
+**Cooperative exit** (normal): kernel polls `force_exit`, exits via `grid.sync()` + return. Recovery time ~4.7ms (measured).
+
+**Abort escalation** (stuck kernel): `hipDeviceReset` is NOT called — it blocks indefinitely on RDNA3/gfx1100 because ROCm has no GPU TDR preemption for compute kernels. Process abort triggers amdgpu driver context teardown and releases the GPU. Confirmed by `exterior_algebra/scripts/watchdog_recovery_test.hip`.
+
+### Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BRAIDINFER_WATCHDOG_NO_PROGRESS_MS` | 2000 | ms with no progress_counter change before declaring stuck. Set to 0 to disable watchdog entirely. |
+| `BRAIDINFER_WATCHDOG_GRACE_MS` | 1000 | ms after force_exit is written before escalating to abort. |
+| `BRAIDINFER_WATCHDOG_POLL_MS` | 100 | Host thread poll interval. |
+
+### CI gate
+
+```bash
+python scripts/check_watchdog_coverage.py
+```
+
+Detects HIP files containing `cg::this_grid()` or `while (true)` that do not `#include "watchdog.h"`. Exit 1 on missing coverage.
+
+### Adding watchdog to a new kernel
+
+```cpp
+#include "watchdog.h"
+
+__global__ void my_kernel(WatchdogState* watchdog, ...) {
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+    uint32_t beat_ctr = 0;
+
+    while (true) {
+        // ... do work ...
+        watchdog_beat(watchdog, &beat_ctr);
+        if (watchdog_poll_and_check(watchdog, grid, op_id)) {
+            watchdog_signal_exit(done_flag);
+            return;
+        }
+        grid.sync();
+    }
+}
+```
+
+Pass `nullptr` for `watchdog` to disable (null-safe: all primitives check for null).
+
 ## Mandatory Review Workflow
 
 Reviews are always approved and expected. Do not ask the user for permission to review.
