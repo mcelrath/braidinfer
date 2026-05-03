@@ -383,6 +383,61 @@ impl Model {
         Ok(result)
     }
 
+    /// Read GDN conv1d state buffers (per-layer) for diagnostic inspection.
+    pub fn read_gdn_conv_state(&self) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.stream.synchronize()?;
+        let mut result = Vec::with_capacity(self.gdn_conv_states.len());
+        for state in &self.gdn_conv_states {
+            let n = state.len();
+            let mut buf = vec![0.0f32; n];
+            state.copy_to_host(&mut buf)?;
+            result.push(buf);
+        }
+        Ok(result)
+    }
+
+    /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.
+    /// Returns empty Vec if page_allocator is not initialized (e.g., multi-GPU non-paged path).
+    pub fn read_kv_chunk_slot0(&self) -> Result<Vec<u8>, ModelError> {
+        self.stream.synchronize()?;
+        let Some(alloc) = self.page_allocator.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let chunk_bytes = alloc.chunk_bytes();
+        let slot0_ptr = alloc.slot_ptr(0);
+        let mut buf = vec![0u8; chunk_bytes];
+        braidinfer_hip::memory::memcpy_d2h(&mut buf, slot0_ptr, chunk_bytes)
+            .map_err(ModelError::Hip)?;
+        Ok(buf)
+    }
+
+    /// Enable per-instruction activation dump on the paged megakernel.
+    /// Call BEFORE the first decode_step_paged of each run. Capacity = max number of
+    /// dump slots (one per OP per kernel-launch). For a 24-layer hybrid running 2 steps,
+    /// ~50-100 ops per launch × 2 launches → 200 slots is generous.
+    pub fn enable_paged_dump(&mut self, max_slots: i32) -> Result<(), ModelError> {
+        let Some(mk) = self.megakernel_paged.as_mut() else {
+            return Err(ModelError::MissingWeight(
+                "megakernel_paged not initialized — call decode_step_paged once first".into(),
+            ));
+        };
+        mk.enable_dump(max_slots).map_err(ModelError::Hip)
+    }
+
+    /// Read the per-instruction dump from the paged megakernel.
+    /// Returns Vec<(opcode, inst_idx, output_data)> in the order they were dumped.
+    pub fn read_paged_dump(&self) -> Result<Vec<(u32, u32, Vec<f32>)>, ModelError> {
+        let Some(mk) = self.megakernel_paged.as_ref() else {
+            return Err(ModelError::MissingWeight("megakernel_paged not initialized".into()));
+        };
+        mk.read_dump(&self.stream).map_err(ModelError::Hip)
+    }
+
+    /// Get the human-readable opcode name for a dumped op (for diagnostic printing).
+    pub fn opcode_name(op: u32) -> String {
+        crate::megakernel::opcode_name_str(op)
+    }
+
     /// Restore GDN recurrent states from a previously saved checkpoint slot.
     pub fn restore_recurrent_checkpoint(&mut self, slot: u32) -> Result<(), ModelError> {
         let pool = self

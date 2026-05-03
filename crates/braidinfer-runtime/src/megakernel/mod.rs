@@ -377,6 +377,10 @@ fn upload_program(device: DeviceId, instructions: &[Instruction]) -> HipResult<D
     Ok(buf)
 }
 
+pub fn opcode_name_str(op: u32) -> String {
+    opcode_name(op).to_string()
+}
+
 fn opcode_name(op: u32) -> &'static str {
     match op {
         OP_NOP => "NOP",

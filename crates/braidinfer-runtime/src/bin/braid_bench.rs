@@ -143,14 +143,186 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     // (including P2P workers for multi-GPU), so the reference is correct for all model types.
     // decode_step_paged is NOT used because for multi-GPU MoE models it skips expert computation
     // (experts are lite-loaded on GPU 0 when MULTI_GPU=1).
-    model.reset_state().expect("reset");
-    let mut seq_logits = vec![];
-    for &tok in prompt.iter() {
-        seq_logits = model.prefill(&[tok]).expect("seq prefill");
-    }
-    let seq_top = top10(&seq_logits);
+    // Compute fingerprint of last-token logits: sum of finite values + count of NaN/Inf.
+    // ULP-level diffs between runs will produce different sums.
+    let fingerprint = |logits: &[f32]| -> (f64, usize, usize, f32, f32) {
+        let mut sum = 0.0f64;
+        let mut nans = 0;
+        let mut infs = 0;
+        let mut max = f32::NEG_INFINITY;
+        let mut min = f32::INFINITY;
+        for &v in logits {
+            if v.is_nan() { nans += 1; continue; }
+            if v.is_infinite() { infs += 1; continue; }
+            sum += v as f64;
+            if v > max { max = v; }
+            if v < min { min = v; }
+        }
+        (sum, nans, infs, min, max)
+    };
 
-    // Batched prefill
+    // Per-step fingerprint to find FIRST DIVERGING STEP between two consecutive runs.
+    // ALSO dumps GDN state (recurrent + conv) after step 0 to compare across runs.
+    // If logits are bit-exact at step 0 but state bytes differ → confirms FP non-associativity
+    // in GDN state writes (multi-block-per-head). If state bytes ARE bit-exact → step 1's reads
+    // produce different output despite same input (mysterious, deeper investigation needed).
+    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>) {
+        m.reset_state().expect("reset");
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(prompt.len());
+        let mut state_after_step0: Vec<Vec<f32>> = Vec::new();
+        let mut conv_state_after_step0: Vec<Vec<f32>> = Vec::new();
+        let mut kv_after_step0: Vec<u8> = Vec::new();
+        for (i, &tok) in prompt.iter().enumerate() {
+            let l = m.prefill(&[tok]).expect("seq prefill (per-step)");
+            if i == 0 {
+                state_after_step0 = m.read_gdn_state().expect("read gdn state");
+                conv_state_after_step0 = m.read_gdn_conv_state().expect("read gdn conv state");
+                kv_after_step0 = m.read_kv_chunk_slot0().expect("read kv chunk slot 0");
+            }
+            out.push(l);
+        }
+        (out, state_after_step0, conv_state_after_step0, kv_after_step0)
+    };
+    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv) = collect_step_logits(model, &prompt);
+    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv) = collect_step_logits(model, &prompt);
+
+    // Compare GDN recurrent state bytes after step 0
+    println!("  GDN state comparison after step 0 (run1 vs run2):");
+    let mut total_recur_diff = 0usize;
+    let mut total_recur_floats = 0usize;
+    let mut max_recur_abs = 0.0f32;
+    let mut total_run1_recur_sum = 0.0f64;
+    for (i, (l1, l2)) in run1_gdn_state.iter().zip(run2_gdn_state.iter()).enumerate() {
+        let n = l1.len();
+        let bit_diff = l1.iter().zip(l2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let max_abs = l1.iter().zip(l2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let l1_abs_sum: f64 = l1.iter().map(|&v| v.abs() as f64).sum();
+        let l1_max = l1.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+        total_recur_diff += bit_diff;
+        total_recur_floats += n;
+        total_run1_recur_sum += l1_abs_sum;
+        if max_abs > max_recur_abs { max_recur_abs = max_abs; }
+        if i < 3 || bit_diff > 0 {
+            println!("    GDN_RECUR layer {i}: bit_diff={bit_diff}/{n} max_abs_diff={max_abs:.3e} run1_abs_sum={l1_abs_sum:.3e} run1_max={l1_max:.3e}");
+        }
+    }
+    println!("    GDN_RECUR total: {total_recur_diff}/{total_recur_floats} max_abs_diff={max_recur_abs:.3e} run1_total_abs_sum={total_run1_recur_sum:.3e}");
+
+    // Compare GDN conv1d state bytes after step 0
+    let mut total_conv_diff = 0usize;
+    let mut total_conv_floats = 0usize;
+    let mut max_conv_abs = 0.0f32;
+    for (i, (l1, l2)) in run1_conv_state.iter().zip(run2_conv_state.iter()).enumerate() {
+        let n = l1.len();
+        let bit_diff = l1.iter().zip(l2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let max_abs = l1.iter().zip(l2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        total_conv_diff += bit_diff;
+        total_conv_floats += n;
+        if max_abs > max_conv_abs { max_conv_abs = max_abs; }
+        if i < 3 || bit_diff > 0 {
+            println!("    GDN_CONV layer {i}: bit_diff={bit_diff}/{n} max_abs={max_abs:.3e}");
+        }
+    }
+    println!("    GDN_CONV total: {total_conv_diff}/{total_conv_floats} max_abs={max_conv_abs:.3e}");
+
+    // Compare KV chunk slot 0 bytes after step 0
+    let kv_byte_diff = run1_kv.iter().zip(run2_kv.iter()).filter(|(a, b)| a != b).count();
+    let kv_total = run1_kv.len();
+    let run1_kv_nonzero = run1_kv.iter().filter(|&&b| b != 0).count();
+    println!("    KV_CHUNK_SLOT0: byte_diff={kv_byte_diff}/{kv_total} run1_nonzero_bytes={run1_kv_nonzero}");
+    println!("  per-step seq->seq comparison:");
+    for (i, (l1, l2)) in run1_steps.iter().zip(run2_steps.iter()).enumerate() {
+        let s1: f64 = l1.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();
+        let s2: f64 = l2.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();
+        let n_bit_diff = l1.iter().zip(l2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let max_abs = l1.iter().zip(l2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("    step {i}: bit_diff={n_bit_diff}/{} max_abs={max_abs:.3e} sum1={s1:.4e} sum2={s2:.4e}", l1.len());
+    }
+
+    // Per-instruction dump comparison.
+    // Run two consecutive prefill streams with enable_dump active, compare per-op outputs.
+    // Find FIRST divergent op = the kernel op that introduces the non-determinism.
+    if std::env::var("BZ0_DUMP").is_ok() {
+        println!("  per-instruction dump comparison (BZ0_DUMP=1):");
+        // Need megakernel_paged created first. Run one decode_step to lazy-init it.
+        model.reset_state().expect("reset");
+        let _ = model.prefill(&[prompt[0]]).expect("prime megakernel_paged");
+        // Now enable dump.
+        const MAX_SLOTS: i32 = 4096;
+        let collect_dump = |m: &mut Model, prompt: &[u32]| -> Vec<(u32, u32, Vec<f32>)> {
+            m.reset_state().expect("reset");
+            m.enable_paged_dump(MAX_SLOTS).expect("enable dump");
+            for &tok in prompt.iter() {
+                let _ = m.prefill(&[tok]).expect("prefill (with dump)");
+            }
+            m.read_paged_dump().expect("read dump")
+        };
+        // Probe with enough tokens to expose step 1+ divergence (per the optimization
+        // matrix in bd, divergence at step 1+ at -O3 default).
+        let probe_prompt: Vec<u32> = prompt.iter().take(2).copied().collect();
+        let dump1 = collect_dump(model, &probe_prompt);
+        let dump2 = collect_dump(model, &probe_prompt);
+        println!("    dump1 slots: {}, dump2 slots: {}", dump1.len(), dump2.len());
+        let max_print = std::cmp::min(dump1.len(), dump2.len());
+        let mut divergent_count = 0usize;
+        let mut first_5: Vec<usize> = Vec::new();
+        for slot_idx in 0..max_print {
+            let (op1, idx1, data1) = &dump1[slot_idx];
+            let (op2, idx2, data2) = &dump2[slot_idx];
+            if op1 != op2 || idx1 != idx2 { continue; }
+            let bit_diff = data1.iter().zip(data2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            if bit_diff > 0 {
+                divergent_count += 1;
+                if first_5.len() < 5 {
+                    first_5.push(slot_idx);
+                }
+            }
+        }
+        println!("    {} divergent ops out of {} compared. First 5 divergent slots: {:?}",
+                 divergent_count, max_print, first_5);
+        if let Some(&div_slot) = first_5.first() {
+            let lo = div_slot.saturating_sub(15);
+            let hi = (div_slot + 5).min(max_print);
+            println!("    Context around first divergence (wider):");
+            for s in lo..hi {
+                let (op1, idx1, data1) = &dump1[s];
+                let (_op2, _idx2, data2) = &dump2[s];
+                let bit_diff = data1.iter().zip(data2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                let max_abs = data1.iter().zip(data2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                println!(
+                    "      slot {s}: op={} (op_id={op1}) inst_idx={idx1} size={} bit_diff={bit_diff} max_abs={max_abs:.3e}",
+                    Model::opcode_name(*op1), data1.len()
+                );
+            }
+        }
+    }
+    let seq_logits = run1_steps.last().unwrap().clone();
+    let seq_logits2 = run2_steps.last().unwrap().clone();
+    let seq_top = top10(&seq_logits);
+    let fp1 = fingerprint(&seq_logits);
+    let seq_top2 = top10(&seq_logits2);
+    let fp2 = fingerprint(&seq_logits2);
+    let same = seq_top.iter().zip(seq_top2.iter()).filter(|(a, b)| a == b).count();
+
+    // Bit-exact comparison of logits arrays.
+    let bit_exact = seq_logits.iter().zip(seq_logits2.iter()).all(|(a, b)| a.to_bits() == b.to_bits());
+    let n_diff = seq_logits.iter().zip(seq_logits2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+    let max_abs_diff = seq_logits.iter().zip(seq_logits2.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    println!(
+        "  seq->seq same-process determinism: {same}/10 top, bit-exact={bit_exact}, n_diff_logits={n_diff}/{}, max_abs_diff={max_abs_diff:.3e}",
+        seq_logits.len()
+    );
+    println!("    fp1: sum={:.6e} nans={} infs={} range=[{:.3e}, {:.3e}]", fp1.0, fp1.1, fp1.2, fp1.3, fp1.4);
+    println!("    fp2: sum={:.6e} nans={} infs={} range=[{:.3e}, {:.3e}]", fp2.0, fp2.1, fp2.2, fp2.3, fp2.4);
+    if same < 10 {
+        println!("    seq run1: {:?}", &seq_top[..5.min(seq_top.len())]);
+        println!("    seq run2: {:?}", &seq_top2[..5.min(seq_top2.len())]);
+    }
+
+    // Batched prefill comparison.
     model.reset_state().expect("reset");
     let prefill_logits = model.prefill(&prompt).expect("batched prefill");
     let prefill_top = top10(&prefill_logits);
