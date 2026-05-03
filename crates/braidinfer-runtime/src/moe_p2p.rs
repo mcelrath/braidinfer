@@ -284,10 +284,12 @@ impl MoeP2pContext {
             ];
 
             let num_cus = multiprocessor_count(device)?;
-            // Use exactly num_cus blocks (1 per CU): safest cooperative launch count.
-            // Each block polls independently; more blocks = more parallelism but risks
-            // cooperative constraint violations if bpsm * num_cus exceeds hardware capacity.
-            let num_blocks = num_cus;
+            // Cooperative kernels MUST launch num_cus * blocks_per_sm blocks or grid.sync()
+            // deadlocks waiting for non-resident blocks. hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
+            // returns the correct per-SM count for the actual compiled kernel.
+            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)
+                .unwrap_or(1);
+            let num_blocks = (num_cus as i32 * blocks_per_sm) as u32;
             func.launch_cooperative(
                 (num_blocks, 1, 1),
                 (256, 1, 1),

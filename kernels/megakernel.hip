@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
+#include "watchdog.h"
 
 // Megakernel: persistent cooperative kernel that executes a program of instructions.
 // Launched once with max cooperative blocks (384 on gfx1100 with 256 threads).
@@ -130,7 +131,8 @@ __device__ void dump_instruction_output(
 
 extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     const u64* __restrict__ program,
-    int num_instructions
+    int num_instructions,
+    WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
@@ -156,7 +158,16 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         dump_count = (int*)nop->dump_counter;
     }
 
+    uint32_t watchdog_beat_ctr = 0;
+
     for (int pc = 0; pc < num_instructions; pc++) {
+        // Watchdog: check force_exit between instructions. All blocks reach this point
+        // via the grid.sync() at the end of each instruction, so cooperative exit is safe.
+        if (watchdog && watchdog_poll_and_check(watchdog, grid, (uint32_t)pc)) {
+            return;  // all blocks return together; no done_flag (megakernel has no persistent done)
+        }
+        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
+
         const u64* inst = program + pc * INST_SIZE;
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
@@ -193,7 +204,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         // OP_MOE_DISPATCH: GPU-initiated MoE — triggers workers, polls acks, sums results.
         // Manages its own grid.sync() internally.
         if (opcode == OP_MOE_DISPATCH) {
-            op_moe_dispatch(inst, grid);
+            op_moe_dispatch(inst, grid, watchdog);
             continue;
         }
 

@@ -23,8 +23,9 @@
 //                                    = moe_latent_size for Nemotron-H)
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
+#include "watchdog.h"
 
-__device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid) {
+__device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid, WatchdogState* watchdog = nullptr) {
     const MoeDispatchInst* i = (const MoeDispatchInst*)inst;
     volatile MoeWorkItem* wq = (volatile MoeWorkItem*)(uintptr_t)i->work_queue;
     float* output_slots = (float*)(uintptr_t)i->output_slots;
@@ -138,11 +139,15 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
         coop_weighted_acc(gpu0_output, scratch_gate, ew, gupd, grid);
     }
 
-    // 4. Block 0 thread 0: poll worker acks (GPU 0's experts are done by now)
+    // 4. Block 0 thread 0: poll worker acks (GPU 0's experts are done by now).
+    // watchdog_beat inside the ack-poll loop: if a worker wedges, the host watchdog
+    // sees no progress and sets force_exit. The kernel returns at the next outer check.
     if (blockIdx.x == 0 && threadIdx.x == 0) {
+        uint32_t ack_beat_ctr = 0;
         for (int w = 0; w < num_workers; w++) {
             while (wq->ack_flags[w + 1] != seq) {
                 __builtin_amdgcn_s_sleep(0);
+                if (watchdog) watchdog_beat(watchdog, &ack_beat_ctr);
             }
         }
     }

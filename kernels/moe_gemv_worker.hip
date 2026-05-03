@@ -7,6 +7,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
 #include "moe_expert_ops.h"
+#include "watchdog.h"
 
 #define MOE_MAX_BATCH 16
 
@@ -62,12 +63,14 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
     volatile MoeWorkerQueue* queue,
     float* scratch_gate,
     float* scratch_up,
-    float* scratch_act
+    float* scratch_act,
+    WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
     uint32_t last_seq = 0;
+    uint32_t watchdog_beat_ctr = 0;
 
     while (true) {
         // grid.sync() at TOP — all blocks converge here before block 0 polls.
@@ -82,6 +85,13 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
             }
         }
         grid.sync();
+
+        // Watchdog: cooperative exit if force_exit set.
+        if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
+            watchdog_signal_exit(&queue->done);
+            return;
+        }
+        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
 
         uint32_t seq = queue->seq_num;
         if (seq == 0xFFFFFFFFu) {

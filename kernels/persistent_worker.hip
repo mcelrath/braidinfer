@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
+#include "watchdog.h"
 
 // Include all megakernel op implementations (same as megakernel.hip)
 #include "megakernel_ops.hip"
@@ -27,7 +28,8 @@ struct WorkerQueue {
 };
 
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
-    volatile WorkerQueue* queue
+    volatile WorkerQueue* queue,
+    WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable
 ) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         printf("persistent_worker: started, queue=%p\n", (void*)queue);
@@ -37,6 +39,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     cg::grid_group grid = cg::this_grid();
 
     uint32_t last_seq = 0;
+    uint32_t watchdog_beat_ctr = 0;
 
     while (true) {
         // Single-thread poll to avoid PCIe storm
@@ -53,6 +56,13 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             }
         }
         grid.sync();
+
+        // Watchdog: cooperative exit if force_exit set.
+        if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
+            watchdog_signal_exit(&queue->done);
+            return;
+        }
+        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
 
         uint32_t seq = queue->seq_num;
         if (seq == 0xFFFFFFFFu) {
@@ -90,7 +100,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
         } else if (opcode == OP_MOE_DISPATCH) {
-            op_moe_dispatch(inst, grid);
+            op_moe_dispatch(inst, grid, watchdog);
         } else if (opcode == OP_LINEAR_PROJ_PCG32) {
             op_linear_proj_pcg32_full(inst, grid_x);
             grid.sync();

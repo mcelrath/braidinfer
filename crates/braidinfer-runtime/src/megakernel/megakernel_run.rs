@@ -703,9 +703,12 @@ impl MegakernelProgram {
         let func = self.module.get_function("megakernel_f32")?;
         let mut prog_ptr: *const c_void = prog_buf.as_ptr().cast();
         let mut num_inst = instructions.len() as i32;
-        let mut args: [*mut c_void; 2] = [
+        // watchdog: NULL disables (Phase 2 wires real WatchdogState).
+        let mut wd_ptr: *mut c_void = std::ptr::null_mut();
+        let mut args: [*mut c_void; 3] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),
+            std::ptr::addr_of_mut!(wd_ptr).cast(),
         ];
         func.launch_cooperative(
             (self.num_blocks, 1, 1),

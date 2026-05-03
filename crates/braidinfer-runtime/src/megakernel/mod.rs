@@ -347,9 +347,12 @@ impl MegakernelProgram {
         let extra = if self.dump_buffer.is_some() { 1 } else { 0 };
         let mut num_inst = (self.instructions.len() + extra) as i32;
 
-        let mut args: [*mut c_void; 2] = [
+        // watchdog: NULL disables (Phase 2 wires real WatchdogState).
+        let mut wd_ptr: *mut c_void = std::ptr::null_mut();
+        let mut args: [*mut c_void; 3] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),
+            std::ptr::addr_of_mut!(wd_ptr).cast(),
         ];
 
         func.launch_cooperative(

@@ -150,7 +150,12 @@ impl PersistentDispatch {
             let module = Module::load(device, &kernel_dir.join("persistent_worker.hsaco"))?;
             let func = module.get_function("persistent_worker")?;
             let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 1] = [std::ptr::addr_of_mut!(queue_ptr).cast()];
+            // watchdog: NULL disables (Phase 2 wires real WatchdogState).
+            let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut args: [*mut std::ffi::c_void; 2] = [
+                std::ptr::addr_of_mut!(queue_ptr).cast(),
+                std::ptr::addr_of_mut!(wd_ptr).cast(),
+            ];
             let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
             let bpsm_max = bpsm_raw.min(2);
             let bpsm = std::env::var("BRAIDINFER_BPSM")
@@ -352,7 +357,12 @@ impl PersistentDispatch {
         let num_cus = multiprocessor_count(gpu0)?;
         let num_blocks = (blocks_per_sm * num_cus as u32).max(num_cus as u32);
         let mut q = queue.device_ptr() as *mut std::ffi::c_void;
-        let mut args = [std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>()];
+        // watchdog: NULL disables (Phase 2 wires real WatchdogState).
+        let mut wd_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut args = [
+            std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>(),
+            std::ptr::addr_of_mut!(wd_ptr).cast(),
+        ];
         func.launch_cooperative(
             (num_blocks, 1, 1),
             (256, 1, 1),
