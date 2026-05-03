@@ -288,9 +288,11 @@ impl MoeP2pContext {
             ];
 
             let num_cus = multiprocessor_count(device)?;
-            // Cooperative kernels MUST launch num_cus * blocks_per_sm blocks or grid.sync()
-            // deadlocks waiting for non-resident blocks. hipModuleOccupancyMaxActiveBlocksPerMultiprocessor
-            // returns the correct per-SM count for the actual compiled kernel.
+            // Cooperative constraint: blocks ≤ num_cus × blocks_per_sm (NOT ==).
+            // hipOccupancyMaxActiveBlocksPerMultiprocessor returns 9 for moe_worker_kernel
+            // on gfx1100, so the correct max is 432 blocks. Prior launch used 48 (= num_cus),
+            // which is valid (≤ 432) and safe, but left 384 SMs idle. 432 blocks gives full
+            // SIMD utilization without violating the cooperative constraint.
             let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)
                 .unwrap_or(1);
             let num_blocks = (num_cus as i32 * blocks_per_sm) as u32;
