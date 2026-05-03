@@ -1934,7 +1934,10 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
                 const uint16_t* kn_w = i->k_norm;
                 if (kn_w != nullptr) {
                     float my_k = (tid < head_dim) ? sh_k[tid] : 0.0f;
-                    float k_rms = rsqrtf(block_reduce_sum(my_k * my_k, partial) / (float)head_dim + 1e-6f);
+                    // bz0 fix: tree reduction (no __shfl_down). Same pattern as
+                    // op_attn_paged K-rms — shfl-based block_reduce_sum here is a
+                    // source of non-determinism amplified by online-softmax max.
+                    float k_rms = rsqrtf(tree_reduce_sum_256(my_k * my_k, partial) / (float)head_dim + 1e-6f);
                     if (tid < head_dim) {
                         float w = 1.0f + bf16_to_f32(kn_w[tid]);
                         sh_k[tid] = my_k * k_rms * w;
