@@ -810,6 +810,13 @@ __device__ __attribute__((noinline)) void op_gdn_gate(const u64* inst, u32 vbloc
 // OP_GDN_RECUR: gated delta rule recurrence (one block per head)
 // args: [1]=q, [2]=k, [3]=v, [4]=gate, [5]=b, [6]=state, [7]=output, [8]=key_dim, [9]=value_dim
 __device__ __attribute__((noinline)) void op_gdn_recurrent(const u64* inst, u32 vblock) {
+    // bz0 fix: invalidate per-WGP L1 on op entry. Multi-block-per-head GDN reads/writes
+    // a HBM state buffer; consumer WGPs may have stale L1 lines.
+    if (threadIdx.x == 0) {
+        asm volatile("buffer_gl1_inv" ::: "memory");
+    }
+    __syncthreads();
+
     const GdnRecurInst* i = (const GdnRecurInst*)inst;
     const float* q = i->q;
     const float* k = i->k;
@@ -1599,6 +1606,13 @@ __device__ __attribute__((noinline)) void op_output_gate(const u64* inst, u32 vb
 //       [14]=partial_state (float* or 0; if non-null, init (m,d,v_acc) from quantized pass scratch)
 //       [16]=k_norm_weight (bf16* or null; if non-null, apply QK-norm after K load/dequant)
 __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vblock) {
+    // bz0 fix: invalidate per-WGP L1 on op entry. KV chunk pool is written by prior op
+    // (OP_D2D_COPY) on potentially different WGPs from the consumer.
+    if (threadIdx.x == 0) {
+        asm volatile("buffer_gl1_inv" ::: "memory");
+    }
+    __syncthreads();
+
     const AttnPagedInst* i = (const AttnPagedInst*)inst;
     float* output          = i->output;
     const float* q         = i->q;

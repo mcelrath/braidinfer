@@ -63,6 +63,13 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         uint32_t num_inst = queue->num_instructions;
         if (num_inst == 0) num_inst = 1; // backward compat: 0 means 1
 
+        // bz0 fix: invalidate per-WGP L1 at batch boundary. Activation buffer writes by
+        // prior batch may leave stale L1 lines on different WGPs.
+        if (threadIdx.x == 0) {
+            asm volatile("buffer_gl1_inv" ::: "memory");
+        }
+        __syncthreads();
+
         // Process batch of instructions with grid.sync() between each
         for (uint32_t pc = 0; pc < num_inst; pc++) {
         // Report progress so CPU can identify stuck instruction on timeout.

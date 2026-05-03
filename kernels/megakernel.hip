@@ -135,6 +135,15 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
+    // bz0 probe v3: kernel-entry L1 invalidation WITHOUT s_waitcnt (which has hang
+    // pathology on gfx1100 — confirmed by PCIe-coherency investigation: vmcnt(0) blocks
+    // forever if any vmem op response is delayed). RDNA3 cooperative-launch AQL packets
+    // use AGENT scope which flushes/invalidates L2 but NOT per-WGP L1.
+    if (threadIdx.x == 0) {
+        asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
+    }
+    __syncthreads();
+
     // Dump state: encoded in first instruction if OP_NOP with dump_base != 0
     // First instruction words: [0]=opcode(NOP), [1]=dump_base ptr, [2]=dump_capacity, [3]=dump_count ptr
     char* dump_base = nullptr;
