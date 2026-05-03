@@ -32,6 +32,7 @@ unsafe extern "C" {
     pub fn hipSetDevice(device: c_int) -> hipError_t;
     pub fn hipGetDevice(device: *mut c_int) -> hipError_t;
     pub fn hipDeviceSynchronize() -> hipError_t;
+    pub fn hipDeviceReset() -> hipError_t;
     pub fn hipDeviceGetAttribute(pi: *mut c_int, attr: c_int, device: c_int) -> hipError_t;
 
     // Memory management
