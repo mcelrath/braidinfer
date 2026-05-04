@@ -878,7 +878,7 @@ tell you "no path supports this, fall back to software" before the hang happens.
 
 ### Additional anomalies surfaced by the systematic sweep (2026-05-03)
 
-**GPU 4 (PCI 86:00.0, root 0080) is 3.5× slower for 1 MB memcpy_peer_async** — **REVISED 2026-05-04**: re-tested with exclusive GPU access (v3 sweep, results/peer_topology_full_v3.json). The earlier 3.5× factor was contamination from concurrent Claude session workloads on the c3/c6/c9 GPUs. Under exclusive access, GPU 4 numbers are within normal range. NOT a hardware issue.
+**GPU 4 (PCI 86:00.0, root 0080) is 3.5× slower for 1 MB memcpy_peer_async** — **REVISED 2026-05-04 then RE-CONFIRMED AS DEFECTIVE 2026-05-04**: initial v3 retest under exclusive access showed normal numbers (suggesting contamination), but subsequent inference testing on Qwen3-0.6B confirmed this card is hardware-defective with progressive degradation. See "Two defective cards confirmed" section below.
 
 **~~Pair (3,7) [root 0080 ↔ root 0000] times out~~ — RETRACTED 2026-05-04**: also contamination. Under exclusive access, pair (3,7) measures host_mapped 5.39 µs / gpu_peer_write 3.17 µs / memcpy 22.12 µs / segmented_graph 11.41 µs — all normal. Probe pairs (4,7) and (4,5) confirm there is NO root_80↔outer-root path issue. The "specific cross-root pair (3,7)" claim was wrong.
 
@@ -948,6 +948,121 @@ Other 7 GPUs are equivalent for cross-GPU latency. The c3↔03 pair specifically
 the worst (100-160 µs); other c3 pairs are usable but with high variance (10-60 µs
 typical). Defer hardware diagnostic until c3's full performance is operationally
 needed.
+
+---
+
+## Two defective cards confirmed (2026-05-04 final diagnosis)
+
+After extensive debugging (slot swap, multiple cold and warm reboots, inference
+testing on Qwen3-0.6B), **two physical cards are confirmed defective**, regardless
+of which slot they occupy.
+
+**IMPORTANT — identification convention**: PCI bus addresses change when cards are
+swapped between slots, and HIP enumeration order can change across reboots. The
+**only stable identifier** for a specific physical card is its **unique chip ID**
+(reported by `rocm-smi --showuniqueid`). All references to specific cards in this
+document use the unique chip ID. PCI bus numbers and HIP indices are
+position-dependent and ephemeral.
+
+| Card unique ID | Symptom | Severity |
+|----------------|---------|----------|
+| **0x915bc79ac2392b08** | ~20% slower inference (121.9 vs 152 tok/s median); intermittently elevated cross-GPU latency | Mild — usable but degraded |
+| **0x656b2deec7eff341** | UTCL2 (page table cache) hardware fault — SDMA0 page faults during inference, llama-cli stalls, intermittent SMU hang on boot | SEVERE — RMA candidate |
+
+The other 6 cards perform uniformly at 142-166 tok/s (Qwen3-0.6B). Their unique IDs:
+- 0x85878240f862b48c
+- 0xaef1626a54203fa9
+- 0xa8127e08aacff814
+- 0xfd31b53f2166df07
+- 0x7879cd5ad3ad02f3
+- 0x211c74ad20551ade
+
+### Identifying which physical card to exclude at runtime
+
+```bash
+# List unique IDs by current rocm-smi index
+sudo /opt/rocm/bin/rocm-smi --showuniqueid
+
+# Then construct HIP_VISIBLE_DEVICES that excludes the defective unique IDs.
+# WARNING: rocm-smi indices and HIP indices may differ in some boots —
+# verify the mapping per boot before relying on the list.
+```
+
+A small wrapper script that reads unique IDs and builds a HIP_VISIBLE_DEVICES list
+that excludes specific unique IDs is the robust approach (vs hardcoding bus or
+HIP index numbers, which change).
+
+### Defective card #1: 0x915bc79ac2392b08
+
+- **Symptom**: ~20% slower inference vs peer median, plus occasional cross-GPU
+  latency outliers (p50 normal at 7-8 µs but p99 spikes 100-700 µs on some pairs)
+- **Persistent**: anomaly survived a slot swap — moves with the card, not the slot
+- **Survives reboots**: warm reboot, cold cycle don't fix it
+- **AER counters clean**, link state healthy — silicon defect not at PCIe layer
+- **Root cause**: undetermined; likely degraded UTCL2 cache or SDMA engine
+  (similar class of issue as defective card #2 but earlier-stage)
+- **Recommended action**: monitor for further degradation; RMA-candidate
+
+### Defective card #2: 0x656b2deec7eff341
+
+- **Symptom A — Boot-time SMU hang** (intermittent, transient): some boots, this
+  card's SMU initialization fails. Symptoms: amd-smi shows `N/A` for all metrics
+  (temp, power, clocks, util), dmesg floods with `SMU is in hanged state, failed to
+  send smu message!`. Recovers with reboot (rolls the dice on next boot).
+- **Symptom B — UTCL2 page faults during sustained workloads**: when running
+  inference (llama-cli on Qwen3-0.6B), llama-cli stalls and dmesg shows:
+  ```
+  amdgpu <bus>: [gfxhub] page fault (src_id:0 ring:24 vmid:8 pasid:N)
+  GCVM_L2_PROTECTION_FAULT_STATUS:0x00801A31
+  Faulty UTCL2 client ID: SDMA0 (0xd)
+  PERMISSION_FAULTS: 0x3
+  ```
+  Sequential page addresses (0x...006000, 0x...007000, 0x...008000, ...) faulting
+  one per page = SDMA iterating through a buffer where each page lookup fails at
+  the UTCL2 cache.
+- **AER counters clean** — fault is at the GPU's internal address translation
+  layer (UTCL2 cache silicon), not PCIe
+- **Root cause**: hardware defect in the Unified Translation Cache L2 (UTCL2)
+  on this specific card. Software cannot fix this. The translation lookup unit
+  inside the GPU returns "permission denied" for memory pages that are correctly
+  mapped in software.
+- **Why intermittent earlier, hard failure now**: the card has been progressively
+  degrading. Earlier symptoms (3.5× slow 1MB memcpy in v3, intermittent SMU hangs)
+  were the same silicon failing in lighter conditions. Sustained inference load
+  triggers it consistently.
+- **Recommended action**: **RMA / replace immediately**. This card is no longer
+  fit for production. Run with `HIP_VISIBLE_DEVICES` excluding it.
+
+### What was wrong with our prior hypotheses
+
+| Prior hypothesis | Status |
+|------------------|--------|
+| "card-X slow because MCIO bifurcated cable" | WRONG — both cards involved in the swap test are in direct x16 standard slots, not MCIO |
+| "card-X slow because boot VGA legacy IO" | WRONG — `boot_vga=0` on all AMD GPUs (BMC ASPEED is the boot VGA) |
+| "specific cross-IOD path has SDP fabric routing issue" | WRONG — control-pair probes showed no path-specific issue |
+| "specific slot has hardware quirk" | WRONG — slot swap proved the slow follows the card unique ID |
+| "Transient SMU stuck-state, reseat clears it" | PARTIALLY CORRECT — SMU hangs are transient and clear with reboot, but underlying card defect persists |
+| "All v3 anomalies were contamination" | PARTIALLY CORRECT — most were, but two cards have persistent hardware defects that surface under heavier load |
+
+### Operational guidance
+
+For multi-GPU workloads on this system going forward:
+
+- **Hard exclude** the card with unique ID **0x656b2deec7eff341** — fails
+  inference with SDMA UTCL2 page faults, RMA candidate
+- **Soft exclude / monitor** the card with unique ID **0x915bc79ac2392b08** —
+  works at ~80% of peer performance; OK for non-critical workloads, avoid for
+  latency-sensitive paths
+- **Healthy 6-GPU set**: the other 6 unique IDs listed above
+
+For BIOS / kernel tuning:
+- Aggressive recovery params (`amdgpu.lockup_timeout=2000`, `reset_method=3`,
+  `gpu_recovery=2`) added during the original cross-card page-fault-crash
+  investigation are now obsolete — Fix A in `p2p_latency_matrix.hip` eliminated
+  the root cause. Reverting these to defaults is queued for next boot. They may
+  have been contributing to SMU init fragility on the marginal card #2.
+- Keep `amdgpu.runpm=0`, `amdgpu.gfx_off=0`, `amdgpu.tmz=0`, `amdgpu.mcbp=0` —
+  these are all known-good and unrelated to the card defects.
 
 **HARDWARE-LEVEL CONFIRMED HEALTHY (2026-05-03 post-crash investigation)**: Both PCI 83
 and PCI c3 lspci as healthy. `LnkSta: Speed 16GT/s, Width x16`. `EqualizationComplete+`.
