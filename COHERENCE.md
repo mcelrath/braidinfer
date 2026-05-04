@@ -900,9 +900,54 @@ GPU c3 (PCI 0000:c3:00.0 = topology GPU 0 = HIP 5) has ~10× elevated host_mappe
 - Worst: c3 ↔ root_00 (PCI 03) p50 = **121 µs**, p99 = **769 µs**
 - Other root_00 pairs (e.g., 7↔1, 7↔3) measure normally at 4–5 µs — issue is c3-specific, not root_00
 
-**Hypothesis**: c3 is on the x8 MCIO bifurcated cable per the system's "mixed bifurcation" topology note. lspci reports `current_link_width=16` so the PCIe negotiated x16 — but the physical cable adds latency from signal integrity / extra connector hops compared to direct slot mounting. Worth confirming with: physical inspection of which slot c3 is in, and whether the path goes through an MCIO retimer.
+**Diagnostic results (2026-05-04)**:
 
-**Recommendation**: avoid placing latency-sensitive workloads on GPU c3 (HIP 5). Other 7 GPUs are equivalent for cross-GPU latency.
+- **AER correctable error counters: ALL ZERO** on both c3 and its peers. RxErr, BadTLP,
+  BadDLLP, Rollover, Timeout, NonFatalErr, CorrIntErr, HeaderOF — every counter clean.
+  This rules out PCIe link instability with retries.
+- **Link state stable**: `LnkSta: Speed 16GT/s, Width x16`,
+  `EqualizationComplete+ EqualizationPhase1+`. No retraining, no link rate downshift.
+- **MAbort status: cleared** (`<MAbort-`) after fresh boot — the prior MAbort+ was
+  from the cross-GPU atomicAdd hang attempts on prior session.
+- **No kernel-level retrain events** in journalctl since the last boot.
+- **Per-pair isolation tests** (`results/p2p_c3_isolation_test.json`): c3↔03 in a
+  fresh 2-GPU process measures 109.5 µs (vs 4 µs baseline for other pairs). 10
+  back-to-back iterations of c3↔03 in same reservation showed range 10-160 µs
+  with no monotonic drift — one outlier at 10.2 µs proves the path CAN be low
+  latency. Most iterations 50-160 µs.
+- **State-accumulation hypothesis REFUTED**: reverse-order c3 sweep showed first-
+  tested pair (03) was still slowest. The "monotonic with sweep index" pattern
+  in v3 was coincidence — 03 was last in v3 forward order AND happens to be
+  c3's slowest peer.
+
+**The link is electrically fine. The variability has a cause we can't software-attribute.**
+
+**Likely causes** (cannot discriminate without hardware swap test):
+
+1. **MCIO bifurcated cable** (per system's mixed-bifurcation topology note). MCIO adds
+   connector hops + trace length, and signal-integrity-induced jitter that does not
+   trigger AER errors but does delay transactions through retimer buffering. lspci
+   reports `current_link_width=16` regardless — the cable doesn't advertise itself
+   differently to the OS.
+2. **Physical slot routing length** — longer PCB traces from CPU IOD to connector.
+3. **Boot VGA decoding overhead** — c3 has the `vgaarb: setting as boot VGA device`
+   flag at boot. Even without a display attached, legacy VGA IO/memory decoding may
+   add per-transaction overhead.
+
+**Diagnostic next step (not done yet — requires physical access + reboot):**
+- Identify which slot c3 is in physically (ASRockRack ROMED8-2T/BCM has mixed
+  direct + MCIO slots; match BIOS slot label to PCI bus c3)
+- Slot swap: move c3's card into a slot currently holding a clean-latency GPU,
+  reboot, re-run v3 sweep. If the slot determines the issue, the new card in c3's
+  old slot will show the anomaly. If the card itself, the c3 card will show the
+  anomaly in its new slot.
+- BIOS: change boot VGA priority off c3 onto BMC ASPEED or another AMD GPU.
+
+**Recommendation**: avoid placing latency-sensitive workloads on GPU c3 (HIP 5).
+Other 7 GPUs are equivalent for cross-GPU latency. The c3↔03 pair specifically is
+the worst (100-160 µs); other c3 pairs are usable but with high variance (10-60 µs
+typical). Defer hardware diagnostic until c3's full performance is operationally
+needed.
 
 **HARDWARE-LEVEL CONFIRMED HEALTHY (2026-05-03 post-crash investigation)**: Both PCI 83
 and PCI c3 lspci as healthy. `LnkSta: Speed 16GT/s, Width x16`. `EqualizationComplete+`.
