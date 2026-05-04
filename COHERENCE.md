@@ -878,18 +878,31 @@ tell you "no path supports this, fall back to software" before the hang happens.
 
 ### Additional anomalies surfaced by the systematic sweep (2026-05-03)
 
-**GPU 4 (PCI 86:00.0, root 0080) is 3.5× slower for 1 MB memcpy_peer_async.**
-All pair measurements involving GPU 4 at 1 MB payload show ~322-329 µs vs normal ~91 µs.
-Affects both same-root (3,4) and all cross-root pairs (0-2,4) and (4,5-7). Possible
-PCIe link degradation, slower SDMA engine on that specific card, or persistent thermal
-throttle (memory at 62 °C in idle state, highest of the 8 cards). Worth investigating
-with `lspci -vvv -s 0000:86:00.0` for link state, retrains, or AER errors.
+**GPU 4 (PCI 86:00.0, root 0080) is 3.5× slower for 1 MB memcpy_peer_async** — **REVISED 2026-05-04**: re-tested with exclusive GPU access (v3 sweep, results/peer_topology_full_v3.json). The earlier 3.5× factor was contamination from concurrent Claude session workloads on the c3/c6/c9 GPUs. Under exclusive access, GPU 4 numbers are within normal range. NOT a hardware issue.
 
-**Pair (3,7) [root 0080 ↔ root 0000] times out on host_mapped_roundtrip and
-gpu_to_gpu_peer_write.** Other primitives (memcpy 13-55 µs, segmented_graph 213 µs)
-work fine on the same pair. This is a specific cross-root pair issue, NOT a generic
-cross-root problem (most cross-root pairs work normally). Suggests TTM or driver-level
-state for this specific root-complex pairing. Avoid as a critical path in production.
+**~~Pair (3,7) [root 0080 ↔ root 0000] times out~~ — RETRACTED 2026-05-04**: also contamination. Under exclusive access, pair (3,7) measures host_mapped 5.39 µs / gpu_peer_write 3.17 µs / memcpy 22.12 µs / segmented_graph 11.41 µs — all normal. Probe pairs (4,7) and (4,5) confirm there is NO root_80↔outer-root path issue. The "specific cross-root pair (3,7)" claim was wrong.
+
+**v3 corrections** (results/peer_topology_full_v3.json, 308 measurements, exclusive GPU access):
+
+| v2 anomaly | v3 actual | Verdict |
+|------------|-----------|---------|
+| (3,7) host_mapped/gpu_peer_write TIMEOUT | 5.39 / 3.17 µs | Was contamination |
+| (0,3) = c3↔83 timeout (post-Fix A) | 24.27 / 11.87 µs | Was contamination (Fix A also working) |
+| (0,4) gpu_peer_write TIMEOUT | 14.20 µs | Was contamination |
+| (0,2) host_mapped 629 µs | 54 µs | Was contamination |
+| (0,5) host_mapped 521 µs | 13 µs | Was contamination |
+| GPU 4 1 MB memcpy 3.5× slowdown | within normal range | Was contamination |
+
+**The ONE genuine c3 anomaly that survives v3**:
+
+GPU c3 (PCI 0000:c3:00.0 = topology GPU 0 = HIP 5) has ~10× elevated host_mapped_roundtrip latency vs other GPUs:
+- c3 mean across all peers: **43.81 µs** (vs **4.22 µs** for the other 7 GPUs combined)
+- Worst: c3 ↔ root_00 (PCI 03) p50 = **121 µs**, p99 = **769 µs**
+- Other root_00 pairs (e.g., 7↔1, 7↔3) measure normally at 4–5 µs — issue is c3-specific, not root_00
+
+**Hypothesis**: c3 is on the x8 MCIO bifurcated cable per the system's "mixed bifurcation" topology note. lspci reports `current_link_width=16` so the PCIe negotiated x16 — but the physical cable adds latency from signal integrity / extra connector hops compared to direct slot mounting. Worth confirming with: physical inspection of which slot c3 is in, and whether the path goes through an MCIO retimer.
+
+**Recommendation**: avoid placing latency-sensitive workloads on GPU c3 (HIP 5). Other 7 GPUs are equivalent for cross-GPU latency.
 
 **HARDWARE-LEVEL CONFIRMED HEALTHY (2026-05-03 post-crash investigation)**: Both PCI 83
 and PCI c3 lspci as healthy. `LnkSta: Speed 16GT/s, Width x16`. `EqualizationComplete+`.
