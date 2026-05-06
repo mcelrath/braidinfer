@@ -200,6 +200,16 @@ impl PrefillBuffers {
     }
 }
 
+/// 5ax K-trace + MROPE in-kernel dump diagnostic gate.
+/// Set `BRAIDINFER_K_TRACE_5AX=1` to enable; off by default.
+/// When off, the diagnostic adds no instructions to the megakernel program
+/// and no kernel-side dump writes. The trace/dump buffers are still allocated
+/// (~12KB) but unused.
+pub fn k_trace_5ax_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("BRAIDINFER_K_TRACE_5AX").is_ok())
+}
+
 impl PrefillBuffers {
     pub fn alloc(device: DeviceId, cfg: &ModelConfig, chunk_tokens: usize) -> HipResult<Self> {
         let n = chunk_tokens;

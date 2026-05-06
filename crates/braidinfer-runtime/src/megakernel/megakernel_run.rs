@@ -768,14 +768,7 @@ impl MegakernelProgram {
         }
 
         // 4. Upload updated position IDs
-        let mut pos_data = vec![0i32; n * 3];
-        for t in 0..n {
-            let pos = (start_pos + t as u32) as i32;
-            pos_data[t * 3] = pos;
-            pos_data[t * 3 + 1] = pos;
-            pos_data[t * 3 + 2] = pos;
-        }
-        prefill_bufs.position_ids.copy_from_host(&pos_data)?;
+        prefill_bufs.write_positions(start_pos, n)?;
 
         // 5. Re-upload modified instructions to device
         // Reuse pre-allocated flat_program buffer to avoid per-chunk allocation.

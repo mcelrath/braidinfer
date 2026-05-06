@@ -274,7 +274,6 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
             // Detailed per-head + first-divergent-offsets for layer 0.
             // K layout: [nkh, max_seq_len, head_dim]. For seq_len=1, position 0 is first.
             // We need nkh and head_dim from the model config. Use the cache size to back them out.
-            let (k1, _) = &run1_legacy_kv[l];
             let (k1_full, _) = &run1_legacy_kv[l];
             let (k2_full, _) = &run2_legacy_kv[l];
             // Heuristic: hd is the smallest power of 2 dividing 128 evenly that matches typical sizes.
@@ -338,7 +337,8 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     //   1 = post-LINEAR_PROJ K — diverges only here → LINEAR_PROJ K is non-det
     //   2 = post-QK_NORM K — diverges only here → QK_NORM is non-det
     //   (post-MROPE K = legacy_kv_caches[0][0..nkh*hd], already shown above)
-    if !run1_k_trace.is_empty() && run1_k_trace.len() == run2_k_trace.len() {
+    let k_trace_diag = braidinfer_runtime::megakernel::k_trace_5ax_enabled();
+    if k_trace_diag && !run1_k_trace.is_empty() && run1_k_trace.len() == run2_k_trace.len() {
         let phase_names = ["pre-LINEAR_PROJ (normed)", "post-LINEAR_PROJ K", "post-QK_NORM K"];
         println!("  K-TRACE per-phase comparison (first attention layer, step 0):");
         for (p, (a, b)) in run1_k_trace.iter().zip(run2_k_trace.iter()).enumerate() {
@@ -353,7 +353,7 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
 
     // 5ax MROPE in-kernel dump comparison (first attention layer, K heads, token 0).
     // Per (k_head, pair): [pair, pos, theta, cos, sin, x0, x1, out0, out1]
-    if !run1_mrope_dump.is_empty() && run1_mrope_dump.len() == run2_mrope_dump.len() {
+    if k_trace_diag && !run1_mrope_dump.is_empty() && run1_mrope_dump.len() == run2_mrope_dump.len() {
         let n = run1_mrope_dump.len();
         let total_pairs = model.config.rope_dim / 2;
         let nkh = model.config.num_kv_heads;

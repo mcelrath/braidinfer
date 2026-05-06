@@ -376,16 +376,7 @@ impl MegakernelProgram {
         }
 
         // Upload positions into prefill_bufs.position_ids: [N × 3] i32
-        {
-            let mut pos_data = vec![0i32; n * 3];
-            for t in 0..n {
-                let pos = (start_pos + t as u32) as i32;
-                pos_data[t * 3] = pos;
-                pos_data[t * 3 + 1] = pos;
-                pos_data[t * 3 + 2] = pos;
-            }
-            prefill_bufs.position_ids.copy_from_host(&pos_data)?;
-        }
+        prefill_bufs.write_positions(start_pos, n)?;
 
         // === Layers ===
         let mut gdn_idx = 0usize;
@@ -430,7 +421,7 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
-                    kv_idx == 0,
+                    kv_idx == 0 && super::k_trace_5ax_enabled(),
                 );
 
                 // Scan emitted instructions for KV-write D2dCopy and AttnPrefillInst.
@@ -1209,17 +1200,8 @@ impl MegakernelProgram {
         let ck = cfg.linear_conv_kernel_dim;
         let eps = cfg.rms_norm_eps;
 
-        // Position IDs for attention layers (same as compile_prefill)
-        {
-            let mut pos_data = vec![0i32; n * 3];
-            for t in 0..n {
-                let pos = (start_pos + t as u32) as i32;
-                pos_data[t * 3] = pos;
-                pos_data[t * 3 + 1] = pos;
-                pos_data[t * 3 + 2] = pos;
-            }
-            prefill_bufs.position_ids.copy_from_host(&pos_data)?;
-        }
+        // Position IDs are written before every execute() in state.rs (cached
+        // programs share the buffer); see PrefillBuffers::write_positions.
 
         // Count GDN/KV/Mamba2 indices up to layer_start
         let mut gdn_idx = 0usize;
@@ -1274,7 +1256,7 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
-                    kv_idx == 0,
+                    kv_idx == 0 && super::k_trace_5ax_enabled(),
                 );
 
                 let nkh = cfg.num_kv_heads;
