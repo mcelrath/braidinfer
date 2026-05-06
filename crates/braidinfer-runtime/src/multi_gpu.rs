@@ -341,7 +341,7 @@ impl MultiGpuContext {
 
         for (attn_i, &kv_i) in attn_to_kv_idx.iter().enumerate() {
             let src_kv = &legacy_kv_caches[kv_i];
-            for gpu_i in 1..self.num_devices {
+            for gpu_i in 0..self.num_devices {
                 let worker = &self.workers[gpu_i];
                 let dst_kv = &worker.attn_kv_caches[attn_i];
                 for h in 0..num_kv_heads {
@@ -376,8 +376,9 @@ impl MultiGpuContext {
         // Synchronize via mailbox: launch set_flag on each worker stream and
         // CPU-poll. Avoids hipStreamSynchronize, which would deadlock against
         // the cooperative moe_worker_kernel running on the worker GPU.
+        // Includes GPU 0 — its compute_stream also queued same-device copies.
         use std::sync::atomic::Ordering;
-        for gpu_i in 1..self.num_devices {
+        for gpu_i in 0..self.num_devices {
             Device::set_current(DeviceId(gpu_i as u32))?;
             let worker = &self.workers[gpu_i];
             let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
