@@ -193,7 +193,11 @@ impl MultiGpuContext {
                 worker.device,
                 local_nqh * head_dim,
             )?);
-            worker.attn_out = Some(DeviceBuffer::<f32>::alloc(
+            // attn_out is peer-read by GPU 0's persistent worker via D2D_COPY
+            // gather. Without UC, GPU 0's L2 may serve stale entries from prior
+            // decode steps (no KMD L2 invalidation between CPU-spin and the
+            // gather kernel — see GFX1100_ARCH.md §5.1).
+            worker.attn_out = Some(DeviceBuffer::<f32>::alloc_uncached(
                 worker.device,
                 local_nqh * head_dim,
             )?);
@@ -212,7 +216,8 @@ impl MultiGpuContext {
                 local_nkh * head_dim,
             )?);
             if q_mult > 1 {
-                worker.attn_gate = Some(DeviceBuffer::<f32>::alloc(
+                // attn_gate is also peer-read by GPU 0's gather (alongside attn_out).
+                worker.attn_gate = Some(DeviceBuffer::<f32>::alloc_uncached(
                     worker.device,
                     local_nqh * head_dim,
                 )?);

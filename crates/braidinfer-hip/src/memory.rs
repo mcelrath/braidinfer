@@ -26,6 +26,29 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
+    /// Allocate uncached device memory (MTYPE=UC). Use for cross-GPU buffers
+    /// read after a CPU spin-wait (no kernel-launch boundary): UC bypasses L2
+    /// on **all** GPUs, so peer reads see fresh VRAM without needing
+    /// hipEventWaitEvent's KMD-driven L2 invalidation. Per
+    /// composable_kernel/GFX1100_ARCH.md §5.1: gfx1100 has no ISA-level L2
+    /// invalidation, so UC is the only non-launch path to coherent peer reads.
+    pub fn alloc_uncached(device: DeviceId, len: usize) -> HipResult<Self> {
+        crate::device::Device::set_current(device)?;
+        let size = len * std::mem::size_of::<T>();
+        let mut ptr: *mut std::ffi::c_void = ptr::null_mut();
+        // hipDeviceMallocUncached = 0x3 (per ROCm hip_runtime_api.h).
+        const HIP_DEVICE_MALLOC_UNCACHED: std::ffi::c_uint = 0x3;
+        error::check(unsafe {
+            ffi::hipExtMallocWithFlags(&mut ptr, size, HIP_DEVICE_MALLOC_UNCACHED)
+        })?;
+        Ok(DeviceBuffer {
+            ptr: ptr.cast(),
+            len,
+            device,
+            _marker: PhantomData,
+        })
+    }
+
     pub fn as_ptr(&self) -> *const T {
         self.ptr
     }
