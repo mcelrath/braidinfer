@@ -166,25 +166,27 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     // If logits are bit-exact at step 0 but state bytes differ → confirms FP non-associativity
     // in GDN state writes (multi-block-per-head). If state bytes ARE bit-exact → step 1's reads
     // produce different output despite same input (mysterious, deeper investigation needed).
-    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>) {
+    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>, Vec<(Vec<f32>, Vec<f32>)>) {
         m.reset_state().expect("reset");
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(prompt.len());
         let mut state_after_step0: Vec<Vec<f32>> = Vec::new();
         let mut conv_state_after_step0: Vec<Vec<f32>> = Vec::new();
         let mut kv_after_step0: Vec<u8> = Vec::new();
+        let mut legacy_kv_after_step0: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
         for (i, &tok) in prompt.iter().enumerate() {
             let l = m.prefill(&[tok]).expect("seq prefill (per-step)");
             if i == 0 {
                 state_after_step0 = m.read_gdn_state().expect("read gdn state");
                 conv_state_after_step0 = m.read_gdn_conv_state().expect("read gdn conv state");
                 kv_after_step0 = m.read_kv_chunk_slot0().expect("read kv chunk slot 0");
+                legacy_kv_after_step0 = m.read_legacy_kv_caches().expect("read legacy kv caches");
             }
             out.push(l);
         }
-        (out, state_after_step0, conv_state_after_step0, kv_after_step0)
+        (out, state_after_step0, conv_state_after_step0, kv_after_step0, legacy_kv_after_step0)
     };
-    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv) = collect_step_logits(model, &prompt);
-    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv) = collect_step_logits(model, &prompt);
+    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv, run1_legacy_kv) = collect_step_logits(model, &prompt);
+    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv, run2_legacy_kv) = collect_step_logits(model, &prompt);
 
     // Compare GDN recurrent state bytes after step 0
     println!("  GDN state comparison after step 0 (run1 vs run2):");
@@ -230,6 +232,43 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     let kv_total = run1_kv.len();
     let run1_kv_nonzero = run1_kv.iter().filter(|&&b| b != 0).count();
     println!("    KV_CHUNK_SLOT0: byte_diff={kv_byte_diff}/{kv_total} run1_nonzero_bytes={run1_kv_nonzero}");
+
+    // Compare legacy_kv_caches contents per layer after step 0 (multi-GPU MoE path uses these).
+    // If K/V bit-exact across runs but logits at step 1 diverge → divergence is in step 1 read.
+    // If K/V differ between runs → step 0's K/V write is non-deterministic.
+    if !run1_legacy_kv.is_empty() {
+        let mut total_k_diff = 0usize;
+        let mut total_v_diff = 0usize;
+        let mut total_floats = 0usize;
+        let mut max_k_abs = 0.0f32;
+        let mut max_v_abs = 0.0f32;
+        let mut total_run1_k_abs_sum = 0.0f64;
+        let mut first_diverge_layer: Option<usize> = None;
+        for (i, ((k1, v1), (k2, v2))) in run1_legacy_kv.iter().zip(run2_legacy_kv.iter()).enumerate() {
+            let k_diff = k1.iter().zip(k2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let v_diff = v1.iter().zip(v2.iter()).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let k_max = k1.iter().zip(k2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let v_max = v1.iter().zip(v2.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            let k1_abs_sum: f64 = k1.iter().map(|&v| v.abs() as f64).sum();
+            total_k_diff += k_diff;
+            total_v_diff += v_diff;
+            total_floats += k1.len();
+            total_run1_k_abs_sum += k1_abs_sum;
+            if k_max > max_k_abs { max_k_abs = k_max; }
+            if v_max > max_v_abs { max_v_abs = v_max; }
+            if (k_diff > 0 || v_diff > 0) && first_diverge_layer.is_none() {
+                first_diverge_layer = Some(i);
+            }
+            if i < 3 || k_diff > 0 || v_diff > 0 {
+                println!("    LEGACY_KV layer {i}: k_diff={k_diff}/{} v_diff={v_diff}/{} max_k_abs={k_max:.3e} max_v_abs={v_max:.3e} run1_k_abs_sum={k1_abs_sum:.3e}",
+                    k1.len(), v1.len());
+            }
+        }
+        println!("    LEGACY_KV total: k_diff={total_k_diff}/{total_floats} v_diff={total_v_diff}/{total_floats} max_k_abs={max_k_abs:.3e} max_v_abs={max_v_abs:.3e} run1_k_total_abs_sum={total_run1_k_abs_sum:.3e}");
+        if let Some(l) = first_diverge_layer {
+            println!("    LEGACY_KV first divergent attn layer: {l}");
+        }
+    }
     println!("  per-step seq->seq comparison:");
     for (i, (l1, l2)) in run1_steps.iter().zip(run2_steps.iter()).enumerate() {
         let s1: f64 = l1.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();

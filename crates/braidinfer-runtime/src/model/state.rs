@@ -396,6 +396,26 @@ impl Model {
         Ok(result)
     }
 
+    /// Read legacy_kv_caches K and V tensors per layer (diagnostic).
+    /// Returns Vec<(K_layer, V_layer)>; empty Vec if legacy_kv_caches not initialized.
+    /// Used by bench_coherence to compare K/V cache contents across runs (track 5ax).
+    pub fn read_legacy_kv_caches(&self) -> Result<Vec<(Vec<f32>, Vec<f32>)>, ModelError> {
+        self.stream.synchronize()?;
+        let Some(caches) = self.legacy_kv_caches.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut result = Vec::with_capacity(caches.len());
+        for cache in caches {
+            let n = cache.k.len();
+            let mut k_buf = vec![0.0f32; n];
+            let mut v_buf = vec![0.0f32; n];
+            cache.k.copy_to_host(&mut k_buf)?;
+            cache.v.copy_to_host(&mut v_buf)?;
+            result.push((k_buf, v_buf));
+        }
+        Ok(result)
+    }
+
     /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.
     /// Returns empty Vec if page_allocator is not initialized (e.g., multi-GPU non-paged path).
     pub fn read_kv_chunk_slot0(&self) -> Result<Vec<u8>, ModelError> {
