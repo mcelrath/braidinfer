@@ -166,10 +166,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         // Ack: flush ALL threads' writes to system-visible memory, then write ack.
         // grid.sync() ensures all threads completed (device-scope). But P2P readers on
         // GPUs 1-3 bypass GPU 0's L2 and read VRAM directly. grid.sync() alone does NOT
-        // flush L2 → VRAM for P2P visibility. __threadfence_system() from EACH thread
+        // flush L2 → VRAM for P2P visibility. __threadfence() from EACH thread
         // ensures that thread's cache lines are written back to system-visible memory.
         // Must be called by ALL threads (not just thread 0,0) to cover all written cache lines.
-        __threadfence_system();
+        __threadfence();
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             queue->ack = seq;
         }

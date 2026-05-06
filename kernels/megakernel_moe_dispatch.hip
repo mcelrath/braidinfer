@@ -71,7 +71,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
         wq->expert_intermediate_size = eis;
         wq->has_gate_proj = has_gate;
         wq->gate_up_in_dim = gupd;
-        wq->activation_ptr = (uint64_t)activation;  // GPU 0 VRAM; workers P2P-read after __threadfence_system()
+        wq->activation_ptr = (uint64_t)activation;  // GPU 0 VRAM; workers P2P-read after __threadfence()
         wq->output_slots_ptr = (uint64_t)output_slots;
         wq->num_workers = num_workers;
 
@@ -81,7 +81,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
 
         // Flush GPU 0 L2 to HBM so workers can P2P-read activation_ptr (VRAM) directly.
         // wq field writes (GART) also bypass L2 → visible before seq_num write.
-        __threadfence_system();
+        __threadfence();
 
         uint32_t seq = *seq_counter + 1;
         *seq_counter = seq;
@@ -154,9 +154,9 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
     grid.sync();
 
     // Acquire fence: ensure all worker P2P writes to output_slots are visible before sum.
-    // Workers use __threadfence_system() before writing ack_flags; this matching fence on
+    // Workers use __threadfence() before writing ack_flags; this matching fence on
     // GPU 0 side ensures the HIP memory model guarantees ordering (not just empirical RDNA3 behavior).
-    __threadfence_system();
+    __threadfence();
 
     // 5. Sum all output_slots into final_output (gupd elements per slot, slot stride = hs).
     // GPU 0 slot (index 0) is in local VRAM — no stale L2 issue.

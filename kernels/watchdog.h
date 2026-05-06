@@ -91,10 +91,13 @@ __device__ __forceinline__ bool watchdog_poll_and_check(
 // that launch repeatedly against the same state.
 __device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local_counter) {
     if (threadIdx.x == 0 && blockIdx.x == 0 && ws) {
-        *local_counter = (uint32_t)__hip_atomic_load(&ws->progress_counter,
-                                                     __ATOMIC_ACQUIRE,
-                                                     __HIP_MEMORY_SCOPE_SYSTEM);
-        // Clear the exited flag — kernel is now running again.
+        // gfx1100 hazard: __hip_atomic_load(SYSTEM scope) hangs. Use volatile
+        // read instead — the WatchdogState page is host-mapped MTYPE=UC, so
+        // the read goes directly to system memory bypassing GPU L2.
+        *local_counter = *(volatile uint64_t*)&ws->progress_counter;
+        // Clear the exited flag — kernel is now running again. SYSTEM-scope
+        // store works on gfx1100 (per watchdog.h comment); use it for explicit
+        // release ordering.
         __hip_atomic_store(&ws->exited, 0u,
                            __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
@@ -132,6 +135,6 @@ __device__ __forceinline__ void watchdog_beat(WatchdogState* ws, uint32_t* local
 __device__ __forceinline__ void watchdog_signal_exit(volatile uint32_t* done_flag) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         if (done_flag) *done_flag = 1u;
-        __threadfence_system();
+        __threadfence();
     }
 }

@@ -27,7 +27,7 @@
 // the flag flip.
 extern "C" __global__ void set_flag_kernel(volatile uint32_t* flag, uint32_t value) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        __threadfence_system();
+        __threadfence();
         *flag = value;
     }
 }
@@ -41,11 +41,11 @@ extern "C" __global__ void wait_flag_kernel(volatile const uint32_t* flag, uint3
         const uint64_t deadline = clock64() + SYNC_FLAG_TIMEOUT_TICKS;
         uint32_t iter_lo = 0;
         while (*flag != expect) {
-            __threadfence_system();
+            __threadfence();
             if ((++iter_lo & 0xFFFF) == 0) {
                 if (clock64() > deadline) return; // TDR-safe bailout
             }
         }
-        __threadfence_system();
+        __threadfence();
     }
 }

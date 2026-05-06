@@ -51,7 +51,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     // Signal CPU that kernel started before cg::this_grid() (to detect early crash).
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *done_flag = 0xAA01u;
-        __threadfence_system();
+        __threadfence();
     }
 
     cg::grid_group grid = cg::this_grid();
@@ -59,7 +59,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     // Signal CPU that kernel is past cg::this_grid() (CPU waits for this before proceeding).
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         *done_flag = 0xAA02u;
-        __threadfence_system();
+        __threadfence();
     }
 
     uint32_t my_gpu = gpu_id;
@@ -103,7 +103,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
 
         // Acquire fence: ensures all wq field writes from GPU 0 (done before seq_num RELEASE)
         // are visible to this GPU before we read activation_ptr, output_slots_ptr, etc.
-        __threadfence_system();
+        __threadfence();
 
         uint32_t seq = work_queue->seq_num;
         if (seq == 0xFFFFFFFFu) {
@@ -137,7 +137,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         float* output_slots = (float*)work_queue->output_slots_ptr;
 
         for (uint32_t t = 0; t < bs; t++) {
-            // P2P-read activation from GPU 0 VRAM (flushed to HBM by __threadfence_system() before seq_num).
+            // P2P-read activation from GPU 0 VRAM (flushed to HBM by __threadfence() before seq_num).
             const float* activation_src = (const float*)(uintptr_t)work_queue->activation_ptr + (size_t)t * gupd;
             uint32_t total_gpus = work_queue->num_workers + 1;
             float* my_output_slot = output_slots + ((size_t)t * total_gpus + my_gpu) * hs;
@@ -215,7 +215,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
             }
 
             // 4. P2P write local_output to GPU 0's output_slots.
-            __threadfence_system();
+            __threadfence();
             coop_copy(my_output_slot, local_output, gupd, grid);
 
             // Liveness beat between tokens.
@@ -229,7 +229,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
         }
 
         // 5. Ack via host-mapped flag (single ack covers entire batch).
-        __threadfence_system();
+        __threadfence();
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             work_queue->ack_flags[my_gpu] = seq;
         }
