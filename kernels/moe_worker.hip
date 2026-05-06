@@ -68,6 +68,12 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
     uint32_t watchdog_beat_ctr = 0;
 
     while (true) {
+        // Mark idle BEFORE entering the inner poll loop. The host watchdog
+        // pauses its no-progress timer when exited=1, distinguishing idle
+        // (waiting for next batch) from hang. Cleared inside the loop the
+        // moment work arrives.
+        if (watchdog) watchdog_signal_exited(watchdog);
+
         // Single-thread poll: only block 0 thread 0 checks host-mapped memory.
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             while (true) {
@@ -81,6 +87,8 @@ extern "C" __global__ __launch_bounds__(256) void moe_worker_kernel(
             }
         }
         grid.sync();
+        // Clear `exited` — kernel is now actively processing a batch.
+        if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
         // Watchdog: check force_exit after every outer poll iteration.
         // watchdog_poll_and_check uses volatile read (avoids gfx1100 atomic_load SYSTEM hang).

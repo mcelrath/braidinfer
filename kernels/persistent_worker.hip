@@ -42,6 +42,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     uint32_t watchdog_beat_ctr = 0;
 
     while (true) {
+        // Mark idle BEFORE entering the inner poll loop. Distinguishes idle
+        // wait (no batch yet) from hang for the host watchdog.
+        if (watchdog) watchdog_signal_exited(watchdog);
+
         // Single-thread poll to avoid PCIe storm
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             while (true) {
@@ -56,6 +60,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             }
         }
         grid.sync();
+        // Clear `exited` — kernel is now actively processing a batch.
+        if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
         // Watchdog: cooperative exit if force_exit set.
         if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
