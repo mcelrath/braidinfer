@@ -964,10 +964,10 @@ swapped between slots, and HIP enumeration order can change across reboots. The
 document use the unique chip ID. PCI bus numbers and HIP indices are
 position-dependent and ephemeral.
 
-| Card unique ID | Symptom | Severity |
-|----------------|---------|----------|
-| **0x915bc79ac2392b08** | ~20% slower inference (121.9 vs 152 tok/s median); intermittently elevated cross-GPU latency | Mild — usable but degraded |
-| **0x656b2deec7eff341** | UTCL2 (page table cache) hardware fault — SDMA0 page faults during inference, llama-cli stalls, intermittent SMU hang on boot | SEVERE — RMA candidate |
+| Card unique ID | Severity (Run 4, properly cooled) | Trajectory |
+|----------------|-----------------------------------|------------|
+| **0x915bc79ac2392b08** | **CATASTROPHIC** — T1 compute 0.15× ref, T3 walker 13× slower, T4 scatter 0.04× ref, T5 sustained 0.05× ref. SDMA cliffs at both 256 MB AND 1 GB (0.03–0.06× ref). | **ACTIVELY DEGRADING.** R1+2 (~2hr earlier) showed a relatively benign ~30% SE deficit with intact walker; R3b+R4 show full multi-system failure mirroring then exceeding the original SEVERE card. Cooling does not help. RMA immediately. |
+| **0x656b2deec7eff341** | **MODERATE** — T1 compute 0.47× ref, T2 256 MB cliff at 0.53× (was 0.04× when uncooled), T3 walker 2.9× slower, T4 scatter 0.21× ref, T5 sustained 0.26× ref. | **STABLE** when properly cooled. R1+2 numbers were thermally exacerbated; with 50% fan, T1 doubled, walker recovered substantially, and the 256 MB SDMA cliff partially lifted. UTCL2 defect persists but is less catastrophic than previously reported. |
 
 The other 6 cards perform uniformly at 142-166 tok/s (Qwen3-0.6B). Their unique IDs:
 - 0x85878240f862b48c
@@ -992,16 +992,36 @@ A small wrapper script that reads unique IDs and builds a HIP_VISIBLE_DEVICES li
 that excludes specific unique IDs is the robust approach (vs hardcoding bus or
 HIP index numbers, which change).
 
-### Defective card #1: 0x915bc79ac2392b08
+### Defective card #1: 0x915bc79ac2392b08 — RAPIDLY DEGRADING multi-system failure
 
-- **Symptom**: ~20% slower inference vs peer median, plus occasional cross-GPU
-  latency outliers (p50 normal at 7-8 µs but p99 spikes 100-700 µs on some pairs)
-- **Persistent**: anomaly survived a slot swap — moves with the card, not the slot
-- **Survives reboots**: warm reboot, cold cycle don't fix it
+- **Original symptom (R1+2, ~14:00–16:00)**: ~20% slower inference vs peer
+  median (121.9 vs 152 tok/s on Qwen3-0.6B); ~30% deficit across pure compute,
+  mid-range SDMA, scatter, sustained; UTCL2 walker INTACT. Looked like a
+  partial shader-engine throughput defect.
+- **Current symptom (R3b+R4, ~16:00 onward)**: full multi-system failure
+  exceeding what the SEVERE card showed in R1+2. UTCL2 walker now 13× slower
+  than reference (was normal). SDMA cliffs at both 256 MB and 1 GB. Compute
+  collapsed to 0.15× ref. **The card degraded in <2 hours of testing.**
+- **Persistent**: anomaly survives slot swaps and reboots
 - **AER counters clean**, link state healthy — silicon defect not at PCIe layer
-- **Root cause**: undetermined; likely degraded UTCL2 cache or SDMA engine
-  (similar class of issue as defective card #2 but earlier-stage)
-- **Recommended action**: monitor for further degradation; RMA-candidate
+- **Cooling does not help**: Run 4 with 50% pinned fan curve produced the same
+  catastrophic numbers as Run 3b (uncooled). Defect is silicon, not thermal.
+- **Stress probe progression** (`results/card_stress.json`, healthy ref =
+  0x85878240f862b48c (R3b/R4) or 0x211c74ad20551ade (R1/R2)):
+  | Test | R1 (cool) | R2 (cool) | R3b (uncool) | R4 (cooled) | R4/healthy |
+  |------|-----------|-----------|--------------|-------------|------------|
+  | T1 compute GFLOP/s | 3708 | 4324 | 918 | 828 | **0.15×** |
+  | T2 256 MB GB/s | 24.6 | 300.6 | 24.9 | 6.5 | **0.03×** |
+  | T2 1 GB GB/s | 355 | 349 | 20.4 | 20.95 | **0.06×** |
+  | T3 UTCL2 walker (s) | 0.18 | 0.21 | 3.28 | 3.18 | **13× slower** |
+  | T4 scatter MB/s | 546 | 542 | 36.8 | 31.2 | **0.04×** |
+  | T5 sustained cyc/s | 63.5 | 62.8 | 9.0 | 4.6 | **0.05×** |
+- **Root cause**: progressive UTCL2 / address-translation hardware failure.
+  Pattern of degradation matches what the SEVERE card showed earlier in its
+  failure trajectory — but compressed into a much shorter timeframe.
+- **Recommended action**: **STOP USING IMMEDIATELY**. Pull from inference rotation,
+  add to HIP_VISIBLE_DEVICES exclude list, RMA. The rapid degradation suggests
+  imminent hard failure.
 
 ### Defective card #2: 0x656b2deec7eff341
 
@@ -1022,14 +1042,34 @@ HIP index numbers, which change).
   the UTCL2 cache.
 - **AER counters clean** — fault is at the GPU's internal address translation
   layer (UTCL2 cache silicon), not PCIe
-- **Root cause**: hardware defect in the Unified Translation Cache L2 (UTCL2)
-  on this specific card. Software cannot fix this. The translation lookup unit
-  inside the GPU returns "permission denied" for memory pages that are correctly
-  mapped in software.
-- **Why intermittent earlier, hard failure now**: the card has been progressively
-  degrading. Earlier symptoms (3.5× slow 1MB memcpy in v3, intermittent SMU hangs)
-  were the same silicon failing in lighter conditions. Sustained inference load
-  triggers it consistently.
+- **Stress probe results** (`results/card_stress.json`, 2026-05-04, two
+  independent runs; healthy ref = 0x211c74ad20551ade):
+  | Test | Run 1 | Run 2 | Ref avg | Ratio (avg/ref) |
+  |------|-------|-------|---------|-----------------|
+  | T1 compute (FMA) GFLOP/s | 1502 | 1456 | 5841 | **0.25× (4× slower)** |
+  | T2 SDMA 16 MB GB/s | 415.0 | 399.9 | 402.5 | 1.01× (normal) |
+  | T2 SDMA **256 MB** GB/s | **20.8** | **8.14** | 235.9 | **0.06× (reproducible cliff)** |
+  | T2 SDMA 1 GB GB/s | 342.6 | 229.7 | 346.3 | 0.83× (variable) |
+  | T2 SDMA 4 GB GB/s | 90.0 | 153.6 | 347.5 | 0.35× |
+  | T3 UTCL2 16k-page walker (s) | **2.34** | **1.25** | 0.19 | **9.3× slower** |
+  | T4 scatter-gather (KV-cache mimic) MB/s | **66.8** | **56.5** | 849 | **0.07× (14× slower)** |
+  | T5 sustained compute+DMA cyc/s | 10.1 | 7.4 | 93.1 | **0.09× (11× slower)** |
+- **Root cause refined**: hardware defect in the **Unified Translation Cache L2
+  (UTCL2)** plus **degraded CU throughput**:
+  - **SDMA size-threshold cliff at ~256 MB**: bandwidth collapses 12× when
+    buffer size hits the 128–512 MB range, then **recovers at 1 GB+** (likely
+    using a different page granularity / DMA path). Same cliff present on
+    card #1 — both cards share this defect. Matches dmesg pattern observed
+    during llama.cpp inference (sequential page addresses faulting one-per-page).
+  - **UTCL2 walker 13× slower under random-page pressure** (T3) — distinct from
+    card #1, which has an intact walker.
+  - **CU throughput 3.9× slower** even on pure compute (T1, no SDMA involved)
+    — the silicon fault extends into the CU clock domain or execution pipelines.
+  - **Combined load** (T5): 9× slower. The impaired subsystems interfere.
+- **Why intermittent earlier, hard failure now**: progressive degradation.
+  Earlier symptoms (3.5× slow 1MB memcpy in v3, intermittent SMU hangs) were
+  the same silicon failing in lighter conditions. Sustained inference load
+  exceeds UTCL2 TLB coverage and triggers the size-threshold cliff consistently.
 - **Recommended action**: **RMA / replace immediately**. This card is no longer
   fit for production. Run with `HIP_VISIBLE_DEVICES` excluding it.
 
@@ -1043,6 +1083,8 @@ HIP index numbers, which change).
 | "specific slot has hardware quirk" | WRONG — slot swap proved the slow follows the card unique ID |
 | "Transient SMU stuck-state, reseat clears it" | PARTIALLY CORRECT — SMU hangs are transient and clear with reboot, but underlying card defect persists |
 | "All v3 anomalies were contamination" | PARTIALLY CORRECT — most were, but two cards have persistent hardware defects that surface under heavier load |
+| "MILD card #1 is an earlier-stage version of card #2's UTCL2 failure" | CONFIRMED — stress probe shows BOTH cards have the same SDMA size-threshold cliff at 256 MB (10× and 12× collapse respectively, recovering at 1 GB). MILD differs only in that its random-page walker (T3) is still intact and CU throughput is less degraded. Same defect family, different progression stage. |
+| "SEVERE card #2 defect is SDMA-only (UTCL2 page faults)" | INCOMPLETE — stress probe shows the defect also affects pure-compute CU throughput (3.9× slower with no SDMA involved); the address-translation hardware feeds both SDMA and the shader engines |
 
 ### Operational guidance
 
