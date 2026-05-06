@@ -4,10 +4,12 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
+#include "moe_work_queue.h"      // MoeWorkerConfig + MoeExpertEntry types for OP_MOE_FFN_REMOTE
 #include "watchdog.h"
 
 // Include all megakernel op implementations (same as megakernel.hip)
 #include "megakernel_ops.hip"
+#include "moe_expert_ops.h"      // coop_* helpers shared with moe_worker (used by OP_MOE_FFN_REMOTE)
 #include "megakernel_moe.hip"
 #include "megakernel_moe_dispatch.hip"
 
@@ -105,6 +107,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             grid.sync();
         } else if (opcode == OP_MOE_FFN) {
             op_moe_ffn(inst, grid);
+        } else if (opcode == OP_MOE_FFN_REMOTE) {
+            op_moe_ffn_remote(inst, grid);
         } else if (opcode == OP_MOE_DISPATCH) {
             op_moe_dispatch(inst, grid, watchdog);
         } else if (opcode == OP_LINEAR_PROJ_PCG32) {

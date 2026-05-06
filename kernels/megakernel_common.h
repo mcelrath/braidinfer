@@ -569,3 +569,30 @@ typedef struct {
 } BarrierInst;
 static_assert(sizeof(BarrierInst) == INST_SIZE_WORDS * 8, "BarrierInst size mismatch");
 static_assert(offsetof(BarrierInst, barrier_flag) == 8, "BarrierInst.barrier_flag offset");
+
+// OP_MOE_FFN_REMOTE (opcode 44)
+// Cross-GPU MoE expert compute dispatched on a worker GPU's persistent_worker.
+// Reads activation from GPU 0 VRAM (P2P), runs experts that are local to this
+// GPU (per-expert lookup in MoeWorkerConfig.entries[eid].gate_up_ptr — skip
+// if NULL), writes accumulated output to GPU 0's per-worker output_slot (P2P).
+//
+// Replaces moe_worker_kernel + MoeWorkItem queue.
+typedef struct {
+    uint64_t opcode_gridx;
+    const float* activation_p2p;     // GPU 0 VRAM, [gupd] floats — single-token activation
+    float* output_slot_p2p;          // GPU 0 VRAM, [hs] floats — this worker's slot in output_slots
+    const int32_t* expert_ids;       // [k] global expert IDs (host-mapped or VRAM)
+    const float* expert_weights;     // [k]
+    const void* config;              // worker-local VRAM, MoeWorkerConfig*
+    float* local_activation;         // worker VRAM, [gupd] — staging buffer for P2P-read
+    float* local_output;             // worker VRAM, [gupd] — accumulator (sized hs since gupd<=hs)
+    float* scratch_gate;             // worker VRAM, [max(eis, gupd)] — also reused for down output
+    float* scratch_up;               // worker VRAM, [eis]
+    float* scratch_act;              // worker VRAM, [eis]
+    int64_t k_eis;                   // low 32: k, high 32: eis
+    int64_t hs_gupd;                 // low 32: hs, high 32: gupd
+    int64_t flags;                   // bit0=has_gate, bit1=relu_sq (else silu*up)
+    uint64_t _pad[4];
+} MoeFfnRemoteInst;
+static_assert(sizeof(MoeFfnRemoteInst) == INST_SIZE_WORDS * 8, "MoeFfnRemoteInst size mismatch");
+static_assert(offsetof(MoeFfnRemoteInst, activation_p2p) == 8, "MoeFfnRemoteInst.activation_p2p offset");

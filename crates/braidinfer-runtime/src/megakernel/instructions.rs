@@ -12,9 +12,9 @@ use super::{
     OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT,
     OP_KV_QUANTIZE, OP_LM_HEAD, OP_MAMBA2_CONV1D, OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH,
-    OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM, OP_RELU_SQ,
-    OP_CONV1D_3X, OP_LINEAR_PROJ_2X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE, OP_SCALE_ADD,
-    OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
+    OP_MOE_FFN, OP_MOE_FFN_REMOTE, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM,
+    OP_RELU_SQ, OP_CONV1D_3X, OP_LINEAR_PROJ_2X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE,
+    OP_SCALE_ADD, OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
 
 // Compile-time size assertions: each struct must be exactly INST_SIZE * 8 bytes.
@@ -1248,6 +1248,78 @@ impl LinearProj2xInst {
             in_dim: in_dim as i64,
             batch: batch as i64,
             _pad: [0; 9],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_MOE_FFN_REMOTE (opcode 44)
+// Cross-GPU MoE expert compute on a worker GPU's persistent_worker. Reads
+// activation from GPU 0 VRAM (P2P), runs experts that are local to this GPU
+// (per-eid lookup in MoeWorkerConfig.entries), accumulates weighted outputs
+// in worker VRAM, P2P-writes to this worker's slot in GPU 0's output_slots.
+// Layout must match MoeFfnRemoteInst in kernels/megakernel_common.h.
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct MoeFfnRemoteInst {
+    pub opcode_gridx: u64,
+    pub activation_p2p: *const f32,
+    pub output_slot_p2p: *mut f32,
+    pub expert_ids: *const i32,
+    pub expert_weights: *const f32,
+    pub config: *const std::ffi::c_void,
+    pub local_activation: *mut f32,
+    pub local_output: *mut f32,
+    pub scratch_gate: *mut f32,
+    pub scratch_up: *mut f32,
+    pub scratch_act: *mut f32,
+    pub k_eis: u64,    // low 32: k, high 32: eis
+    pub hs_gupd: u64,  // low 32: hs, high 32: gupd
+    pub flags: u64,    // bit0=has_gate, bit1=relu_sq
+    pub _pad: [u64; 4],
+}
+assert_inst_size!(MoeFfnRemoteInst);
+impl_inst!(MoeFfnRemoteInst);
+
+impl MoeFfnRemoteInst {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // wired in Phase 3 (decode + prefill MoE caller migration)
+    pub(crate) fn new(
+        grid_x: u32,
+        activation_p2p: *const f32,
+        output_slot_p2p: *mut f32,
+        expert_ids: *const i32,
+        expert_weights: *const f32,
+        config: *const std::ffi::c_void,
+        local_activation: *mut f32,
+        local_output: *mut f32,
+        scratch_gate: *mut f32,
+        scratch_up: *mut f32,
+        scratch_act: *mut f32,
+        k: u32,
+        eis: u32,
+        hs: u32,
+        gupd: u32,
+        has_gate_proj: bool,
+        relu_sq: bool,
+    ) -> Self {
+        let flags = (has_gate_proj as u64) | ((relu_sq as u64) << 1);
+        MoeFfnRemoteInst {
+            opcode_gridx: make_opcode_gridx(OP_MOE_FFN_REMOTE, grid_x),
+            activation_p2p,
+            output_slot_p2p,
+            expert_ids,
+            expert_weights,
+            config,
+            local_activation,
+            local_output,
+            scratch_gate,
+            scratch_up,
+            scratch_act,
+            k_eis: (k as u64) | ((eis as u64) << 32),
+            hs_gupd: (hs as u64) | ((gupd as u64) << 32),
+            flags,
+            _pad: [0; 4],
         }
     }
 }

@@ -1,4 +1,11 @@
 
+// OP_MOE_FFN_REMOTE depends on the moe_worker config layout (per-eid pointer
+// table) plus the coop_* GEMV helpers. Including these here keeps the file
+// self-contained so any TU that includes megakernel_moe.hip (megakernel.hip,
+// persistent_worker.hip) compiles uniformly.
+#include "moe_work_queue.h"
+#include "moe_expert_ops.h"
+
 // OP_MOE_GATE: Router top-k expert selection from pre-computed scores.
 // Assumes scores already computed via OP_LINEAR_PROJ (hidden @ gate^T → [num_experts]).
 // This kernel does: top-k selection + softmax/sigmoid/norm_topk + write expert_ids and weights.
@@ -308,5 +315,90 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
         }
         grid.sync();
     }
+}
+
+// OP_MOE_FFN_REMOTE: cross-GPU MoE expert compute on a worker GPU.
+//
+// Reads activation from GPU 0 VRAM (P2P), iterates over k experts, skipping
+// any whose gate_up_ptr is NULL in this worker's MoeWorkerConfig (= not local
+// to this GPU). Accumulates weighted expert outputs into a local-VRAM buffer,
+// then P2P-writes the result to this worker's slot in GPU 0's output_slots.
+//
+// Uses the moe_expert_ops.h coop_* helpers (same path as moe_worker_kernel),
+// preserving its proven correctness. Replaces the single-token inner loop of
+// moe_worker_kernel — that whole kernel becomes redundant once Phase 4 lands.
+template<typename GridGroup>
+__device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, GridGroup& grid) {
+    const MoeFfnRemoteInst* i = (const MoeFfnRemoteInst*)inst;
+    const float* act_p2p = i->activation_p2p;
+    float* out_p2p = i->output_slot_p2p;
+    const int* eids = i->expert_ids;
+    const float* ews = i->expert_weights;
+    const MoeWorkerConfig* cfg = (const MoeWorkerConfig*)i->config;
+    float* la = i->local_activation;
+    float* lo = i->local_output;
+    float* sg = i->scratch_gate;
+    float* su = i->scratch_up;
+    float* sa = i->scratch_act;
+    int k    = (int)((uint64_t)i->k_eis & 0xFFFFFFFFu);
+    int eis  = (int)(((uint64_t)i->k_eis >> 32) & 0xFFFFFFFFu);
+    int hs   = (int)((uint64_t)i->hs_gupd & 0xFFFFFFFFu);
+    int gupd = (int)(((uint64_t)i->hs_gupd >> 32) & 0xFFFFFFFFu);
+    int flags = (int)i->flags;
+    bool has_gate_proj = (flags & 1) != 0;
+    bool relu_sq      = (flags & 2) != 0;
+    bool is_rnf4 = (cfg->weight_format == MOE_WEIGHT_FORMAT_RNF4G128);
+    long long gate_up_row_stride = (long long)cfg->gate_up_row_stride;
+
+    // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
+    coop_copy(la, act_p2p, gupd, grid);
+
+    // 2. Zero accumulator.
+    coop_zero(lo, gupd, grid);
+
+    // 3. Per-expert compute. Skip experts not on this GPU (gate_up_ptr == 0).
+    for (int j = 0; j < k; j++) {
+        int eid = eids[j];
+        if (eid < 0 || eid >= 512) continue;
+        const MoeExpertEntry& e = cfg->entries[eid];
+        if (e.gate_up_ptr == 0) continue; // not local to this worker
+        float w = ews[j];
+
+        const unsigned char* gu = (const unsigned char*)e.gate_up_ptr;
+        const unsigned char* dn = (const unsigned char*)e.down_ptr;
+
+        if (is_rnf4) {
+            if (has_gate_proj) {
+                const unsigned char* up_data = gu + (long long)eis * gate_up_row_stride;
+                coop_gemv_rnf4_fused_gate_up(sg, gu, su, up_data, la, eis, gupd, grid);
+                coop_silu_mul(sa, sg, su, eis, grid);
+            } else {
+                coop_gemv_rnf4(su, gu, la, eis, gupd, grid);
+                coop_relu_squared(sa, su, eis, grid);
+            }
+            // down: eis -> gupd. scratch_gate reused as down output.
+            coop_gemv_rnf4(sg, dn, sa, gupd, eis, grid);
+        } else {
+            if (has_gate_proj) {
+                const unsigned char* up_data = gu + (long long)eis * gate_up_row_stride;
+                coop_gemv_pcg32_fused_gate_up(sg, gu, su, up_data, la, eis, gupd, grid);
+                coop_silu_mul(sa, sg, su, eis, grid);
+            } else {
+                coop_gemv_pcg32(su, gu, la, eis, gupd, grid);
+                coop_relu_squared(sa, su, eis, grid);
+            }
+            coop_gemv_pcg32(sg, dn, sa, gupd, eis, grid);
+        }
+
+        // Weighted accumulate: lo[i] += w * sg[i] for gupd elements.
+        coop_weighted_acc(lo, sg, w, gupd, grid);
+    }
+
+    // 4. P2P-write accumulated output to GPU 0's output_slot.
+    // __threadfence() ensures all blocks' writes to lo are flushed to local
+    // VRAM before the cross-GPU copy, and the coop_copy below issues writes
+    // visible across PCIe by the time grid.sync() returns at copy end.
+    __threadfence();
+    coop_copy(out_p2p, lo, gupd, grid);
 }
 
