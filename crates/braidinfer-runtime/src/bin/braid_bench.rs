@@ -166,7 +166,7 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     // If logits are bit-exact at step 0 but state bytes differ → confirms FP non-associativity
     // in GDN state writes (multi-block-per-head). If state bytes ARE bit-exact → step 1's reads
     // produce different output despite same input (mysterious, deeper investigation needed).
-    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>, Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<f32>>) {
+    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>, Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<f32>>, Vec<[u32; 9]>) {
         m.reset_state().expect("reset");
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(prompt.len());
         let mut state_after_step0: Vec<Vec<f32>> = Vec::new();
@@ -174,6 +174,7 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
         let mut kv_after_step0: Vec<u8> = Vec::new();
         let mut legacy_kv_after_step0: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
         let mut k_trace_after_step0: Vec<Vec<f32>> = Vec::new();
+        let mut mrope_dump_after_step0: Vec<[u32; 9]> = Vec::new();
         for (i, &tok) in prompt.iter().enumerate() {
             let l = m.prefill(&[tok]).expect("seq prefill (per-step)");
             if i == 0 {
@@ -182,13 +183,14 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
                 kv_after_step0 = m.read_kv_chunk_slot0().expect("read kv chunk slot 0");
                 legacy_kv_after_step0 = m.read_legacy_kv_caches().expect("read legacy kv caches");
                 k_trace_after_step0 = m.read_k_trace_phases().expect("read k trace");
+                mrope_dump_after_step0 = m.read_mrope_dump().expect("read mrope dump");
             }
             out.push(l);
         }
-        (out, state_after_step0, conv_state_after_step0, kv_after_step0, legacy_kv_after_step0, k_trace_after_step0)
+        (out, state_after_step0, conv_state_after_step0, kv_after_step0, legacy_kv_after_step0, k_trace_after_step0, mrope_dump_after_step0)
     };
-    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv, run1_legacy_kv, run1_k_trace) = collect_step_logits(model, &prompt);
-    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv, run2_legacy_kv, run2_k_trace) = collect_step_logits(model, &prompt);
+    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv, run1_legacy_kv, run1_k_trace, run1_mrope_dump) = collect_step_logits(model, &prompt);
+    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv, run2_legacy_kv, run2_k_trace, run2_mrope_dump) = collect_step_logits(model, &prompt);
 
     // Compare GDN recurrent state bytes after step 0
     println!("  GDN state comparison after step 0 (run1 vs run2):");
@@ -346,6 +348,67 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
             let abs_sum: f64 = a.iter().map(|&v| v.abs() as f64).sum();
             let label = phase_names.get(p).copied().unwrap_or("?");
             println!("    phase {p} ({label}): bit_diff={bit_diff}/{n} max_abs={max_abs:.3e} run1_abs_sum={abs_sum:.3e}");
+        }
+    }
+
+    // 5ax MROPE in-kernel dump comparison (first attention layer, K heads, token 0).
+    // Per (k_head, pair): [pair, pos, theta, cos, sin, x0, x1, out0, out1]
+    if !run1_mrope_dump.is_empty() && run1_mrope_dump.len() == run2_mrope_dump.len() {
+        let n = run1_mrope_dump.len();
+        let total_pairs = model.config.rope_dim / 2;
+        let nkh = model.config.num_kv_heads;
+        let mut field_diff = [0usize; 9];
+        let mut first_diff_entry: Option<usize> = None;
+        for (e, (a, b)) in run1_mrope_dump.iter().zip(run2_mrope_dump.iter()).enumerate() {
+            for f in 0..9 {
+                if a[f] != b[f] {
+                    field_diff[f] += 1;
+                    if first_diff_entry.is_none() {
+                        first_diff_entry = Some(e);
+                    }
+                }
+            }
+        }
+        let labels = ["pair", "pos", "theta", "cos", "sin", "x0", "x1", "out0", "out1"];
+        println!("  MROPE-DUMP comparison (first attention layer, K heads, token 0, n={n} entries={nkh}×{total_pairs}):");
+        for f in 0..9 {
+            println!("    field {} ({}): bit_diff={}/{}", f, labels[f], field_diff[f], n);
+        }
+        // Print first 8 entries for run1 (raw values) so we can SEE what cos/sin/pos actually are.
+        println!("  MROPE-DUMP run1 first 8 entries (h, pair, pos, theta, cos, sin, x0, x1, out0, out1):");
+        for e in 0..n.min(8) {
+            let h = e / total_pairs;
+            let p = e % total_pairs;
+            let r = &run1_mrope_dump[e];
+            let theta = f32::from_bits(r[2]);
+            let cos = f32::from_bits(r[3]);
+            let sin = f32::from_bits(r[4]);
+            let x0 = f32::from_bits(r[5]);
+            let x1 = f32::from_bits(r[6]);
+            let o0 = f32::from_bits(r[7]);
+            let o1 = f32::from_bits(r[8]);
+            println!("    [h={h}, p={p}] pair={} pos={} θ={theta:.3e} cos={cos:.6} sin={sin:.6} x0={x0:.4e} x1={x1:.4e} out0={o0:.4e} out1={o1:.4e}", r[0], r[1] as i32);
+        }
+        // If field_diff is non-zero anywhere, print the FIRST divergent entry side-by-side.
+        if let Some(e) = first_diff_entry {
+            let h = e / total_pairs;
+            let p = e % total_pairs;
+            let a = &run1_mrope_dump[e];
+            let b = &run2_mrope_dump[e];
+            println!("  MROPE-DUMP first divergent entry [h={h}, p={p}]:");
+            for f in 0..9 {
+                let av = if f < 2 { a[f] as i64 } else { f32::from_bits(a[f]).to_bits() as i64 };
+                let bv = if f < 2 { b[f] as i64 } else { f32::from_bits(b[f]).to_bits() as i64 };
+                let af = f32::from_bits(a[f]);
+                let bf = f32::from_bits(b[f]);
+                let mark = if a[f] != b[f] { "*" } else { " " };
+                if f < 2 {
+                    println!("    {} {}: run1={} run2={}", mark, labels[f], a[f] as i32, b[f] as i32);
+                } else {
+                    println!("    {} {}: run1={af:.6e} (0x{:08x}) run2={bf:.6e} (0x{:08x})", mark, labels[f], a[f], b[f]);
+                }
+                let _ = (av, bv);
+            }
         }
     }
 

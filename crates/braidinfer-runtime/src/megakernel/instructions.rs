@@ -344,7 +344,8 @@ pub(crate) struct MropeInst {
     pub s1: u64,
     pub s2: u64,
     pub batch: u64,
-    pub _pad: [u64; 5],
+    pub dump: *mut u32, // 5ax diag: optional u32 dump buffer (null disables)
+    pub _pad: [u64; 4],
 }
 assert_inst_size!(MropeInst);
 impl_inst!(MropeInst);
@@ -362,8 +363,14 @@ impl MropeInst {
             s1: s1 as u64,
             s2: s2 as u64,
             batch: batch as u64,
-            _pad: [0; 5],
+            dump: std::ptr::null_mut(),
+            _pad: [0; 4],
         }
+    }
+
+    /// 5ax diag: set dump pointer on already-built MropeInst. Pass null to disable.
+    pub(crate) fn set_dump(&mut self, dump: *mut u32) {
+        self.dump = dump;
     }
 }
 

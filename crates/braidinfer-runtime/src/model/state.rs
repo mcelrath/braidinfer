@@ -219,6 +219,12 @@ impl Model {
                     ).map_err(ModelError::Hip)?;
                     self.megakernel_prefill_segments.insert(key, mk);
                 }
+                // 5ax fix: position_ids is a SHARED buffer; cached segment programs
+                // do NOT re-write it on execute. Refresh before every execute so the
+                // FIRST run of a previously-compiled program reads the correct positions
+                // (otherwise stale values from the LAST compiled program leak into
+                // subsequent runs — manifests as MROPE reading wrong pos at token 0).
+                bufs.write_positions(start_pos, n).map_err(ModelError::Hip)?;
                 self.prefill_bufs = Some(bufs);
                 let mk = self.megakernel_prefill_segments.get(&key).unwrap();
                 mk.execute(&self.stream).map_err(ModelError::Hip)?;
@@ -272,6 +278,9 @@ impl Model {
                     ).map_err(ModelError::Hip)?;
                     self.megakernel_prefill_segments.insert(key, mk);
                 }
+                // 5ax fix: refresh position_ids before every execute (cached programs
+                // share the prefill_bufs.position_ids buffer).
+                bufs.write_positions(start_pos, n).map_err(ModelError::Hip)?;
                 self.prefill_bufs = Some(bufs);
                 let mk = self.megakernel_prefill_segments.get(&key).unwrap();
                 mk.execute(&self.stream).map_err(ModelError::Hip)?;
@@ -437,6 +446,29 @@ impl Model {
         let phase1 = buf[hs..hs + nkh * hd].to_vec();
         let phase2 = buf[hs + nkh * hd..hs + 2 * nkh * hd].to_vec();
         Ok(vec![phase0, phase1, phase2])
+    }
+
+    /// Read 5ax MROPE in-kernel dump. Returns one entry per (k_head, pair) for token 0:
+    ///   [pair, pos, theta_bits, cos_bits, sin_bits, x0_bits, x1_bits, out0_bits, out1_bits]
+    /// Length = num_kv_heads * (rope_dim/2). Empty if prefill_bufs not initialized.
+    pub fn read_mrope_dump(&self) -> Result<Vec<[u32; 9]>, ModelError> {
+        self.stream.synchronize()?;
+        let Some(pb) = self.prefill_bufs.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let nkh = self.config.num_kv_heads;
+        let total_pairs = self.config.rope_dim / 2;
+        let n_words = nkh * total_pairs * 9;
+        let mut buf = vec![0u32; n_words];
+        pb.mrope_dump.copy_to_host(&mut buf)?;
+        let n_entries = nkh * total_pairs;
+        let mut out: Vec<[u32; 9]> = Vec::with_capacity(n_entries);
+        for e in 0..n_entries {
+            let mut entry = [0u32; 9];
+            entry.copy_from_slice(&buf[e * 9..e * 9 + 9]);
+            out.push(entry);
+        }
+        Ok(out)
     }
 
     /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.

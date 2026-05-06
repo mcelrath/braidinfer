@@ -183,7 +183,8 @@ typedef struct {
     int64_t s1;
     int64_t s2;
     int64_t batch;
-    uint64_t _pad[5];
+    uint32_t* dump; // 5ax diag: optional u32 dump buffer (nullptr disables)
+    uint64_t _pad[4];
 } MropeInst;
 static_assert(sizeof(MropeInst) == INST_SIZE_WORDS * 8, "MropeInst size mismatch");
 static_assert(offsetof(MropeInst, q) == 8, "MropeInst.q offset");

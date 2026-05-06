@@ -1539,6 +1539,12 @@ __device__ __attribute__((noinline)) void op_mrope(const u64* inst, u32 vblock) 
     // Per-token position_ids: 3 ints per token (temporal, height, width)
     const int* tok_pos = position_ids + token_idx * 3;
 
+    // 5ax diag: dump for K heads at token 0. Layout per (k_head, pair):
+    //   9 u32: [pair, pos, theta, cos_t, sin_t, x0, x1, out0, out1]
+    uint32_t* dump = i->dump;
+    bool do_dump = (dump != nullptr) && (token_idx == 0) && (head_idx >= num_q_heads);
+    int dump_k_head = head_idx - num_q_heads;
+
     int total_pairs = rope_dim / 2;
     for (int pair = threadIdx.x; pair < total_pairs; pair += blockDim.x) {
         int section = (pair < section0_pairs) ? 0 : (pair < section0_pairs + section1_pairs) ? 1 : 2;
@@ -1547,8 +1553,22 @@ __device__ __attribute__((noinline)) void op_mrope(const u64* inst, u32 vblock) 
         float cos_t = cosf(theta), sin_t = sinf(theta);
         int i0 = pair * 2, i1 = pair * 2 + 1;
         float x0 = head_ptr[i0], x1 = head_ptr[i1];
-        head_ptr[i0] = x0 * cos_t - x1 * sin_t;
-        head_ptr[i1] = x0 * sin_t + x1 * cos_t;
+        float out0 = x0 * cos_t - x1 * sin_t;
+        float out1 = x0 * sin_t + x1 * cos_t;
+        head_ptr[i0] = out0;
+        head_ptr[i1] = out1;
+        if (do_dump) {
+            uint32_t* d = dump + (dump_k_head * total_pairs + pair) * 9;
+            d[0] = (uint32_t)pair;
+            d[1] = (uint32_t)pos;
+            d[2] = __float_as_uint(theta);
+            d[3] = __float_as_uint(cos_t);
+            d[4] = __float_as_uint(sin_t);
+            d[5] = __float_as_uint(x0);
+            d[6] = __float_as_uint(x1);
+            d[7] = __float_as_uint(out0);
+            d[8] = __float_as_uint(out1);
+        }
     }
 }
 

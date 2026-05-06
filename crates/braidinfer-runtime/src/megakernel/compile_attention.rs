@@ -314,7 +314,7 @@ impl MegakernelProgram {
                 // mRoPE first (batched)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
-                instructions.push(MropeInst::new(
+                let mut mrope_inst = MropeInst::new(
                     (n * (nqh + nkh)) as u32,
                     q_attn_ptr, k_attn_ptr,
                     act.inv_freq.as_ptr(), position_ids_ptr,
@@ -323,7 +323,11 @@ impl MegakernelProgram {
                     cfg.mrope_sections()[1] as i32,
                     cfg.mrope_sections()[2] as i32,
                     n as i32,
-                ).into_inst());
+                );
+                if k_trace_active {
+                    mrope_inst.set_dump(prefill.as_ref().unwrap().0.mrope_dump.as_write_ptr());
+                }
+                instructions.push(mrope_inst.into_inst());
                 // Note: phase-3 (post-MROPE K) snapshot is redundant —
                 // legacy_kv_caches[0][0..nkh*hd] captures exactly the post-MROPE K
                 // (Prefill variant: KV write happens AFTER MROPE, copies k_attn → kv_cache.k).

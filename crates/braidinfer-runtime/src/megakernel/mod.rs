@@ -176,6 +176,28 @@ pub struct PrefillBuffers {
     //   phase 2 (post QK_NORM K):             offset hs +   nkh*hd,          length nkh*hd
     // (phase 3 post-MROPE is redundant with legacy_kv_caches[0][0..nkh*hd]).
     pub k_trace: DeviceBuffer<f32>,
+    // 5ax MROPE in-kernel dump: nkh * (rope_dim/2) entries, 9 u32 each.
+    // Per (k_head, pair): [pair, pos, theta_bits, cos_bits, sin_bits, x0_bits, x1_bits, out0_bits, out1_bits]
+    pub mrope_dump: DeviceBuffer<u32>,
+}
+
+impl PrefillBuffers {
+    /// Refresh `position_ids` for an N-token chunk starting at `start_pos`.
+    /// MUST be called before every execute() of a prefill_segment program — the
+    /// program is keyed by start_pos but position_ids is a SHARED buffer that
+    /// other cached programs may have overwritten since the last execute.
+    /// Without this refresh, the second run of bench_coherence reads stale
+    /// positions from the previous run's last prefill (5ax root cause).
+    pub fn write_positions(&mut self, start_pos: u32, n: usize) -> HipResult<()> {
+        let mut pos_data = vec![0i32; n * 3];
+        for t in 0..n {
+            let pos = (start_pos + t as u32) as i32;
+            pos_data[t * 3] = pos;
+            pos_data[t * 3 + 1] = pos;
+            pos_data[t * 3 + 2] = pos;
+        }
+        self.position_ids.copy_from_host(&pos_data)
+    }
 }
 
 impl PrefillBuffers {
@@ -222,6 +244,9 @@ impl PrefillBuffers {
             ffn_down_scratch: DeviceBuffer::alloc(device, hs)?,
             // 5ax K-trace: hs (normed) + 2 × nkh*hd (post-LINEAR_PROJ, post-QK_NORM).
             k_trace: DeviceBuffer::alloc(device, hs + 2 * nkh * hd)?,
+            // 5ax MROPE in-kernel dump: nkh * (rope_dim/2) entries × 9 u32 each.
+            // rope_dim is part of cfg; size based on max possible (rope_dim<=hd).
+            mrope_dump: DeviceBuffer::alloc(device, nkh * (cfg.rope_dim / 2) * 9)?,
         })
     }
 }
