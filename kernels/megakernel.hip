@@ -304,4 +304,9 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             grid.sync();
         }
     }
+
+    // Signal clean exit so host watchdog pauses its no-progress timer until
+    // the next launch (otherwise it spuriously fires on the frozen
+    // progress_counter during inter-segment dispatch gaps).
+    if (watchdog) watchdog_signal_exited(watchdog);
 }

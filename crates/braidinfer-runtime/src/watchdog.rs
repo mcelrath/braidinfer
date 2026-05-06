@@ -7,7 +7,7 @@ use braidinfer_hip::{HipResult, memory::MappedHostBuffer};
 // Mirror of WatchdogState from kernels/watchdog.h.
 // C layout with natural alignment:
 //   force_exit       u32 @ 0
-//   [implicit pad]   u32 @ 4   (compiler inserts to align progress_counter to 8)
+//   exited           u32 @ 4   (kernel writes 1 on clean exit; host pauses no-progress timer)
 //   progress_counter u64 @ 8
 //   last_op_id       u32 @ 16
 //   _pad             u32 @ 20  (explicit in header to align last_beat_us to 8)
@@ -15,7 +15,7 @@ use braidinfer_hip::{HipResult, memory::MappedHostBuffer};
 #[repr(C)]
 pub struct WatchdogState {
     pub force_exit: u32,
-    pub _pad0: u32,
+    pub exited: u32,
     pub progress_counter: u64,
     pub last_op_id: u32,
     pub _pad1: u32,
@@ -153,6 +153,18 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
             let state = unsafe { &*entry.state.host_ptr() };
             let counter = unsafe { std::ptr::read_volatile(&state.progress_counter) };
             let op_id  = unsafe { std::ptr::read_volatile(&state.last_op_id) };
+            let exited = unsafe { std::ptr::read_volatile(&state.exited) };
+
+            // Kernel signaled clean exit — pause the no-progress timer until
+            // next launch clears `exited` via watchdog_init. Without this, the
+            // host keeps polling a frozen progress_counter and spuriously fires
+            // during inter-segment dispatch gaps in prefill.
+            if exited != 0 {
+                entry.last_progress = counter;
+                entry.last_progress_at = now;
+                entry.force_exit_sent_at = None;
+                continue;
+            }
 
             if counter > entry.last_progress {
                 // Kernel is making progress (strictly monotonic).

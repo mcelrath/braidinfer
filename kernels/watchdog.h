@@ -16,6 +16,7 @@
 
 struct WatchdogState {
     volatile uint32_t force_exit;        // host writes 1 to request emergency exit
+    volatile uint32_t exited;            // kernel writes 1 on clean exit (host pauses no-progress timer)
     volatile uint64_t progress_counter;  // kernel increments at progress points
     volatile uint32_t last_op_id;        // telemetry: which op was running at last beat
     volatile uint32_t _pad;              // alignment padding
@@ -93,6 +94,22 @@ __device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local
         *local_counter = (uint32_t)__hip_atomic_load(&ws->progress_counter,
                                                      __ATOMIC_ACQUIRE,
                                                      __HIP_MEMORY_SCOPE_SYSTEM);
+        // Clear the exited flag — kernel is now running again.
+        __hip_atomic_store(&ws->exited, 0u,
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+// Mark the kernel as cleanly exited so the host watchdog pauses its
+// no-progress timer until the next launch (which calls watchdog_init).
+// Without this, the host keeps polling a frozen progress_counter and
+// spuriously fires force_exit during the gap between launches (most
+// commonly: per-segment prefill where the host runs MoE dispatch +
+// next-segment compile between mk.execute() calls).
+__device__ __forceinline__ void watchdog_signal_exited(WatchdogState* ws) {
+    if (threadIdx.x == 0 && blockIdx.x == 0 && ws) {
+        __hip_atomic_store(&ws->exited, 1u,
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
 
