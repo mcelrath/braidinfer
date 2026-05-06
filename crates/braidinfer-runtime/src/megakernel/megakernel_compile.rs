@@ -430,6 +430,7 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
+                    kv_idx == 0,
                 );
 
                 // Scan emitted instructions for KV-write D2dCopy and AttnPrefillInst.
@@ -1273,11 +1274,18 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
+                    kv_idx == 0,
                 );
 
                 let nkh = cfg.num_kv_heads;
+                // Start scan AFTER OP_MROPE: pre-MROPE D2D_COPYs (q_gate→q_attn deinterleave
+                // for !has_output_gate, plus 5ax K-trace snapshots) are NOT KV writes.
+                let kv_scan_start = (attn_start..instructions.len())
+                    .find(|&idx| instructions[idx].words[0] as u32 == OP_MROPE)
+                    .map(|i| i + 1)
+                    .unwrap_or(attn_start);
                 let mut kv_pair_count = 0usize;
-                for idx in attn_start..instructions.len() {
+                for idx in kv_scan_start..instructions.len() {
                     let opcode = instructions[idx].words[0] as u32;
                     if opcode == OP_D2D_COPY && kv_pair_count < n * nkh * 2 {
                         let pair_flat = kv_pair_count / 2;

@@ -416,6 +416,29 @@ impl Model {
         Ok(result)
     }
 
+    /// Read K-trace diagnostic buffer (5ax). Returns three Vec<f32>:
+    ///   phase 0: pre-LINEAR_PROJ K (normed, length hidden_size)
+    ///   phase 1: post-LINEAR_PROJ K (length num_kv_heads * head_dim)
+    ///   phase 2: post-QK_NORM K (length num_kv_heads * head_dim)
+    /// Returns Vec::new() if prefill_bufs is not initialized.
+    /// Captured only for the first attention layer of the most recent prefill (n=1).
+    pub fn read_k_trace_phases(&self) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.stream.synchronize()?;
+        let Some(pb) = self.prefill_bufs.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let hs = self.config.hidden_size;
+        let nkh = self.config.num_kv_heads;
+        let hd = self.config.head_dim;
+        let total = hs + 2 * nkh * hd;
+        let mut buf = vec![0.0f32; total];
+        pb.k_trace.copy_to_host(&mut buf)?;
+        let phase0 = buf[0..hs].to_vec();
+        let phase1 = buf[hs..hs + nkh * hd].to_vec();
+        let phase2 = buf[hs + nkh * hd..hs + 2 * nkh * hd].to_vec();
+        Ok(vec![phase0, phase1, phase2])
+    }
+
     /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.
     /// Returns empty Vec if page_allocator is not initialized (e.g., multi-GPU non-paged path).
     pub fn read_kv_chunk_slot0(&self) -> Result<Vec<u8>, ModelError> {

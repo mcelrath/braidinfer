@@ -166,13 +166,14 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     // If logits are bit-exact at step 0 but state bytes differ → confirms FP non-associativity
     // in GDN state writes (multi-block-per-head). If state bytes ARE bit-exact → step 1's reads
     // produce different output despite same input (mysterious, deeper investigation needed).
-    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>, Vec<(Vec<f32>, Vec<f32>)>) {
+    let collect_step_logits = |m: &mut Model, prompt: &[u32]| -> (Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u8>, Vec<(Vec<f32>, Vec<f32>)>, Vec<Vec<f32>>) {
         m.reset_state().expect("reset");
         let mut out: Vec<Vec<f32>> = Vec::with_capacity(prompt.len());
         let mut state_after_step0: Vec<Vec<f32>> = Vec::new();
         let mut conv_state_after_step0: Vec<Vec<f32>> = Vec::new();
         let mut kv_after_step0: Vec<u8> = Vec::new();
         let mut legacy_kv_after_step0: Vec<(Vec<f32>, Vec<f32>)> = Vec::new();
+        let mut k_trace_after_step0: Vec<Vec<f32>> = Vec::new();
         for (i, &tok) in prompt.iter().enumerate() {
             let l = m.prefill(&[tok]).expect("seq prefill (per-step)");
             if i == 0 {
@@ -180,13 +181,14 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
                 conv_state_after_step0 = m.read_gdn_conv_state().expect("read gdn conv state");
                 kv_after_step0 = m.read_kv_chunk_slot0().expect("read kv chunk slot 0");
                 legacy_kv_after_step0 = m.read_legacy_kv_caches().expect("read legacy kv caches");
+                k_trace_after_step0 = m.read_k_trace_phases().expect("read k trace");
             }
             out.push(l);
         }
-        (out, state_after_step0, conv_state_after_step0, kv_after_step0, legacy_kv_after_step0)
+        (out, state_after_step0, conv_state_after_step0, kv_after_step0, legacy_kv_after_step0, k_trace_after_step0)
     };
-    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv, run1_legacy_kv) = collect_step_logits(model, &prompt);
-    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv, run2_legacy_kv) = collect_step_logits(model, &prompt);
+    let (run1_steps, run1_gdn_state, run1_conv_state, run1_kv, run1_legacy_kv, run1_k_trace) = collect_step_logits(model, &prompt);
+    let (run2_steps, run2_gdn_state, run2_conv_state, run2_kv, run2_legacy_kv, run2_k_trace) = collect_step_logits(model, &prompt);
 
     // Compare GDN recurrent state bytes after step 0
     println!("  GDN state comparison after step 0 (run1 vs run2):");
@@ -328,6 +330,25 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
             }
         }
     }
+    // 5ax K-trace per-phase comparison after step 0 (first attention layer).
+    // Phases:
+    //   0 = pre-LINEAR_PROJ K (normed input) — diverges → RMSNorm or earlier path is non-det
+    //   1 = post-LINEAR_PROJ K — diverges only here → LINEAR_PROJ K is non-det
+    //   2 = post-QK_NORM K — diverges only here → QK_NORM is non-det
+    //   (post-MROPE K = legacy_kv_caches[0][0..nkh*hd], already shown above)
+    if !run1_k_trace.is_empty() && run1_k_trace.len() == run2_k_trace.len() {
+        let phase_names = ["pre-LINEAR_PROJ (normed)", "post-LINEAR_PROJ K", "post-QK_NORM K"];
+        println!("  K-TRACE per-phase comparison (first attention layer, step 0):");
+        for (p, (a, b)) in run1_k_trace.iter().zip(run2_k_trace.iter()).enumerate() {
+            let n = a.len();
+            let bit_diff = a.iter().zip(b.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count();
+            let max_abs = a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let abs_sum: f64 = a.iter().map(|&v| v.abs() as f64).sum();
+            let label = phase_names.get(p).copied().unwrap_or("?");
+            println!("    phase {p} ({label}): bit_diff={bit_diff}/{n} max_abs={max_abs:.3e} run1_abs_sum={abs_sum:.3e}");
+        }
+    }
+
     println!("  per-step seq->seq comparison:");
     for (i, (l1, l2)) in run1_steps.iter().zip(run2_steps.iter()).enumerate() {
         let s1: f64 = l1.iter().filter(|v| v.is_finite()).map(|&v| v as f64).sum();

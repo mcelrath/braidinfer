@@ -170,6 +170,12 @@ pub struct PrefillBuffers {
     pub ffn_gate_scratch: DeviceBuffer<f32>, // [intermediate_size]
     pub ffn_up_scratch: DeviceBuffer<f32>,   // [intermediate_size]
     pub ffn_down_scratch: DeviceBuffer<f32>, // [hidden_size]
+    // 5ax K-trace diagnostic: 3 phases. Layout:
+    //   phase 0 (pre LINEAR_PROJ K, normed):  offset 0,                      length hs
+    //   phase 1 (post LINEAR_PROJ K):         offset hs,                     length nkh*hd
+    //   phase 2 (post QK_NORM K):             offset hs +   nkh*hd,          length nkh*hd
+    // (phase 3 post-MROPE is redundant with legacy_kv_caches[0][0..nkh*hd]).
+    pub k_trace: DeviceBuffer<f32>,
 }
 
 impl PrefillBuffers {
@@ -214,6 +220,8 @@ impl PrefillBuffers {
             ffn_gate_scratch: DeviceBuffer::alloc(device, is)?,
             ffn_up_scratch: DeviceBuffer::alloc(device, is)?,
             ffn_down_scratch: DeviceBuffer::alloc(device, hs)?,
+            // 5ax K-trace: hs (normed) + 2 × nkh*hd (post-LINEAR_PROJ, post-QK_NORM).
+            k_trace: DeviceBuffer::alloc(device, hs + 2 * nkh * hd)?,
         })
     }
 }
