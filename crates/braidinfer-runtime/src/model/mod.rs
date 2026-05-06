@@ -26,7 +26,7 @@ pub struct Model {
     pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
     // GPU-native P2P MoE dispatch: cooperative kernels on GPUs 1-3. Drop before other GPU 1-3 resources.
     pub(crate) moe_p2p: Option<crate::moe_p2p::MoeP2pContext>,
-    pub(crate) config: ModelConfig,
+    pub config: ModelConfig,
     pub(crate) device: DeviceId,
     pub(crate) stream: Stream,
     pub(crate) kernels: AllKernels,

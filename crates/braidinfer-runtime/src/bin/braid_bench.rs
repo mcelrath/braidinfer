@@ -267,6 +267,65 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
         println!("    LEGACY_KV total: k_diff={total_k_diff}/{total_floats} v_diff={total_v_diff}/{total_floats} max_k_abs={max_k_abs:.3e} max_v_abs={max_v_abs:.3e} run1_k_total_abs_sum={total_run1_k_abs_sum:.3e}");
         if let Some(l) = first_diverge_layer {
             println!("    LEGACY_KV first divergent attn layer: {l}");
+            // Detailed per-head + first-divergent-offsets for layer 0.
+            // K layout: [nkh, max_seq_len, head_dim]. For seq_len=1, position 0 is first.
+            // We need nkh and head_dim from the model config. Use the cache size to back them out.
+            let (k1, _) = &run1_legacy_kv[l];
+            let (k1_full, _) = &run1_legacy_kv[l];
+            let (k2_full, _) = &run2_legacy_kv[l];
+            // Heuristic: hd is the smallest power of 2 dividing 128 evenly that matches typical sizes.
+            // For qwen35 family hd=128. If k_diff is exactly 128, that's one head_dim's worth.
+            let total_floats = k1_full.len();
+            // Try common values of head_dim. If 128 floats differ and divergence is contiguous,
+            // we should see it at one (head_idx, position_idx) location.
+            // Try hd=128 (most common); compute nkh, max_seq_len from total_floats / hd / max_seq_len.
+            // We don't know max_seq_len directly; assume max_seq_len = total_floats / (nkh * hd).
+            // For Qwen3 35B-A3B: nkh=16, max_seq_len=2048, hd=128 → 16*2048*128 = 4194304 ✓
+            // Use actual config dimensions instead of guessing.
+            let hd_guess = model.config.head_dim;
+            let nkh_guess = model.config.num_kv_heads;
+            let max_sl_guess = total_floats / (nkh_guess * hd_guess);
+            if max_sl_guess * nkh_guess * hd_guess == total_floats {
+                println!("    LEGACY_KV layer {l} per-head breakdown (nkh={nkh_guess}, hd={hd_guess}, max_sl={max_sl_guess}, rope_dim={}):", model.config.rope_dim);
+                let head_stride = max_sl_guess * hd_guess;
+                for h in 0..nkh_guess {
+                    let head_diff: usize = (0..head_stride).filter(|&i| {
+                        let off = h * head_stride + i;
+                        k1_full[off].to_bits() != k2_full[off].to_bits()
+                    }).count();
+                    if head_diff > 0 {
+                        // For each token position in this head, count the diffs.
+                        let mut pos_diffs: Vec<(usize, usize)> = Vec::new();
+                        for t in 0..max_sl_guess {
+                            let pd: usize = (0..hd_guess).filter(|&d| {
+                                let off = h * head_stride + t * hd_guess + d;
+                                k1_full[off].to_bits() != k2_full[off].to_bits()
+                            }).count();
+                            if pd > 0 { pos_diffs.push((t, pd)); }
+                        }
+                        let pos_summary: String = pos_diffs.iter().take(5).map(|(t, n)| format!("t={}:{}", t, n)).collect::<Vec<_>>().join(", ");
+                        println!("      head {h}: k_diff={head_diff} positions=[{pos_summary}]");
+                    }
+                }
+                // Dump first 4 (offset, run1, run2) tuples for head with diverge.
+                let mut first_tuples = Vec::new();
+                for off in 0..total_floats.min(2_000_000) {
+                    if k1_full[off].to_bits() != k2_full[off].to_bits() {
+                        let h = off / head_stride;
+                        let rem = off % head_stride;
+                        let t = rem / hd_guess;
+                        let d = rem % hd_guess;
+                        first_tuples.push((h, t, d, k1_full[off], k2_full[off]));
+                        if first_tuples.len() >= 8 { break; }
+                    }
+                }
+                if !first_tuples.is_empty() {
+                    println!("    LEGACY_KV layer {l} first 8 divergent (h,t,d) → (run1, run2):");
+                    for (h, t, d, v1, v2) in &first_tuples {
+                        println!("      [{h:2}, {t:2}, {d:3}] = ({v1:.6e}, {v2:.6e})  diff={:.3e}", v1 - v2);
+                    }
+                }
+            }
         }
     }
     println!("  per-step seq->seq comparison:");
