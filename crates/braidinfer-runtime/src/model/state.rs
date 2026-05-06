@@ -509,6 +509,46 @@ impl Model {
         Ok(out)
     }
 
+    /// Read per-GPU attn_kv_caches for the first attention layer, all KV heads,
+    /// positions [0..max_pos). Returns Vec of (gpu_idx, k_slice, v_slice).
+    /// Diagnostic for braidinfer-sew: compares against read_legacy_kv_caches[0]
+    /// to verify the prefill broadcast reached every worker AND decode-time
+    /// writes match the broadcast format.
+    pub fn read_attn_kv_first_layer(
+        &self,
+        max_pos: usize,
+    ) -> Result<Vec<(usize, Vec<f32>, Vec<f32>)>, ModelError> {
+        self.stream.synchronize()?;
+        let Some(mgpu) = self.multi_gpu.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let nkh = self.config.num_kv_heads;
+        let hd = self.config.head_dim;
+        let max_sl = self.config.max_seq_len;
+        let mut result = Vec::with_capacity(mgpu.num_devices);
+        for (gpu_i, worker) in mgpu.workers.iter().enumerate() {
+            if worker.attn_kv_caches.is_empty() { continue; }
+            let kv = &worker.attn_kv_caches[0];
+            let k_full_len = kv.k.len();
+            let mut k_full = vec![0.0f32; k_full_len];
+            let mut v_full = vec![0.0f32; k_full_len];
+            kv.k.copy_to_host(&mut k_full)?;
+            kv.v.copy_to_host(&mut v_full)?;
+            // Extract positions [0..max_pos) for each head into a flat slice.
+            // Layout: [nkh, max_sl, hd]; we want [nkh, max_pos, hd].
+            let mut k_slice = Vec::with_capacity(nkh * max_pos * hd);
+            let mut v_slice = Vec::with_capacity(nkh * max_pos * hd);
+            for h in 0..nkh {
+                let base = h * max_sl * hd;
+                let want = max_pos * hd;
+                k_slice.extend_from_slice(&k_full[base..base + want]);
+                v_slice.extend_from_slice(&v_full[base..base + want]);
+            }
+            result.push((gpu_i, k_slice, v_slice));
+        }
+        Ok(result)
+    }
+
     /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.
     /// Returns empty Vec if page_allocator is not initialized (e.g., multi-GPU non-paged path).
     pub fn read_kv_chunk_slot0(&self) -> Result<Vec<u8>, ModelError> {
