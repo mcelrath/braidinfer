@@ -353,7 +353,11 @@ def main():
     env["HIP_VISIBLE_DEVICES"] = vis
     env["CUDA_VISIBLE_DEVICES"] = vis
 
-    proc = subprocess.Popen(cmd_args, env=env)
+    # start_new_session: own process group → killpg can reap forked workers
+    # cleanly when this script's signal handler / cleanup fires.  Matches
+    # llama.cpp/scripts/launch-llama.py convention so all four launchers
+    # sharing $XDG_RUNTIME_DIR/launch-llama/ behave consistently.
+    proc = subprocess.Popen(cmd_args, env=env, start_new_session=True)
 
     reserved = []
     lock_fds = {}
