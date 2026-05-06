@@ -633,7 +633,19 @@ impl Model {
                     batch.push(QkNormInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, q_norm_ptr, k_norm_ptr, local_nqh as i32, local_nkh as i32, hd as i32, qk_norm_eps, 0).into_inst());
                 }
 
-                // 6. KV write (local — from local k/v to local KV cache)
+                // 6. mRoPE on local Q+K — only for models that use RoPE.
+                // MUST run BEFORE the KV write so the cache stores POST-MROPE K
+                // (op_gqa_attn at step 8 reads cache K without re-applying MROPE).
+                // This also matches legacy_kv_caches's layout (post-MROPE K written
+                // by emit_attention_layer Prefill variant), so the sew prefill
+                // broadcast is consistent with what decode-time KV writes produce.
+                if self.config.use_rope {
+                    let rd = self.config.rope_dim;
+                    let ms = self.config.mrope_sections();
+                    batch.push(MropeInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, self.activations.inv_freq.as_ptr(), self.activations.position_ids.as_ptr(), local_nqh as i32, local_nkh as i32, hd as i32, rd as i32, ms[0] as i32, ms[1] as i32, ms[2] as i32, 0).into_inst());
+                }
+
+                // 7. KV write (local — from local k/v to local KV cache)
                 for h_local in 0..local_nkh {
                     let src_k = k_local_ptr + (h_local * hd * 4) as u64;
                     let src_v = v_local_ptr + (h_local * hd * 4) as u64;
@@ -643,13 +655,6 @@ impl Model {
                         kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
                     batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).into_inst());
                     batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).into_inst());
-                }
-
-                // 7. mRoPE on local Q+K — only for models that use RoPE
-                if self.config.use_rope {
-                    let rd = self.config.rope_dim;
-                    let ms = self.config.mrope_sections();
-                    batch.push(MropeInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, self.activations.inv_freq.as_ptr(), self.activations.position_ids.as_ptr(), local_nqh as i32, local_nkh as i32, hd as i32, rd as i32, ms[0] as i32, ms[1] as i32, ms[2] as i32, 0).into_inst());
                 }
 
                 // 8. GQA (same as legacy path)

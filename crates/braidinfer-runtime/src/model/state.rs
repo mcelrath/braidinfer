@@ -375,6 +375,11 @@ impl Model {
         }
 
         self.seq_len += total as u32;
+        // Ensure prefill writes to legacy_kv_caches have completed on GPU 0
+        // before the broadcast reads them. Safe — no cooperative kernel runs
+        // on GPU 0 between prefill end and decode start (persistent_worker is
+        // launched lazily on first decode call).
+        self.stream.synchronize().map_err(ModelError::Hip)?;
         // Fix braidinfer-sew: multi-GPU prefill wrote K/V only to GPU 0's
         // legacy_kv_caches; broadcast positions 0..total to each worker's
         // attn_kv_caches so the head-parallel decode path reads valid
