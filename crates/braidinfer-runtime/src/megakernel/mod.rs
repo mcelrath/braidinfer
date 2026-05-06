@@ -131,7 +131,10 @@ pub struct MegakernelProgram {
     /// Avoids a Vec allocation per decode step.
     pub(crate) flat_program: Vec<u64>,
     /// Host-side watchdog thread polling this program's WatchdogState page.
-    pub(crate) watchdog: WatchdogThread,
+    /// Held as RAII guard — `WatchdogThread::drop` signals stop and joins the
+    /// polling thread. Underscore-prefixed because the field is never read,
+    /// only its `Drop` matters (compiler can't see Drop as a "use").
+    pub(crate) _watchdog: WatchdogThread,
     /// Device pointer to WatchdogState (host-mapped, owned by watchdog). Passed to kernel.
     pub(crate) wd_dev_ptr: *mut c_void,
 }

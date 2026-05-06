@@ -331,14 +331,13 @@ impl MoeGateKernel {
 
 pub struct MoePrefillKernel {
     module: Module,
-    device: DeviceId,
 }
 
 impl MoePrefillKernel {
     pub fn load(device: DeviceId) -> HipResult<Self> {
         let path = super::kernel_dir().join("moe_prefill.hsaco");
         let module = Module::load(device, &path)?;
-        Ok(Self { module, device })
+        Ok(Self { module })
     }
 
     pub fn gather(

@@ -1078,7 +1078,6 @@ impl Model {
             activations,
             gdn_conv_states,
             legacy_kv_caches: Some(kv_caches),
-            megakernel: None,
             megakernel_prefill: None,
             megakernel_prefill_partial: None,
             megakernel_prefill_partial_n: 0,

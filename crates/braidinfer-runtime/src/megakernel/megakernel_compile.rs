@@ -310,7 +310,7 @@ impl MegakernelProgram {
             barrier_layer_map,
             multi_gpu_attn_boundaries,
             flat_program,
-            watchdog,
+            _watchdog: watchdog,
             wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
@@ -742,7 +742,7 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
-            watchdog,
+            _watchdog: watchdog,
             wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
@@ -1135,7 +1135,7 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
-            watchdog,
+            _watchdog: watchdog,
             wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
@@ -1411,7 +1411,7 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
-            watchdog,
+            _watchdog: watchdog,
             wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
@@ -1492,7 +1492,7 @@ impl MegakernelProgram {
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
-            watchdog,
+            _watchdog: watchdog,
             wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })

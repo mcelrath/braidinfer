@@ -46,7 +46,6 @@ pub struct Model {
     pub(crate) gdn_states: Vec<GdnState>,
     pub(crate) mamba2_states: Vec<Mamba2State>,
     pub(crate) seq_len: u32,
-    pub(crate) megakernel: Option<MegakernelProgram>,
     pub(crate) megakernel_prefill: Option<MegakernelProgram>,
     pub(crate) megakernel_prefill_partial: Option<MegakernelProgram>,
     pub(crate) megakernel_prefill_partial_n: usize,
