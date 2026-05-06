@@ -194,6 +194,11 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     }
 
     uint32_t watchdog_beat_ctr = 0;
+    // Seed counter from prior value so successive kernel launches against the
+    // same WatchdogState produce a monotonically advancing sequence (otherwise
+    // every launch stores 100, 200, ... — identical across launches — and the
+    // host watchdog spuriously declares no-progress between launches).
+    if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
     for (int pc = 0; pc < num_instructions; pc++) {
         // Watchdog: check force_exit between instructions. All blocks reach this point

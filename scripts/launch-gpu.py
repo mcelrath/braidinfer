@@ -96,6 +96,48 @@ def is_pid_alive(pid):
         return False
 
 
+def kill_process(proc, grace_s=KILL_GRACE_S):
+    """SIGTERM the process group, wait, SIGKILL, log if D-state.
+
+    Ported from llama.cpp/scripts/launch-llama.py kill_process(). Uses
+    killpg so any forked threads/subprocesses are reaped together. Bounded
+    wait after SIGKILL so a D-state (uninterruptible-sleep on GPU) process
+    doesn't hang the launcher forever — the next invocation's stale-lock
+    sweep cleans up leftovers.
+    """
+    pid = proc.pid
+
+    def _signal(sig):
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, sig)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, sig)
+            except (OSError, ProcessLookupError):
+                pass
+
+    _signal(signal.SIGTERM)
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not is_pid_alive(pid):
+            return
+        time.sleep(0.2)
+    _signal(signal.SIGKILL)
+    # Bounded wait — D-state may hold for a while after SIGKILL until the
+    # outstanding GPU kernel call returns to user-space. Don't block forever.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not is_pid_alive(pid):
+            return
+        time.sleep(0.2)
+    print(
+        f"WARNING: process {pid} did not exit after SIGKILL "
+        f"(likely D-state on GPU; will be reaped on next invocation)",
+        file=sys.stderr,
+    )
+
+
 def lock_path(gpu_idx):
     # Use ROCmN naming to match llama.cpp/scripts/launch-llama.py lock files
     return LOCK_DIR / f"gpu-ROCm{gpu_idx}.lock"
@@ -230,6 +272,39 @@ def wait_for_gpus(count, min_vram_mb, timeout_s):
         time.sleep(GPU_WAIT_POLL_S)
 
 
+def _kill_pid(pid, grace_s=KILL_GRACE_S):
+    """SIGTERM-then-SIGKILL by PID (and process group if available). For
+    do_kill which only has a PID from the lock file, not a Popen handle.
+    """
+    def _signal(sig):
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, sig)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, sig)
+            except (OSError, ProcessLookupError):
+                pass
+
+    _signal(signal.SIGTERM)
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not is_pid_alive(pid):
+            return
+        time.sleep(0.2)
+    _signal(signal.SIGKILL)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not is_pid_alive(pid):
+            return
+        time.sleep(0.2)
+    print(
+        f"WARNING: process {pid} did not exit after SIGKILL "
+        f"(likely D-state on GPU; will be reaped on next invocation)",
+        file=sys.stderr,
+    )
+
+
 def do_kill(session_id=None):
     """Kill processes launched by this session (or a specified session)."""
     if not LOCK_DIR.exists():
@@ -250,17 +325,7 @@ def do_kill(session_id=None):
             continue
         if is_pid_alive(pid):
             print(f"Killing PID {pid} (GPU {info.get('gpu', '?')}, session {lock_session})")
-            try:
-                os.kill(pid, signal.SIGTERM)
-                # Wait briefly for graceful exit
-                for _ in range(KILL_GRACE_S * 10):
-                    time.sleep(0.1)
-                    if not is_pid_alive(pid):
-                        break
-                else:
-                    os.kill(pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+            _kill_pid(pid)
             killed += 1
         lp.unlink(missing_ok=True)
     print(f"Killed {killed} process(es)." + (f" Skipped {skipped} from other sessions." if skipped else ""))
@@ -378,11 +443,7 @@ def main():
         lock_fds.clear()
 
     def _sig(signum, frame):
-        proc.terminate()
-        try:
-            proc.wait(timeout=KILL_GRACE_S)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        kill_process(proc)
         _release()
         sys.exit(1)
 
@@ -395,12 +456,7 @@ def main():
         sys.exit(proc.returncode)
     except subprocess.TimeoutExpired:
         print(f"\n*** TIMEOUT: process killed after {args.timeout}s (exit 124) ***", file=sys.stderr)
-        proc.terminate()
-        try:
-            proc.wait(timeout=KILL_GRACE_S)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        kill_process(proc)
         _release()
         sys.exit(124)
 

@@ -1370,6 +1370,19 @@ impl MegakernelProgram {
         }
         instructions.push(Instruction::new(OP_HALT, 0));
 
+        // Diagnostic: BRAIDINFER_DUMP_PROGRAM=1 prints opcode list per compiled segment.
+        if std::env::var("BRAIDINFER_DUMP_PROGRAM").is_ok() {
+            eprintln!(
+                "[dump] compile_prefill_segment: layers {layer_start}..{layer_end} n={n} start_pos={start_pos} num_inst={}",
+                instructions.len()
+            );
+            for (pc, inst) in instructions.iter().enumerate() {
+                let op = inst.words[0] as u32;
+                let grid_x = (inst.words[0] >> 32) as u32;
+                eprintln!("  [{pc:4}] {} grid_x={grid_x}", super::opcode_name_str(op));
+            }
+        }
+
         let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 

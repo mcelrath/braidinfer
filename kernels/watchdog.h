@@ -77,6 +77,25 @@ __device__ __forceinline__ bool watchdog_poll_and_check(
     return __watchdog_should_exit;
 }
 
+// Initialize local counter from the device-visible progress_counter.
+// CRITICAL for kernels that re-launch on the same WatchdogState (e.g. megakernel
+// per execute()): without this, every launch starts local_counter at 0 and
+// stores 100, 200, 300, ... — identical sequence each launch — so the host
+// watchdog sees the counter "stuck" at the same value across launches and
+// spuriously aborts. By seeding from the device-visible value, each launch
+// continues the monotonic sequence.
+//
+// Long-lived persistent kernels (persistent_worker, moe_worker) call this once
+// at start and the value will be 0 — same as before. Only matters for kernels
+// that launch repeatedly against the same state.
+__device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local_counter) {
+    if (threadIdx.x == 0 && blockIdx.x == 0 && ws) {
+        *local_counter = (uint32_t)__hip_atomic_load(&ws->progress_counter,
+                                                     __ATOMIC_ACQUIRE,
+                                                     __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
 // Progress beat: increment counter every K iterations to signal liveness to host watchdog.
 // K=100 at s_sleep(1) ≈ 1µs/iteration → one SYSTEM-scope store per 100µs.
 // Host thread declares no-progress if counter unchanged for WATCHDOG_NO_PROGRESS_MS (default 2s).
