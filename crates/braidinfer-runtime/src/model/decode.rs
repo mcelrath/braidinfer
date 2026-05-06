@@ -639,10 +639,19 @@ impl Model {
                 // This also matches legacy_kv_caches's layout (post-MROPE K written
                 // by emit_attention_layer Prefill variant), so the sew prefill
                 // broadcast is consistent with what decode-time KV writes produce.
+                //
+                // CRITICAL: use the per-worker position_ids_local pointer, NOT
+                // self.activations.position_ids — the latter is a non-portable
+                // host-mapped buffer whose device_ptr is only valid on GPU 0.
+                // Workers reading via that pointer get garbage → wrong rotation
+                // → wrong K → broken attention.
                 if self.config.use_rope {
                     let rd = self.config.rope_dim;
                     let ms = self.config.mrope_sections();
-                    batch.push(MropeInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, self.activations.inv_freq.as_ptr(), self.activations.position_ids.as_ptr(), local_nqh as i32, local_nkh as i32, hd as i32, rd as i32, ms[0] as i32, ms[1] as i32, ms[2] as i32, 0).into_inst());
+                    let pos_ptr = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
+                        .position_ids_local
+                        .as_ptr();
+                    batch.push(MropeInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, self.activations.inv_freq.as_ptr(), pos_ptr, local_nqh as i32, local_nkh as i32, hd as i32, rd as i32, ms[0] as i32, ms[1] as i32, ms[2] as i32, 0).into_inst());
                 }
 
                 // 7. KV write (local — from local k/v to local KV cache)

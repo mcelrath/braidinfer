@@ -144,6 +144,21 @@ impl Model {
                 3,
             );
         }
+        // Mirror to each worker's per-GPU position_ids buffer. activations
+        // .position_ids is non-portable host-mapped (only GPU 0's device_ptr
+        // is valid); workers' MROPE in dispatch_head_parallel_attention needs
+        // a pointer valid on its own device.
+        if let Some(mgpu) = self.multi_gpu.as_ref() {
+            for worker in &mgpu.workers {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        pos_data.as_ptr(),
+                        worker.position_ids_local.host_ptr(),
+                        3,
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

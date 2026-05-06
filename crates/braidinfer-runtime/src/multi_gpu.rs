@@ -56,6 +56,12 @@ pub struct GpuWorker {
     // chain ends with set_flag_kernel writing the next seq, CPU polls for it.
     pub compute_done_flag: braidinfer_hip::memory::MappedHostBuffer<u32>,
     pub compute_done_seq: std::sync::atomic::AtomicU32,
+    // Per-worker position_ids buffer. activations.position_ids on GPU 0 is a
+    // NON-PORTABLE MappedHostBuffer — its device pointer is only valid on
+    // GPU 0. Workers reading via that pointer get invalid memory → MROPE
+    // computes wrong rotation → attention is wrong. Each worker gets its own
+    // host-mapped i32[3] buffer that the host writes per decode step.
+    pub position_ids_local: braidinfer_hip::memory::MappedHostBuffer<i32>,
     // Head-parallel attention buffers (allocated by init_attn_buffers after construction)
     pub attn_kv_caches: Vec<crate::weights::KvCache>, // [num_attn_layers], each [local_nkh, max_seq_len, hd]
     pub attn_q: Option<DeviceBuffer<f32>>,            // [local_nqh * head_dim]
@@ -141,6 +147,7 @@ impl MultiGpuContext {
                 )?,
                 compute_done_flag: braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(1)?,
                 compute_done_seq: std::sync::atomic::AtomicU32::new(0),
+                position_ids_local: braidinfer_hip::memory::MappedHostBuffer::<i32>::alloc(3)?,
                 attn_kv_caches: Vec::new(),
                 attn_q: None,
                 attn_out: None,
@@ -339,9 +346,12 @@ impl MultiGpuContext {
         let head_elems = max_seq_len * head_dim;
         let copy_bytes = prefill_len * head_dim * std::mem::size_of::<f32>();
 
+        // DIAGNOSTIC: skip GPU 0 — the previous "first 4 tokens coherent"
+        // result came from this configuration, suggesting GPU 0's
+        // attn_kv_caches might already be valid from another path.
         for (attn_i, &kv_i) in attn_to_kv_idx.iter().enumerate() {
             let src_kv = &legacy_kv_caches[kv_i];
-            for gpu_i in 0..self.num_devices {
+            for gpu_i in 1..self.num_devices {
                 let worker = &self.workers[gpu_i];
                 let dst_kv = &worker.attn_kv_caches[attn_i];
                 for h in 0..num_kv_heads {
@@ -376,9 +386,8 @@ impl MultiGpuContext {
         // Synchronize via mailbox: launch set_flag on each worker stream and
         // CPU-poll. Avoids hipStreamSynchronize, which would deadlock against
         // the cooperative moe_worker_kernel running on the worker GPU.
-        // Includes GPU 0 — its compute_stream also queued same-device copies.
         use std::sync::atomic::Ordering;
-        for gpu_i in 0..self.num_devices {
+        for gpu_i in 1..self.num_devices {
             Device::set_current(DeviceId(gpu_i as u32))?;
             let worker = &self.workers[gpu_i];
             let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
