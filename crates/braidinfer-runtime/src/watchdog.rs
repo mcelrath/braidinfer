@@ -56,6 +56,13 @@ struct WatchdogEntry {
     last_progress: u64,
     last_progress_at: Instant,
     force_exit_sent_at: Option<Instant>,
+    // Set true on first observed counter > 0. Until then, the no-progress
+    // timer is NOT enforced — many kernels register their state at compile
+    // time but only launch later (e.g. compile_multi_gpu_p2p compiled
+    // during prefill, kernel only runs on first decode call). Without this
+    // gate, the watchdog spuriously aborts during the gap between register
+    // and first kernel launch.
+    has_started: bool,
 }
 
 // Host-side watchdog thread. Monitors all registered WatchdogState pages.
@@ -97,6 +104,7 @@ impl WatchdogThread {
             last_progress: 0,
             last_progress_at: Instant::now(),
             force_exit_sent_at: None,
+            has_started: false,
         };
 
         self.entries.lock().unwrap().push(entry);
@@ -154,6 +162,17 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
                 entry.last_progress = counter;
                 entry.last_progress_at = now;
                 entry.force_exit_sent_at = None;
+                entry.has_started = true;
+                continue;
+            }
+
+            // Until the kernel has been observed running at least once, do not
+            // enforce the no-progress timeout. compile_multi_gpu_p2p (and other
+            // compile sites) register their watchdog state at compile time but
+            // only launch the kernel later (e.g. on first decode_step). The gap
+            // between register and first launch can exceed no_progress_ms on
+            // larger models — without this gate, the watchdog spuriously aborts.
+            if !entry.has_started {
                 continue;
             }
 
