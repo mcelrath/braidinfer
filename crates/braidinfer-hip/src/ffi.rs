@@ -37,6 +37,7 @@ unsafe extern "C" {
 
     // Memory management
     pub fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> hipError_t;
+    pub fn hipExtMallocWithFlags(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> hipError_t;
     pub fn hipFree(ptr: *mut c_void) -> hipError_t;
     pub fn hipMemcpy(dst: *mut c_void, src: *const c_void, size: usize, kind: c_uint)
     -> hipError_t;

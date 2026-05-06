@@ -26,6 +26,27 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
+    /// Allocate a device buffer with MTYPE_UC (uncached): GPU writes/reads bypass GL2 entirely.
+    /// Required for cross-GPU P2P read scenarios on RDNA3/gfx1100 where the writer GPU's
+    /// GL2 staleness corrupts BAR1-bypass reads from peer GPUs (no L2 invalidation in ISA).
+    /// See COHERENCE.md and llama.cpp commit 3aa2b53db for the same class of bug.
+    pub fn alloc_uncached(device: DeviceId, len: usize) -> HipResult<Self> {
+        crate::device::Device::set_current(device)?;
+        let size = len * std::mem::size_of::<T>();
+        let mut ptr: *mut std::ffi::c_void = ptr::null_mut();
+        // hipDeviceMallocUncached = 0x3 (per ROCm hip_runtime_api.h hipMemAllocationGranularity_*).
+        const HIP_DEVICE_MALLOC_UNCACHED: u32 = 0x3;
+        error::check(unsafe {
+            ffi::hipExtMallocWithFlags(&mut ptr, size, HIP_DEVICE_MALLOC_UNCACHED)
+        })?;
+        Ok(DeviceBuffer {
+            ptr: ptr.cast(),
+            len,
+            device,
+            _marker: PhantomData,
+        })
+    }
+
     pub fn as_ptr(&self) -> *const T {
         self.ptr
     }
