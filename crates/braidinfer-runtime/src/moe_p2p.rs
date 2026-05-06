@@ -289,13 +289,15 @@ impl MoeP2pContext {
 
             let num_cus = multiprocessor_count(device)?;
             // Cooperative constraint: blocks ≤ num_cus × blocks_per_sm (NOT ==).
-            // hipOccupancyMaxActiveBlocksPerMultiprocessor returns 9 for moe_worker_kernel
-            // on gfx1100, so the correct max is 432 blocks. Prior launch used 48 (= num_cus),
-            // which is valid (≤ 432) and safe, but left 384 SMs idle. 432 blocks gives full
-            // SIMD utilization without violating the cooperative constraint.
-            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)
+            // Use num_cus blocks (1 block/CU) to leave 8/9 of bpsm slots open for
+            // concurrent kbk attention kernels. The full bpsm × num_cus = 432
+            // saturation (commit af6e051) gives full SIMD utilization for moe-only
+            // workloads but starves kbk attention launches of CU occupancy on the
+            // multi-GPU MoE decode path (decode.rs dispatch_attn_kbk → kernels
+            // queued but never scheduled).
+            let _bpsm_unused = func.max_active_blocks_per_sm(256, shared_mem as usize)
                 .unwrap_or(1);
-            let num_blocks = (num_cus as i32 * blocks_per_sm) as u32;
+            let num_blocks = num_cus;
             func.launch_cooperative(
                 (num_blocks, 1, 1),
                 (256, 1, 1),
