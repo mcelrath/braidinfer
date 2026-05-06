@@ -43,6 +43,7 @@ fn main() {
         "persistent_worker",
         "deinterleave",
         "moe_worker",
+        "sync_flag",
     ];
 
     for kernel in &kernels {

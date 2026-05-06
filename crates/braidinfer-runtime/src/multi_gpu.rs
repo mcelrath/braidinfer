@@ -47,6 +47,15 @@ pub struct GpuWorker {
     pub compute_stream: Stream,
     // Compute-path P2P copy kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe)
     pub peer_copy_module: Module,
+    // sync_flag module: <<<1,1>>> set_flag_kernel + wait_flag_kernel for
+    // CPU-poll-based stream waits without HIP API calls (avoids deadlock with
+    // cooperative kernels on the same device).
+    pub sync_flag_module: Module,
+    // Host-mapped flag written by set_flag_kernel; CPU spins on this in lieu
+    // of compute_stream.synchronize(). Monotonic seq counter — each stream
+    // chain ends with set_flag_kernel writing the next seq, CPU polls for it.
+    pub compute_done_flag: braidinfer_hip::memory::MappedHostBuffer<u32>,
+    pub compute_done_seq: std::sync::atomic::AtomicU32,
     // Head-parallel attention buffers (allocated by init_attn_buffers after construction)
     pub attn_kv_caches: Vec<crate::weights::KvCache>, // [num_attn_layers], each [local_nkh, max_seq_len, hd]
     pub attn_q: Option<DeviceBuffer<f32>>,            // [local_nqh * head_dim]
@@ -126,6 +135,12 @@ impl MultiGpuContext {
                     device,
                     &crate::kernel::kernel_dir().join("peer_copy.hsaco"),
                 )?,
+                sync_flag_module: Module::load(
+                    device,
+                    &crate::kernel::kernel_dir().join("sync_flag.hsaco"),
+                )?,
+                compute_done_flag: braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(1)?,
+                compute_done_seq: std::sync::atomic::AtomicU32::new(0),
                 attn_kv_caches: Vec::new(),
                 attn_q: None,
                 attn_out: None,
@@ -275,5 +290,25 @@ impl MultiGpuContext {
         braidinfer_hip::error::check(unsafe {
             ffi::hipStreamWaitEvent(stream.raw(), event.raw(), 0)
         })
+    }
+
+    /// Stream-side mailbox-set: enqueue a `<<<1,1>>>` kernel that writes
+    /// `value` to the host-mapped `flag` after a `__threadfence_system()`.
+    /// Used to signal end-of-stream-work to the host without
+    /// `hipStreamSynchronize`, which deadlocks while a cooperative kernel
+    /// is running on the same device. The CPU should poll the host pointer
+    /// of the same MappedHostBuffer with `read_volatile`.
+    pub fn launch_set_flag(
+        sync_flag_module: &Module,
+        flag_dev_ptr: *mut u32,
+        value: u32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        let func = sync_flag_module.get_function("set_flag_kernel")?;
+        let mut args: [*mut std::ffi::c_void; 2] = [
+            &flag_dev_ptr as *const _ as *mut std::ffi::c_void,
+            &value as *const _ as *mut std::ffi::c_void,
+        ];
+        func.launch((1, 1, 1), (1, 1, 1), 0, stream, &mut args)
     }
 }

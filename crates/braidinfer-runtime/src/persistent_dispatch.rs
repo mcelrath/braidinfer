@@ -201,6 +201,7 @@ impl PersistentDispatch {
     /// Wait for a GPU to ack a specific seq number.
     pub(crate) fn wait_ack(&self, gpu_idx: usize, seq: u32) {
         let q_ptr = self.workers[gpu_idx].queue.host_ptr() as *const WorkerQueueLayout;
+        let start = std::time::Instant::now();
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
             if ack == seq {
@@ -208,6 +209,14 @@ impl PersistentDispatch {
             }
             if shutdown_requested() {
                 panic!("wait_ack interrupted: SIGINT/SIGTERM (gpu={gpu_idx}, seq={seq})");
+            }
+            if start.elapsed().as_secs() > 30 {
+                let progress_pc = unsafe {
+                    std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc))
+                };
+                panic!(
+                    "wait_ack timeout gpu={gpu_idx} seq={seq} ack={ack} progress_pc={progress_pc}"
+                );
             }
             std::hint::spin_loop();
         }

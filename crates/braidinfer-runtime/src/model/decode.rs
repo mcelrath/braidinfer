@@ -716,16 +716,44 @@ impl Model {
                 .unwrap()
                 .wait_ack(gpu_i, seq);
         }
-        // Wait for GPUs 1+ compute_streams to complete
+        // Wait for GPUs 1+ compute_streams to complete via host-mapped flag poll.
+        // CANNOT use compute_stream.synchronize(): the moe_worker_kernel runs as a
+        // cooperative kernel on these GPUs, and HIP's hipStreamSynchronize internally
+        // calls SyncAllStreams which waits for the cooperative kernel to complete →
+        // deadlock. Instead, enqueue a tiny <<<1,1>>> set_flag_kernel after the kbk
+        // attn work; CPU polls the host-mapped flag without any HIP API.
         for gpu_i in 1..num_gpus {
+            use std::sync::atomic::Ordering;
             braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(
                 gpu_i as u32,
             ))
             .map_err(ModelError::Hip)?;
-            self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                .compute_stream
-                .synchronize()
-                .map_err(ModelError::Hip)?;
+            let worker = &self.multi_gpu.as_ref().unwrap().workers[gpu_i];
+            let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            crate::multi_gpu::MultiGpuContext::launch_set_flag(
+                &worker.sync_flag_module,
+                worker.compute_done_flag.as_write_ptr(),
+                next_seq,
+                &worker.compute_stream,
+            )
+            .map_err(ModelError::Hip)?;
+            let host_ptr = worker.compute_done_flag.host_ptr();
+            let start = std::time::Instant::now();
+            loop {
+                let v = unsafe { std::ptr::read_volatile(host_ptr) };
+                if v >= next_seq {
+                    break;
+                }
+                if crate::persistent_dispatch::shutdown_requested() {
+                    panic!("compute_done flag wait interrupted: SIGINT/SIGTERM (gpu={gpu_i}, seq={next_seq})");
+                }
+                if start.elapsed().as_secs() > 30 {
+                    panic!(
+                        "compute_done flag wait timeout gpu={gpu_i} seq={next_seq} flag_value={v}"
+                    );
+                }
+                std::hint::spin_loop();
+            }
         }
         // Reset to GPU 0 for gather
         braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(0))
