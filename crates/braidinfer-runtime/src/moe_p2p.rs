@@ -171,7 +171,12 @@ impl MoeP2pContext {
         let seq_counter = MappedHostBuffer::<u32>::alloc(1)?;
         // Output slots sized for MAX_PREFILL_BATCH × num_gpus × hidden_size.
         // Decode uses only the first (0 * num_gpus + gpu) * hs slot (batch_size=1).
-        let output_slots = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * num_gpus * hidden_size)?;
+        // MTYPE=UC (uncached) for cross-GPU coherence: workers P2P-write expert
+        // outputs here, GPU 0 reads back. Without UC, GPU 0's L2 may serve stale
+        // entries (sew-class bug, see commit 57af4a3 + GFX1100_ARCH.md §5.1).
+        // gfx1100 has no usable __threadfence_system (compiles same as
+        // __threadfence per commit 843e84a), so MTYPE=UC is the only mechanism.
+        let output_slots = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * num_gpus * hidden_size)?;
 
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
@@ -195,8 +200,13 @@ impl MoeP2pContext {
             },
         )?;
 
-        // Activation staging: GPU 0 VRAM for prefill batches (workers P2P-read after __threadfence_system).
-        let activation_staging = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // Activation staging: GPU 0 VRAM for prefill batches. Workers P2P-read
+        // this buffer; MTYPE=UC ensures the read does not hit GPU 0's L2 with
+        // stale data when persistent_worker on workers reads it (post-Phase 4).
+        // Cost: GPU 0 sees no L2 caching when CPU writes it via copy_from_host —
+        // acceptable because activation_staging is written once per prefill
+        // batch and read once per expert per worker.
+        let activation_staging = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim).
         let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
