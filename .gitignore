@@ -23,7 +23,11 @@ __pycache__
 *-host-x86_64-pc-linux-gnu.bc
 *-host-x86_64-pc-linux-gnu.hipi
 *-host-x86_64-pc-linux-gnu.s
+*-host-x86_64-pc-linux-gnu.o
 *.hip-hip-amdgcn-amd-amdhsa.hipfb
+
+# Diagnostic reproducer binaries (built via kernels/diagnostic/build_repro.sh)
+kernels/diagnostic/bpermute_repro
 
 # Activation traces (regenerated via TRACE=... target/release/generate)
 *.bin
