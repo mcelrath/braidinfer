@@ -195,14 +195,8 @@ impl MoeP2pContext {
             },
         )?;
 
-        // braidinfer-5ax fix: activation staging on GPU 0 must be UNCACHED (MTYPE_UC).
-        // Workers on GPUs 1-3 BAR1-read this buffer with volatile/dlc=1; GPU 0's GL2
-        // can hold stale entries that BAR1 reads bypass — and __threadfence_system()
-        // does NOT flush GL2 to VRAM on GFX11 (no buffer_wbl2; no L2 invalidate exists
-        // on gfx1100). Concurrent BAR1 traffic also perturbs GPU 0's GL2 timing for
-        // adjacent K-projection writes, producing run-to-run K-cache divergence.
-        // Per COHERENCE.md and llama.cpp commit 3aa2b53db, MTYPE_UC bypasses GL2 entirely.
-        let activation_staging = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // Activation staging: GPU 0 VRAM for prefill batches (workers P2P-read after __threadfence_system).
+        let activation_staging = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim).
         let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
