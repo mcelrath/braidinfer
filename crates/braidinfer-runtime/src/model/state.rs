@@ -375,6 +375,39 @@ impl Model {
         }
 
         self.seq_len += total as u32;
+        // Fix braidinfer-sew: multi-GPU prefill wrote K/V only to GPU 0's
+        // legacy_kv_caches; broadcast positions 0..total to each worker's
+        // attn_kv_caches so the head-parallel decode path reads valid
+        // (non-uninit) keys/values for prefill positions.
+        if let Some(mgpu) = self.multi_gpu.as_ref() {
+            let has_attn_kv = !mgpu.workers.is_empty() && !mgpu.workers[0].attn_kv_caches.is_empty();
+            if has_attn_kv {
+                if let Some(legacy_kv) = self.legacy_kv_caches.as_ref() {
+                    use crate::config::LayerType;
+                    // Build attn_i → kv_i mapping. legacy_kv_caches is indexed by
+                    // attention-layer order (kv_idx in compile_prefill); attn_kv_caches
+                    // is indexed by attention-layer occurrence in cfg.layers.
+                    let attn_to_kv: Vec<usize> = self
+                        .config
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.layer_type == LayerType::Attention)
+                        .enumerate()
+                        .map(|(_attn_i, (_layer_i, _))| _attn_i)
+                        .collect();
+                    mgpu.broadcast_prefill_kv_to_workers(
+                        legacy_kv,
+                        &attn_to_kv,
+                        self.config.num_kv_heads,
+                        self.config.head_dim,
+                        self.config.max_seq_len,
+                        total,
+                    )
+                    .map_err(ModelError::Hip)?;
+                }
+            }
+        }
         self.activations.logits.copy_to_host(&mut logits)?;
         Ok(logits)
     }

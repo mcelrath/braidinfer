@@ -311,4 +311,97 @@ impl MultiGpuContext {
         ];
         func.launch((1, 1, 1), (1, 1, 1), 0, stream, &mut args)
     }
+
+    /// Broadcast prefill K/V from GPU 0's `legacy_kv_caches` to each worker's
+    /// `attn_kv_caches` (fixes braidinfer-sew). Multi-GPU prefill writes K/V
+    /// only to GPU 0's flat-KV cache; the head-parallel decode path reads
+    /// per-GPU local `attn_kv_caches`, leaving positions 0..prefill_len-1
+    /// uninitialized → garbage attention output. This copies the prefill
+    /// slice to every worker after prefill completes (cheap: nkh×prefill_len×hd
+    /// floats per (layer, worker)).
+    ///
+    /// Uses hipMemcpyPeerAsync (SDMA — doesn't require GPU compute, so it
+    /// runs concurrently with the cooperative moe_worker_kernel on workers).
+    /// Synchronizes via the sync_flag mailbox to avoid hipStreamSynchronize
+    /// deadlocking against the cooperative moe_worker.
+    pub fn broadcast_prefill_kv_to_workers(
+        &self,
+        legacy_kv_caches: &[crate::weights::KvCache],
+        attn_to_kv_idx: &[usize],
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        prefill_len: usize,
+    ) -> HipResult<()> {
+        if prefill_len == 0 || self.num_devices <= 1 {
+            return Ok(());
+        }
+        let head_elems = max_seq_len * head_dim;
+        let copy_bytes = prefill_len * head_dim * std::mem::size_of::<f32>();
+
+        for (attn_i, &kv_i) in attn_to_kv_idx.iter().enumerate() {
+            let src_kv = &legacy_kv_caches[kv_i];
+            for gpu_i in 1..self.num_devices {
+                let worker = &self.workers[gpu_i];
+                let dst_kv = &worker.attn_kv_caches[attn_i];
+                for h in 0..num_kv_heads {
+                    let src_k = unsafe { src_kv.k.as_ptr().add(h * head_elems) };
+                    let dst_k = unsafe { dst_kv.k.as_write_ptr().add(h * head_elems) };
+                    let src_v = unsafe { src_kv.v.as_ptr().add(h * head_elems) };
+                    let dst_v = unsafe { dst_kv.v.as_write_ptr().add(h * head_elems) };
+                    braidinfer_hip::error::check(unsafe {
+                        ffi::hipMemcpyPeerAsync(
+                            dst_k as *mut std::ffi::c_void,
+                            gpu_i as i32,
+                            src_k as *const std::ffi::c_void,
+                            0,
+                            copy_bytes,
+                            worker.compute_stream.raw(),
+                        )
+                    })?;
+                    braidinfer_hip::error::check(unsafe {
+                        ffi::hipMemcpyPeerAsync(
+                            dst_v as *mut std::ffi::c_void,
+                            gpu_i as i32,
+                            src_v as *const std::ffi::c_void,
+                            0,
+                            copy_bytes,
+                            worker.compute_stream.raw(),
+                        )
+                    })?;
+                }
+            }
+        }
+
+        // Synchronize via mailbox: launch set_flag on each worker stream and
+        // CPU-poll. Avoids hipStreamSynchronize, which would deadlock against
+        // the cooperative moe_worker_kernel running on the worker GPU.
+        use std::sync::atomic::Ordering;
+        for gpu_i in 1..self.num_devices {
+            Device::set_current(DeviceId(gpu_i as u32))?;
+            let worker = &self.workers[gpu_i];
+            let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            Self::launch_set_flag(
+                &worker.sync_flag_module,
+                worker.compute_done_flag.as_write_ptr(),
+                next_seq,
+                &worker.compute_stream,
+            )?;
+            let host_ptr = worker.compute_done_flag.host_ptr();
+            let start = std::time::Instant::now();
+            loop {
+                let v = unsafe { std::ptr::read_volatile(host_ptr) };
+                if v >= next_seq { break; }
+                if start.elapsed().as_secs() > 30 {
+                    panic!(
+                        "broadcast_prefill_kv_to_workers timeout gpu={gpu_i} \
+                         seq={next_seq} flag_value={v}"
+                    );
+                }
+                std::hint::spin_loop();
+            }
+        }
+        Device::set_current(DeviceId(0))?;
+        Ok(())
+    }
 }
