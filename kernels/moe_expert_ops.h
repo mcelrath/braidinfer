@@ -5,6 +5,22 @@
 #include <hip/hip_cooperative_groups.h>
 #include "bf16_utils.h"
 #include "quant_consts.h"
+#include "rdna3_reduce.h"
+
+// Runtime dispatch for sub-wave sum reduction. tpg ∈ {1,2,4,8,16}.
+// W==1: input is already the per-thread "sum" (no reduction needed).
+// W∈{2,4,8,16}: dispatch to braidinfer::rdna3::subwave_reduce_sum<W>.
+// Same butterfly pairings as the prior `for (offset=tpg/2; offset>0; offset>>=1)
+// acc += __shfl_down(acc, offset)` loop, so lane-0 result is bit-exact.
+__device__ __forceinline__ float subwave_reduce_dynamic(float v, int tpg) {
+    switch (tpg) {
+        case 16: return braidinfer::rdna3::subwave_reduce_sum<16>(v);
+        case 8:  return braidinfer::rdna3::subwave_reduce_sum<8>(v);
+        case 4:  return braidinfer::rdna3::subwave_reduce_sum<4>(v);
+        case 2:  return braidinfer::rdna3::subwave_reduce_sum<2>(v);
+        default: return v;  // tpg == 1: no reduction
+    }
+}
 
 // Q4 PcG32 GEMV: one row per block in virtual block loop.
 // Thread utilization: tpg (threads-per-group) threads cooperate on each quantization group.
@@ -52,8 +68,7 @@ __device__ inline void coop_gemv_pcg32(
             }
         }
         // Reduce within tpg threads (warp shuffle)
-        for (int offset = tpg / 2; offset > 0; offset >>= 1)
-            acc += __shfl_down(acc, offset);
+        acc = subwave_reduce_dynamic(acc, tpg);
         // lane==0 of each tpg-group stores its partial sum
         if (lane == 0) shared[group_in_block] = acc;
         __syncthreads();
@@ -117,8 +132,7 @@ __device__ inline void coop_gemv_pcg32_fused_gate_up(
                 if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
             }
         }
-        for (int offset = tpg / 2; offset > 0; offset >>= 1)
-            acc += __shfl_down(acc, offset);
+        acc = subwave_reduce_dynamic(acc, tpg);
         if (lane == 0) shared[group_in_block] = acc;
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -179,8 +193,7 @@ __device__ inline void coop_gemv_rnf4(
                 if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
             }
         }
-        for (int offset = tpg / 2; offset > 0; offset >>= 1)
-            acc += __shfl_down(acc, offset);
+        acc = subwave_reduce_dynamic(acc, tpg);
         if (lane == 0) shared[group_in_block] = acc;
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -240,8 +253,7 @@ __device__ inline void coop_gemv_rnf4_fused_gate_up(
                 if (b * 2 + 1 < count) acc += v1 * input[elem_base + b * 2 + 1];
             }
         }
-        for (int offset = tpg / 2; offset > 0; offset >>= 1)
-            acc += __shfl_down(acc, offset);
+        acc = subwave_reduce_dynamic(acc, tpg);
         if (lane == 0) shared[group_in_block] = acc;
         __syncthreads();
         if (threadIdx.x == 0) {

@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include "bf16_utils.h"
+#include "rdna3_reduce.h"
 
 // Matrix-vector multiply: y = W @ x
 // W is [out_dim x in_dim] row-major BF16, x is [in_dim] f32, y is [out_dim] f32.
@@ -130,10 +131,9 @@ extern "C" __global__ void linear_proj_rnf4_g128(
         acc += v0 * sh_input[base] + v1 * sh_input[base + 1];
     }
 
-    // Wave32 reduction within 64-thread sub-group (2 waves)
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down(acc, offset);
-    }
+    // Wave32 reduction within 64-thread sub-group (2 waves) — DPP butterfly,
+    // same lane pairings as the prior __shfl_down loop (bit-exact).
+    acc = braidinfer::rdna3::wave32_reduce_sum(acc);
     float* wave_sums = sh_input + in_dim + sub_row * 2;
     if (sub_tid == 0) wave_sums[0] = acc;
     if (sub_tid == 32) wave_sums[1] = acc;

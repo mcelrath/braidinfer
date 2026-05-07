@@ -5,6 +5,7 @@
 // persistent_worker.hip) compiles uniformly.
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
+#include "rdna3_reduce.h"
 
 // OP_MOE_GATE: Router top-k expert selection from pre-computed scores.
 // Assumes scores already computed via OP_LINEAR_PROJ (hidden @ gate^T → [num_experts]).
@@ -179,8 +180,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                     }
                 }
                 // Wave32 reduction
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    acc += __shfl_down(acc, offset);
+                acc = braidinfer::rdna3::wave32_reduce_sum(acc);
                 extern __shared__ float shared[];
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
@@ -214,8 +214,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                         acc += v0 * input[base + i] + v1 * input[base + i + 1];
                     }
                 }
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    acc += __shfl_down(acc, offset);
+                acc = braidinfer::rdna3::wave32_reduce_sum(acc);
                 extern __shared__ float shared[];
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
@@ -254,8 +253,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                         acc += v0 * input[base + i] + v1 * input[base + i + 1];
                     }
                 }
-                for (int offset = 16; offset > 0; offset >>= 1)
-                    acc += __shfl_down(acc, offset);
+                acc = braidinfer::rdna3::wave32_reduce_sum(acc);
                 extern __shared__ float shared[];
                 if ((tid & 31) == 0) shared[tid >> 5] = acc;
                 __syncthreads();
@@ -296,8 +294,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                     acc += v0 * scratch_act[base + i] + v1 * scratch_act[base + i + 1];
                 }
             }
-            for (int offset = 16; offset > 0; offset >>= 1)
-                acc += __shfl_down(acc, offset);
+            acc = braidinfer::rdna3::wave32_reduce_sum(acc);
             extern __shared__ float shared[];
             if ((tid & 31) == 0) shared[tid >> 5] = acc;
             __syncthreads();

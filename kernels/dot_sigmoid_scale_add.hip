@@ -1,5 +1,6 @@
 #include <hip/hip_runtime.h>
 #include "bf16_utils.h"
+#include "rdna3_reduce.h"
 
 // Fused: scale = sigmoid(dot(bf16_weight, f32_input)), then output[i] += scale * src[i]
 // Eliminates CPU round-trip for shared expert gate weighting.
@@ -22,9 +23,9 @@ extern "C" __global__ void dot_sigmoid_scale_add_bf16_f32(
     for (int i = tid; i < size; i += bs)
         partial += input[i] * bf16_to_f32(weight[i]);
 
-    // Warp-level reduction
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        partial += __shfl_down(partial, offset);
+    // Warp-level reduction (DPP butterfly — same lane pairings as shfl_down,
+    // bit-exact result on lane 0 of each wave).
+    partial = braidinfer::rdna3::wave32_reduce_sum(partial);
 
     // Store warp sums into shared memory
     if (tid % warpSize == 0)

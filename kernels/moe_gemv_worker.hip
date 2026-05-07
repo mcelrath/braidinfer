@@ -8,6 +8,7 @@
 #include "megakernel_common.h"
 #include "moe_expert_ops.h"
 #include "watchdog.h"
+#include "rdna3_reduce.h"
 
 #define MOE_MAX_BATCH 16
 
@@ -48,13 +49,19 @@ __device__ static void lean_gemv_pcg32(
                  + ((float)((byte >> 4) & 0xF) * sc + mn) * input[base + i + 1];
         }
     }
-    for (int o = 16; o > 0; o >>= 1) acc += __shfl_down(acc, o);
+    // Wave32 sum (DPP butterfly — same pairings as the prior shfl_down loop).
+    acc = braidinfer::rdna3::wave32_reduce_sum(acc);
     if ((tid & 31) == 0) shm[tid >> 5] = acc;
     __syncthreads();
-    if (tid < 8) {
-        acc = shm[tid];
-        for (int o = 4; o > 0; o >>= 1) acc += __shfl_down(acc, o);
-        if (tid == 0) output[row] = acc;
+    // 8-warp combine: load shm[0..7] into the first 8 lanes of wave 0 and run
+    // an 8-wide subwave butterfly. Lane-0 result is bit-exact with the prior
+    // `if (tid<8) { ... shfl 4,2,1 ... }` butterfly (same pairings on the
+    // active lanes). DPP needs all source lanes to have valid input, so we
+    // load 0.0f for lanes >= 8.
+    {
+        float v8 = (tid < 8) ? shm[tid] : 0.0f;
+        v8 = braidinfer::rdna3::subwave_reduce_sum<8>(v8);
+        if (tid == 0) output[row] = v8;
     }
     __syncthreads();
 }
