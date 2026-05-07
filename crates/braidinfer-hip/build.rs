@@ -42,7 +42,6 @@ fn main() {
         "peer_copy",
         "persistent_worker",
         "deinterleave",
-        "moe_worker",
         "sync_flag",
     ];
 
@@ -148,10 +147,6 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         kernel_dir.join("megakernel_moe_dispatch.hip").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        kernel_dir.join("moe_worker.hip").display()
     );
     println!(
         "cargo:rerun-if-changed={}",

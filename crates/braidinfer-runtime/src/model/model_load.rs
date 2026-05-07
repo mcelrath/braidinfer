@@ -1106,7 +1106,6 @@ impl Model {
             weight_prefix: prefix.clone(),
             multi_gpu: None,
             distributed_moe: Vec::new(),
-            worker_kernels: Vec::new(),
             moe_p2p: None,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
@@ -1160,14 +1159,6 @@ impl Model {
             }
         };
 
-        // Load worker kernels on each device
-        let mut worker_kernels = Vec::with_capacity(ctx.num_devices);
-        for i in 0..ctx.num_devices {
-            eprintln!("Multi-GPU: loading kernels on GPU {i}");
-            worker_kernels.push(crate::moe_dispatch::WorkerKernels::load(DeviceId(
-                i as u32,
-            ))?);
-        }
         braidinfer_hip::device::Device::set_current(DeviceId(0))?;
 
         // Distribute MoE weights across GPUs
@@ -1222,7 +1213,6 @@ impl Model {
         }
 
         self.distributed_moe = distributed;
-        self.worker_kernels = worker_kernels;
         eprintln!("Multi-GPU: experts distributed across all {num_devices} GPUs");
 
         // Allocate head-parallel attention buffers for all GPUs

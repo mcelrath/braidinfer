@@ -71,7 +71,6 @@ pub struct Model {
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
     // Multi-GPU expert parallel (None for single-GPU)
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
-    pub(crate) worker_kernels: Vec<crate::moe_dispatch::WorkerKernels>,
     // Multi-GPU megakernel programs
     pub(crate) megakernel_multi_gpu_p2p: Option<MegakernelProgram>,
 }

@@ -1,6 +1,5 @@
 //! Multi-GPU context: P2P setup, per-device streams and events for expert parallel dispatch.
 
-use crate::kernel::{DeinterleaveKernel, GqaAttentionKernel, MRoPEKernel, QkNormKernel};
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::Device;
 use braidinfer_hip::memory::DeviceBuffer;
@@ -76,11 +75,6 @@ pub struct GpuWorker {
     pub attn_w_q_gate: Vec<crate::quant::LinearWeight>, // [local_nqh*hd*q_mult, hs] per attn layer
     pub attn_w_k: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
     pub attn_w_v: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
-    // Kernels for kbk attention dispatch on GPUs 1+ (GPU 0 uses persistent worker)
-    pub qk_norm_kernel: QkNormKernel,
-    pub mrope_kernel: MRoPEKernel,
-    pub gqa_kernel: GqaAttentionKernel,
-    pub deinterleave_kernel: DeinterleaveKernel,
 }
 
 /// Multi-GPU context for expert parallel dispatch.
@@ -159,10 +153,6 @@ impl MultiGpuContext {
                 attn_w_q_gate: Vec::new(),
                 attn_w_k: Vec::new(),
                 attn_w_v: Vec::new(),
-                qk_norm_kernel: QkNormKernel::load(device)?,
-                mrope_kernel: MRoPEKernel::load(device)?,
-                gqa_kernel: GqaAttentionKernel::load(device)?,
-                deinterleave_kernel: DeinterleaveKernel::load(device)?,
             });
         }
 
