@@ -9,6 +9,10 @@
 #include "moe_expert_ops.h"
 #include "watchdog.h"
 #include "rdna3_reduce.h"
+#include "rdna3_sync.h"
+
+// Per-TU GridBarrierState: zero-init __device__ static, cache-coherent VRAM.
+__device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 
 #define MOE_MAX_BATCH 16
 
@@ -91,7 +95,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
                 __builtin_amdgcn_s_sleep(1);
             }
         }
-        grid.sync();
+        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
 
         // Watchdog: cooperative exit if force_exit set.
         if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
@@ -132,38 +136,38 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
                 // Gate proj → scratch_gate[0..eis]
                 for (int row = blockIdx.x; row < eis; row += gridDim.x)
                     lean_gemv_pcg32(scratch_gate, gate_up, activation, row, eis, hs);
-                grid.sync();
+                braidinfer::rdna3::atomic_block_barrier(&g_gbs);
                 // Up proj → scratch_up[0..eis]
                 const unsigned char* up_data = gate_up + (long long)eis * gu_rs;
                 for (int row = blockIdx.x; row < eis; row += gridDim.x)
                     lean_gemv_pcg32(scratch_up, up_data, activation, row, eis, hs);
-                grid.sync();
+                braidinfer::rdna3::atomic_block_barrier(&g_gbs);
                 // SiLU: scratch_act[i] = silu(scratch_gate[i]) * scratch_up[i]
                 for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
                     float g = scratch_gate[i];
                     scratch_act[i] = (g / (1.0f + expf(-g))) * scratch_up[i];
                 }
-                grid.sync();
+                braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             } else {
                 // Up proj only → scratch_up[0..eis]
                 for (int row = blockIdx.x; row < eis; row += gridDim.x)
                     lean_gemv_pcg32(scratch_up, gate_up, activation, row, eis, hs);
-                grid.sync();
+                braidinfer::rdna3::atomic_block_barrier(&g_gbs);
                 // ReLU²: scratch_act[i] = relu(scratch_up[i])²
                 for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < eis; i += gridDim.x * blockDim.x) {
                     float x = scratch_up[i]; float r = x > 0.0f ? x : 0.0f; scratch_act[i] = r * r;
                 }
-                grid.sync();
+                braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             }
 
             // Down proj: scratch_gate[0..hs] = down × scratch_act
             for (int row = blockIdx.x; row < hs; row += gridDim.x)
                 lean_gemv_pcg32(scratch_gate, down, scratch_act, row, hs, eis);
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             // Weighted accumulate: output[i] += ew * scratch_gate[i]
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < hs; i += gridDim.x * blockDim.x)
                 output[i] += ew * scratch_gate[i];
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
 
         last_seq = seq;

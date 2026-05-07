@@ -6,6 +6,14 @@
 #include "megakernel_common.h"
 #include "moe_work_queue.h"      // MoeWorkerConfig + MoeExpertEntry types for OP_MOE_FFN_REMOTE
 #include "watchdog.h"
+#include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
+
+// Per-TU GridBarrierState for atomic_block_barrier. Allocated in cache-coherent
+// VRAM by the loader (zero-initialized __device__ static). Replaces grid.sync()
+// system-coverage barrier with ~115-155x faster CTA-arrival barrier.
+// One state suffices: barrier protocol resets counter on each pass via
+// generation flip, no ABA risk for non-overlapping barriers.
+__device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 
 // Include all megakernel op implementations (same as megakernel.hip)
 #include "megakernel_ops.hip"
@@ -61,7 +69,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                 __builtin_amdgcn_s_sleep(1);
             }
         }
-        grid.sync();
+        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         // Clear `exited` — kernel is now actively processing a batch.
         if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
@@ -104,21 +112,21 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         u32 grid_x = inst_grid_x(inst);
 
         if (opcode == OP_BARRIER) {
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         } else if (opcode == OP_MOE_FFN) {
-            op_moe_ffn(inst, grid);
+            op_moe_ffn(inst, grid, &g_gbs);
         } else if (opcode == OP_MOE_FFN_REMOTE) {
-            op_moe_ffn_remote(inst, grid);
+            op_moe_ffn_remote(inst, grid, &g_gbs);
         } else if (opcode == OP_MOE_DISPATCH) {
-            op_moe_dispatch(inst, grid, watchdog);
+            op_moe_dispatch(inst, grid, &g_gbs, watchdog);
         } else if (opcode == OP_MOE_DISPATCH_POST) {
-            op_moe_dispatch_post(inst, grid, watchdog);
+            op_moe_dispatch_post(inst, grid, &g_gbs, watchdog);
         } else if (opcode == OP_LINEAR_PROJ_PCG32) {
             op_linear_proj_pcg32_full(inst, grid_x);
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         } else if (opcode == OP_LINEAR_PROJ_RNF4) {
             op_linear_proj_rnf4_full(inst, grid_x);
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         } else {
             // Virtual block loop
             for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
@@ -164,7 +172,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     default: break;
                 }
             }
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
 
         } // end for (pc = 0; pc < num_inst; pc++)

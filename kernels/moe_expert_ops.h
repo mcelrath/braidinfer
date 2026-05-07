@@ -1,11 +1,14 @@
 // Cooperative expert FFN operations shared between megakernel (GPU 0) and
 // persistent worker kernels (GPUs 1..N-1).
-// All functions are cooperative — all blocks participate, grid.sync() at end.
+// All functions are cooperative — all blocks participate, atomic_block_barrier
+// (or grid.sync() if gbs==nullptr) at end. Callers pass GridBarrierState* from
+// their TU's __device__ static.
 #pragma once
 #include <hip/hip_cooperative_groups.h>
 #include "bf16_utils.h"
 #include "quant_consts.h"
 #include "rdna3_reduce.h"
+#include "rdna3_sync.h"
 
 // Runtime dispatch for sub-wave sum reduction. tpg ∈ {1,2,4,8,16}.
 // W==1: input is already the per-thread "sum" (no reduction needed).
@@ -32,7 +35,8 @@ __device__ __forceinline__ float subwave_reduce_dynamic(float v, int tpg) {
 __device__ inline void coop_gemv_pcg32(
     float* output, const unsigned char* weight, const float* input,
     int out_dim, int in_dim,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     const int group_size = 32;
     const int group_bytes = 20;
@@ -80,7 +84,7 @@ __device__ inline void coop_gemv_pcg32(
         }
         __syncthreads();
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 // Fused gate+up GEMV: compute gate_proj and up_proj simultaneously using all blocks.
@@ -91,7 +95,8 @@ __device__ inline void coop_gemv_pcg32_fused_gate_up(
     float* gate_out, const unsigned char* gate_weight,
     float* up_out,   const unsigned char* up_weight,
     const float* input, int out_dim, int in_dim,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     const int group_size = 32;
     const int group_bytes = 20;
@@ -142,7 +147,7 @@ __device__ inline void coop_gemv_pcg32_fused_gate_up(
         }
         __syncthreads();
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 // Q8 RNF4G128 GEMV: one row per block in virtual block loop.
@@ -156,7 +161,8 @@ __device__ inline void coop_gemv_pcg32_fused_gate_up(
 __device__ inline void coop_gemv_rnf4(
     float* output, const unsigned char* weight, const float* input,
     int out_dim, int in_dim,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     const int group_size = 128;
     const int group_bytes = 132;
@@ -203,7 +209,7 @@ __device__ inline void coop_gemv_rnf4(
         }
         __syncthreads();
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 // Fused gate+up RNF4 GEMV: same split as coop_gemv_pcg32_fused_gate_up.
@@ -212,7 +218,8 @@ __device__ inline void coop_gemv_rnf4_fused_gate_up(
     float* gate_out, const unsigned char* gate_weight,
     float* up_out,   const unsigned char* up_weight,
     const float* input, int out_dim, int in_dim,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     const int group_size = 128;
     const int group_bytes = 132;
@@ -263,24 +270,26 @@ __device__ inline void coop_gemv_rnf4_fused_gate_up(
         }
         __syncthreads();
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 __device__ inline void coop_silu_mul(
     float* output, const float* gate, const float* up, int size,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size;
          i += gridDim.x * blockDim.x) {
         float g = gate[i];
         output[i] = (g / (1.0f + expf(-g))) * up[i];
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 __device__ inline void coop_relu_squared(
     float* output, const float* input, int size,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size;
          i += gridDim.x * blockDim.x) {
@@ -288,34 +297,37 @@ __device__ inline void coop_relu_squared(
         float r = x > 0.0f ? x : 0.0f;
         output[i] = r * r;
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 __device__ inline void coop_weighted_acc(
     float* output, const float* input, float weight, int size,
-    cooperative_groups::grid_group& grid
+    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs
 ) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size;
          i += gridDim.x * blockDim.x) {
         output[i] += weight * input[i];
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 __device__ inline void coop_zero(float* buf, int size,
-                                  cooperative_groups::grid_group& grid) {
+                                  cooperative_groups::grid_group& grid,
+                                  braidinfer::rdna3::GridBarrierState* gbs) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < size;
          i += gridDim.x * blockDim.x) {
         buf[i] = 0.0f;
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 __device__ inline void coop_copy(float* dst, const float* src, int count,
-                                  cooperative_groups::grid_group& grid) {
+                                  cooperative_groups::grid_group& grid,
+                                  braidinfer::rdna3::GridBarrierState* gbs) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count;
          i += gridDim.x * blockDim.x) {
         dst[i] = src[i];
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }

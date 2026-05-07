@@ -2,11 +2,16 @@
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
 #include "watchdog.h"
+#include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
 
 // Megakernel: persistent cooperative kernel that executes a program of instructions.
 // Launched once with max cooperative blocks (384 on gfx1100 with 256 threads).
 // Each instruction specifies an operation and how many "virtual blocks" it needs.
 // Physical blocks loop over virtual blocks: for (vb = blockIdx.x; vb < grid_x; vb += gridDim.x)
+
+// Per-TU GridBarrierState: zero-init __device__ static, cache-coherent VRAM.
+// One state suffices — the barrier protocol resets the counter via generation flip.
+__device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
@@ -213,15 +218,15 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         u32 grid_x = inst_grid_x(inst);
 
         if (opcode == OP_HALT) break;
-        if (opcode == OP_BARRIER) { grid.sync(); continue; }
+        if (opcode == OP_BARRIER) { braidinfer::rdna3::atomic_block_barrier(&g_gbs); continue; }
 
         // OP_MOE_FFN manages its own blocks and grid.sync() internally
         if (opcode == OP_MOE_FFN) {
-            op_moe_ffn(inst, grid);
-            // op_moe_ffn does its own grid.sync(); skip outer sync
+            op_moe_ffn(inst, grid, &g_gbs);
+            // op_moe_ffn does its own barrier; skip outer sync
             if (dump_base) {
                 dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
-                grid.sync();
+                braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             }
             continue;
         }
@@ -230,28 +235,28 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         // (loads input tile once per block, processes all assigned rows per tile).
         if (opcode == OP_LINEAR_PROJ_PCG32) {
             op_linear_proj_pcg32_full(inst, grid_x);
-            grid.sync();
-            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); grid.sync(); }
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); braidinfer::rdna3::atomic_block_barrier(&g_gbs); }
             continue;
         }
         if (opcode == OP_LINEAR_PROJ_RNF4) {
             op_linear_proj_rnf4_full(inst, grid_x);
-            grid.sync();
-            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); grid.sync(); }
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); braidinfer::rdna3::atomic_block_barrier(&g_gbs); }
             continue;
         }
 
         // OP_MOE_DISPATCH: PRE stage — zero GPU 0's output slot + run GPU 0 local experts.
         // Manages its own grid.sync() internally.
         if (opcode == OP_MOE_DISPATCH) {
-            op_moe_dispatch(inst, grid, watchdog);
+            op_moe_dispatch(inst, grid, &g_gbs, watchdog);
             continue;
         }
 
         // OP_MOE_DISPATCH_POST: sum output_slots across all GPUs into final_output.
         // Fired AFTER CPU wait_ack on workers + after PRE batch completes.
         if (opcode == OP_MOE_DISPATCH_POST) {
-            op_moe_dispatch_post(inst, grid, watchdog);
+            op_moe_dispatch_post(inst, grid, &g_gbs, watchdog);
             continue;
         }
 
@@ -304,11 +309,11 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         }
 
         // Dump output when enabled (no grid.sync here; caller inserts BarrierInst after dump groups)
-        grid.sync();
+        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
 
         if (dump_base) {
             dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
     }
 

@@ -114,7 +114,8 @@ __device__ __attribute__((noinline)) void op_moe_gate(const u64* inst, u32 vbloc
 // Weight format: PcG32Q4 (group_size=32, 20 bytes/group). Other formats use fallback path.
 // grid_x should be max(eis, hs) to give enough virtual blocks for all matmuls.
 template<typename GridGroup>
-__device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup& grid) {
+__device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup& grid,
+                                                       braidinfer::rdna3::GridBarrierState* gbs) {
     const MoeFfnInst* i = (const MoeFfnInst*)inst;
     const int* expert_ids = i->expert_ids;
     const float* expert_weights = i->expert_weights;
@@ -143,7 +144,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
     for (int i = blockIdx.x * blockDim.x + tid; i < hs; i += gridDim.x * blockDim.x) {
         output[i] = 0.0f;
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 
     // PcG32Q4 matmul helper (inline): row_data points to group data, dot with input
     // Returns dot product for one output row, reduced to thread 0.
@@ -192,7 +193,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                     scratch_gate[row] = total;
                 }
             }
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(gbs);
 
             // Up proj: next eis rows
             for (int row = (int)blockIdx.x; row < eis; row += (int)gridDim.x) {
@@ -224,7 +225,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                     scratch_up[row] = total;
                 }
             }
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(gbs);
 
             // SiLU(gate) * up → scratch_act
             for (int i = (int)blockIdx.x * (int)blockDim.x + tid; i < eis; i += (int)gridDim.x * (int)blockDim.x) {
@@ -263,7 +264,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                     scratch_up[row] = total;
                 }
             }
-            grid.sync();
+            braidinfer::rdna3::atomic_block_barrier(gbs);
 
             // relu²: output[i] = relu(x)^2
             for (int i = (int)blockIdx.x * (int)blockDim.x + tid; i < eis; i += (int)gridDim.x * (int)blockDim.x) {
@@ -272,7 +273,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                 scratch_act[i] = r * r;
             }
         }
-        grid.sync();
+        braidinfer::rdna3::atomic_block_barrier(gbs);
 
         // Down proj: expert_down @ scratch_act → scratch_out [hs]
         for (int row = (int)blockIdx.x; row < hs; row += (int)gridDim.x) {
@@ -304,13 +305,13 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
                 scratch_out[row] = total;
             }
         }
-        grid.sync();
+        braidinfer::rdna3::atomic_block_barrier(gbs);
 
         // Weighted accumulate: output += w * scratch_out
         for (int i = (int)blockIdx.x * (int)blockDim.x + tid; i < hs; i += (int)gridDim.x * (int)blockDim.x) {
             output[i] += w * scratch_out[i];
         }
-        grid.sync();
+        braidinfer::rdna3::atomic_block_barrier(gbs);
     }
 }
 
@@ -325,7 +326,8 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
 // preserving its proven correctness. Replaces the single-token inner loop of
 // moe_worker_kernel — that whole kernel becomes redundant once Phase 4 lands.
 template<typename GridGroup>
-__device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, GridGroup& grid) {
+__device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, GridGroup& grid,
+                                                              braidinfer::rdna3::GridBarrierState* gbs) {
     const MoeFfnRemoteInst* i = (const MoeFfnRemoteInst*)inst;
     const float* act_p2p = i->activation_p2p;
     float* out_p2p = i->output_slot_p2p;
@@ -348,10 +350,10 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     long long gate_up_row_stride = (long long)cfg->gate_up_row_stride;
 
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
-    coop_copy(la, act_p2p, gupd, grid);
+    coop_copy(la, act_p2p, gupd, grid, gbs);
 
     // 2. Zero accumulator.
-    coop_zero(lo, gupd, grid);
+    coop_zero(lo, gupd, grid, gbs);
 
     // 3. Per-expert compute. Skip experts not on this GPU (gate_up_ptr == 0).
     for (int j = 0; j < k; j++) {
@@ -367,28 +369,28 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
         if (is_rnf4) {
             if (has_gate_proj) {
                 const unsigned char* up_data = gu + (long long)eis * gate_up_row_stride;
-                coop_gemv_rnf4_fused_gate_up(sg, gu, su, up_data, la, eis, gupd, grid);
-                coop_silu_mul(sa, sg, su, eis, grid);
+                coop_gemv_rnf4_fused_gate_up(sg, gu, su, up_data, la, eis, gupd, grid, gbs);
+                coop_silu_mul(sa, sg, su, eis, grid, gbs);
             } else {
-                coop_gemv_rnf4(su, gu, la, eis, gupd, grid);
-                coop_relu_squared(sa, su, eis, grid);
+                coop_gemv_rnf4(su, gu, la, eis, gupd, grid, gbs);
+                coop_relu_squared(sa, su, eis, grid, gbs);
             }
             // down: eis -> gupd. scratch_gate reused as down output.
-            coop_gemv_rnf4(sg, dn, sa, gupd, eis, grid);
+            coop_gemv_rnf4(sg, dn, sa, gupd, eis, grid, gbs);
         } else {
             if (has_gate_proj) {
                 const unsigned char* up_data = gu + (long long)eis * gate_up_row_stride;
-                coop_gemv_pcg32_fused_gate_up(sg, gu, su, up_data, la, eis, gupd, grid);
-                coop_silu_mul(sa, sg, su, eis, grid);
+                coop_gemv_pcg32_fused_gate_up(sg, gu, su, up_data, la, eis, gupd, grid, gbs);
+                coop_silu_mul(sa, sg, su, eis, grid, gbs);
             } else {
-                coop_gemv_pcg32(su, gu, la, eis, gupd, grid);
-                coop_relu_squared(sa, su, eis, grid);
+                coop_gemv_pcg32(su, gu, la, eis, gupd, grid, gbs);
+                coop_relu_squared(sa, su, eis, grid, gbs);
             }
-            coop_gemv_pcg32(sg, dn, sa, gupd, eis, grid);
+            coop_gemv_pcg32(sg, dn, sa, gupd, eis, grid, gbs);
         }
 
         // Weighted accumulate: lo[i] += w * sg[i] for gupd elements.
-        coop_weighted_acc(lo, sg, w, gupd, grid);
+        coop_weighted_acc(lo, sg, w, gupd, grid, gbs);
     }
 
     // 4. P2P-write accumulated output to GPU 0's output_slot.
@@ -396,6 +398,6 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     // VRAM before the cross-GPU copy, and the coop_copy below issues writes
     // visible across PCIe by the time grid.sync() returns at copy end.
     __threadfence();
-    coop_copy(out_p2p, lo, gupd, grid);
+    coop_copy(out_p2p, lo, gupd, grid, gbs);
 }
 

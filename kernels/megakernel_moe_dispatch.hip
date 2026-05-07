@@ -40,8 +40,11 @@
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
 #include "watchdog.h"
+#include "rdna3_sync.h"
 
-__device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid, WatchdogState* watchdog = nullptr) {
+__device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid,
+                                                            braidinfer::rdna3::GridBarrierState* gbs,
+                                                            WatchdogState* watchdog = nullptr) {
     (void)watchdog;
     const MoeDispatchInst* i = (const MoeDispatchInst*)inst;
     float* output_slots = (float*)(uintptr_t)i->output_slots;
@@ -71,7 +74,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
     // Do NOT zero final_output — the sum loop overwrites it completely.
     // Do NOT zero worker output slots — those were P2P-written by workers and the
     // CPU has waited for their ack before firing this op.
-    coop_zero(gpu0_output, gupd, grid);
+    coop_zero(gpu0_output, gupd, grid, gbs);
 
     // (Worker-trigger section removed — CPU now drives OP_MOE_FFN_REMOTE on workers
     //  before this op fires, and CPU waits for worker ack before this batch dispatch.)
@@ -98,14 +101,14 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
                     (long long)eis * gpu0_config->gate_up_row_stride;
                 coop_gemv_rnf4_fused_gate_up(scratch_gate, gate_up_data,
                                                scratch_up, up_data,
-                                               activation, eis, gupd, grid);
-                coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
+                                               activation, eis, gupd, grid, gbs);
+                coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid, gbs);
             } else {
-                coop_gemv_rnf4(scratch_up, gate_up_data, activation, eis, gupd, grid);
-                coop_relu_squared(scratch_act, scratch_up, eis, grid);
+                coop_gemv_rnf4(scratch_up, gate_up_data, activation, eis, gupd, grid, gbs);
+                coop_relu_squared(scratch_act, scratch_up, eis, grid, gbs);
             }
             // down: eis → gupd
-            coop_gemv_rnf4(scratch_gate, down_data, scratch_act, gupd, eis, grid);
+            coop_gemv_rnf4(scratch_gate, down_data, scratch_act, gupd, eis, grid, gbs);
         } else {
             // PCG32Q4 (default)
             if (has_gate) {
@@ -113,17 +116,17 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
                     (long long)eis * gpu0_config->gate_up_row_stride;
                 coop_gemv_pcg32_fused_gate_up(scratch_gate, gate_up_data,
                                                scratch_up, up_data,
-                                               activation, eis, gupd, grid);
-                coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid);
+                                               activation, eis, gupd, grid, gbs);
+                coop_silu_mul(scratch_act, scratch_gate, scratch_up, eis, grid, gbs);
             } else {
-                coop_gemv_pcg32(scratch_up, gate_up_data, activation, eis, gupd, grid);
-                coop_relu_squared(scratch_act, scratch_up, eis, grid);
+                coop_gemv_pcg32(scratch_up, gate_up_data, activation, eis, gupd, grid, gbs);
+                coop_relu_squared(scratch_act, scratch_up, eis, grid, gbs);
             }
             // down: eis → gupd
-            coop_gemv_pcg32(scratch_gate, down_data, scratch_act, gupd, eis, grid);
+            coop_gemv_pcg32(scratch_gate, down_data, scratch_act, gupd, eis, grid, gbs);
         }
 
-        coop_weighted_acc(gpu0_output, scratch_gate, ew, gupd, grid);
+        coop_weighted_acc(gpu0_output, scratch_gate, ew, gupd, grid, gbs);
     }
 
     // PRE complete: GPU 0 has zeroed slot 0 and accumulated its local experts there.
@@ -133,7 +136,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
     (void)total_gpus;
 
     __threadfence();
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
 
 // OP_MOE_DISPATCH_POST (opcode 45): sum output_slots across all GPUs into final_output.
@@ -149,7 +152,9 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
 //   inst[7]  = (..   << 32) | hs    (slot stride; gupd <= hs)
 //   inst[15] = total_gpus
 //   inst[16] = gate_up_in_dim
-__device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, cooperative_groups::grid_group& grid, WatchdogState* watchdog = nullptr) {
+__device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, cooperative_groups::grid_group& grid,
+                                                                  braidinfer::rdna3::GridBarrierState* gbs,
+                                                                  WatchdogState* watchdog = nullptr) {
     (void)watchdog;
     const MoeDispatchInst* i = (const MoeDispatchInst*)inst;
     float* output_slots = (float*)(uintptr_t)i->output_slots;
@@ -168,5 +173,5 @@ __device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, 
         }
         final_output[idx] = sum;
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
 }
