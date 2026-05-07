@@ -12,26 +12,50 @@ pub use memory::{
 };
 pub use stream::Stream;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use braidinfer_core::types::DeviceId;
+use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Set to true while the persistent cooperative kernel holds all GPU 0 CUs.
-/// Any hipMemcpy / hipLaunchKernel on GPU 0 while this is set will deadlock.
-static PERSISTENT_WORKER_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Bitmask of GPUs that currently have a persistent cooperative worker holding
+/// all CUs. Bit `i` set => GPU `i` is busy. Any hipMemcpy / hipLaunchKernel on
+/// the same GPU as a set bit would deadlock; cross-GPU operations are fine.
+/// Supports up to 32 GPUs.
+static PERSISTENT_WORKER_ACTIVE_MASK: AtomicU32 = AtomicU32::new(0);
 
-pub fn set_persistent_worker_active(active: bool) {
-    PERSISTENT_WORKER_ACTIVE.store(active, Ordering::SeqCst);
+pub fn set_persistent_worker_active(device: DeviceId, active: bool) {
+    let bit = 1u32 << device.0;
+    if active {
+        PERSISTENT_WORKER_ACTIVE_MASK.fetch_or(bit, Ordering::SeqCst);
+    } else {
+        PERSISTENT_WORKER_ACTIVE_MASK.fetch_and(!bit, Ordering::SeqCst);
+    }
 }
 
-/// Panics if called while the persistent worker is active.
+fn is_persistent_worker_active(device: DeviceId) -> bool {
+    let bit = 1u32 << device.0;
+    PERSISTENT_WORKER_ACTIVE_MASK.load(Ordering::SeqCst) & bit != 0
+}
+
+/// Panics if a persistent worker is active on the given GPU.
 /// Use this guard in any HIP function that would deadlock (memcpy, kernel launch, etc.).
 #[track_caller]
-pub fn assert_no_persistent_worker(op: &str) {
-    if PERSISTENT_WORKER_ACTIVE.load(Ordering::SeqCst) {
+pub fn assert_no_persistent_worker_on(op: &str, device: DeviceId) {
+    if is_persistent_worker_active(device) {
         panic!(
-            "HIP operation '{}' called while persistent worker holds all GPU 0 CUs — \
+            "HIP operation '{}' called on GPU {} while persistent worker holds all its CUs — \
              this would deadlock. Use GPU-side printf() for debugging during inference. \
              See CLAUDE.md 'What Causes Hangs in Persistent Mode'.",
-            op
+            op, device.0
         );
+    }
+}
+
+/// Panics if a persistent worker is active on the *current* GPU. Used for free
+/// functions like `memcpy_d2h`/`memcpy_h2d` that don't carry a `DeviceId`.
+#[track_caller]
+pub fn assert_no_persistent_worker_current(op: &str) {
+    let mut current: i32 = 0;
+    unsafe { ffi::hipGetDevice(&mut current) };
+    if current >= 0 {
+        assert_no_persistent_worker_on(op, DeviceId(current as u32));
     }
 }

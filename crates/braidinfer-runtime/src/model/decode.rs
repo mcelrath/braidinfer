@@ -121,8 +121,17 @@ impl Model {
         token_id: u32,
         position: u32,
     ) -> Result<Vec<f32>, ModelError> {
-        // Lazy-init: compile P2P megakernel + launch workers on ALL GPUs
-        if self.persistent_workers.is_none() {
+        // Lazy-init: compile P2P megakernel + launch workers on ALL GPUs.
+        // For MoE multi-GPU, ensure_moe_workers_started already populated GPUs 1..N
+        // during prefill, but GPU 0's persistent worker is launched here on the first
+        // decode call (after prefill kbk launches on GPU 0 are complete). For non-MoE
+        // multi-GPU, persistent_workers is None until this point.
+        let needs_gpu0 = self
+            .persistent_workers
+            .as_ref()
+            .map(|d| !d.has_worker(0))
+            .unwrap_or(true);
+        if needs_gpu0 {
             self.init_multi_gpu_persistent()?;
         }
 

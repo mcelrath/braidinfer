@@ -216,7 +216,7 @@ impl PersistentDispatch {
             "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared, bpsm_raw={bpsm_raw} bpsm={bpsm} num_cus={num_cus})",
             device.0
         );
-        braidinfer_hip::set_persistent_worker_active(true);
+        braidinfer_hip::set_persistent_worker_active(device, true);
         let slot = device.0 as usize;
         if slot >= self.workers.len() {
             self.workers.resize_with(slot + 1, || None);
@@ -453,13 +453,14 @@ impl Drop for PersistentDispatch {
         for (idx, slot) in self.workers.iter_mut().enumerate() {
             if worker_done[idx] {
                 if let Some(mut worker) = slot.take() {
+                    let device = worker.device;
                     unsafe {
                         std::mem::ManuallyDrop::drop(&mut worker);
                     }
+                    braidinfer_hip::set_persistent_worker_active(device, false);
                 }
             }
         }
-        braidinfer_hip::set_persistent_worker_active(false);
 
         // On panic, terminate the process AFTER the best-effort shutdown above. This
         // matches the original behavior (panic = abort) but ensures we attempted the
