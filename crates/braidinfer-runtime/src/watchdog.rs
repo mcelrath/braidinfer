@@ -117,6 +117,23 @@ impl WatchdogThread {
             let _ = h.join();
         }
     }
+
+    /// Set `force_exit=1` on every registered WatchdogState. Used by the Drop
+    /// path as a fallback when normal shutdown_flag polling stalls — workers
+    /// will see force_exit at their next watchdog_poll_and_check call, which
+    /// is reached at every top-level instruction boundary, much more
+    /// frequently than the outer-loop shutdown poll.
+    pub fn force_exit_all(&self) {
+        let entries = self.entries.lock().unwrap();
+        for entry in entries.iter() {
+            unsafe {
+                std::ptr::write_volatile(
+                    &mut (*entry.state.host_ptr()).force_exit as *mut u32,
+                    1u32,
+                );
+            }
+        }
+    }
 }
 
 impl Drop for WatchdogThread {

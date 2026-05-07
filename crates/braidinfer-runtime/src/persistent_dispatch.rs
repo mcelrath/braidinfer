@@ -409,45 +409,117 @@ impl Drop for PersistentDispatch {
     /// write_volatile on host_ptr). The kernel writes `done=1` before returning so we can
     /// poll without any HIP API.
     fn drop(&mut self) {
-        // ALWAYS request shutdown — even on panic. The kernel polls the shutdown flag at
-        // the top of its outer instruction loop. If at least one block reaches the poll
-        // (and writes seq_num=0xFFFFFFFFu), surviving blocks see the sentinel and exit
-        // via the next grid.sync. If blocks are split between "done" and "stuck inside
-        // an instruction", grid.sync deadlocks — that's the case we time out on.
+        // Two-phase shutdown to handle multi-GPU MoE q8 (and similar slow-batch
+        // workloads) where the worker may not see `shutdown` for several hundred
+        // ms because it's mid-batch. The previous single-phase 5s deadline was
+        // (a) absolute (cascading leaks if any one worker took >5s) and (b) too
+        // short for q8 4-GPU MoE.
         //
-        // Use a short timeout on panic (we're already aborting; the user is waiting) and
-        // a longer one on clean exit. Either way, leak (don't free) on timeout to avoid
-        // hipFree deadlocks against a still-running kernel.
+        // Phase 1 (1s clean / 200ms panic): cooperative shutdown via the
+        // shutdown flag. Worker checks at outer-loop boundaries, so this is
+        // sufficient when workers are between batches.
+        //
+        // Phase 2 (up to total_timeout): if any worker hasn't acked by the
+        // phase-1 deadline, fire watchdog `force_exit` on every registered
+        // WatchdogState. Workers honor force_exit at their next
+        // watchdog_poll_and_check call (at every instruction boundary inside
+        // every kernel that includes watchdog.h), which is much more frequent
+        // than the outer-loop shutdown check. Continue polling until the total
+        // timeout. After that, leak (don't free) to avoid hipFree deadlocking
+        // against a still-running cooperative kernel.
+        //
+        // All polling is PARALLEL across workers (single shared spin loop) so
+        // one slow worker can't cascade-starve the others' deadline.
         let panicking = std::thread::panicking();
-        let shutdown_timeout = if panicking {
+        let phase1_timeout = if panicking {
+            std::time::Duration::from_millis(200)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        let total_timeout = if panicking {
             std::time::Duration::from_secs(2)
         } else {
-            std::time::Duration::from_secs(5)
+            std::time::Duration::from_secs(30)
         };
 
         self.request_shutdown();
-        let shutdown_deadline = std::time::Instant::now() + shutdown_timeout;
+        let start = std::time::Instant::now();
+        let phase1_deadline = start + phase1_timeout;
+        let total_deadline = start + total_timeout;
+
         let mut worker_done = vec![false; self.workers.len()];
+        // Empty slots count as already-done.
         for (idx, slot) in self.workers.iter().enumerate() {
-            let Some(worker) = slot.as_ref() else { worker_done[idx] = true; continue; };
-            let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
-            loop {
-                let done = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done)) };
-                if done != 0 {
-                    worker_done[idx] = true;
-                    break;
+            if slot.is_none() {
+                worker_done[idx] = true;
+            }
+        }
+
+        let poll_round = |worker_done: &mut [bool], workers: &[Option<std::mem::ManuallyDrop<GpuWorker>>]| -> bool {
+            let mut all = true;
+            for (idx, slot) in workers.iter().enumerate() {
+                if worker_done[idx] {
+                    continue;
                 }
-                if std::time::Instant::now() > shutdown_deadline {
+                if let Some(worker) = slot.as_ref() {
+                    let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
+                    let done = unsafe {
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done))
+                    };
+                    if done != 0 {
+                        worker_done[idx] = true;
+                    } else {
+                        all = false;
+                    }
+                } else {
+                    worker_done[idx] = true;
+                }
+            }
+            all
+        };
+
+        // Phase 1: cooperative shutdown polling.
+        while !poll_round(&mut worker_done, &self.workers)
+            && std::time::Instant::now() < phase1_deadline
+        {
+            std::hint::spin_loop();
+        }
+
+        // Phase 2: if any worker hasn't acked, escalate to watchdog force_exit.
+        if !worker_done.iter().all(|&d| d) {
+            let stuck: Vec<u32> = self
+                .workers
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !worker_done[*idx])
+                .filter_map(|(_, slot)| slot.as_ref().map(|w| w.device.0))
+                .collect();
+            eprintln!(
+                "braidinfer: shutdown polling slow on GPUs {:?} after {:?}; firing watchdog force_exit fallback (total deadline {:?})",
+                stuck, phase1_timeout, total_timeout
+            );
+            self.watchdog.force_exit_all();
+
+            while !poll_round(&mut worker_done, &self.workers)
+                && std::time::Instant::now() < total_deadline
+            {
+                std::hint::spin_loop();
+            }
+        }
+
+        // Log any workers that still didn't exit (will be leaked).
+        for (idx, slot) in self.workers.iter().enumerate() {
+            if !worker_done[idx] {
+                if let Some(worker) = slot.as_ref() {
                     eprintln!(
                         "braidinfer: persistent worker shutdown timeout on GPU {} (leaking) {}",
                         worker.device.0,
                         if panicking { "[panic]" } else { "" }
                     );
-                    break;
                 }
-                std::hint::spin_loop();
             }
         }
+
         // Free HIP resources only for workers that confirmed exit. Timed-out
         // workers are intentionally leaked to avoid deadlocking on HIP cleanup.
         for (idx, slot) in self.workers.iter_mut().enumerate() {
