@@ -1,0 +1,46 @@
+Reserved GPUs: 5 (free VRAM: 24534MiB)
+Device: AMD Radeon RX 7900 XTX   warpSize=32   gcnArch=gfx1100
+LDS per block: 65536   shared mem per block: 65536
+
+=== LDS bank-conflict scan (cyc/access, median across 64 blocks) ===
+  pattern                           cyc/acc   
+  --------------------------------  ----------
+  packed_1d  shared[256]            3.996     
+  packed_2d  [8][32]                17.854    
+  packed_2d  [8][64]  (bank-hit)    17.834    
+  packed_2d  [8][128] (bank-hit)    18.026    
+  padded_2d  [8][32+1]              2.672     
+  padded_2d  [8][64+1]              2.673     
+  padded_2d  [8][128+1]             2.672     
+  tpg=2   gpb=128 (1 thread reads)  2.150     
+  tpg=4   gpb=64  (1 thread reads)  1.122     
+  tpg=8   gpb=32  (1 thread reads)  1.844     
+  tpg=16  gpb=16  (1 thread reads)  2.015     
+
+=== Global→LDS staging width (regular load + ds_write) ===
+  IN_DIM=2048  LDS_TILE=1024  N_WEIGHT_ROW=32
+  variant                           cyc/elem      rel_speed   
+  --------------------------------  ------------  ------------
+  b32  scalar load + ds_write_b32   0.099         1.00x       
+  b64  vec2 load + ds_write_b64     0.055         1.78x
+  b128 vec4 load + ds_write_b128    0.033         2.96x
+
+=== atomicAdd contention (f32 HW vs bf16 CAS-emulated) ===
+  n_slots       f32_cas cyc   f32_hw cyc    bf16 cyc      bf16/hw   
+  ------------  ------------  ------------  ------------  ----------
+  1 (hot)       68801.98      72.31         78.36         1.08      x
+  4             4860.51       18.08         44.57         2.46      x
+  16            1205.58       9.69          26.35         2.72      x
+  64            332.92        8.80          25.84         2.94      x
+  all-distinct  23.61         1.80          25.84         14.38     x
+
+=== Cache invalidation cost (cyc / inv, lane-0 issue, 1-block) ===
+  variant                           cyc/inv     
+  --------------------------------  ------------
+  baseline                          0.883         (loop-overhead floor)
+  buffer_gl0_inv                    2.086       
+  buffer_gl1_inv                    4.180       
+  buffer_gl0_inv + buffer_gl1_inv   4.238       
+  (gpu clock 2304 MHz; 1 cycle ≈ 0.43 ns)
+
+Done.
