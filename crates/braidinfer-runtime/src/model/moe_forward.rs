@@ -563,15 +563,19 @@ impl Model {
         // path uses host-mapped expert_ids/weights too — see model_load).
         // Simpler approach: write per-token id/weight into act.moe_expert_ids
         // and dispatch immediately, since the worker reads them once.
-        let (output_slots_raw, num_gpus, num_workers, activation_staging_ptr) = {
+        let (output_slots_raw, num_gpus, num_workers, activation_staging_typed) = {
             let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
+            // `activation_staging_typed` carries a `tags::UncachedDeviceLocal`
+            // tag — the type system rejects misuse with hw-atomic ops.
+            // Pilot site for epic braidinfer-77r.5.
             (
                 p2p.output_slots.as_mut_ptr(),
                 p2p.num_gpus,
                 p2p.workers.len(),
-                p2p.activation_staging.as_mut_ptr(),
+                p2p.activation_staging_typed(),
             )
         };
+        let activation_staging_ptr: *mut f32 = activation_staging_typed.as_raw();
         // Copy all_activations to activation_staging (GPU 0 VRAM/UC).
         // Safe: GPU 0 has no persistent worker yet during prefill.
         {

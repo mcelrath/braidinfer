@@ -1,3 +1,4 @@
+pub mod dev_ptr;
 pub mod device;
 pub mod error;
 pub mod ffi;
@@ -5,6 +6,7 @@ pub mod memory;
 pub mod module;
 pub mod stream;
 
+pub use dev_ptr::{DevPtr, tags};
 pub use device::Device;
 pub use error::{HipError, HipResult};
 pub use memory::{

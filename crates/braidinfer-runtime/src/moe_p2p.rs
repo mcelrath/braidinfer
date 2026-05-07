@@ -21,6 +21,7 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
+use braidinfer_hip::dev_ptr::{DevPtr, tags::UncachedDeviceLocal};
 use braidinfer_hip::device::Device;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 
@@ -264,6 +265,19 @@ impl MoeP2pContext {
             num_gpus,
             hidden_size,
         })
+    }
+
+    /// Typed pointer to the GPU 0 activation staging buffer.
+    ///
+    /// Tagged [`UncachedDeviceLocal`]: the buffer is allocated MTYPE=UC for
+    /// cross-GPU coherence (see `init` for rationale). Hardware atomics
+    /// (`unsafeAtomicAdd`) are **undefined** through this pointer; the type
+    /// system rejects passing it to a function that expects
+    /// `CoarseGrainedLocal`.
+    ///
+    /// Pilot of typed-pointer migration (epic braidinfer-77r.5).
+    pub fn activation_staging_typed(&self) -> DevPtr<f32, UncachedDeviceLocal> {
+        self.activation_staging.as_typed_uncached()
     }
 
     /// Build an OP_MOE_FFN_REMOTE instruction for one token on `worker_idx`

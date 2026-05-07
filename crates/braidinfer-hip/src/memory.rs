@@ -1,7 +1,24 @@
+use crate::dev_ptr::{DevPtr, tags};
 use crate::{HipResult, error, ffi};
 use braidinfer_core::types::DeviceId;
 use std::marker::PhantomData;
 use std::ptr;
+
+/// Allocation class for a [`DeviceBuffer`]. Recorded at construction so that
+/// typed-pointer accessors (`as_typed_local` / `as_typed_uncached` /
+/// `as_typed_peer`) can assert the buffer was allocated with the right
+/// constructor. The fast path is monomorphized — there is no runtime check
+/// in the generic accessor; the tag is only used by the unsafe `from_raw`
+/// inside each typed accessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocClass {
+    /// `hipMalloc` — coarse-grained, device-local.
+    CoarseGrainedLocal,
+    /// `hipExtMallocWithFlags(HIP_DEVICE_MALLOC_UNCACHED)` — MTYPE=UC.
+    UncachedDeviceLocal,
+    /// portable / peer-visible coarse-grained.
+    CoarseGrainedPeer,
+}
 
 /// GPU device memory buffer. Encodes device ID to prevent cross-device misuse.
 /// Deliberately NOT Send/Sync — GPU pointers are device-local.
@@ -9,6 +26,7 @@ pub struct DeviceBuffer<T> {
     ptr: *mut T,
     len: usize,
     device: DeviceId,
+    alloc_class: AllocClass,
     _marker: PhantomData<*mut T>, // !Send, !Sync
 }
 
@@ -22,6 +40,7 @@ impl<T> DeviceBuffer<T> {
             ptr: ptr.cast(),
             len,
             device,
+            alloc_class: AllocClass::CoarseGrainedLocal,
             _marker: PhantomData,
         })
     }
@@ -45,8 +64,65 @@ impl<T> DeviceBuffer<T> {
             ptr: ptr.cast(),
             len,
             device,
+            alloc_class: AllocClass::UncachedDeviceLocal,
             _marker: PhantomData,
         })
+    }
+
+    /// Typed-pointer accessor for coarse-grained device-local buffers
+    /// (i.e. allocated by [`DeviceBuffer::alloc`]). Hardware atomics
+    /// (`unsafeAtomicAdd`) are safe through this pointer.
+    ///
+    /// # Panics
+    /// Panics if this buffer was not allocated by `alloc` (debug + release).
+    /// This is a programming error, not a runtime condition.
+    #[track_caller]
+    pub fn as_typed_local(&self) -> DevPtr<T, tags::CoarseGrainedLocal> {
+        assert_eq!(
+            self.alloc_class,
+            AllocClass::CoarseGrainedLocal,
+            "DeviceBuffer::as_typed_local() called on a buffer allocated with {:?} \
+             — use the matching as_typed_* accessor",
+            self.alloc_class
+        );
+        unsafe { DevPtr::from_raw(self.ptr, self.len) }
+    }
+
+    /// Typed-pointer accessor for MTYPE=UC buffers (allocated by
+    /// [`DeviceBuffer::alloc_uncached`]). Hardware atomics are **undefined**
+    /// through this pointer; the type system prevents passing it to a
+    /// function that requires `CoarseGrainedLocal`.
+    ///
+    /// # Panics
+    /// Panics if this buffer was not allocated by `alloc_uncached`.
+    #[track_caller]
+    pub fn as_typed_uncached(&self) -> DevPtr<T, tags::UncachedDeviceLocal> {
+        assert_eq!(
+            self.alloc_class,
+            AllocClass::UncachedDeviceLocal,
+            "DeviceBuffer::as_typed_uncached() called on a buffer allocated with {:?} \
+             — use the matching as_typed_* accessor",
+            self.alloc_class
+        );
+        unsafe { DevPtr::from_raw(self.ptr, self.len) }
+    }
+
+    /// Typed-pointer accessor for portable / peer-visible coarse-grained
+    /// buffers. Hardware atomics through this pointer complete in the
+    /// owning GPU's local cache and may NOT be visible to peers.
+    ///
+    /// # Panics
+    /// Panics if this buffer was not allocated as portable/peer-visible.
+    #[track_caller]
+    pub fn as_typed_peer(&self) -> DevPtr<T, tags::CoarseGrainedPeer> {
+        assert_eq!(
+            self.alloc_class,
+            AllocClass::CoarseGrainedPeer,
+            "DeviceBuffer::as_typed_peer() called on a buffer allocated with {:?} \
+             — use the matching as_typed_* accessor",
+            self.alloc_class
+        );
+        unsafe { DevPtr::from_raw(self.ptr, self.len) }
     }
 
     pub fn as_ptr(&self) -> *const T {
@@ -312,6 +388,14 @@ impl<T> MappedHostBuffer<T> {
     /// Returns *mut T from &self for GPU instruction packing (see DeviceBuffer::as_write_ptr).
     pub fn as_write_ptr(&self) -> *mut T {
         self.device_ptr
+    }
+
+    /// Typed-pointer view of the GPU-side address. Tagged
+    /// [`tags::HostMapped`]: hardware atomics through this pointer are
+    /// **undefined** (host fine-grained memory does not implement device
+    /// atomics).
+    pub fn as_typed_host_mapped(&self) -> DevPtr<T, tags::HostMapped> {
+        unsafe { DevPtr::from_raw(self.device_ptr, self.len) }
     }
 
     pub fn len(&self) -> usize {
