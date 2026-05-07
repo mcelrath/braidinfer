@@ -241,10 +241,17 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             continue;
         }
 
-        // OP_MOE_DISPATCH: GPU-initiated MoE — triggers workers, polls acks, sums results.
+        // OP_MOE_DISPATCH: PRE stage — zero GPU 0's output slot + run GPU 0 local experts.
         // Manages its own grid.sync() internally.
         if (opcode == OP_MOE_DISPATCH) {
             op_moe_dispatch(inst, grid, watchdog);
+            continue;
+        }
+
+        // OP_MOE_DISPATCH_POST: sum output_slots across all GPUs into final_output.
+        // Fired AFTER CPU wait_ack on workers + after PRE batch completes.
+        if (opcode == OP_MOE_DISPATCH_POST) {
+            op_moe_dispatch_post(inst, grid, watchdog);
             continue;
         }
 

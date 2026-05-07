@@ -111,6 +111,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             op_moe_ffn_remote(inst, grid);
         } else if (opcode == OP_MOE_DISPATCH) {
             op_moe_dispatch(inst, grid, watchdog);
+        } else if (opcode == OP_MOE_DISPATCH_POST) {
+            op_moe_dispatch_post(inst, grid, watchdog);
         } else if (opcode == OP_LINEAR_PROJ_PCG32) {
             op_linear_proj_pcg32_full(inst, grid_x);
             grid.sync();

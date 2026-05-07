@@ -16,7 +16,7 @@ use super::{
     OP_DEINTERLEAVE, OP_EMBEDDING, OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4, OP_FFN_GATE_UP,
     OP_FFN_GATE_UP_RNF4, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT, OP_KV_QUANTIZE,
     OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_LM_HEAD, OP_MAMBA2_CONV1D,
-    OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH, OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE,
+    OP_MAMBA2_NORM_GATED, OP_MOE_DISPATCH, OP_MOE_DISPATCH_POST, OP_MOE_FFN, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE,
     OP_QK_NORM, OP_RELU_SQ, OP_RESIDUAL_ADD, OP_RMSNORM, OP_RMSNORM_GATE, OP_RMSNORM_WX,
     OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
@@ -1616,36 +1616,79 @@ impl MegakernelProgram {
             }.into_inst();
         }
 
-        // Pass 2: rebuild instruction stream to insert fc2+shared_expert+residual_add after
-        // OP_MOE_DISPATCH for Nemotron-H layers with fc2_latent_proj.
+        // Pass 2: rebuild instruction stream to insert OP_MOE_DISPATCH_POST after every
+        // OP_MOE_DISPATCH, plus fc2+shared_expert+residual_add after POST for Nemotron-H
+        // layers with fc2_latent_proj.
+        //
+        // Splitting OP_MOE_DISPATCH (PRE: zero+GPU0 experts) and OP_MOE_DISPATCH_POST (sum)
+        // allows the CPU to fire workers concurrently with GPU 0's PRE batch, then wait for
+        // both before firing POST. Restores ~25% of decode throughput on multi-GPU MoE.
+        // (epic braidinfer-0hu Phase 7)
         //
         // compile_moe_ffn_multi_gpu emits NO post-barrier instructions for fc2_latent_proj layers
         // (emit_post_barrier=false), so there are no stale instructions to skip — only insertions.
-        // The old_to_new map tracks index shift due to inserted instructions for attn-boundary remap.
-        let has_fc2_layers: bool = prog
-            .barrier_layer_map
-            .iter()
-            .any(|&(_, li)| {
-                model.moe_weights[li]
-                    .as_ref()
-                    .map(|m| m.fc2_latent_proj.is_some())
-                    .unwrap_or(false)
-            });
-
-        if has_fc2_layers {
+        // The inserted_before map tracks index shift due to inserted instructions for attn-boundary remap.
+        {
             let mut new_instructions =
-                Vec::with_capacity(prog.instructions.len() + 2 * barrier_map.len());
+                Vec::with_capacity(prog.instructions.len() + 8 * barrier_map.len());
             // inserted_before[i] = number of instructions inserted before old index i
             let mut inserted_before: Vec<usize> = vec![0usize; prog.instructions.len() + 1];
             for (i, inst) in prog.instructions.iter().enumerate() {
                 inserted_before[i] = new_instructions.len() - i;
                 new_instructions.push(inst.clone());
-                // After OP_MOE_DISPATCH: insert fc2_latent_proj + shared_expert + residual_add
+                // After OP_MOE_DISPATCH: insert OP_MOE_DISPATCH_POST (sum), then for
+                // Nemotron-H, fc2_latent_proj + shared_expert + residual_add.
                 if let Some(&layer_idx) = barrier_map.get(&i) {
                     let moe = model.moe_weights[layer_idx].as_ref().unwrap();
                     let dist = model.distributed_moe[layer_idx].as_ref();
                     let gupd = dist.map(|d| d.gate_up_in_dim).unwrap_or(hs);
-                    let cfg = &model.config;
+                    let num_workers = p2p.workers.len();
+                    let num_gpus = p2p.num_gpus;
+                    let (k, eis) = match &cfg.layers[layer_idx].ffn_type {
+                        crate::model::FfnType::MoE {
+                            num_active,
+                            expert_intermediate_size,
+                            ..
+                        } => (*num_active, *expert_intermediate_size),
+                        _ => unreachable!(),
+                    };
+                    let has_gate = if moe.has_gate_proj { 1u64 } else { 0u64 };
+                    let final_output_ptr = if moe.fc2_latent_proj.is_some() {
+                        act.moe_latent.as_ptr() as u64
+                    } else {
+                        act.ffn_down_stage.as_ptr() as u64
+                    };
+                    let activation_ptr = if moe.fc1_latent_proj.is_some() {
+                        act.moe_latent.as_ptr() as u64
+                    } else {
+                        act.normed.as_ptr() as u64
+                    };
+
+                    // OP_MOE_DISPATCH_POST: sums output_slots[0..num_gpus * hs] into final_output[0..gupd].
+                    // Reuses MoeDispatchInst layout — same fields as OP_MOE_DISPATCH for ABI consistency.
+                    new_instructions.push(MoeDispatchInst {
+                        opcode_gridx: OP_MOE_DISPATCH_POST as u64,
+                        work_queue: p2p.work_queue.device_ptr() as u64,
+                        output_slots: p2p.output_slots.as_ptr() as u64,
+                        final_output: final_output_ptr,
+                        expert_ids: act.moe_expert_ids.as_ptr() as u64,
+                        expert_weights: act.moe_expert_weights.as_ptr() as u64,
+                        seq_counter: p2p.seq_counter.device_ptr() as u64,
+                        num_workers_hs: ((num_workers as u64) << 32) | (hs as u64),
+                        layer_k: ((layer_idx as u64) << 32) | (k as u64),
+                        eis_gate: ((eis as u64) << 32) | has_gate,
+                        activation: activation_ptr,
+                        layer_config_ptrs: p2p.gpu0_layer_config_ptrs.as_ptr() as u64,
+                        scratch_gate: p2p.gpu0_scratch_gate.as_ptr() as u64,
+                        scratch_up: p2p.gpu0_scratch_up.as_ptr() as u64,
+                        scratch_act: p2p.gpu0_scratch_act.as_ptr() as u64,
+                        num_gpus: num_gpus as u64,
+                        gate_up_in_dim: gupd as u64,
+                        _pad: 0,
+                    }.into_inst());
+
+                    // The rest of the post-MoE insertions only apply to Nemotron-H
+                    // (fc2_latent_proj-bearing layers).
                     if let Some(ref fc2) = moe.fc2_latent_proj {
                         // fc2: moe_latent(gupd) → ffn_down_stage(hs)
                         {

@@ -318,30 +318,51 @@ impl Model {
                 break;
             }
 
-            // MoE boundary: dispatch OP_MOE_FFN_REMOTE on workers BEFORE the GPU 0
-            // batch containing this OP_MOE_DISPATCH fires. Flush the GPU 0 segment
-            // up to (but not including) op_moe_dispatch first; the worker dispatch
-            // races with op_moe_dispatch's GPU 0 expert compute (workers should
-            // finish before GPU 0's sum if there's enough parallelism; if not, the
-            // CPU wait_ack on workers gates GPU 0's op_moe_dispatch firing).
+            // MoE boundary (Phase 7 split): OP_MOE_DISPATCH at index i is the PRE op
+            // (zero output_slots[0] + GPU 0 local experts). The instruction at i+1
+            // is OP_MOE_DISPATCH_POST (sum across slots). To restore parallelism
+            // between GPU 0's local experts and worker remote experts:
+            //   1. Flush GPU 0 segment [seg_start..=i] including PRE — fire async.
+            //   2. Concurrently fire OP_MOE_FFN_REMOTE on each worker (async).
+            //   3. Wait for ALL acks (GPU 0 PRE + workers).
+            //   4. Resume segment at i+1 (OP_MOE_DISPATCH_POST runs as part of the
+            //      next batch, which starts only after wait_ack guarantees workers
+            //      have written output_slots).
             if moe_i < moe_boundaries.len() && i == moe_boundaries[moe_i].0 {
                 let layer_idx = moe_boundaries[moe_i].1;
-                // Flush GPU 0 segment [seg_start..i) — everything BEFORE op_moe_dispatch.
-                if seg_start < i || !pending_gather.is_empty() {
-                    let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
-                    if pending_gather.is_empty() {
-                        self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, mk_insts);
+                // Build combined GPU 0 segment [seg_start..=i] (including PRE).
+                let seg_end_inclusive = i + 1;
+                let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end_inclusive];
+                let combined: Vec<crate::megakernel::Instruction> = if pending_gather.is_empty() {
+                    mk_insts.to_vec()
+                } else {
+                    let mut c = std::mem::take(&mut pending_gather);
+                    c.extend_from_slice(mk_insts);
+                    c
+                };
+                // Fire GPU 0 batch async (PRE included). All chunks except the LAST
+                // use synchronous dispatch_batch (waits per-chunk); the last chunk
+                // uses dispatch_batch_fire so PRE runs concurrently with workers.
+                let dispatch = self.persistent_workers.as_mut().unwrap();
+                let mut chunks = combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS).peekable();
+                let mut gpu0_seq: Option<u32> = None;
+                while let Some(chunk) = chunks.next() {
+                    if chunks.peek().is_none() {
+                        // Last chunk — fire async, hold seq for wait_ack below.
+                        gpu0_seq = Some(dispatch.dispatch_batch_fire(0, chunk));
                     } else {
-                        let mut combined = std::mem::take(&mut pending_gather);
-                        combined.extend_from_slice(mk_insts);
-                        self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, &combined);
+                        dispatch.dispatch_batch(0, chunk);
                     }
                 }
-                // Dispatch OP_MOE_FFN_REMOTE on each worker for this single token.
-                self.dispatch_moe_workers_decode(layer_idx)?;
-                // Resume segment AT op_moe_dispatch (it stays in the GPU 0 stream).
-                seg_start = i;
+                // Concurrently dispatch OP_MOE_FFN_REMOTE on each worker (async).
+                // dispatch_moe_workers_decode_async returns the per-worker seqs;
+                // we then wait_ack for all (workers + GPU 0 PRE).
+                self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
+                // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
+                seg_start = i + 1;
                 moe_i += 1;
+                i = seg_start;
+                continue;
             }
 
             // Head-parallel attention boundary: flush segment, dispatch parallel QKV+GQA
@@ -825,12 +846,14 @@ impl Model {
     }
 
     /// CPU-orchestrated MoE dispatch on worker GPUs (1..N-1) for one decode token.
-    /// Reads parameters from the upcoming OP_MOE_DISPATCH instruction at index
-    /// `moe_inst_idx` (located via barrier_layer_map). Dispatches OP_MOE_FFN_REMOTE
-    /// on each worker's persistent_worker mailbox and waits for ack on each.
-    /// After return, GPU 0 can fire its batch containing op_moe_dispatch (which
-    /// will sum output_slots across all GPUs).
-    fn dispatch_moe_workers_decode(&mut self, layer_idx: usize) -> Result<(), ModelError> {
+    ///
+    /// Phase 7 split: this is called AFTER GPU 0's PRE batch (containing
+    /// OP_MOE_DISPATCH) has been fired async. We dispatch OP_MOE_FFN_REMOTE
+    /// on each worker async, then wait for both worker acks AND `gpu0_seq` ack
+    /// before returning. After return, the caller fires the next GPU 0 batch
+    /// starting with OP_MOE_DISPATCH_POST (sum), which runs only after this
+    /// wait completes — guaranteeing all output_slots are populated and visible.
+    fn dispatch_moe_workers_decode_async(&mut self, layer_idx: usize, gpu0_seq: Option<u32>) -> Result<(), ModelError> {
         // Find the OP_MOE_DISPATCH instruction for this layer.
         let mk = self.megakernel_multi_gpu_p2p.as_ref().unwrap();
         let moe_inst_idx = mk.barrier_layer_map.iter()
@@ -883,15 +906,19 @@ impl Model {
         let _ = num_gpus;
 
         let dispatch = self.persistent_workers.as_mut().unwrap();
-        let mut seq_per_gpu: Vec<(usize, u32)> = Vec::with_capacity(num_workers);
+        let mut seq_per_gpu: Vec<(usize, u32)> = Vec::with_capacity(num_workers + 1);
         for (gpu_idx, inst) in &insts {
             // dispatch_batch_fire takes a slice; one OP_MOE_FFN_REMOTE per worker.
             let single = std::slice::from_ref(inst);
             let seq = dispatch.dispatch_batch_fire(*gpu_idx, single);
             seq_per_gpu.push((*gpu_idx, seq));
         }
-        // Wait for every worker's ack before returning — the GPU 0 batch with
-        // op_moe_dispatch fires next and reads output_slots from worker outputs.
+        // Wait for every worker's ack AND for GPU 0's PRE batch ack (if provided).
+        // The next GPU 0 batch — starting with OP_MOE_DISPATCH_POST — fires only
+        // after this wait completes, ensuring output_slots are fully populated.
+        if let Some(seq) = gpu0_seq {
+            seq_per_gpu.push((0, seq));
+        }
         for (gpu_idx, seq) in seq_per_gpu {
             dispatch.wait_ack(gpu_idx, seq);
         }
