@@ -138,6 +138,7 @@ impl Model {
     /// persistent cooperative kernel. Safe to call during prefill (no cooperative kernel
     /// running on GPU 0 yet, so hipMalloc is allowed).
     pub(super) fn ensure_moe_workers_started(&mut self) -> Result<(), ModelError> {
+        use crate::persistent_dispatch::PersistentDispatch;
         if self.moe_p2p.is_some() {
             return Ok(());
         }
@@ -152,6 +153,7 @@ impl Model {
             return Ok(());
         }
         let moe_worker_shared_mem = 1024u32 * 4 + 256;
+        let shared_mem_persistent = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
         let hs = self.config.hidden_size;
         let max_eis = self
             .config
@@ -187,6 +189,20 @@ impl Model {
             .map_err(ModelError::Hip)?;
         self.moe_p2p = Some(p2p);
         self.megakernel_multi_gpu_p2p = Some(mk_p2p);
+
+        // Launch persistent_worker on each WORKER GPU (1..N-1) — but NOT GPU 0.
+        // GPU 0 still runs kbk launches during prefill (kernels.linear_proj.forward
+        // in moe_ffn_forward / compile_prefill_segment paths). Its persistent
+        // worker is added on first decode call by `init_multi_gpu_persistent`.
+        let dispatch = PersistentDispatch::init_with_total(
+            num_gpus,
+            &worker_devices,
+            shared_mem_persistent,
+            hs,
+        )
+        .map_err(ModelError::Hip)?;
+        // Hand to model state.
+        self.persistent_workers = Some(dispatch);
         eprintln!("  MoE P2P dispatch initialized: {} worker GPUs (prefill path)", num_gpus - 1);
         Ok(())
     }
@@ -198,36 +214,32 @@ impl Model {
         let moe_worker_shared_mem = 1024u32 * 4 + 256;
         let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
         let hs = self.config.hidden_size;
-        let max_eis = self
-            .config
-            .layers
-            .iter()
-            .filter_map(|l| match &l.ffn_type {
-                crate::model::FfnType::MoE { expert_intermediate_size, .. } => {
-                    Some(*expert_intermediate_size)
-                }
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-        // Init GPU-native P2P MoE dispatch BEFORE launching the persistent cooperative
-        // worker on GPU 0. hipMalloc on GPU 0 deadlocks if the cooperative kernel is
-        // already running. Launch persistent_worker LAST.
+        // For MoE multi-GPU: workers (GPUs 1..N-1) were already launched by
+        // ensure_moe_workers_started during prefill. Add GPU 0 now (after
+        // prefill kbk completes — its persistent kernel can hold all CUs).
+        // For non-MoE multi-GPU or single-GPU: nothing exists yet, allocate
+        // a fresh PersistentDispatch with the required slots and launch only
+        // GPU 0 (workers don't need persistent_worker — there's no MoE).
         self.ensure_moe_workers_started()?;
 
-        // Launch persistent cooperative worker on GPU 0 LAST.
-        let all_devices: Vec<_> = (0..num_gpus)
-            .map(|i| braidinfer_core::types::DeviceId(i as u32))
-            .collect();
-        let dispatch = PersistentDispatch::init_multi_gpu(
-            self.device,
-            &all_devices,
-            shared_mem,
-            hs,
-            max_eis,
-        )
-        .map_err(ModelError::Hip)?;
-        self.persistent_workers = Some(dispatch);
+        if self.persistent_workers.is_none() {
+            // Non-MoE or single-GPU path: create a single-slot dispatcher.
+            let total = num_gpus.max(1);
+            let dispatch = PersistentDispatch::init_with_total(
+                total,
+                &[self.device],
+                shared_mem,
+                hs,
+            ).map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
+        } else {
+            // MoE path: workers already up; add GPU 0.
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            if !dispatch.has_worker(0) {
+                dispatch.add_device(self.device, shared_mem)
+                    .map_err(ModelError::Hip)?;
+            }
+        }
         Ok(())
     }
 
@@ -271,6 +283,11 @@ impl Model {
         } else {
             Vec::new()
         };
+        // MoE dispatch boundaries: instruction indices of OP_MOE_DISPATCH (post-Pass-2 remap).
+        // For each, CPU dispatches OP_MOE_FFN_REMOTE on every worker BEFORE firing the
+        // GPU 0 batch containing the OP_MOE_DISPATCH instruction.
+        let moe_boundaries: Vec<(usize, usize)> = self.megakernel_multi_gpu_p2p
+            .as_ref().unwrap().barrier_layer_map.clone();
         let n_inst = self
             .megakernel_multi_gpu_p2p
             .as_ref()
@@ -279,6 +296,7 @@ impl Model {
             .len();
 
         let mut attn_i = 0usize;
+        let mut moe_i = 0usize;
         let mut i = 0usize;
         let mut seg_start = 0usize; // start of current segment in mk.instructions
         // Gather instructions returned from dispatch_head_parallel_attention, prepended
@@ -289,6 +307,32 @@ impl Model {
             let opcode = self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[i].words[0] as u32 as u64;
             if opcode == OP_HALT as u64 {
                 break;
+            }
+
+            // MoE boundary: dispatch OP_MOE_FFN_REMOTE on workers BEFORE the GPU 0
+            // batch containing this OP_MOE_DISPATCH fires. Flush the GPU 0 segment
+            // up to (but not including) op_moe_dispatch first; the worker dispatch
+            // races with op_moe_dispatch's GPU 0 expert compute (workers should
+            // finish before GPU 0's sum if there's enough parallelism; if not, the
+            // CPU wait_ack on workers gates GPU 0's op_moe_dispatch firing).
+            if moe_i < moe_boundaries.len() && i == moe_boundaries[moe_i].0 {
+                let layer_idx = moe_boundaries[moe_i].1;
+                // Flush GPU 0 segment [seg_start..i) — everything BEFORE op_moe_dispatch.
+                if seg_start < i || !pending_gather.is_empty() {
+                    let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
+                    if pending_gather.is_empty() {
+                        self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, mk_insts);
+                    } else {
+                        let mut combined = std::mem::take(&mut pending_gather);
+                        combined.extend_from_slice(mk_insts);
+                        self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, &combined);
+                    }
+                }
+                // Dispatch OP_MOE_FFN_REMOTE on each worker for this single token.
+                self.dispatch_moe_workers_decode(layer_idx)?;
+                // Resume segment AT op_moe_dispatch (it stays in the GPU 0 stream).
+                seg_start = i;
+                moe_i += 1;
             }
 
             // Head-parallel attention boundary: flush segment, dispatch parallel QKV+GQA
@@ -379,13 +423,8 @@ impl Model {
             self.trace.as_mut().unwrap().write_checkpoint("top10_logits", &top10);
         }
 
-        // After first token: print worker timing report if MOE_TIMING env var is set.
-        if self.seq_len == 0 && self.moe_timing {
-            if let Some(ref p2p) = self.moe_p2p {
-                p2p.print_timing_report(2500.0); // 7900XTX ~2500 MHz
-            }
-        }
-
+        // (MoE worker timing report removed with the unified-worker cutover —
+        //  per-op timing is now visible via DISPATCH_RTT in persistent_dispatch.)
         self.seq_len = position + 1;
         Ok(logits)
     }
@@ -704,74 +743,28 @@ impl Model {
                 }
             }
 
-            // GPU 0: dispatch via persistent worker. GPUs 1+: kbk on compute_stream.
-            if gpu_i == 0 {
-                assert!(
-                    batch.len() <= MAX_BATCH_INSTRUCTIONS,
-                    "attn batch overflow gpu=0 len={}",
-                    batch.len()
-                );
-                let seq = self
-                    .persistent_workers
-                    .as_mut()
-                    .unwrap()
-                    .dispatch_batch_fire(0, &batch);
-                seq_nums.push((0, seq));
-            } else {
-                self.dispatch_attn_kbk(gpu_i, attn_i, position, &batch)
-                    .map_err(ModelError::Hip)?;
-            }
+            // All GPUs (including workers 1..N-1) dispatch via persistent_worker
+            // mailbox. The unified-worker design eliminates the kbk fallback.
+            assert!(
+                batch.len() <= MAX_BATCH_INSTRUCTIONS,
+                "attn batch overflow gpu={} len={}",
+                gpu_i, batch.len()
+            );
+            let seq = self
+                .persistent_workers
+                .as_mut()
+                .unwrap()
+                .dispatch_batch_fire(gpu_i, &batch);
+            seq_nums.push((gpu_i, seq));
         }
 
-        // Wait for GPU 0 persistent worker to complete
+        // Wait for all GPUs' persistent workers to complete attention.
         for &(gpu_i, seq) in &seq_nums {
             self.persistent_workers
                 .as_ref()
                 .unwrap()
                 .wait_ack(gpu_i, seq);
         }
-        // Wait for GPUs 1+ compute_streams to complete via host-mapped flag poll.
-        // CANNOT use compute_stream.synchronize(): the moe_worker_kernel runs as a
-        // cooperative kernel on these GPUs, and HIP's hipStreamSynchronize internally
-        // calls SyncAllStreams which waits for the cooperative kernel to complete →
-        // deadlock. Instead, enqueue a tiny <<<1,1>>> set_flag_kernel after the kbk
-        // attn work; CPU polls the host-mapped flag without any HIP API.
-        for gpu_i in 1..num_gpus {
-            use std::sync::atomic::Ordering;
-            braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(
-                gpu_i as u32,
-            ))
-            .map_err(ModelError::Hip)?;
-            let worker = &self.multi_gpu.as_ref().unwrap().workers[gpu_i];
-            let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
-            crate::multi_gpu::MultiGpuContext::launch_set_flag(
-                &worker.sync_flag_module,
-                worker.compute_done_flag.as_write_ptr(),
-                next_seq,
-                &worker.compute_stream,
-            )
-            .map_err(ModelError::Hip)?;
-            let host_ptr = worker.compute_done_flag.host_ptr();
-            let start = std::time::Instant::now();
-            loop {
-                let v = unsafe { std::ptr::read_volatile(host_ptr) };
-                if v >= next_seq {
-                    break;
-                }
-                if crate::persistent_dispatch::shutdown_requested() {
-                    panic!("compute_done flag wait interrupted: SIGINT/SIGTERM (gpu={gpu_i}, seq={next_seq})");
-                }
-                if start.elapsed().as_secs() > 30 {
-                    panic!(
-                        "compute_done flag wait timeout gpu={gpu_i} seq={next_seq} flag_value={v}"
-                    );
-                }
-                std::hint::spin_loop();
-            }
-        }
-        // Reset to GPU 0 for gather
-        braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(0))
-            .map_err(ModelError::Hip)?;
 
         // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.
         // MUST NOT use peer_copy_async (kernel launch on GPU 0) while persistent cooperative
@@ -822,119 +815,76 @@ impl Model {
         Ok(gather_batch)
     }
 
-    /// Dispatch a batch of attention instructions via kbk on GPU i's compute_stream.
-    /// Used for GPUs 1+ where persistent cooperative workers cannot coexist with MoE kbk.
-    fn dispatch_attn_kbk(
-        &mut self,
-        gpu_i: usize,
-        _attn_i: usize,
-        _position: u32,
-        batch: &[crate::megakernel::Instruction],
-    ) -> braidinfer_hip::HipResult<()> {
-        use crate::megakernel::{OP_D2D_COPY, OP_DEINTERLEAVE, OP_GQA_ATTN, OP_MROPE, OP_QK_NORM};
-        use crate::megakernel::{OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4};
-        use crate::moe_dispatch::dispatch_proj;
-        use crate::quant::WeightFormat;
-        use braidinfer_core::types::DeviceId;
-        use braidinfer_hip::device::Device;
+    /// CPU-orchestrated MoE dispatch on worker GPUs (1..N-1) for one decode token.
+    /// Reads parameters from the upcoming OP_MOE_DISPATCH instruction at index
+    /// `moe_inst_idx` (located via barrier_layer_map). Dispatches OP_MOE_FFN_REMOTE
+    /// on each worker's persistent_worker mailbox and waits for ack on each.
+    /// After return, GPU 0 can fire its batch containing op_moe_dispatch (which
+    /// will sum output_slots across all GPUs).
+    fn dispatch_moe_workers_decode(&mut self, layer_idx: usize) -> Result<(), ModelError> {
+        // Find the OP_MOE_DISPATCH instruction for this layer.
+        let mk = self.megakernel_multi_gpu_p2p.as_ref().unwrap();
+        let moe_inst_idx = mk.barrier_layer_map.iter()
+            .find(|&&(_, l)| l == layer_idx)
+            .map(|&(i, _)| i)
+            .expect("layer_idx not in barrier_layer_map");
+        let inst = &mk.instructions[moe_inst_idx];
 
-        Device::set_current(DeviceId(gpu_i as u32))?;
+        // Decode MoeDispatchInst layout (see kernels/megakernel_moe_dispatch.hip header).
+        // words[2]=output_slots, [4]=expert_ids, [5]=expert_weights, [7]=(num_workers<<32)|hs,
+        // [8]=(layer_idx<<32)|k, [9]=(eis<<32)|has_gate, [10]=activation, [16]=gate_up_in_dim
+        let output_slots = inst.words[2] as *mut f32;
+        let expert_ids = inst.words[4] as *const i32;
+        let expert_weights = inst.words[5] as *const f32;
+        let hs = (inst.words[7] & 0xFFFFFFFF) as usize;
+        let k = (inst.words[8] & 0xFFFFFFFF) as usize;
+        let eis = (inst.words[9] >> 32) as usize;
+        let has_gate = (inst.words[9] & 0xFFFFFFFF) != 0;
+        let activation = inst.words[10] as *const f32;
+        let mut gupd = inst.words[16] as usize;
+        if gupd == 0 { gupd = hs; }
+        // Standard MoE has gate→silu_mul; non-gated path uses relu_squared.
+        let relu_sq = !has_gate;
 
-        let stream = unsafe {
-            &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].compute_stream
-                as *const braidinfer_hip::stream::Stream)
-        };
+        let p2p = self.moe_p2p.as_ref().expect("moe_p2p must be initialized for MoE decode");
+        let num_gpus = p2p.num_gpus;
+        let num_workers = p2p.workers.len();
+        // Token index 0 for decode (single-token); per-worker output slot:
+        //   output_slots + (0 * num_gpus + gpu_id) * hs == output_slots + gpu_id * hs
+        // Worker GPU id = worker_idx + 1 (workers are GPUs 1..N-1).
 
-        for inst in batch {
-            let opcode = inst.words[0] as u32;
-            match opcode {
-                OP_D2D_COPY => {
-                    let dst = inst.words[1] as *mut u8;
-                    let src = inst.words[2] as *const u8;
-                    // Recover original element count from inst word 3 (set_int(3, n))
-                    let n_elems = inst.words[3] as usize;
-                    let size = n_elems * 4; // f32 bytes
-                    crate::multi_gpu::MultiGpuContext::peer_copy_async(
-                        dst,
-                        src,
-                        size,
-                        &self.multi_gpu.as_ref().unwrap().workers[gpu_i].peer_copy_module,
-                        stream,
-                    )?;
-                }
-                OP_LINEAR_PROJ | OP_LINEAR_PROJ_PCG32 | OP_LINEAR_PROJ_RNF4 => {
-                    let out = inst.words[1] as *mut f32;
-                    let w_bytes = inst.words[2] as *const u8;
-                    let inp = inst.words[3] as *const f32;
-                    let out_dim = inst.words[4] as u32;
-                    let in_dim = inst.words[5] as u32;
-                    let fmt = match opcode {
-                        OP_LINEAR_PROJ_PCG32 => WeightFormat::PcG32Q4,
-                        OP_LINEAR_PROJ_RNF4 => WeightFormat::Rnf4G128,
-                        _ => WeightFormat::Bf16,
-                    };
-                    let kernel = &self.worker_kernels[gpu_i].linear_proj;
-                    dispatch_proj(kernel, out, w_bytes, inp, out_dim, in_dim, fmt, stream)?;
-                }
-                OP_DEINTERLEAVE => {
-                    let dst_q = inst.words[1] as *mut f32;
-                    let dst_gate = inst.words[2] as *mut f32;
-                    let src = inst.words[3] as *const f32;
-                    let num_heads = inst.words[4] as u32;
-                    let head_dim = inst.words[5] as u32;
-                    self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                        .deinterleave_kernel
-                        .forward_ptr(dst_q, dst_gate, src, num_heads, head_dim, stream)?;
-                }
-                OP_QK_NORM => {
-                    let q = inst.words[1] as *mut f32;
-                    let k = inst.words[2] as *mut f32;
-                    let q_norm = inst.words[3] as *const u16;
-                    let k_norm = inst.words[4] as *const u16;
-                    let nqh = inst.words[5] as u32;
-                    let nkh = inst.words[6] as u32;
-                    let hd = inst.words[7] as u32;
-                    let eps = f32::from_bits(inst.words[8] as u32);
-                    self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                        .qk_norm_kernel
-                        .forward_ptr(q, k, q_norm, k_norm, nqh, nkh, hd, eps, stream)?;
-                }
-                OP_MROPE => {
-                    let q = inst.words[1] as *mut f32;
-                    let k = inst.words[2] as *mut f32;
-                    let inv_freq = inst.words[3] as *const f32;
-                    let pos_ids = inst.words[4] as *const i32;
-                    let nqh = inst.words[5] as u32;
-                    let nkh = inst.words[6] as u32;
-                    let hd = inst.words[7] as u32;
-                    let rd = inst.words[8] as u32;
-                    let s0 = inst.words[9] as u32;
-                    let s1 = inst.words[10] as u32;
-                    let s2 = inst.words[11] as u32;
-                    self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                        .mrope_kernel
-                        .forward_ptr(
-                            q, k, inv_freq, pos_ids, nqh, nkh, hd, rd, s0, s1, s2, stream,
-                        )?;
-                }
-                OP_GQA_ATTN => {
-                    let out = inst.words[1] as *mut f32;
-                    let q = inst.words[2] as *const f32;
-                    let k_cache = inst.words[3] as *const f32;
-                    let v_cache = inst.words[4] as *const f32;
-                    let nqh = inst.words[5] as u32;
-                    let nkh = inst.words[6] as u32;
-                    let hd = inst.words[7] as u32;
-                    let sl = inst.words[8] as u32;
-                    let msl = inst.words[9] as u32;
-                    let q_head_start = inst.words[10] as u32;
-                    let local_nqh = (inst.words[0] >> 32) as u32; // gupd = block count
-                    self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                        .gqa_kernel
-                        .forward_ptr(out, q, k_cache, v_cache, nqh, nkh, hd, sl, msl, local_nqh, q_head_start, stream)?;
-                }
-                _ => {}
-            }
+        // Build per-worker instructions then dispatch_batch_fire on each, then wait.
+        // We borrow p2p immutably for build; persistent_workers borrowed mutably for dispatch.
+        let insts: Vec<(usize, crate::megakernel::Instruction)> = (0..num_workers).map(|w| {
+            let gpu_id = w + 1;
+            let out_slot = unsafe { output_slots.add(gpu_id * hs) };
+            let inst = p2p.build_ffn_remote_inst(
+                w,
+                layer_idx,
+                activation,
+                out_slot,
+                expert_ids,
+                expert_weights,
+                k, eis, hs, gupd, has_gate, relu_sq,
+            );
+            (gpu_id, inst)
+        }).collect();
+        // Sanity: gpu_id maps to persistent_workers index = gpu_id (workers are
+        // [GPU0, GPU1, ..., GPU(num_gpus-1)] in PersistentDispatch::workers).
+        let _ = num_gpus;
+
+        let dispatch = self.persistent_workers.as_mut().unwrap();
+        let mut seq_per_gpu: Vec<(usize, u32)> = Vec::with_capacity(num_workers);
+        for (gpu_idx, inst) in &insts {
+            // dispatch_batch_fire takes a slice; one OP_MOE_FFN_REMOTE per worker.
+            let single = std::slice::from_ref(inst);
+            let seq = dispatch.dispatch_batch_fire(*gpu_idx, single);
+            seq_per_gpu.push((*gpu_idx, seq));
+        }
+        // Wait for every worker's ack before returning — the GPU 0 batch with
+        // op_moe_dispatch fires next and reads output_slots from worker outputs.
+        for (gpu_idx, seq) in seq_per_gpu {
+            dispatch.wait_ack(gpu_idx, seq);
         }
         Ok(())
     }

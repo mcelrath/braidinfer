@@ -552,21 +552,76 @@ impl Model {
                 .write_checkpoint(&format!("L{layer_idx}.moe_expert_weights"), &all_expert_weights[0..k]);
         }
 
-        // Step 2: Trigger worker GPUs with full batch (single round-trip)
-        let seq = {
+        // Step 2: Stage activations + per-token routing into GPU 0 VRAM (UC) so
+        // workers can P2P-read them. Workers will be dispatched per-token via
+        // OP_MOE_FFN_REMOTE on their persistent_worker mailbox.
+        // We need the routing on the GPU side (P2P-readable). The activation
+        // staging buffer is already UC; expert ids/weights live in
+        // host-mapped GPU 0 buffers (act.moe_expert_ids/_weights) but those
+        // hold only one token. For prefill we keep them on the host side and
+        // pass the host pointer via hipHostGetDevicePointer (single-GPU model
+        // path uses host-mapped expert_ids/weights too — see model_load).
+        // Simpler approach: write per-token id/weight into act.moe_expert_ids
+        // and dispatch immediately, since the worker reads them once.
+        let (output_slots_raw, num_gpus, num_workers, activation_staging_ptr) = {
             let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
-            p2p.trigger_prefill_batch(
-                &all_activations, &all_expert_ids, &all_expert_weights,
-                n, k, layer_idx as u32, hs, eis, has_gate, latent_size,
+            (
+                p2p.output_slots.as_mut_ptr(),
+                p2p.num_gpus,
+                p2p.workers.len(),
+                p2p.activation_staging.as_mut_ptr(),
             )
         };
-
-        // Step 3: GPU 0 computes its local expert subset for all tokens in parallel with workers.
-        // Accumulate into ffn_down, then D2D copy to output_slots[(t * num_gpus + 0) * hs].
-        let (output_slots_raw, num_gpus) = {
+        // Copy all_activations to activation_staging (GPU 0 VRAM/UC).
+        // Safe: GPU 0 has no persistent worker yet during prefill.
+        {
             let p2p = self.moe_p2p.as_mut().unwrap();
-            (p2p.output_slots.as_mut_ptr(), p2p.num_gpus)
-        };
+            p2p.activation_staging
+                .copy_from_host(&all_activations[..n * latent_size])?;
+        }
+
+        // Step 2.5: Dispatch OP_MOE_FFN_REMOTE for all (token, worker) pairs.
+        // Fire all workers concurrently per token; sequencing across tokens is
+        // handled by per-worker FIFO. We collect (gpu_idx, seq) and wait at end.
+        let mut all_seqs: Vec<(usize, u32)> = Vec::with_capacity(n * num_workers);
+        for t in 0..n {
+            let act_p2p = unsafe { activation_staging_ptr.add(t * latent_size) as *const f32 };
+            // Routing pointers for token t: host-mapped expert_ids/_weights are
+            // single-token buffers; copy this token's slice to them so the
+            // worker can read after we trigger the dispatch.
+            unsafe {
+                let ids_dst = self.activations.moe_expert_ids.host_ptr() as *mut i32;
+                let wts_dst = self.activations.moe_expert_weights.host_ptr() as *mut f32;
+                for j in 0..k {
+                    std::ptr::write_volatile(ids_dst.add(j), all_expert_ids[t * k + j]);
+                    std::ptr::write_volatile(wts_dst.add(j), all_expert_weights[t * k + j]);
+                }
+            }
+            // Build instruction per worker.
+            let p2p = self.moe_p2p.as_ref().unwrap();
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            for w in 0..num_workers {
+                let gpu_id = w + 1;
+                let out_slot = unsafe { output_slots_raw.add((t * num_gpus + gpu_id) * hs) };
+                let inst = p2p.build_ffn_remote_inst(
+                    w, layer_idx, act_p2p, out_slot,
+                    self.activations.moe_expert_ids.as_ptr() as *const i32,
+                    self.activations.moe_expert_weights.as_ptr() as *const f32,
+                    k, eis, hs, latent_size, has_gate, !has_gate,
+                );
+                let single = std::slice::from_ref(&inst);
+                let seq = dispatch.dispatch_batch_fire(gpu_id, single);
+                all_seqs.push((gpu_id, seq));
+            }
+            // Wait for THIS token's worker dispatches before reusing the
+            // single-slot moe_expert_ids/_weights buffers for the next token.
+            for (g, s) in all_seqs.drain(..) {
+                dispatch.wait_ack(g, s);
+            }
+        }
+
+        // Step 3: GPU 0 computes its local expert subset for all tokens.
+        // Accumulate into ffn_down, then D2D copy to output_slots[(t * num_gpus + 0) * hs].
         for t in 0..n {
             // Load token t's activation into GPU buffer for expert computation
             let act_dst_ptr = if fc1_ptr.is_some() {
@@ -668,12 +723,10 @@ impl Model {
             }
         }
 
-        // Step 4: Wait for all worker GPUs to finish
+        // Step 4: Wait for GPU 0's stream to finish (its expert compute already
+        // wrote to output_slots[t * num_gpus * hs]). Worker dispatches are
+        // already ack'd above (see Step 2.5).
         self.stream.synchronize()?;
-        {
-            let p2p = self.moe_p2p.as_ref().unwrap();
-            p2p.poll_prefill_batch_ack(seq);
-        }
 
         // Step 5: Sum output_slots + shared expert + residual per token
         let output_slots_raw = self.moe_p2p.as_ref().unwrap().output_slots.as_ptr();

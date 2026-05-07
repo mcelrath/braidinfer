@@ -1,15 +1,28 @@
-// OP_MOE_DISPATCH: GPU-initiated MoE dispatch with GPU 0 expert execution.
+// OP_MOE_DISPATCH (post-unified-worker): GPU 0's local-expert + sum stage of MoE.
 //
-// GPU 0 computes its local experts WHILE workers on GPUs 1-3 compute theirs.
-// After GPU 0 finishes its experts, it polls worker acks, then sums all results.
+// In the unified-worker design (epic braidinfer-0hu Phase 2-5), the CPU emits
+// OP_MOE_FFN_REMOTE on each worker GPU's persistent_worker BEFORE this op runs,
+// and waits for all workers to ack before firing the GPU 0 batch containing
+// this op. By the time op_moe_dispatch executes, all worker output_slots are
+// already populated and visible (workers' P2P writes + UC mapping).
+//
+// This op now:
+//   1. Zeros GPU 0's slot in output_slots
+//   2. Runs GPU 0's local experts (entries[eid].gate_up_ptr != 0)
+//   3. Sums output_slots across all GPUs into final_output
+//
+// Worker-trigger and ack-poll sections have been removed — CPU orchestrates
+// the worker dispatch/wait around this op (see decode.rs / moe_p2p.rs).
+// work_queue and seq_counter fields are now unused but preserved in the
+// instruction layout for ABI stability (no kernel-side reads).
 //
 // Instruction layout (17 u64 words):
-//   inst[1]  = work_queue_ptr       (MoeWorkItem*, host-mapped)
-//   inst[2]  = output_slots_ptr     (float*, GPU 0 VRAM, [total_gpus * hs])
+//   inst[1]  = work_queue_ptr       (UNUSED — preserved for layout)
+//   inst[2]  = output_slots_ptr     (float*, GPU 0 VRAM/UC, [total_gpus * hs])
 //   inst[3]  = final_output_ptr     (float*, GPU 0 VRAM, [hs] accumulated result)
 //   inst[4]  = expert_ids_ptr       (int32_t*, host-mapped — OP_MOE_GATE output)
 //   inst[5]  = expert_weights_ptr   (float*, host-mapped — OP_MOE_GATE output)
-//   inst[6]  = seq_counter_ptr      (volatile uint32_t*, host-mapped)
+//   inst[6]  = seq_counter_ptr      (UNUSED — preserved for layout)
 //   inst[7]  = (num_workers << 32) | hidden_size   [hidden_size for output slot stride]
 //   inst[8]  = (layer_idx << 32) | num_active (k)
 //   inst[9]  = (expert_intermediate_size << 32) | has_gate_proj
@@ -26,14 +39,12 @@
 #include "watchdog.h"
 
 __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid, WatchdogState* watchdog = nullptr) {
+    (void)watchdog;
     const MoeDispatchInst* i = (const MoeDispatchInst*)inst;
-    volatile MoeWorkItem* wq = (volatile MoeWorkItem*)(uintptr_t)i->work_queue;
     float* output_slots = (float*)(uintptr_t)i->output_slots;
     float* final_output = (float*)(uintptr_t)i->final_output;
     const int32_t* src_expert_ids = (const int32_t*)(uintptr_t)i->expert_ids;
     const float* src_expert_weights = (const float*)(uintptr_t)i->expert_weights;
-    volatile uint32_t* seq_counter = (volatile uint32_t*)(uintptr_t)i->seq_counter;
-    int num_workers = (int)(i->num_workers_hs >> 32);
     int hs = (int)(i->num_workers_hs & 0xFFFFFFFF);  // hidden_size (output slot stride)
     int layer_idx = (int)(i->layer_k >> 32);
     int k = (int)(i->layer_k & 0xFFFFFFFF);
@@ -55,45 +66,18 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
 
     // 1. Zero GPU 0's output slot.
     // Do NOT zero final_output — the sum loop overwrites it completely.
-    // Do NOT zero worker output slots — GPU 0 would cache those in L2.
+    // Do NOT zero worker output slots — those were P2P-written by workers and the
+    // CPU has waited for their ack before firing this op.
     coop_zero(gpu0_output, gupd, grid);
 
-    // 2. Block 0 thread 0: populate work queue and trigger workers
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (int j = 0; j < k && j < MOE_MAX_ACTIVE_EXPERTS; j++) {
-            wq->expert_ids[j] = src_expert_ids[j];
-            wq->expert_weights[j] = src_expert_weights[j];
-        }
-        wq->batch_size = 1;  // decode: single token per dispatch
-        wq->layer_idx = layer_idx;
-        wq->num_active = k;
-        wq->hidden_size = hs;
-        wq->expert_intermediate_size = eis;
-        wq->has_gate_proj = has_gate;
-        wq->gate_up_in_dim = gupd;
-        wq->activation_ptr = (uint64_t)activation;  // GPU 0 VRAM; workers P2P-read after __threadfence()
-        wq->output_slots_ptr = (uint64_t)output_slots;
-        wq->num_workers = num_workers;
-
-        // ack_flags are indexed by GPU ID; workers are GPUs 1..num_workers
-        for (int w = 1; w <= num_workers; w++)
-            wq->ack_flags[w] = 0;
-
-        // Flush GPU 0 L2 to HBM so workers can P2P-read activation_ptr (VRAM) directly.
-        // wq field writes (GART) also bypass L2 → visible before seq_num write.
-        __threadfence();
-
-        uint32_t seq = *seq_counter + 1;
-        *seq_counter = seq;
-        wq->seq_num = seq;  // triggers workers
-    }
-    grid.sync();
-
-    // Read seq for later ack polling
-    uint32_t seq = *seq_counter;
+    // (Worker-trigger section removed — CPU now drives OP_MOE_FFN_REMOTE on workers
+    //  before this op fires, and CPU waits for worker ack before this batch dispatch.)
 
     // 3. GPU 0 computes its local experts (all blocks cooperate).
-    // Workers on GPUs 1-3 are computing in parallel.
+    // Workers on GPUs 1-3 have already finished their experts and written
+    // to output_slots[g * hs] for g >= 1 — guaranteed because CPU waited for
+    // worker ack before firing this op. UC mapping on output_slots ensures
+    // no stale L2 entries on GPU 0 reads.
     for (int j = 0; j < k; j++) {
         int32_t eid = src_expert_ids[j];
         float ew = src_expert_weights[j];
@@ -139,23 +123,12 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
         coop_weighted_acc(gpu0_output, scratch_gate, ew, gupd, grid);
     }
 
-    // 4. Block 0 thread 0: poll worker acks (GPU 0's experts are done by now).
-    // watchdog_beat inside the ack-poll loop: if a worker wedges, the host watchdog
-    // sees no progress and sets force_exit. The kernel returns at the next outer check.
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        uint32_t ack_beat_ctr = 0;
-        for (int w = 0; w < num_workers; w++) {
-            while (wq->ack_flags[w + 1] != seq) {
-                __builtin_amdgcn_s_sleep(0);
-                if (watchdog) watchdog_beat(watchdog, &ack_beat_ctr);
-            }
-        }
-    }
-    grid.sync();
+    // (Worker ack-poll removed — CPU has already waited for all workers before
+    //  firing this batch.)
 
-    // Acquire fence: ensure all worker P2P writes to output_slots are visible before sum.
-    // Workers use __threadfence() before writing ack_flags; this matching fence on
-    // GPU 0 side ensures the HIP memory model guarantees ordering (not just empirical RDNA3 behavior).
+    // Acquire fence on GPU 0's writes to gpu0_output (other GPU output_slots are
+    // already visible via UC mapping). Workers' P2P writes were ack'd to CPU
+    // before this op; UC ensures no stale L2 on GPU 0's read of those slots.
     __threadfence();
 
     // 5. Sum all output_slots into final_output (gupd elements per slot, slot stride = hs).

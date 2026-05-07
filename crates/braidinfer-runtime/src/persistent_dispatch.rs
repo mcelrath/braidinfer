@@ -99,18 +99,20 @@ pub struct GpuWorker {
     pub seq_counter: u32,
 }
 
-/// Persistent dispatch context: manages the fat cooperative worker on GPU 0.
+/// Persistent dispatch context: manages persistent cooperative workers on every
+/// GPU running the model. Workers are launched incrementally — the unified-worker
+/// design starts workers (GPUs 1..N-1) during prefill, then adds GPU 0 on first
+/// decode call. `workers` is indexed by `DeviceId.0` so GPU N's worker is at slot N
+/// (or `None` if not yet launched). This keeps the `dispatch_batch_fire(gpu_idx)`
+/// API stable across the prefill→decode boundary.
 ///
-/// `workers` is wrapped in `ManuallyDrop` so HIP resources (DeviceBuffer → hipFree,
-/// MappedHostBuffer → hipHostFree, Stream → hipStreamDestroy, Module → hipModuleUnload)
-/// are only freed after the cooperative kernel has confirmed exit via the `done` flag.
-/// Auto-drop would free while the kernel is still running.
-///
-/// MoE dispatch: GPU 0 gets experts via OP_EXPERT_FFN (fat worker); GPUs 1+ via kbk.
-/// moe_output_slot holds GPU 0's expert accumulation result (host-mapped, MTYPE_UC).
-/// CPU zeros it before firing GPU 0's batch, then adds it into ffn_down_stage after.
+/// `workers` slots are wrapped in `ManuallyDrop` so HIP resources (DeviceBuffer →
+/// hipFree, MappedHostBuffer → hipHostFree, Stream → hipStreamDestroy, Module →
+/// hipModuleUnload) are only freed after the cooperative kernel has confirmed exit
+/// via the `done` flag. Auto-drop would free while the kernel is still running.
 pub struct PersistentDispatch {
-    pub workers: Vec<std::mem::ManuallyDrop<GpuWorker>>,
+    /// Per-device workers, indexed by DeviceId.0. `None` means no worker on that GPU yet.
+    pub workers: Vec<Option<std::mem::ManuallyDrop<GpuWorker>>>,
     /// Host-mapped buffer for GPU 0 expert FFN output (hidden_size f32 elements).
     /// Allocated on GPU 0 (MTYPE_UC). Valid device_ptr only from GPU 0.
     pub moe_output_slot: MappedHostBuffer<f32>,
@@ -129,78 +131,115 @@ fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
 }
 
 impl PersistentDispatch {
+    fn worker(&self, gpu_idx: usize) -> &GpuWorker {
+        self.workers[gpu_idx].as_ref().expect("no persistent worker on this GPU")
+    }
+    fn worker_mut(&mut self, gpu_idx: usize) -> &mut GpuWorker {
+        self.workers[gpu_idx].as_mut().expect("no persistent worker on this GPU")
+    }
+
     fn request_shutdown(&self) {
-        for worker in &self.workers {
-            let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
-            unsafe {
-                std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1);
+        for slot in &self.workers {
+            if let Some(worker) = slot.as_ref() {
+                let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
+                unsafe {
+                    std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).shutdown), 1);
+                }
             }
         }
     }
 
-    /// Launch persistent workers on specified GPUs.
+    /// Initialize the dispatcher with `total_gpus` slots and launch workers on
+    /// `devices`. Slot index = `DeviceId.0`, so e.g. an init with `total_gpus=4`
+    /// and `devices=[GPU1, GPU2, GPU3]` yields workers populated at slots 1-3
+    /// and slot 0 empty (GPU 0 added later via `add_device`).
     /// `hidden_size`: for MoE output slot allocation (0 if no MoE).
-    pub fn init(devices: &[DeviceId], shared_mem: u32, _hidden_size: usize) -> HipResult<Self> {
-        // Install before launch so signals between launch and first dispatch are observed.
+    pub fn init_with_total(total_gpus: usize, devices: &[DeviceId], shared_mem: u32, _hidden_size: usize) -> HipResult<Self> {
         install_signal_handlers_once();
+        let watchdog = WatchdogThread::spawn();
+        let mut workers: Vec<Option<std::mem::ManuallyDrop<GpuWorker>>> = (0..total_gpus).map(|_| None).collect();
+        let mut dispatch = PersistentDispatch {
+            workers: std::mem::take(&mut workers),
+            moe_output_slot: MappedHostBuffer::<f32>::alloc(1)?,
+            watchdog,
+        };
+        for &device in devices {
+            dispatch.add_device(device, shared_mem)?;
+        }
+        Ok(dispatch)
+    }
+
+    /// Single-GPU init helper (unchanged signature for non-MoE callers).
+    /// Allocates a single-slot dispatcher launched on `devices[0]`.
+    pub fn init(devices: &[DeviceId], shared_mem: u32, hidden_size: usize) -> HipResult<Self> {
+        // Old signature: assume `devices` is a single-GPU list and allocate
+        // exactly that many slots. Callers that need slot-by-DeviceId.0 layout
+        // should call `init_with_total` directly.
+        let total = devices.iter().map(|d| d.0 as usize + 1).max().unwrap_or(1);
+        Self::init_with_total(total, devices, shared_mem, hidden_size)
+    }
+
+    /// Append a GPU to the persistent worker pool. Used by the unified-worker
+    /// design so workers (GPUs 1..N-1) can launch during prefill (when GPU 0
+    /// is still running kbk kernels) and GPU 0 is added on first decode call.
+    pub fn add_device(&mut self, device: DeviceId, shared_mem: u32) -> HipResult<()> {
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
-        let mut workers = Vec::with_capacity(devices.len());
-        let watchdog = WatchdogThread::spawn();
-
-        for &device in devices {
-            Device::set_current(device)?;
-            let queue = MappedHostBuffer::<u8>::alloc(queue_size)?;
-            let stream = Stream::new(device)?;
-            let module = Module::load(device, &kernel_dir.join("persistent_worker.hsaco"))?;
-            let func = module.get_function("persistent_worker")?;
-            let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
-            let wd_state_dev = watchdog.register(device)?;
-            let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 2] = [
-                std::ptr::addr_of_mut!(queue_ptr).cast(),
-                std::ptr::addr_of_mut!(wd_ptr).cast(),
-            ];
-            let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-            let bpsm_max = bpsm_raw.min(2);
-            let bpsm = std::env::var("BRAIDINFER_BPSM")
-                .ok().and_then(|v| v.parse::<u32>().ok())
-                .map(|v| v.clamp(1, bpsm_max as u32) as usize)
-                .unwrap_or(bpsm_max as usize);
-            let num_cus = multiprocessor_count(device)?;
-            let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
-            func.launch_cooperative(
-                (num_blocks, 1, 1),
-                (256, 1, 1),
-                shared_mem,
-                &stream,
-                &mut args,
-            )?;
-            eprintln!(
-                "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared, bpsm_raw={bpsm_raw} bpsm={bpsm} num_cus={num_cus})",
-                device.0
-            );
-            braidinfer_hip::set_persistent_worker_active(true);
-            workers.push(std::mem::ManuallyDrop::new(GpuWorker {
-                device,
-                queue,
-                stream,
-                module,
-                seq_counter: 0,
-            }));
+        Device::set_current(device)?;
+        let queue = MappedHostBuffer::<u8>::alloc(queue_size)?;
+        let stream = Stream::new(device)?;
+        let module = Module::load(device, &kernel_dir.join("persistent_worker.hsaco"))?;
+        let func = module.get_function("persistent_worker")?;
+        let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;
+        let wd_state_dev = self.watchdog.register(device)?;
+        let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
+        let mut args: [*mut std::ffi::c_void; 2] = [
+            std::ptr::addr_of_mut!(queue_ptr).cast(),
+            std::ptr::addr_of_mut!(wd_ptr).cast(),
+        ];
+        let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let bpsm_max = bpsm_raw.min(2);
+        let bpsm = std::env::var("BRAIDINFER_BPSM")
+            .ok().and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.clamp(1, bpsm_max as u32) as usize)
+            .unwrap_or(bpsm_max as usize);
+        let num_cus = multiprocessor_count(device)?;
+        let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
+        func.launch_cooperative(
+            (num_blocks, 1, 1),
+            (256, 1, 1),
+            shared_mem,
+            &stream,
+            &mut args,
+        )?;
+        eprintln!(
+            "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared, bpsm_raw={bpsm_raw} bpsm={bpsm} num_cus={num_cus})",
+            device.0
+        );
+        braidinfer_hip::set_persistent_worker_active(true);
+        let slot = device.0 as usize;
+        if slot >= self.workers.len() {
+            self.workers.resize_with(slot + 1, || None);
         }
+        assert!(self.workers[slot].is_none(), "double-init persistent worker on GPU {}", slot);
+        self.workers[slot] = Some(std::mem::ManuallyDrop::new(GpuWorker {
+            device,
+            queue,
+            stream,
+            module,
+            seq_counter: 0,
+        }));
+        Ok(())
+    }
 
-        let moe_output_slot = MappedHostBuffer::<f32>::alloc(1)?; // placeholder for init() path
-        Ok(PersistentDispatch {
-            workers,
-            moe_output_slot,
-            watchdog,
-        })
+    /// True if persistent worker on this GPU has been launched.
+    pub fn has_worker(&self, gpu_idx: usize) -> bool {
+        gpu_idx < self.workers.len() && self.workers[gpu_idx].is_some()
     }
 
     /// Wait for a GPU to ack a specific seq number.
     pub(crate) fn wait_ack(&self, gpu_idx: usize, seq: u32) {
-        let q_ptr = self.workers[gpu_idx].queue.host_ptr() as *const WorkerQueueLayout;
+        let q_ptr = self.worker(gpu_idx).queue.host_ptr() as *const WorkerQueueLayout;
         let start = std::time::Instant::now();
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
@@ -226,7 +265,7 @@ impl PersistentDispatch {
     /// between them, acks once at the end. One signal round-trip per batch.
     pub(crate) fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
         assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
-        let w = &mut self.workers[gpu_idx];
+        let w = self.worker_mut(gpu_idx);
         let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
 
         // Copy all instructions to the batch buffer
@@ -317,7 +356,7 @@ impl PersistentDispatch {
         instructions: &[Instruction],
     ) -> u32 {
         assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
-        let w = &mut self.workers[gpu_idx];
+        let w = self.worker_mut(gpu_idx);
         let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
         for (i, inst) in instructions.iter().enumerate() {
             let offset = i * INST_SIZE;
@@ -345,66 +384,6 @@ impl PersistentDispatch {
         seq
     }
 
-    /// Multi-GPU init: launch persistent workers on ALL devices.
-    /// GPU 0 handles MoE + its head slice; GPUs 1+ handle their head slices.
-    /// Launch persistent cooperative worker on GPU 0 only.
-    /// GPUs 1+ use kbk (hipLaunchKernel) for MoE expert dispatch — cooperative kernels
-    /// hold all SMs and deadlock with kbk on the same device.
-    pub fn init_multi_gpu(
-        gpu0: DeviceId,
-        _all_devices: &[DeviceId],
-        shared_mem: u32,
-        hidden_size: usize,
-        _max_eis: usize,
-    ) -> HipResult<Self> {
-        let kernel_dir = crate::kernel::kernel_dir();
-        Device::set_current(gpu0)?;
-        let queue = MappedHostBuffer::<u8>::alloc(std::mem::size_of::<WorkerQueueLayout>())?;
-        let stream = Stream::new(gpu0)?;
-        let module = Module::load(gpu0, &kernel_dir.join("persistent_worker.hsaco"))?;
-        let func = module.get_function("persistent_worker")?;
-        let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-        let bpsm_max = bpsm_raw.min(2);
-        let blocks_per_sm = std::env::var("BRAIDINFER_BPSM")
-            .ok().and_then(|v| v.parse::<u32>().ok())
-            .map(|v| v.clamp(1, bpsm_max as u32))
-            .unwrap_or(bpsm_max as u32);
-        let num_cus = multiprocessor_count(gpu0)?;
-        let num_blocks = (blocks_per_sm * num_cus as u32).max(num_cus as u32);
-        let mut q = queue.device_ptr() as *mut std::ffi::c_void;
-        let watchdog = WatchdogThread::spawn();
-        let wd_state_dev = watchdog.register(gpu0)?;
-        let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
-        let mut args = [
-            std::ptr::addr_of_mut!(q).cast::<std::ffi::c_void>(),
-            std::ptr::addr_of_mut!(wd_ptr).cast(),
-        ];
-        func.launch_cooperative(
-            (num_blocks, 1, 1),
-            (256, 1, 1),
-            shared_mem,
-            &stream,
-            &mut args,
-        )?;
-        eprintln!(
-            "  GPU {}: persistent worker launched ({num_blocks} blocks, {shared_mem}B shared, bpsm_raw={bpsm_raw} bpsm={blocks_per_sm} num_cus={num_cus}); GPUs 1+ use kbk",
-            gpu0.0
-        );
-        braidinfer_hip::set_persistent_worker_active(true);
-        let moe_output_slot = MappedHostBuffer::<f32>::alloc(hidden_size.max(1))?;
-        Ok(PersistentDispatch {
-            workers: vec![std::mem::ManuallyDrop::new(GpuWorker {
-                device: gpu0,
-                queue,
-                stream,
-                module,
-                seq_counter: 0,
-            })],
-            moe_output_slot,
-            watchdog,
-        })
-    }
-
     /// Request worker shutdown via host-mapped flags only.
     ///
     /// This intentionally does not call any HIP APIs. Cooperative kernels must
@@ -413,9 +392,9 @@ impl PersistentDispatch {
         self.request_shutdown();
     }
 
-    /// Number of GPUs with workers.
+    /// Number of GPUs with launched workers.
     pub fn num_gpus(&self) -> usize {
-        self.workers.len()
+        self.workers.iter().filter(|s| s.is_some()).count()
     }
 }
 
@@ -449,7 +428,8 @@ impl Drop for PersistentDispatch {
         self.request_shutdown();
         let shutdown_deadline = std::time::Instant::now() + shutdown_timeout;
         let mut worker_done = vec![false; self.workers.len()];
-        for (idx, worker) in self.workers.iter().enumerate() {
+        for (idx, slot) in self.workers.iter().enumerate() {
+            let Some(worker) = slot.as_ref() else { worker_done[idx] = true; continue; };
             let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
             loop {
                 let done = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done)) };
@@ -470,10 +450,12 @@ impl Drop for PersistentDispatch {
         }
         // Free HIP resources only for workers that confirmed exit. Timed-out
         // workers are intentionally leaked to avoid deadlocking on HIP cleanup.
-        for (idx, worker) in self.workers.iter_mut().enumerate() {
+        for (idx, slot) in self.workers.iter_mut().enumerate() {
             if worker_done[idx] {
-                unsafe {
-                    std::mem::ManuallyDrop::drop(worker);
+                if let Some(mut worker) = slot.take() {
+                    unsafe {
+                        std::mem::ManuallyDrop::drop(&mut worker);
+                    }
                 }
             }
         }

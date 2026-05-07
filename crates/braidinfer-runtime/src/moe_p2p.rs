@@ -1,38 +1,30 @@
-//! GPU-native P2P MoE dispatch via persistent cooperative worker kernels.
+//! Shared MoE state (post-unified-worker, epic braidinfer-0hu Phase 2-5).
 //!
-//! # Architecture
+//! After the unified-worker cutover, `moe_worker_kernel` is gone — every GPU
+//! runs `persistent_worker.hsaco`, dispatched via `PersistentDispatch`.
 //!
-//! GPU 0 runs `megakernel_f32` (persistent cooperative kernel). When it encounters
-//! `OP_MOE_DISPATCH`, `op_moe_dispatch` in megakernel_moe_barrier.hip:
-//!   1. Writes expert_ids/weights/activation_ptr into `MoeWorkItem` (GART/host-mapped)
-//!   2. Bumps `seq_counter` to trigger workers on GPUs 1-3
-//!   3. Computes GPU 0's local experts (all SMs cooperate)
-//!   4. Polls `MoeWorkItem.ack_flags[w]` for all workers
-//!   5. Sums `output_slots[gpu * hs]` into `final_output`
+//! `MoeP2pContext` retains the buffer/state ownership it had before:
+//!   - `output_slots`: GPU 0 VRAM (UC-mapped) `[MAX_PREFILL_BATCH × num_gpus × hs]`,
+//!     written via P2P by workers' `OP_MOE_FFN_REMOTE`, summed by GPU 0's
+//!     `op_moe_dispatch` (now CPU-orchestrated).
+//!   - `gpu0_layer_config_ptrs` + GPU 0 scratch + `activation_staging`: GPU 0's
+//!     local-expert state used by `op_moe_dispatch`.
+//!   - `workers[w]`: per-worker MoE state — `local_activation`, `local_output`,
+//!     `scratch_*`, plus the per-layer `MoeWorkerConfig*` pointer array on each
+//!     worker GPU. CPU populates these into `OP_MOE_FFN_REMOTE` instructions
+//!     and dispatches them via the worker's persistent_worker mailbox.
 //!
-//! Workers (GPUs 1-3) run `moe_worker_kernel` (moe_worker.hip):
-//!   - Poll `MoeWorkItem.seq_num` for new work
-//!   - P2P-copy activation from GPU 0 VRAM
-//!   - Compute local experts (config looked up by layer_idx)
-//!   - P2P-write result to `output_slots[my_gpu * hs]` on GPU 0 VRAM
-//!   - Write `ack_flags[my_gpu] = seq`
-//!
-//! # Shutdown
-//!
-//! `shutdown.write_volatile(1)` → worker kernel writes `done_flag=1` before return.
-//! Drop polls done_flag (30s timeout) before freeing GPU resources.
+//! There are no longer any kernel modules or streams owned by this context —
+//! all GPU work runs through `PersistentDispatch`. The `MoeP2pContext` name
+//! and module location are preserved for now to minimize cutover diff; a
+//! follow-up will fold its state into `PersistentDispatch::GpuWorker`.
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
 use braidinfer_hip::device::Device;
-use braidinfer_hip::ffi;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
-use braidinfer_hip::module::Module;
-use braidinfer_hip::stream::Stream;
-use std::mem::ManuallyDrop;
 
 use crate::quant::WeightFormat;
-use crate::watchdog::WatchdogThread;
 use crate::weights::DistributedMoeWeights;
 
 /// MoeExpertEntry layout (must match moe_work_queue.h).
@@ -59,19 +51,17 @@ struct MoeWorkerConfig {
 
 const CONFIG_SIZE: usize = std::mem::size_of::<MoeWorkerConfig>();
 
-fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
-    let mut val = 0i32;
-    braidinfer_hip::error::check(unsafe {
-        ffi::hipDeviceGetAttribute(&mut val, 63, device.0 as i32)
-    })?;
-    Ok(val as u32)
-}
-
-/// Per-worker GPU state (GPUs 1-3).
+/// Per-worker GPU MoE state (no kernel modules in unified-worker design).
 pub struct MoeWorkerGpu {
     pub device: DeviceId,
     /// Per-layer config pointer array on this GPU's VRAM: `MoeWorkerConfig*[num_layers]`.
-    _layer_config_ptrs: DeviceBuffer<u64>,
+    /// Indexed by layer_idx; CPU reads `[layer_idx]` and passes the pointer in
+    /// `OP_MOE_FFN_REMOTE.config`.
+    pub layer_config_ptrs: DeviceBuffer<u64>,
+    /// Per-layer config pointer values mirrored on the host (same as the device
+    /// buffer above) — CPU dispatch needs these to populate OP_MOE_FFN_REMOTE
+    /// without round-tripping to the GPU.
+    pub layer_config_ptrs_host: Vec<u64>,
     /// Per-layer config blobs on this GPU's VRAM (kept alive for kernel lifetime).
     _config_storage: Vec<DeviceBuffer<u8>>,
     pub local_activation: DeviceBuffer<f32>,
@@ -79,15 +69,6 @@ pub struct MoeWorkerGpu {
     pub scratch_up: DeviceBuffer<f32>,
     pub scratch_act: DeviceBuffer<f32>,
     pub local_output: DeviceBuffer<f32>,
-    /// Host-mapped shutdown flag (write 1 to initiate shutdown).
-    pub shutdown: MappedHostBuffer<u32>,
-    /// Host-mapped done flag (kernel writes 1 before returning after shutdown).
-    pub done: MappedHostBuffer<u32>,
-    /// GART timing buffer: [N_TIMING_SLOTS * 4] u64 cycle timestamps.
-    /// Layout per slot i: [t_work_start, t_copy_done, t_experts_done, t_output_done].
-    pub timing_buf: MappedHostBuffer<u64>,
-    pub stream: Stream,
-    pub module: Module,
 }
 
 /// GPU-native P2P MoE dispatch context.
@@ -110,12 +91,11 @@ pub struct MoeP2pContext {
     pub gpu0_scratch_gate: DeviceBuffer<f32>,
     pub gpu0_scratch_up: DeviceBuffer<f32>,
     pub gpu0_scratch_act: DeviceBuffer<f32>,
-    /// Persistent worker states for GPUs 1-3 (ManuallyDrop: freed only after done_flags set).
-    pub workers: Vec<ManuallyDrop<MoeWorkerGpu>>,
+    /// Per-worker MoE state for GPUs 1..N-1. No kernel modules — workers run
+    /// `persistent_worker.hsaco` via `PersistentDispatch`.
+    pub workers: Vec<MoeWorkerGpu>,
     pub num_gpus: usize,
     pub hidden_size: usize,
-    /// Host-side watchdog thread monitoring all moe_worker_kernel WatchdogState pages.
-    pub watchdog: WatchdogThread,
 }
 
 /// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache[] tail.
@@ -214,9 +194,12 @@ impl MoeP2pContext {
         let gpu0_scratch_up = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
         let gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
 
-        // Launch moe_worker_kernel on each worker GPU
+        // Allocate per-worker MoE state on each worker GPU. No kernel launch —
+        // workers run `persistent_worker.hsaco` via `PersistentDispatch`, dispatched
+        // with `OP_MOE_FFN_REMOTE` from the CPU.
+        let _ = shared_mem;
+        let _ = kernel_dir;
         let mut workers = Vec::with_capacity(num_workers);
-        let watchdog = WatchdogThread::spawn();
         for (w_idx, &device) in worker_devices.iter().enumerate() {
             let gpu_id = (w_idx + 1) as u32;
             Device::set_current(device)?;
@@ -240,6 +223,10 @@ impl MoeP2pContext {
                     })
                 },
             )?;
+            // Mirror the layer config pointer values on the host so CPU dispatch
+            // can fill OP_MOE_FFN_REMOTE.config without GPU reads.
+            let mut layer_config_ptrs_host = vec![0u64; num_total_layers];
+            layer_config_ptrs.copy_to_host(&mut layer_config_ptrs_host)?;
 
             let local_activation = DeviceBuffer::<f32>::alloc(device, gate_up_in_dim)?;
             // scratch_gate reused for gate output (eis) and down output (gupd): allocate max.
@@ -247,105 +234,21 @@ impl MoeP2pContext {
             let scratch_up = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let scratch_act = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let local_output = DeviceBuffer::<f32>::alloc(device, hidden_size)?;
-            let shutdown = MappedHostBuffer::<u32>::alloc(1)?;
-            let done = MappedHostBuffer::<u32>::alloc(1)?;
-            // Timing buffer: 64 slots × 4 timestamps each (GART, CPU-readable without memcpy).
-            let timing_buf = MappedHostBuffer::<u64>::alloc(64 * 4)?;
-            unsafe { std::ptr::write_bytes(timing_buf.host_ptr(), 0, 64 * 4); }
-            let stream = Stream::new(device)?;
-            let module = Module::load(device, &kernel_dir.join("moe_worker.hsaco"))?;
-            let func = module.get_function("moe_worker_kernel")?;
 
-            // Args: work_queue, shutdown, layer_configs, done_flag,
-            //       local_activation, scratch_gate, scratch_up, scratch_act, local_output, gpu_id
-            // Re-query device pointer for work_queue from CURRENT GPU context.
-            // hipHostGetDevicePointer returns the VA for the current GPU's GPUVM page tables.
-            // Even with hipHostMallocPortable, VA may differ per GPU on AMD discrete GPUs.
-            let mut wq_dp: *mut std::ffi::c_void = std::ptr::null_mut();
-            braidinfer_hip::error::check(unsafe {
-                ffi::hipHostGetDevicePointer(
-                    &mut wq_dp,
-                    work_queue.host_ptr() as *mut std::ffi::c_void,
-                    0,
-                )
-            })?;
-            let mut wq_ptr = wq_dp;
-            let mut sd_ptr = shutdown.device_ptr() as *mut std::ffi::c_void;
-            let mut lc_ptr = layer_config_ptrs.as_ptr() as *mut std::ffi::c_void;
-            let mut df_ptr = done.device_ptr() as *mut std::ffi::c_void;
-            let mut la_ptr = local_activation.as_ptr() as *mut std::ffi::c_void;
-            let mut sg_ptr = scratch_gate.as_ptr() as *mut std::ffi::c_void;
-            let mut su_ptr = scratch_up.as_ptr() as *mut std::ffi::c_void;
-            let mut sa_ptr = scratch_act.as_ptr() as *mut std::ffi::c_void;
-            let mut lo_ptr = local_output.as_ptr() as *mut std::ffi::c_void;
-            let mut gid = gpu_id;
-            let mut tb_ptr = timing_buf.device_ptr() as *mut std::ffi::c_void;
-            let wd_state_dev = watchdog.register(device)?;
-            let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 12] = [
-                std::ptr::addr_of_mut!(wq_ptr).cast(),
-                std::ptr::addr_of_mut!(sd_ptr).cast(),
-                std::ptr::addr_of_mut!(lc_ptr).cast(),
-                std::ptr::addr_of_mut!(df_ptr).cast(),
-                std::ptr::addr_of_mut!(la_ptr).cast(),
-                std::ptr::addr_of_mut!(sg_ptr).cast(),
-                std::ptr::addr_of_mut!(su_ptr).cast(),
-                std::ptr::addr_of_mut!(sa_ptr).cast(),
-                std::ptr::addr_of_mut!(lo_ptr).cast(),
-                std::ptr::addr_of_mut!(gid).cast(),
-                std::ptr::addr_of_mut!(tb_ptr).cast(),
-                std::ptr::addr_of_mut!(wd_ptr).cast(),
-            ];
-
-            let num_cus = multiprocessor_count(device)?;
-            // Cooperative constraint: blocks ≤ num_cus × blocks_per_sm (NOT ==).
-            // Use num_cus blocks (1 block/CU) to leave 8/9 of bpsm slots open for
-            // concurrent kbk attention kernels. The full bpsm × num_cus = 432
-            // saturation (commit af6e051) gives full SIMD utilization for moe-only
-            // workloads but starves kbk attention launches of CU occupancy on the
-            // multi-GPU MoE decode path (decode.rs dispatch_attn_kbk → kernels
-            // queued but never scheduled).
-            let _bpsm_unused = func.max_active_blocks_per_sm(256, shared_mem as usize)
-                .unwrap_or(1);
-            let num_blocks = num_cus;
-            func.launch_cooperative(
-                (num_blocks, 1, 1),
-                (256, 1, 1),
-                shared_mem,
-                &stream,
-                &mut args,
-            )?;
-            // Wait until kernel reaches past cg::this_grid() (done_flag >= 0xAA02).
-            let t0 = std::time::Instant::now();
-            loop {
-                let v = unsafe { std::ptr::read_volatile(done.host_ptr()) };
-                if v >= 0xAA02 { break; }
-                if crate::persistent_dispatch::shutdown_requested() {
-                    panic!("moe_worker GPU {} startup interrupted: SIGINT/SIGTERM", gpu_id);
-                }
-                if t0.elapsed().as_millis() > 5000 {
-                    panic!("GPU {} moe_worker_kernel failed to start (done_flag={v:#x})", gpu_id);
-                }
-                std::hint::spin_loop();
-            }
-            eprintln!("  moe_worker_kernel GPU {}: started (done_flag=0xAA02)", gpu_id);
-
-            workers.push(ManuallyDrop::new(MoeWorkerGpu {
+            workers.push(MoeWorkerGpu {
                 device,
-                _layer_config_ptrs: layer_config_ptrs,
+                layer_config_ptrs,
+                layer_config_ptrs_host,
                 _config_storage: config_storage,
                 local_activation,
                 scratch_gate,
                 scratch_up,
                 scratch_act,
                 local_output,
-                shutdown,
-                done,
-                timing_buf,
-                stream,
-                module,
-            }));
+            });
+            eprintln!("  MoE worker state allocated on GPU {} (no separate kernel — runs via persistent_worker)", gpu_id);
         }
+        Device::set_current(gpu0)?;
 
         Ok(MoeP2pContext {
             work_queue,
@@ -360,231 +263,54 @@ impl MoeP2pContext {
             workers,
             num_gpus,
             hidden_size,
-            watchdog,
         })
     }
 
-    // Offsets into the MoeWorkItem byte buffer (must match moe_work_queue.h layout).
-    // seq_num(4)+batch_size(4)+layer_idx(4)+num_active(4)+hidden_size(4)+
-    // eis(4)+has_gate_proj(4)+num_workers(4)+gate_up_in_dim(4) = 36
-    // expert_ids[64*32]*4 = 8192 at offset 36
-    // expert_weights[64*32]*4 = 8192 at offset 8228
-    // _pad_align(4) at offset 16420 (alignment padding before activation_ptr)
-    // activation_ptr(8) at offset 16424
-    // output_slots_ptr(8) at offset 16432
-    // ack_flags[8]*4 = 32 at offset 16440
-    // activation_cache[] at MOE_WORK_QUEUE_FIXED = 16472
-    const OFF_BATCH_SIZE: usize = 4;
-    const OFF_LAYER_IDX: usize = 8;
-    const OFF_NUM_ACTIVE: usize = 12;
-    const OFF_HIDDEN_SIZE: usize = 16;
-    const OFF_EIS: usize = 20;
-    const OFF_HAS_GATE: usize = 24;
-    const OFF_NUM_WORKERS: usize = 28;
-    const OFF_GATE_UP_IN_DIM: usize = 32;
-    const OFF_EXPERT_IDS: usize = 36;
-    const OFF_EXPERT_WEIGHTS: usize = Self::OFF_EXPERT_IDS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4;
-    // +4 for _pad_align, then activation_ptr (8 bytes), then output_slots_ptr
-    const OFF_ACTIVATION_PTR: usize = Self::OFF_EXPERT_WEIGHTS + MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS * 4 + 4;
-    const OFF_OUTPUT_SLOTS_PTR: usize = Self::OFF_ACTIVATION_PTR + 8;
-    const OFF_ACK_FLAGS: usize = Self::OFF_OUTPUT_SLOTS_PTR + 8;
-
-    /// CPU-initiated batched MoE dispatch for prefill.
+    /// Build an OP_MOE_FFN_REMOTE instruction for one token on `worker_idx`
+    /// (0-based — worker_idx 0 is GPU 1, etc.). Dispatches into the worker's
+    /// persistent_worker mailbox via the caller's `PersistentDispatch`.
     ///
-    /// Writes batch_size tokens' activations + routing into the GART work queue,
-    /// triggers all worker GPUs, and returns the dispatch sequence number.
-    /// Caller should do GPU 0 local expert computation, then call `poll_prefill_batch_ack`.
-    ///
-    /// `activations`: [batch_size × gate_up_in_dim] flat slice
-    /// `expert_ids`: [batch_size × k] flat slice (row-major, k per token)
-    /// `expert_weights`: [batch_size × k] flat slice
-    pub fn trigger_prefill_batch(
-        &mut self,
-        activations: &[f32],
-        expert_ids: &[i32],
-        expert_weights: &[f32],
-        batch_size: usize,
+    /// `activation_p2p_dev_ptr`: GPU 0 VRAM activation pointer (worker P2P-reads via this VA).
+    /// `output_slot_p2p_dev_ptr`: GPU 0 VRAM output-slot for this (token, worker_idx) pair.
+    /// `expert_ids_p2p`, `expert_weights_p2p`: GPU 0 VRAM (or host-mapped) expert routing.
+    /// `layer_idx`: index into worker's `layer_config_ptrs` to select per-layer expert config.
+    pub(crate) fn build_ffn_remote_inst(
+        &self,
+        worker_idx: usize,
+        layer_idx: usize,
+        activation_p2p_dev_ptr: *const f32,
+        output_slot_p2p_dev_ptr: *mut f32,
+        expert_ids_p2p: *const i32,
+        expert_weights_p2p: *const f32,
         k: usize,
-        layer_idx: u32,
-        hs: usize,
         eis: usize,
+        hs: usize,
+        gupd: usize,
         has_gate_proj: bool,
-        gate_up_in_dim: usize,
-    ) -> u32 {
-        assert!(batch_size <= MAX_PREFILL_BATCH);
-        assert!(k <= MAX_ACTIVE_EXPERTS);
-        let num_workers = self.workers.len();
-        // Copy activations to GPU 0 VRAM staging buffer. Workers P2P-read via activation_ptr
-        // after GPU 0's __threadfence_system() flushes L2 before seq_num write.
-        // Safe: GPU 0's persistent worker is NOT running during prefill.
-        self.activation_staging
-            .copy_from_host(&activations[..batch_size * gate_up_in_dim])
-            .expect("activation_staging hipMemcpy failed");
-        let wq_ptr = self.work_queue.host_ptr() as *mut u8;
-        unsafe {
-            (wq_ptr.add(Self::OFF_BATCH_SIZE) as *mut u32).write_volatile(batch_size as u32);
-            (wq_ptr.add(Self::OFF_LAYER_IDX) as *mut u32).write_volatile(layer_idx);
-            (wq_ptr.add(Self::OFF_NUM_ACTIVE) as *mut u32).write_volatile(k as u32);
-            (wq_ptr.add(Self::OFF_HIDDEN_SIZE) as *mut u32).write_volatile(hs as u32);
-            (wq_ptr.add(Self::OFF_EIS) as *mut u32).write_volatile(eis as u32);
-            (wq_ptr.add(Self::OFF_HAS_GATE) as *mut u32).write_volatile(has_gate_proj as u32);
-            (wq_ptr.add(Self::OFF_NUM_WORKERS) as *mut u32).write_volatile(num_workers as u32);
-            (wq_ptr.add(Self::OFF_GATE_UP_IN_DIM) as *mut u32).write_volatile(gate_up_in_dim as u32);
-            // output_slots_ptr
-            (wq_ptr.add(Self::OFF_OUTPUT_SLOTS_PTR) as *mut u64)
-                .write_volatile(self.output_slots.as_ptr() as u64);
-            // expert routing: [t * MAX_ACTIVE_EXPERTS + j]
-            let ids_dst = wq_ptr.add(Self::OFF_EXPERT_IDS) as *mut i32;
-            let wts_dst = wq_ptr.add(Self::OFF_EXPERT_WEIGHTS) as *mut f32;
-            for t in 0..batch_size {
-                for j in 0..k {
-                    ids_dst.add(t * MAX_ACTIVE_EXPERTS + j).write_volatile(expert_ids[t * k + j]);
-                    wts_dst.add(t * MAX_ACTIVE_EXPERTS + j).write_volatile(expert_weights[t * k + j]);
-                }
-            }
-            // Write activation_ptr: GPU 0 VRAM staging (workers P2P-read after __threadfence_system).
-            // GPU 0's persistent worker is NOT running during prefill, so hipMemcpy is safe.
-            (wq_ptr.add(Self::OFF_ACTIVATION_PTR) as *mut u64)
-                .write_volatile(self.activation_staging.as_ptr() as u64);
-            // clear ack flags
-            let ack_ptr = wq_ptr.add(Self::OFF_ACK_FLAGS) as *mut u32;
-            for w in 1..=num_workers {
-                ack_ptr.add(w).write_volatile(0u32);
-            }
-            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-            let seq_ptr = self.seq_counter.host_ptr();
-            let seq = seq_ptr.read_volatile().wrapping_add(1);
-            seq_ptr.write_volatile(seq);
-            (wq_ptr as *mut u32).write_volatile(seq); // seq_num triggers workers
-            seq
-        }
-    }
-
-    /// Poll ack flags from all worker GPUs after `trigger_prefill_batch`.
-    /// Call after GPU 0 has finished its local expert computation.
-    pub fn poll_prefill_batch_ack(&self, seq: u32) {
-        let num_workers = self.workers.len();
-        let wq_ptr = self.work_queue.host_ptr() as *const u8;
-        let ack_ptr = unsafe { wq_ptr.add(Self::OFF_ACK_FLAGS) as *const u32 };
-        for w in 1..=num_workers {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let ack = unsafe { ack_ptr.add(w).read_volatile() };
-                if ack == seq { break; }
-                if crate::persistent_dispatch::shutdown_requested() {
-                    panic!("MoE prefill ack interrupted: SIGINT/SIGTERM (gpu={w}, seq={seq})");
-                }
-                if std::time::Instant::now() > deadline {
-                    panic!("MoE worker GPU {} prefill batch ack timeout (seq={seq})", w);
-                }
-                std::hint::spin_loop();
-            }
-        }
-    }
-
-    /// Print timing analysis from the worker GPU timing buffers.
-    /// GPU clock frequency for 7900XTX (RDNA3): ~2500 MHz.
-    /// Call after at least one token has been generated.
-    pub fn print_timing_report(&self, gpu_clock_mhz: f64) {
-        let cycles_per_us = gpu_clock_mhz / 1000.0;
-        for (i, worker) in self.workers.iter().enumerate() {
-            let buf = worker.timing_buf.host_ptr();
-            let mut slots_used = 0u32;
-            // Count non-zero slots
-            for s in 0..64 {
-                let t0 = unsafe { std::ptr::read_volatile(buf.add(s * 4)) };
-                if t0 == 0 { break; }
-                slots_used += 1;
-            }
-            if slots_used == 0 {
-                eprintln!("  Worker GPU {}: no timing data (timing_buf all zero)", i + 1);
-                continue;
-            }
-            eprintln!("  Worker GPU {} timing ({} layers, clock={} MHz):", i + 1, slots_used, gpu_clock_mhz as u64);
-            let mut total_outer_us = 0.0f64;
-            let mut total_copy_us = 0.0f64;
-            let mut total_expert_us = 0.0f64;
-            let mut total_output_us = 0.0f64;
-            for s in 0..(slots_used as usize) {
-                let t0 = unsafe { std::ptr::read_volatile(buf.add(s * 4    )) }; // work_start
-                let t1 = unsafe { std::ptr::read_volatile(buf.add(s * 4 + 1)) }; // copy_done
-                let t2 = unsafe { std::ptr::read_volatile(buf.add(s * 4 + 2)) }; // experts_done
-                let t3 = unsafe { std::ptr::read_volatile(buf.add(s * 4 + 3)) }; // output_done
-                if t0 == 0 || t1 < t0 || t2 < t1 || t3 < t2 { continue; }
-                total_copy_us   += (t1 - t0) as f64 / cycles_per_us;
-                total_expert_us += (t2 - t1) as f64 / cycles_per_us;
-                total_output_us += (t3 - t2) as f64 / cycles_per_us;
-                // Outer sync cost: gap between this slot's output_done and next slot's work_start
-                if s + 1 < slots_used as usize {
-                    let t_next = unsafe { std::ptr::read_volatile(buf.add((s + 1) * 4)) };
-                    if t_next > t3 {
-                        total_outer_us += (t_next - t3) as f64 / cycles_per_us;
-                    }
-                }
-            }
-            let n = (slots_used - 1).max(1) as f64;
-            eprintln!("    Outer sync+poll avg: {:.1} us/layer  (TOTAL {:.1} us)",
-                total_outer_us / n, total_outer_us);
-            eprintln!("    Activation copy avg: {:.1} us/layer  (TOTAL {:.1} us)",
-                total_copy_us / slots_used as f64, total_copy_us);
-            eprintln!("    Expert compute  avg: {:.1} us/layer  (TOTAL {:.1} us)",
-                total_expert_us / slots_used as f64, total_expert_us);
-            eprintln!("    Output copy     avg: {:.1} us/layer  (TOTAL {:.1} us)",
-                total_output_us / slots_used as f64, total_output_us);
-            let total = total_outer_us + total_copy_us + total_expert_us + total_output_us;
-            eprintln!("    Total measured:      {:.1} us  ({:.1} tok/s if dominant)",
-                total, 1e6 / total);
-        }
-    }
-}
-
-impl Drop for MoeP2pContext {
-    fn drop(&mut self) {
-        // ALWAYS request shutdown (even on panic). The kernel polls shutdown at the top
-        // of its instruction loop. Use a short timeout on panic, longer on clean exit.
-        // On timeout we leak HIP resources rather than risk hipFree deadlocking against
-        // a still-running cooperative kernel.
-        let panicking = std::thread::panicking();
-        let timeout = if panicking {
-            std::time::Duration::from_secs(2)
-        } else {
-            std::time::Duration::from_secs(5)
-        };
-        for worker in &self.workers {
-            unsafe {
-                std::ptr::write_volatile(worker.shutdown.host_ptr(), 1u32);
-            }
-        }
-        let deadline = std::time::Instant::now() + timeout;
-        let mut worker_done = vec![false; self.workers.len()];
-        for (idx, worker) in self.workers.iter().enumerate() {
-            loop {
-                let done = unsafe { std::ptr::read_volatile(worker.done.host_ptr()) };
-                if done != 0 {
-                    worker_done[idx] = true;
-                    break;
-                }
-                if std::time::Instant::now() > deadline {
-                    eprintln!(
-                        "braidinfer: moe_worker shutdown timeout on GPU {} (leaking) {}",
-                        worker.device.0,
-                        if panicking { "[panic]" } else { "" }
-                    );
-                    break;
-                }
-                std::hint::spin_loop();
-            }
-        }
-        for (idx, worker) in self.workers.iter_mut().enumerate() {
-            if worker_done[idx] {
-                unsafe {
-                    ManuallyDrop::drop(worker);
-                }
-            }
-        }
-        if panicking {
-            std::process::exit(1);
-        }
+        relu_sq: bool,
+    ) -> crate::megakernel::Instruction {
+        let w = &self.workers[worker_idx];
+        let cfg_ptr = w.layer_config_ptrs_host[layer_idx] as *const std::ffi::c_void;
+        // grid_x is unused inside op_moe_ffn_remote (which uses the full grid).
+        crate::megakernel::instructions::MoeFfnRemoteInst::new(
+            1, // grid_x — kernel uses cooperative full grid; value irrelevant
+            activation_p2p_dev_ptr,
+            output_slot_p2p_dev_ptr,
+            expert_ids_p2p,
+            expert_weights_p2p,
+            cfg_ptr,
+            w.local_activation.as_ptr() as *mut f32,
+            w.local_output.as_ptr() as *mut f32,
+            w.scratch_gate.as_ptr() as *mut f32,
+            w.scratch_up.as_ptr() as *mut f32,
+            w.scratch_act.as_ptr() as *mut f32,
+            k as u32,
+            eis as u32,
+            hs as u32,
+            gupd as u32,
+            has_gate_proj,
+            relu_sq,
+        ).into_inst()
     }
 }
 

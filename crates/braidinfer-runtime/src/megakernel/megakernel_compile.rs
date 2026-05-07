@@ -1741,10 +1741,17 @@ impl MegakernelProgram {
                 .map(|&(flush, resume)| {
                     (flush + inserted_before[flush], resume + inserted_before[resume])
                 }).collect();
+
+            // Remap barrier_layer_map indices (now point at OP_MOE_DISPATCH).
+            prog.barrier_layer_map = prog.barrier_layer_map.iter()
+                .map(|&(idx, layer)| (idx + inserted_before[idx], layer))
+                .collect();
         }
 
-        // Clear barrier_layer_map so it's not misinterpreted after OP_BARRIER→OP_MOE_DISPATCH patch
-        prog.barrier_layer_map.clear();
+        // KEEP barrier_layer_map: in the unified-worker design it identifies
+        // OP_MOE_DISPATCH instruction indices so decode_step_p2p can wrap each
+        // MoE op with worker dispatch (OP_MOE_FFN_REMOTE → wait_ack on each
+        // worker) before firing the GPU 0 batch containing op_moe_dispatch.
 
         Ok(prog)
     }

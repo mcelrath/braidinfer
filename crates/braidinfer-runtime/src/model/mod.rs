@@ -68,7 +68,6 @@ pub struct Model {
     pub(crate) kv_quant: bool,         // cached from KV_QUANT env var at load time
     pub(crate) sync_debug: bool,       // cached from SYNC_DEBUG env var at load time
     pub(crate) debug_p2p_hidden: bool, // cached from DEBUG_P2P_HIDDEN env var at load time
-    pub(crate) moe_timing: bool,       // cached from MOE_TIMING env var at load time
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
     // Multi-GPU expert parallel (None for single-GPU)
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
