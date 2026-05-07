@@ -98,7 +98,7 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
         braidinfer::rdna3::atomic_block_barrier(&g_gbs);
 
         // Watchdog: cooperative exit if force_exit set.
-        if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
+        if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
             watchdog_signal_exit(&queue->done);
             return;
         }

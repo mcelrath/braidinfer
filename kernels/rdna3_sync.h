@@ -261,23 +261,6 @@ __device__ __forceinline__ void asm_block_barrier(GridBarrierState* state) {
     __syncthreads();
 }
 
-// fast_grid_sync — preferred call site spelling.
-//
-// If `state` is non-null, uses atomic_block_barrier (faster on gfx1100 per
-// rdna3_sync_bench). If null, falls back to cooperative_groups grid.sync().
-// This lets callers stage the migration from cg grid.sync without code-wide
-// surgery.
-__device__ __forceinline__ void fast_grid_sync(
-    cooperative_groups::grid_group& grid,
-    GridBarrierState* state)
-{
-    if (state) {
-        atomic_block_barrier(state);
-    } else {
-        grid.sync();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Diagnostic helpers (not for production)
 // ---------------------------------------------------------------------------

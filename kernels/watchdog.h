@@ -13,6 +13,7 @@
 // Use volatile reads for polling host-mapped memory. __hip_atomic_store(SYSTEM) works.
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
+#include "rdna3_sync.h"
 
 struct WatchdogState {
     volatile uint32_t force_exit;        // host writes 1 to request emergency exit
@@ -58,14 +59,22 @@ __device__ bool __watchdog_should_exit;
 // Protocol:
 //   1. Thread 0, block 0 reads force_exit via volatile load (avoids gfx1100 atomic_load hang).
 //   2. Writes decision to __watchdog_should_exit (__device__ global, visible to all blocks).
-//   3. grid.sync() — all blocks wait here, so the decision is fully visible on return.
+//   3. atomic_block_barrier(gbs) — all blocks wait here, so the decision is fully visible on return.
 //   4. All blocks return the shared decision.
 //
+// MIGRATION NOTE: this function previously called cooperative_groups::grid_group::sync().
+// Mixing cg::grid_group::sync() and atomic_block_barrier() in the SAME kernel deadlocks
+// deterministically on gfx1100 (cooperative_groups uses a stateful HW barrier slot that
+// becomes inconsistent if any prior barrier in the same kernel didn't traverse it).
+// All callers in this codebase already use atomic_block_barrier between top-level
+// instructions, so we MUST use the same primitive here. See bd memory
+// 'rdna3-atomic-block-barrier-cg-grid-group-sync'.
+//
 // If this returns true, the caller MUST return from the kernel immediately (all blocks
-// return together, so no block is left waiting at the next grid.sync()).
+// return together, so no block is left waiting at the next barrier).
 __device__ __forceinline__ bool watchdog_poll_and_check(
     WatchdogState* ws,
-    cooperative_groups::grid_group& grid,
+    braidinfer::rdna3::GridBarrierState* gbs,
     uint32_t op_id)
 {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -74,7 +83,7 @@ __device__ __forceinline__ bool watchdog_poll_and_check(
         __watchdog_should_exit = (fe != 0);
         ws->last_op_id = op_id;
     }
-    grid.sync();
+    braidinfer::rdna3::atomic_block_barrier(gbs);
     return __watchdog_should_exit;
 }
 

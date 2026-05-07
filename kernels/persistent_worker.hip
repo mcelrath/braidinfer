@@ -74,7 +74,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
         // Watchdog: cooperative exit if force_exit set.
-        if (watchdog && watchdog_poll_and_check(watchdog, grid, 0u)) {
+        if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
             watchdog_signal_exit(&queue->done);
             return;
         }

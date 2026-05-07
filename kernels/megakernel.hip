@@ -208,7 +208,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     for (int pc = 0; pc < num_instructions; pc++) {
         // Watchdog: check force_exit between instructions. All blocks reach this point
         // via the grid.sync() at the end of each instruction, so cooperative exit is safe.
-        if (watchdog && watchdog_poll_and_check(watchdog, grid, (uint32_t)pc)) {
+        if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, (uint32_t)pc)) {
             return;  // all blocks return together; no done_flag (megakernel has no persistent done)
         }
         if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
