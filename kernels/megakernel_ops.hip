@@ -1794,15 +1794,14 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
     }
 
     int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
-#ifdef BRAIDINFER_USE_PAGE_ROTATION
-    // 77r.2.8: each CTA (blockIdx.x) starts at a different physical chunk
-    // and wraps. Logical-to-physical page mapping unchanged; only iteration
-    // order differs. Reduces MCD contention when many CTAs walk the same
-    // chunk order in lock-step (kb ck-commit-63fb40520f-g1).
+    // 77r.2.8: per-CTA page rotation. Each CTA (blockIdx.x) starts at a
+    // different physical chunk and wraps. Logical-to-physical page mapping
+    // unchanged; only iteration order differs. Reduces MCD contention when
+    // many CTAs walk the same chunk order in lock-step. Validated by
+    // re-runs with corrected env propagation (kb 77r-2-8-page-rotation-real-
+    // 2026-05-08-NET-WIN): +8% qwen35_2b, +1.4% mistral, +19% qwen35-0.8b,
+    // byte-identical coherence on all 3 models.
     const int rotation_offset = (num_chunks > 0) ? (blockIdx.x % num_chunks) : 0;
-#else
-    const int rotation_offset = 0;
-#endif
 
     for (int iter = 0; iter < num_chunks; iter++) {
         const int c = (iter + rotation_offset) % num_chunks;
@@ -1968,11 +1967,8 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
     float v_acc = 0.0f;
 
     int num_chunks = (seq_len + chunk_tokens - 1) / chunk_tokens;
-#ifdef BRAIDINFER_USE_PAGE_ROTATION
+    // 77r.2.8: per-CTA page rotation (see op_attn_paged for details).
     const int rotation_offset = (num_chunks > 0) ? (blockIdx.x % num_chunks) : 0;
-#else
-    const int rotation_offset = 0;
-#endif
 
     for (int iter = 0; iter < num_chunks; iter++) {
         const int c = (iter + rotation_offset) % num_chunks;

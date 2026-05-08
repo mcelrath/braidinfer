@@ -32,14 +32,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_KV_LOAD_AUX");
     let kv_load_aux = env::var("BRAIDINFER_KV_LOAD_AUX").ok();
 
-    // 77r.2.8: optional per-CTA page rotation in op_attn_paged + _quant.
-    // Each CTA starts at a different physical chunk index (rotation_offset =
-    // blockIdx.x % num_chunks), wraps around. Logical-to-physical mapping
-    // unchanged — only iteration order differs. CK measured +9% attention
-    // bandwidth on similar hardware.
-    println!("cargo:rerun-if-env-changed=BRAIDINFER_USE_PAGE_ROTATION");
-    let use_page_rotation = env::var("BRAIDINFER_USE_PAGE_ROTATION").is_ok();
-
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
     let kernels = [
         "rmsnorm",
@@ -91,9 +83,6 @@ fn main() {
         }
         if use_dot2 {
             hipcc_args.push("-DBRAIDINFER_USE_DOT2".to_string());
-        }
-        if use_page_rotation {
-            hipcc_args.push("-DBRAIDINFER_USE_PAGE_ROTATION".to_string());
         }
         if let Some(ref aux) = kv_load_aux {
             hipcc_args.push(format!("-DBRAIDINFER_KV_LOAD_AUX={aux}"));
