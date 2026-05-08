@@ -47,27 +47,62 @@ throttling entirely. Apply without reboot:
 
 Verify: `cat /proc/sys/kernel/sched_rt_runtime_us` shows `-1`.
 
-#### Optional: kernel cmdline core isolation
+#### Kernel cmdline core isolation (8-GPU box, recommended layout)
 
-For multi-tenant deployments (multiple concurrent braidinfer processes),
-add to `GRUB_CMDLINE_LINUX_DEFAULT` in `/etc/default/grub`:
+For an 8-GPU host, reserve **9 cores** at the top end of the CPU range
+(64-core box uses cores 55-63):
 
-    isolcpus=56-63 nohz_full=56-63 rcu_nocbs=56-63
+    isolcpus=55-63 nohz_full=55-63 rcu_nocbs=55-63
 
-Adjust the CPU range to dedicate one core per concurrent process. After editing:
+After editing `/etc/default/grub`:
 
     sudo grub-mkconfig -o /boot/grub/grub.cfg
     sudo reboot
 
-- `isolcpus=` removes listed cores from the general scheduler's load-balancing
-  domain. Only tasks explicitly affined via `sched_setaffinity()` will land
-  there.
-- `nohz_full=` runs those cores tickless when only one task is runnable;
-  eliminates microsecond-scale scheduler jitter.
-- `rcu_nocbs=` moves RCU callback processing off the isolated cores.
+Layout once active:
 
-Not required for single-process workloads — `SCHED_FIFO` plus sane affinity
-is sufficient.
+| Core | Pinned to | How |
+|---|---|---|
+| 55 | braidinfer dispatch thread | server-side `sched_setaffinity` (single thread polls all 8 GPU mailboxes) |
+| 56 | amdgpu card 0 IRQ | `/proc/irq/<N>/smp_affinity` via `amdgpu-irq-pin.sh` |
+| 57-63 | amdgpu cards 1-7 IRQs | same |
+
+What each cmdline param does:
+
+- `isolcpus=` removes listed cores from the general scheduler's
+  load-balancing domain. Only tasks explicitly affined via
+  `sched_setaffinity()` (or `taskset -c`) will land there.
+- `nohz_full=` runs those cores tickless when only one task is runnable;
+  eliminates microsecond-scale scheduler jitter from the periodic timer.
+- `rcu_nocbs=` moves RCU callback processing off the isolated cores so
+  unrelated subsystems don't briefly run there.
+
+amdgpu IRQ pinning notes:
+
+- On stock kernels (no `threadirqs` cmdline, no `force_threading=1`)
+  amdgpu IRQs are **hard IRQs only**: `/proc/irq/<N>/smp_affinity` is
+  the complete pinning. There are no `irq/<N>-amdgpu` kthreads to also
+  pin.
+- If `threadirqs` is in the cmdline OR amdgpu is built with
+  `force_threading=1`, threaded IRQ handlers (`irq/<N>-amdgpu`
+  kthreads) DO exist and must be pinned separately via `taskset -p` and
+  optionally promoted to `SCHED_FIFO` at higher priority than braidinfer
+  dispatch.
+- Verify which path applies: `ps -eLo tid,comm | grep '^\s*[0-9]\+\s\+irq/.*amdgpu'`
+  — if empty, hard IRQs only.
+
+Why core 55 for braidinfer (not co-located with IRQs):
+
+- With hard amdgpu IRQs, co-locating works fine — IRQs preempt
+  `SCHED_FIFO` automatically.
+- A separate dispatch core is preferred for clean perf measurements
+  (no IRQ cycles attributed to dispatch) and for future-proofing
+  against a future kernel that flips amdgpu to threaded IRQs (which
+  would otherwise starve dispatch via SCHED_FIFO competition).
+
+Not required for single-process workloads or single-user dev boxes —
+`SCHED_FIFO` + dispatch-thread affinity to any one CPU is sufficient.
+The 9-core layout is the production-server recipe.
 
 ### Required cmdline tuning (independent of RT)
 
@@ -85,17 +120,21 @@ do not set them:
 | `amdgpu.gfx_off=0` | Keeps GPU graphics block always on |
 | `amdgpu.mcbp=0` | Disables mid-command-buffer preemption |
 
-### Cores to dedicate
+### Cores for the dispatch thread
 
-| Workload | Cores needed | Note |
-|---|---|---|
-| Single braidinfer process | 1 | One pinned dispatch thread |
-| N concurrent processes | N | SCHED_FIFO threads of equal priority do not preempt each other; two spinners on one core = one starves |
-| Single process, multi-GPU MoE | N (one per GPU) | Each GPU has its own dispatch thread in the same process |
+The server architecture (epic `braidinfer-wks`, in progress) consolidates
+dispatch onto a **single thread** that polls all 8 GPU mailboxes
+(`try_wait_acks_many` in `crates/braidinfer-runtime/src/persistent_dispatch.rs`,
+landed in commit `977f002`). One core serves one server — and that
+server can have an arbitrary number of clients, since each in-flight
+generation is just a few hundred nanoseconds of mailbox-polling work
+amortized over ~10 ms of GPU compute per dispatch.
 
-A single thread can poll all 8 GPU mailboxes in one tight inner loop (each
-mailbox check is sub-µs); this would let one core serve eight GPUs but is
-an architectural change to the dispatch path, not currently implemented.
+The pre-server in-process binary (`bin/generate`) follows the older model
+where each invocation owns its own dispatch loop. Running multiple
+concurrent `generate` processes is not the supported multi-tenant
+configuration — for that, run `braidinfer-server` once and connect
+multiple clients (Phase 4+ of the epic).
 
 ### Verification
 
