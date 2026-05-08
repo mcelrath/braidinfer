@@ -260,6 +260,16 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             continue;
         }
 
+        // OP_LM_HEAD (braidinfer-bfd): full-grid bf16 lm_head with LDS-staged
+        // input. Bypasses the virtual block loop (rows iterated internally).
+        if (opcode == OP_LM_HEAD) {
+            op_lm_head(inst, grid_x);
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+            if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); braidinfer::rdna3::atomic_block_barrier(&g_gbs); }
+            OP_PROFILE_END(opcode, op_profile);
+            continue;
+        }
+
         // OP_MOE_DISPATCH: PRE stage — zero GPU 0's output slot + run GPU 0 local experts.
         // Manages its own grid.sync() internally.
         if (opcode == OP_MOE_DISPATCH) {
@@ -293,7 +303,6 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 case OP_FFN_GATE_UP:  op_ffn_gate_up(inst, vb); break;
                 case OP_FFN_DOWN_RES: op_ffn_down_res(inst, vb); break;
                 case OP_EMBEDDING:    op_embedding(inst, vb); break;
-                case OP_LM_HEAD:      op_lm_head(inst, vb); break;
                 case OP_D2D_COPY:     op_d2d_copy(inst, vb); break;
                 case OP_ATTN_PAGED:   op_attn_paged(inst, vb); break;
                 case OP_ATTN_PREFILL: op_attn_prefill(inst, vb); break;

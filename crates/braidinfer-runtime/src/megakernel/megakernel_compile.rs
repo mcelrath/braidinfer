@@ -256,7 +256,11 @@ impl MegakernelProgram {
             } else {
                 model.lm_head_weight.as_ptr() as *const u8
             };
-            instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, vs as u32, act.logits.as_write_ptr(), lm_weight, act.hidden.as_ptr(), vs as i32, hs as i32, 0).into_inst());
+            // braidinfer-bfd: lm_head dispatched as OP_LM_HEAD (LDS-tiled
+            // full-grid variant) instead of OP_LINEAR_PROJ. Numerically
+            // equivalent — same accumulation order, only input source
+            // changes from VRAM to LDS-staged.
+            instructions.push(LinearProjInst::new(OP_LM_HEAD, vs as u32, act.logits.as_write_ptr(), lm_weight, act.hidden.as_ptr(), vs as i32, hs as i32, 0).into_inst());
         }
 
         // HALT
@@ -1080,7 +1084,7 @@ impl MegakernelProgram {
                 model.lm_head_weight.as_ptr() as *const u8
             };
             instructions.push(LinearProjInst::new(
-                OP_LINEAR_PROJ, cfg.vocab_size as u32,
+                OP_LM_HEAD, cfg.vocab_size as u32,
                 act.logits.as_write_ptr(), lm_w_ptr, act.hidden.as_ptr(),
                 cfg.vocab_size as i32, hs as i32, 0,
             ).into_inst());
@@ -1365,7 +1369,7 @@ impl MegakernelProgram {
             instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1, act.hidden.as_write_ptr(), act.normed.as_ptr(), model.final_norm_weight.as_ptr(), hs as i32, eps).into_inst());
             {
                 let lm_w_ptr = if cfg.tie_word_embeddings { model.embed_weight.as_ptr() } else { model.lm_head_weight.as_ptr() };
-                instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, cfg.vocab_size as u32, act.logits.as_write_ptr(), lm_w_ptr as *const u8, act.hidden.as_ptr(), cfg.vocab_size as i32, hs as i32, 0).into_inst());
+                instructions.push(LinearProjInst::new(OP_LM_HEAD, cfg.vocab_size as u32, act.logits.as_write_ptr(), lm_w_ptr as *const u8, act.hidden.as_ptr(), cfg.vocab_size as i32, hs as i32, 0).into_inst());
             }
         }
         instructions.push(Instruction::new(OP_HALT, 0));
@@ -1464,7 +1468,7 @@ impl MegakernelProgram {
         } else {
             model.lm_head_weight.as_ptr() as *const u8
         };
-        instructions.push(LinearProjInst::new(OP_LINEAR_PROJ, vs as u32,
+        instructions.push(LinearProjInst::new(OP_LM_HEAD, vs as u32,
             act.logits.as_write_ptr(), lm_w_ptr, act.hidden.as_ptr(),
             vs as i32, hs as i32, 0).into_inst());
         instructions.push(Instruction::new(OP_HALT, 0));

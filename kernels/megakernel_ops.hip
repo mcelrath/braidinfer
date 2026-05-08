@@ -1512,10 +1512,78 @@ __device__ __attribute__((noinline)) void op_embedding(const u64* inst, u32 vblo
     }
 }
 
-// OP_LM_HEAD: logits[row] = dot(weight[row], input) — same as linear_proj but may be large
-// Reuses op_linear_proj logic
-__device__ __attribute__((noinline)) void op_lm_head(const u64* inst, u32 vblock) {
-    op_linear_proj(inst, vblock);
+// OP_LM_HEAD: full-grid lm_head dispatch. Stages input into LDS once per
+// block, then iterates rows assigned to this block (`row = blockIdx.x` stride
+// `gridDim.x`) reading weight from VRAM. Mirrors op_linear_proj_pcg32_full's
+// structure (kernels/megakernel_ops.hip:599) but for bf16 weights.
+//
+// Caller responsibility: dispatch via the top-level OP_LM_HEAD case in
+// megakernel.hip (NOT through the virtual-block loop). `grid_x` must equal
+// `out_dim` (= vocab_size for tied embedding).
+//
+// Per kb op-profile-bw-2026-05-08-lm-head-77GBps the per-row
+// `op_linear_proj` path achieves ~77 GB/s (8% of 7900 XTX HBM peak) on
+// qwen35_2b's lm_head. The LDS-tiled pattern is the same structure that
+// gave PCG32 a 2.1× speedup in commit f9c382c.
+__device__ __attribute__((noinline)) void op_lm_head(const u64* inst, u32 grid_x) {
+    const LinearProjInst* i = (const LinearProjInst*)inst;
+    float* output_base = i->output;
+    const uint16_t* weight = (const uint16_t*)i->weight;
+    const float* input_base = i->input;
+    int out_dim = (int)i->out_dim;
+    int in_dim = (int)i->in_dim;
+    int batch = (int)i->batch;
+    if (batch <= 1) batch = 1;
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    extern __shared__ float shared[];
+
+    if (batch == 1) {
+        // LDS layout reuses the LPROJ_TILE allocation: shared[0..7] = warp
+        // partials for block_reduce_sum, shared[8..8+in_dim] = staged input.
+        float* lds_input = shared + 8;
+
+        // Stage the entire input into LDS. lm_head input is hidden_size
+        // floats; for typical models (qwen35_2b hidden=2048) this is 8 KB,
+        // well below LPROJ_TILE_FLOATS=7680*4=30720 bytes.
+        for (int j = tid; j < in_dim; j += stride) lds_input[j] = input_base[j];
+        __syncthreads();
+
+        const int vec_elements = 8;
+        const int vec_count = in_dim / vec_elements;
+
+        for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x) {
+            const uint16_t* w_row = weight + (long long)row * in_dim;
+            const ull2* w_vec = (const ull2*)w_row;
+            float acc = 0.0f;
+
+            for (int vi = tid; vi < vec_count; vi += stride) {
+                ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
+                unsigned short ws[8];
+                __builtin_memcpy(ws, &wv, 16);
+                int base = vi * vec_elements;
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    acc += bf16_to_f32(ws[j]) * lds_input[base + j];
+                }
+            }
+            int rem = vec_count * vec_elements;
+            for (int j = rem + tid; j < in_dim; j += stride) {
+                acc += bf16_to_f32(w_row[j]) * lds_input[j];
+            }
+
+            float total = block_reduce_sum(acc, shared);
+            if (tid == 0) output_base[row] = total;
+        }
+        return;
+    }
+
+    // batch > 1: fall back to per-row op_linear_proj (prefill / batched paths
+    // don't go through the lm_head dispatch in current call sites).
+    for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x) {
+        op_linear_proj(inst, row);
+    }
 }
 
 // OP_QK_NORM: per-head RMSNorm on Q and K with (1+weight)

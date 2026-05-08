@@ -88,12 +88,12 @@ fn main() {
     // tag known-shape ops with achieved memory bandwidth so the table
     // exposes whether they are BW- or compute-bound.
     let rate_khz = op_profile::wallclock_rate_khz(device).expect("wallclock rate");
-    // OP_LINEAR_PROJ is only emitted for the lm_head (megakernel_compile.rs
-    // flags it explicitly). Reads vocab_size × hidden_size of bf16 weight.
-    // Opcode 2 = OP_LINEAR_PROJ per kernels/opcodes.h.
+    // OP_LM_HEAD (opcode 15 per kernels/opcodes.h). After braidinfer-bfd
+    // the lm_head emit site uses OP_LM_HEAD (LDS-tiled variant). Reads
+    // vocab_size × hidden_size of bf16 weight per dispatch.
     let lm_head_bytes = (vocab_size * hidden_size * 2) as u64;
     let shapes = vec![op_profile::OpShape {
-        opcode: 2,
+        opcode: 15,
         bytes_per_dispatch: lm_head_bytes,
         label: "lm_head bf16",
     }];
