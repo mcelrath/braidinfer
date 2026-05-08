@@ -75,6 +75,47 @@ pub(crate) fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Recoverable error from the dispatch ack-spin path. The legacy
+/// in-process call sites translate this into `panic!()` (preserving
+/// existing semantics), but a long-running daemon (braidinfer-wks)
+/// converts it into per-session RPC errors instead. See PLAN-dispatch-daemon.md.
+#[derive(Debug)]
+pub enum DispatchError {
+    /// SIGINT/SIGTERM received during the ack-spin. Caller should drain
+    /// in-flight work and return an error to its client.
+    ShutdownRequested { gpu: usize, seq: u32 },
+    /// 30s timeout without ack progress. Indicates a wedged kernel;
+    /// supervisor should SIGKILL the daemon (kb braidinfer-wks Phase 3).
+    Timeout {
+        gpu: usize,
+        seq: u32,
+        ack: u32,
+        progress_pc: u32,
+    },
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchError::ShutdownRequested { gpu, seq } => write!(
+                f,
+                "dispatch interrupted by SIGINT/SIGTERM (gpu={gpu}, seq={seq})"
+            ),
+            DispatchError::Timeout {
+                gpu,
+                seq,
+                ack,
+                progress_pc,
+            } => write!(
+                f,
+                "dispatch timeout gpu={gpu} seq={seq} ack={ack} progress_pc={progress_pc}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
 #[repr(C)]
@@ -281,27 +322,143 @@ impl PersistentDispatch {
         gpu_idx < self.workers.len() && self.workers[gpu_idx].is_some()
     }
 
-    /// Wait for a GPU to ack a specific seq number.
-    pub(crate) fn wait_ack(&self, gpu_idx: usize, seq: u32) {
+    /// Wait for a GPU to ack a specific seq number, returning a recoverable
+    /// error on shutdown / timeout instead of panicking. This is the new
+    /// daemon-friendly path (braidinfer-wks Phase 1). For the in-process
+    /// binary that wants the legacy panic-on-shutdown semantics, use
+    /// [`Self::wait_ack`] (a thin wrapper that unwraps).
+    pub(crate) fn try_wait_ack(&self, gpu_idx: usize, seq: u32) -> Result<(), DispatchError> {
         let q_ptr = self.worker(gpu_idx).queue.host_ptr() as *const WorkerQueueLayout;
         let start = std::time::Instant::now();
         loop {
             let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
             if ack == seq {
-                break;
+                return Ok(());
             }
             if shutdown_requested() {
-                panic!("wait_ack interrupted: SIGINT/SIGTERM (gpu={gpu_idx}, seq={seq})");
+                return Err(DispatchError::ShutdownRequested { gpu: gpu_idx, seq });
             }
             if start.elapsed().as_secs() > 30 {
                 let progress_pc = unsafe {
                     std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc))
                 };
-                panic!(
-                    "wait_ack timeout gpu={gpu_idx} seq={seq} ack={ack} progress_pc={progress_pc}"
-                );
+                return Err(DispatchError::Timeout {
+                    gpu: gpu_idx,
+                    seq,
+                    ack,
+                    progress_pc,
+                });
             }
             std::hint::spin_loop();
+        }
+    }
+
+    /// Wait for multiple (gpu, seq) targets to ack in a single shared poll
+    /// loop. Round-robins across all targets, returning when every one has
+    /// acked. This is the foundation of the single-thread multi-GPU
+    /// dispatcher (PLAN-dispatch-daemon.md Phase 1) — one polling thread
+    /// can service all 8 GPUs concurrently because each iteration costs
+    /// ~100 ns × N targets, vs ~10 ms of GPU compute per dispatch.
+    ///
+    /// Memory ordering: the `ack` fields live in independent host-DRAM
+    /// cache lines (one per GPU's host-mapped queue). Round-robin reads
+    /// across them require no fences — each line's value is independent
+    /// state.
+    ///
+    /// Unlike sequential `try_wait_ack` per target, this also reports
+    /// per-iteration polling overhead when `DISPATCH_RTT=1` is set
+    /// (success-criterion measurement for Phase 1).
+    pub(crate) fn try_wait_acks_many(
+        &self,
+        targets: &[(usize, u32)],
+    ) -> Result<(), DispatchError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        // Cache the queue pointers up front; one indirection per iteration
+        // is wasteful when the inner loop is hot.
+        let q_ptrs: Vec<*const WorkerQueueLayout> = targets
+            .iter()
+            .map(|(g, _)| self.worker(*g).queue.host_ptr() as *const WorkerQueueLayout)
+            .collect();
+        let mut done = vec![false; targets.len()];
+        let mut remaining = targets.len();
+        let start = std::time::Instant::now();
+
+        let report_overhead = std::env::var("DISPATCH_RTT").is_ok();
+        let mut iter_count: u64 = 0;
+
+        while remaining > 0 {
+            for i in 0..targets.len() {
+                if done[i] {
+                    continue;
+                }
+                let (_gpu, seq) = targets[i];
+                let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptrs[i]).ack)) };
+                if ack == seq {
+                    done[i] = true;
+                    remaining -= 1;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+            if shutdown_requested() {
+                // Find the first not-yet-acked target and report it.
+                for i in 0..targets.len() {
+                    if !done[i] {
+                        let (gpu, seq) = targets[i];
+                        return Err(DispatchError::ShutdownRequested { gpu, seq });
+                    }
+                }
+                unreachable!("remaining > 0 but all done");
+            }
+            if start.elapsed().as_secs() > 30 {
+                for i in 0..targets.len() {
+                    if !done[i] {
+                        let (gpu, seq) = targets[i];
+                        let ack = unsafe {
+                            std::ptr::read_volatile(std::ptr::addr_of!((*q_ptrs[i]).ack))
+                        };
+                        let progress_pc = unsafe {
+                            std::ptr::read_volatile(std::ptr::addr_of!((*q_ptrs[i]).progress_pc))
+                        };
+                        return Err(DispatchError::Timeout {
+                            gpu,
+                            seq,
+                            ack,
+                            progress_pc,
+                        });
+                    }
+                }
+                unreachable!("remaining > 0 but all done");
+            }
+            iter_count += 1;
+            std::hint::spin_loop();
+        }
+        if report_overhead {
+            let elapsed_us = start.elapsed().as_micros() as u64;
+            let per_iter_ns = if iter_count > 0 {
+                (elapsed_us * 1000) / iter_count
+            } else {
+                0
+            };
+            eprintln!(
+                "wait_acks_many n_targets={} iters={iter_count} total={elapsed_us}us per_iter={per_iter_ns}ns",
+                targets.len()
+            );
+        }
+        Ok(())
+    }
+
+    /// Legacy wait-ack that panics on shutdown / timeout to preserve the
+    /// existing in-process binary semantics (Drop runs during unwind, the
+    /// panic message is already part of the user-visible behavior). Daemon
+    /// code paths must use [`Self::try_wait_ack`] / [`Self::try_wait_acks_many`]
+    /// directly so they can convert errors to per-session RPC failures.
+    pub(crate) fn wait_ack(&self, gpu_idx: usize, seq: u32) {
+        if let Err(e) = self.try_wait_ack(gpu_idx, seq) {
+            panic!("{e}");
         }
     }
 
@@ -340,23 +497,18 @@ impl PersistentDispatch {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
         }
 
-        // Wait for ack
+        // Wait for ack via the shared try_wait_ack path, panicking to
+        // preserve legacy in-process semantics. Daemon should use
+        // dispatch_batch_fire + try_wait_acks_many directly.
         let start = std::time::Instant::now();
-        loop {
-            let ack = unsafe { std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)) };
-            if ack == seq {
-                break;
-            }
-            if shutdown_requested() {
-                panic!(
-                    "dispatch_batch interrupted: SIGINT/SIGTERM (gpu={gpu_idx}, seq={seq})"
-                );
-            }
-            if start.elapsed().as_secs() > 30 {
+        if let Err(e) = self.try_wait_ack(gpu_idx, seq) {
+            // Augment timeout messages with the original instruction-level
+            // diagnostics that the old inline path produced.
+            if let DispatchError::Timeout {
+                progress_pc, ack, ..
+            } = e
+            {
                 let opcode0 = instructions[0].words[0] as u32;
-                let progress_pc = unsafe {
-                    std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc))
-                };
                 let stuck_op = instructions
                     .get(progress_pc as usize)
                     .map(|i| i.words[0] as u32 as u64)
@@ -366,12 +518,13 @@ impl PersistentDispatch {
                     .map(|i| (i.words[0] >> 32) as u32)
                     .unwrap_or(0);
                 panic!(
-                    "dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} opcode0={opcode0} \
-                     stuck_pc={progress_pc} stuck_op={stuck_op} stuck_grid_x={stuck_grid_x}",
+                    "dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} ack={ack} \
+                     opcode0={opcode0} stuck_pc={progress_pc} stuck_op={stuck_op} \
+                     stuck_grid_x={stuck_grid_x}",
                     instructions.len()
                 );
             }
-            std::hint::spin_loop();
+            panic!("{e}");
         }
         if std::env::var("DISPATCH_RTT").is_ok() {
             let us = start.elapsed().as_micros();

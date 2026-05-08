@@ -637,9 +637,12 @@ impl Model {
             }
             // Wait for THIS token's worker dispatches before reusing the
             // single-slot moe_expert_ids/_weights buffers for the next token.
-            for (g, s) in all_seqs.drain(..) {
-                dispatch.wait_ack(g, s);
+            // braidinfer-wks Phase 1: parallel-poll all workers in one shared
+            // loop instead of sequential wait_ack.
+            if let Err(e) = dispatch.try_wait_acks_many(&all_seqs) {
+                panic!("{e}");
             }
+            all_seqs.clear();
         }
 
         // Step 3: GPU 0 computes its local expert subset for all tokens.

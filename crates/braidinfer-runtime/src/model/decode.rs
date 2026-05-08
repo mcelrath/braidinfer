@@ -916,11 +916,14 @@ impl Model {
         // Wait for every worker's ack AND for GPU 0's PRE batch ack (if provided).
         // The next GPU 0 batch — starting with OP_MOE_DISPATCH_POST — fires only
         // after this wait completes, ensuring output_slots are fully populated.
+        // braidinfer-wks Phase 1: use parallel-poll helper instead of
+        // sequential wait_ack so the polling thread can service all GPUs
+        // in one shared loop (foundation of the daemon's 1-core dispatcher).
         if let Some(seq) = gpu0_seq {
             seq_per_gpu.push((0, seq));
         }
-        for (gpu_idx, seq) in seq_per_gpu {
-            dispatch.wait_ack(gpu_idx, seq);
+        if let Err(e) = dispatch.try_wait_acks_many(&seq_per_gpu) {
+            panic!("{e}");
         }
         Ok(())
     }
