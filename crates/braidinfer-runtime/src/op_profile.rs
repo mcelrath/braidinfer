@@ -171,6 +171,65 @@ pub fn opcode_name(op: u32) -> &'static str {
     }
 }
 
+/// Query the GPU's wallclock-counter frequency in kHz. The
+/// `s_sendmsg_rtnl(0x83)` realtime counter (used by OP_PROFILE_BEGIN/END)
+/// ticks at this rate. On gfx1100 the rate is 100 MHz so 1 tick = 10 ns.
+pub fn wallclock_rate_khz(device: DeviceId) -> HipResult<u32> {
+    let mut rate: i32 = 0;
+    let attr_wallclock_rate: i32 = 10017;
+    let err = unsafe { ffi::hipDeviceGetAttribute(&mut rate, attr_wallclock_rate, device.0 as i32) };
+    braidinfer_hip::error::check(err)?;
+    Ok(rate as u32)
+}
+
+/// Per-op shape annotation: bytes streamed per dispatch on the weight side.
+/// For known opcodes whose dispatch shape is available from `ModelConfig`,
+/// callers can supply this so the profile table prints achieved memory
+/// bandwidth (bytes / ticks × rate). Unknown ops report only ticks.
+#[derive(Debug, Clone, Copy)]
+pub struct OpShape {
+    pub opcode: u32,
+    pub bytes_per_dispatch: u64,
+    pub label: &'static str,
+}
+
+/// Format an OpStats list as a sortable table, sorted by ticks_total descending.
+/// `rate_khz` and `shapes` are optional: when supplied, an `ms/call` column
+/// and (for ops in `shapes`) an achieved-GB/s column are added.
+pub fn format_table_with_bw(stats: &[OpStats], rate_khz: u32, shapes: &[OpShape]) -> String {
+    let total: u64 = stats.iter().map(|s| s.ticks_total).sum();
+    let mut sorted = stats.to_vec();
+    sorted.sort_by(|a, b| b.ticks_total.cmp(&a.ticks_total));
+
+    let ns_per_tick = if rate_khz > 0 { 1.0e6 / rate_khz as f64 } else { 0.0 };
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{:<26} {:>10} {:>16} {:>14} {:>6} {:>10} {:>14}\n",
+        "opcode", "calls", "ticks_total", "ticks/call", "pct", "us/call", "GB/s"
+    ));
+    for s in &sorted {
+        let pct = if total > 0 {
+            100.0 * s.ticks_total as f64 / total as f64
+        } else {
+            0.0
+        };
+        let us_per_call = s.ticks_per_call * ns_per_tick / 1000.0;
+        let bw_str = match shapes.iter().find(|sh| sh.opcode == s.opcode) {
+            Some(sh) if us_per_call > 0.0 => {
+                let gbps = sh.bytes_per_dispatch as f64 / (us_per_call * 1.0e-6) / 1.0e9;
+                format!("{:>9.1} ({})", gbps, sh.label)
+            }
+            _ => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "{:<26} {:>10} {:>16} {:>14.0} {:>5.1}% {:>10.2} {:>14}\n",
+            s.name, s.calls, s.ticks_total, s.ticks_per_call, pct, us_per_call, bw_str
+        ));
+    }
+    out
+}
+
 /// Format an OpStats list as a sortable table, sorted by ticks_total descending.
 pub fn format_table(stats: &[OpStats]) -> String {
     let total: u64 = stats.iter().map(|s| s.ticks_total).sum();

@@ -70,6 +70,10 @@ fn main() {
         .expect("generate");
     eprintln!("[op_profile] generated {} tokens", result.tokens.len());
 
+    // Capture shape data before dropping Model.
+    let vocab_size = model.config().vocab_size;
+    let hidden_size = model.config().hidden_size;
+
     // Drop the model — this drops PersistentDispatch, shutting down the
     // persistent worker and flushing all atomic ops. Only then can we
     // hipMemcpy the counters out without deadlocking.
@@ -78,5 +82,28 @@ fn main() {
 
     // SAFETY: persistent worker is gone (Model dropped). hipMemcpy is safe.
     let stats = unsafe { profile.dump_after_shutdown() }.expect("dump");
-    println!("\n{}", op_profile::format_table(&stats));
+
+    // wallclock rate is constant per arch (gfx1100 = 100 MHz). Convert
+    // ticks/call → us/call so columns are physically interpretable, and
+    // tag known-shape ops with achieved memory bandwidth so the table
+    // exposes whether they are BW- or compute-bound.
+    let rate_khz = op_profile::wallclock_rate_khz(device).expect("wallclock rate");
+    // OP_LINEAR_PROJ is only emitted for the lm_head (megakernel_compile.rs
+    // flags it explicitly). Reads vocab_size × hidden_size of bf16 weight.
+    // Opcode 2 = OP_LINEAR_PROJ per kernels/opcodes.h.
+    let lm_head_bytes = (vocab_size * hidden_size * 2) as u64;
+    let shapes = vec![op_profile::OpShape {
+        opcode: 2,
+        bytes_per_dispatch: lm_head_bytes,
+        label: "lm_head bf16",
+    }];
+    eprintln!(
+        "[op_profile] wallclock_rate={} kHz (1 tick = {:.2} ns); lm_head shape vocab={} hidden={} bytes/dispatch={} MB",
+        rate_khz,
+        1.0e6 / rate_khz as f64,
+        vocab_size,
+        hidden_size,
+        lm_head_bytes / (1024 * 1024),
+    );
+    println!("\n{}", op_profile::format_table_with_bw(&stats, rate_khz, &shapes));
 }
