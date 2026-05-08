@@ -13,6 +13,12 @@ fn main() {
         .unwrap()
         .join("kernels");
 
+    // 77r.2.14: optional probe define passed to hipcc when the env var is set.
+    // Adds a bf16 round-trip on op_linear_proj inputs to simulate the
+    // precision loss of v_dot2_f32_bf16 adoption (kb 77r-2-13).
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_BF16_INPUT_PROBE");
+    let bf16_probe = env::var("BRAIDINFER_BF16_INPUT_PROBE").is_ok();
+
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
     let kernels = [
         "rmsnorm",
@@ -49,18 +55,23 @@ fn main() {
         let src = kernel_dir.join(format!("{kernel}.hip"));
         let hsaco = out_dir.join(format!("{kernel}.hsaco"));
 
+        let mut hipcc_args: Vec<String> = vec![
+            "--offload-arch=gfx1100".to_string(),
+            "--genco".to_string(),
+            "-O3".to_string(),
+            "-std=c++17".to_string(),
+            "-ffp-contract=fast".to_string(),
+            "-mwavefrontsize64".to_string(),
+            "-DHIP_API_PER_THREAD_DEFAULT_STREAM".to_string(),
+            format!("-I{}", kernel_dir.display()),
+        ];
+        if bf16_probe {
+            hipcc_args.push("-DBRAIDINFER_BF16_INPUT_PROBE".to_string());
+        }
+        hipcc_args.push("-o".to_string());
+
         let output = Command::new(&hipcc)
-            .args([
-                "--offload-arch=gfx1100",
-                "--genco",
-                "-O3",
-                "-std=c++17",
-                "-ffp-contract=fast", // Aggressive FMA fusion for performance
-                "-mwavefrontsize64",  // Required for WMMA (V_WMMA_F32_16X16X16_F16)
-                "-DHIP_API_PER_THREAD_DEFAULT_STREAM", // Avoids deadlock with persistent kernels
-                &format!("-I{}", kernel_dir.display()), // For opcodes.h
-                "-o",
-            ])
+            .args(&hipcc_args)
             .arg(&hsaco)
             .arg(&src)
             .output()

@@ -6,6 +6,18 @@
 
 #include "rdna3_reduce.h"
 
+// 77r.2.14 quality probe: -DBRAIDINFER_BF16_INPUT_PROBE makes
+// op_linear_proj round-trip its f32 input through bf16 before the
+// dot product, simulating the precision loss that would result
+// from adopting __builtin_amdgcn_fdot2_f32_bf16 (kb 77r-2-13). The
+// macro is a no-op when the define is absent.
+#ifdef BRAIDINFER_BF16_INPUT_PROBE
+#define BF16_ROUND_F32(x) \
+    __builtin_bit_cast(float, ((unsigned)((unsigned short)(__builtin_bit_cast(unsigned, (x)) >> 16))) << 16)
+#else
+#define BF16_ROUND_F32(x) (x)
+#endif
+
 // Wave32 warp-reduce sum (RDNA3/gfx1100). Works within a 32-thread wavefront.
 // Now backed by braidinfer::rdna3::wave32_reduce_sum (DPP + permlanex16, ~3.85x
 // faster than the prior __shfl_down butterfly; same lane pairings → bit-exact
@@ -122,10 +134,10 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
             __builtin_memcpy(ws, &wv, 16);
             int base = vi * vec_elements;
             #pragma unroll
-            for (int j = 0; j < 8; j++) acc += bf16_to_f32(ws[j]) * input_base[base + j];
+            for (int j = 0; j < 8; j++) acc += bf16_to_f32(ws[j]) * BF16_ROUND_F32(input_base[base + j]);
         }
         int rem = vec_count * vec_elements;
-        for (int i = rem + tid; i < in_dim; i += stride) acc += bf16_to_f32(w[i]) * input_base[i];
+        for (int i = rem + tid; i < in_dim; i += stride) acc += bf16_to_f32(w[i]) * BF16_ROUND_F32(input_base[i]);
 
         extern __shared__ float shared[];
         float total = block_reduce_sum(acc, shared);
@@ -159,13 +171,13 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
             for (int t = 0; t < tile_size; t++) {
                 const float* inp = input_base + (long long)(b0 + t) * in_dim + base;
                 #pragma unroll
-                for (int j = 0; j < 8; j++) acc[t] += wf[j] * inp[j];
+                for (int j = 0; j < 8; j++) acc[t] += wf[j] * BF16_ROUND_F32(inp[j]);
             }
         }
         int rem = vec_count * vec_elements;
         for (int i = rem + tid; i < in_dim; i += stride) {
             float wf = bf16_to_f32(w[i]);
-            for (int t = 0; t < tile_size; t++) acc[t] += wf * input_base[(long long)(b0 + t) * in_dim + i];
+            for (int t = 0; t < tile_size; t++) acc[t] += wf * BF16_ROUND_F32(input_base[(long long)(b0 + t) * in_dim + i]);
         }
 
         for (int t = 0; t < tile_size; t++) {
