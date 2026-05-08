@@ -692,7 +692,7 @@ impl MegakernelProgram {
                 model.lm_head_weight.as_ptr()
             };
             instructions.push(LinearProjInst::new(
-                OP_LINEAR_PROJ,
+                OP_LM_HEAD,
                 cfg.vocab_size as u32,
                 act.logits.as_write_ptr(),
                 lm_w_ptr as *const u8,
