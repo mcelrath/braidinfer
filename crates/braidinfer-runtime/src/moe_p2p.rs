@@ -21,7 +21,6 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::dev_ptr::{DevPtr, tags::UncachedDeviceLocal};
 use braidinfer_hip::device::Device;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 
@@ -84,10 +83,18 @@ pub struct MoeP2pContext {
     pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
     /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
     _gpu0_config_storage: Vec<DeviceBuffer<u8>>,
-    /// GPU 0 VRAM activation staging buffer: [MAX_PREFILL_BATCH × gate_up_in_dim].
-    /// Prefill path copies activations here via hipMemcpy; decode path uses activation directly.
-    /// Workers P2P-read via activation_ptr field (set to VRAM ptr) after __threadfence_system().
-    pub activation_staging: DeviceBuffer<f32>,
+    /// Portable host-mapped activation staging buffer: [MAX_PREFILL_BATCH × gate_up_in_dim].
+    /// CPU writes activations directly via `host_ptr()` (no DMA, no kernel launch).
+    /// Workers P2P-read via per-worker device pointers in `activation_staging_dev_ptrs`.
+    /// Replaces a former `DeviceBuffer<f32>::alloc_uncached(gpu0, ...)` which deadlocked
+    /// when GPU 0's persistent_worker held all CUs (eh2).
+    pub activation_staging: MappedHostBuffer<f32>,
+    /// Per-worker device pointer to `activation_staging`. Indexed by worker_idx
+    /// (0 = first worker = GPU 1). Even with `hipHostMallocPortable`, the device
+    /// address returned by `hipHostGetDevicePointer` is valid only for the GPU
+    /// context that was current at the time of the call. We therefore retrieve
+    /// one device pointer per worker GPU at init time.
+    pub activation_staging_dev_ptrs: Vec<*mut f32>,
     /// GPU 0 scratch buffers for expert computation.
     pub gpu0_scratch_gate: DeviceBuffer<f32>,
     pub gpu0_scratch_up: DeviceBuffer<f32>,
@@ -181,13 +188,16 @@ impl MoeP2pContext {
             },
         )?;
 
-        // Activation staging: GPU 0 VRAM for prefill batches. Workers P2P-read
-        // this buffer; MTYPE=UC ensures the read does not hit GPU 0's L2 with
-        // stale data when persistent_worker on workers reads it (post-Phase 4).
-        // Cost: GPU 0 sees no L2 caching when CPU writes it via copy_from_host —
-        // acceptable because activation_staging is written once per prefill
-        // batch and read once per expert per worker.
-        let activation_staging = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // Activation staging: portable host-mapped (system RAM, mapped into all
+        // GPU contexts). CPU writes directly via host_ptr(); workers P2P-read
+        // via device_ptr() over PCIe. Empirical bench (kernels/diagnostic/
+        // p2p_read_bw_bench/) shows ~7x faster aggregate bandwidth than UC VRAM
+        // P2P at 4 concurrent worker reads (40 GB/s vs 6 GB/s at 64MB).
+        // Coherence validated by 77r.2.2 (host_mapped_coh_bench/): worker reads
+        // see latest CPU writes both with and without explicit gl1_inv.
+        // Required for braidinfer-eh2: copy_from_host deadlocks under GPU 0's
+        // persistent_worker; direct CPU writes to host RAM bypass that hazard.
+        let activation_staging = MappedHostBuffer::<f32>::alloc_portable(MAX_PREFILL_BATCH * gate_up_in_dim)?;
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim).
         let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
@@ -201,9 +211,24 @@ impl MoeP2pContext {
         let _ = shared_mem;
         let _ = kernel_dir;
         let mut workers = Vec::with_capacity(num_workers);
+        let mut activation_staging_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_workers);
         for (w_idx, &device) in worker_devices.iter().enumerate() {
             let gpu_id = (w_idx + 1) as u32;
             Device::set_current(device)?;
+            // Get a worker-specific device pointer to the portable host-mapped
+            // activation_staging. Even with `hipHostMallocPortable`, AMD ROCm
+            // requires this call from each GPU's context to obtain a valid
+            // device address for that GPU; the device pointer from a different
+            // context can page-fault on access.
+            let mut act_dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            unsafe {
+                braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                    &mut act_dev_ptr,
+                    activation_staging.host_ptr() as *mut std::ffi::c_void,
+                    0,
+                ))?;
+            }
+            activation_staging_dev_ptrs.push(act_dev_ptr as *mut f32);
 
             let (layer_config_ptrs, config_storage) = build_layer_configs(
                 device,
@@ -258,6 +283,7 @@ impl MoeP2pContext {
             gpu0_layer_config_ptrs,
             _gpu0_config_storage: gpu0_config_storage,
             activation_staging,
+            activation_staging_dev_ptrs,
             gpu0_scratch_gate,
             gpu0_scratch_up,
             gpu0_scratch_act,
@@ -267,17 +293,11 @@ impl MoeP2pContext {
         })
     }
 
-    /// Typed pointer to the GPU 0 activation staging buffer.
-    ///
-    /// Tagged [`UncachedDeviceLocal`]: the buffer is allocated MTYPE=UC for
-    /// cross-GPU coherence (see `init` for rationale). Hardware atomics
-    /// (`unsafeAtomicAdd`) are **undefined** through this pointer; the type
-    /// system rejects passing it to a function that expects
-    /// `CoarseGrainedLocal`.
-    ///
-    /// Pilot of typed-pointer migration (epic braidinfer-77r.5).
-    pub fn activation_staging_typed(&self) -> DevPtr<f32, UncachedDeviceLocal> {
-        self.activation_staging.as_typed_uncached()
+    /// Worker-specific device pointer to the activation staging buffer.
+    /// Use this when building OP_MOE_FFN_REMOTE for `worker_idx` (0-based —
+    /// 0 = GPU 1). See field doc on `activation_staging_dev_ptrs`.
+    pub fn activation_staging_dev_ptr_for(&self, worker_idx: usize) -> *mut f32 {
+        self.activation_staging_dev_ptrs[worker_idx]
     }
 
     /// Build an OP_MOE_FFN_REMOTE instruction for one token on `worker_idx`

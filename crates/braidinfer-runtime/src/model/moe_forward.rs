@@ -563,25 +563,39 @@ impl Model {
         // path uses host-mapped expert_ids/weights too — see model_load).
         // Simpler approach: write per-token id/weight into act.moe_expert_ids
         // and dispatch immediately, since the worker reads them once.
-        let (output_slots_raw, num_gpus, num_workers, activation_staging_typed) = {
+        let (output_slots_raw, num_gpus, num_workers, worker_act_bases) = {
             let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
-            // `activation_staging_typed` carries a `tags::UncachedDeviceLocal`
-            // tag — the type system rejects misuse with hw-atomic ops.
-            // Pilot site for epic braidinfer-77r.5.
+            // Per-worker device pointers to the portable host-mapped
+            // activation_staging. Even with `hipHostMallocPortable`, ROCm
+            // requires the device pointer to be retrieved from each GPU's
+            // context (done at init time, see moe_p2p::MoeP2pContext::init).
+            // Pilot site for typed-pointer epic braidinfer-77r.5.
+            let bases: Vec<*mut f32> = (0..p2p.workers.len())
+                .map(|w| p2p.activation_staging_dev_ptr_for(w))
+                .collect();
             (
                 p2p.output_slots.as_mut_ptr(),
                 p2p.num_gpus,
                 p2p.workers.len(),
-                p2p.activation_staging_typed(),
+                bases,
             )
         };
-        let activation_staging_ptr: *mut f32 = activation_staging_typed.as_raw();
-        // Copy all_activations to activation_staging (GPU 0 VRAM/UC).
-        // Safe: GPU 0 has no persistent worker yet during prefill.
+        // Write all_activations directly to the host-mapped staging buffer.
+        // No DMA, no kernel launch — CPU stores land in pinned host RAM and
+        // are immediately visible to worker GPUs via the portable device_ptr.
+        // Replaces a former copy_from_host() that deadlocked under GPU 0's
+        // persistent_worker (eh2). Empirical bandwidth: ~10 GB/s per worker
+        // × 4 workers concurrent = ~40 GB/s aggregate (vs ~6 GB/s for UC P2P).
         {
             let p2p = self.moe_p2p.as_mut().unwrap();
-            p2p.activation_staging
-                .copy_from_host(&all_activations[..n * latent_size])?;
+            let host_ptr = p2p.activation_staging.host_ptr();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    all_activations.as_ptr(),
+                    host_ptr,
+                    n * latent_size,
+                );
+            }
         }
 
         // Step 2.5: Dispatch OP_MOE_FFN_REMOTE for all (token, worker) pairs.
@@ -589,7 +603,6 @@ impl Model {
         // handled by per-worker FIFO. We collect (gpu_idx, seq) and wait at end.
         let mut all_seqs: Vec<(usize, u32)> = Vec::with_capacity(n * num_workers);
         for t in 0..n {
-            let act_p2p = unsafe { activation_staging_ptr.add(t * latent_size) as *const f32 };
             // Routing pointers for token t: host-mapped expert_ids/_weights are
             // single-token buffers; copy this token's slice to them so the
             // worker can read after we trigger the dispatch.
@@ -607,6 +620,11 @@ impl Model {
             for w in 0..num_workers {
                 let gpu_id = w + 1;
                 let out_slot = unsafe { output_slots_raw.add((t * num_gpus + gpu_id) * hs) };
+                // Per-worker device pointer (portable host-mapped requires
+                // per-context device pointers on AMD ROCm).
+                let act_p2p = unsafe {
+                    worker_act_bases[w].add(t * latent_size) as *const f32
+                };
                 let inst = p2p.build_ffn_remote_inst(
                     w, layer_idx, act_p2p, out_slot,
                     self.activations.moe_expert_ids.as_ptr() as *const i32,
