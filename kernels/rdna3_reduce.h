@@ -179,8 +179,8 @@ __device__ __forceinline__ float subwave_reduce_sum(float v) {
 __device__ __forceinline__ float block_reduce_sum_256(float v, float* shared) {
     v = wave32_reduce_sum(v);
     int lane    = threadIdx.x & 31;
-    int warp_id = threadIdx.x >> 5;
-    if (lane == 0) shared[warp_id] = v;
+    int wave_id = threadIdx.x >> 5;
+    if (lane == 0) shared[wave_id] = v;
     __syncthreads();
     if (threadIdx.x == 0) {
         float s = 0.0f;
