@@ -75,6 +75,104 @@ pub(crate) fn shutdown_requested() -> bool {
     SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Idempotent promotion guard for [`try_promote_dispatch_thread`]: ensures
+/// the SCHED_FIFO + affinity calls fire only once even when callers
+/// invoke from multiple decode entry points.
+static DISPATCH_PROMOTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Promote the calling thread to SCHED_FIFO + pin it to a single CPU,
+/// gated by the `BRAIDINFER_DISPATCH_RT=1` env var. Idempotent across
+/// multiple call sites.
+///
+/// When enabled:
+/// - Pins the calling thread to `BRAIDINFER_DISPATCH_CPU` (default 55,
+///   matching the 8-GPU box recipe in `README.md` — `isolcpus=55-63`,
+///   amdgpu IRQs on 56-63).
+/// - Sets `SCHED_FIFO` priority to `BRAIDINFER_DISPATCH_PRIO` (default
+///   50, mid-range so future IRQ-thread promotion can sit above us).
+///
+/// Prerequisites for SCHED_FIFO to succeed:
+/// - `/etc/security/limits.conf` includes `<user> - rtprio 99` and the
+///   shell has been re-logged or `sudo prlimit --rtprio=99 --pid=$$`
+///   has been applied.
+/// - `/proc/sys/kernel/sched_rt_runtime_us = -1` (otherwise default
+///   95% throttle injects 50 ms stalls per second on a 100%-CPU
+///   spin-poll).
+///
+/// Returns `Ok(true)` if promotion happened on this call, `Ok(false)`
+/// if already promoted or the env flag is unset, and `Err` describing
+/// the syscall failure (most commonly `EPERM` from rtprio limit not
+/// being raised).
+///
+/// See PLAN-dispatch-daemon-phase4.md decision D-P4-CPU.
+pub fn try_promote_dispatch_thread() -> Result<bool, String> {
+    use std::sync::atomic::Ordering;
+
+    let want_rt = std::env::var("BRAIDINFER_DISPATCH_RT")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !want_rt {
+        return Ok(false);
+    }
+    if DISPATCH_PROMOTED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    let cpu: usize = std::env::var("BRAIDINFER_DISPATCH_CPU")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(55);
+    let prio: libc::c_int = std::env::var("BRAIDINFER_DISPATCH_PRIO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50);
+
+    // sched_setaffinity first so the SCHED_FIFO promotion lands on the
+    // intended CPU (otherwise the kernel would migrate us under FIFO,
+    // briefly defeating the affinity intent).
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_ZERO(&mut set);
+        libc::CPU_SET(cpu, &mut set);
+        let r = libc::sched_setaffinity(
+            0,
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        );
+        if r != 0 {
+            return Err(format!(
+                "sched_setaffinity(cpu={cpu}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    unsafe {
+        let param = libc::sched_param {
+            sched_priority: prio,
+        };
+        let r = libc::sched_setscheduler(0, libc::SCHED_FIFO, &param);
+        if r != 0 {
+            return Err(format!(
+                "sched_setscheduler(SCHED_FIFO, prio={prio}) failed: {}. \
+                 Verify /etc/security/limits.conf has 'rtprio 99' for this user \
+                 and ulimit -r reports 99 (re-login or `sudo prlimit --rtprio=99 \
+                 --pid=$$`). See README.md 'Host system tuning'.",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    eprintln!(
+        "[braidinfer] dispatch thread promoted: SCHED_FIFO prio={prio} cpu={cpu}"
+    );
+    Ok(true)
+}
+
 /// Recoverable error from the dispatch ack-spin path. The legacy
 /// in-process call sites translate this into `panic!()` (preserving
 /// existing semantics), but a long-running daemon (braidinfer-wks)
