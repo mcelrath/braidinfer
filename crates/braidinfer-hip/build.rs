@@ -25,6 +25,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_USE_DOT2");
     let use_dot2 = env::var("BRAIDINFER_USE_DOT2").is_ok();
 
+    // 77r.2.4 (reframed): per-shape cache-hint tuning on op_attn_paged
+    // K/V loads. Set BRAIDINFER_KV_LOAD_AUX={1,2,4,...} to replace plain
+    // global_loads with raw_buffer_load using that aux byte (0x1=glc,
+    // 0x2=slc, 0x4=dlc). Unset = production default (plain global_load).
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_KV_LOAD_AUX");
+    let kv_load_aux = env::var("BRAIDINFER_KV_LOAD_AUX").ok();
+
     // 77r.2.8: optional per-CTA page rotation in op_attn_paged + _quant.
     // Each CTA starts at a different physical chunk index (rotation_offset =
     // blockIdx.x % num_chunks), wraps around. Logical-to-physical mapping
@@ -87,6 +94,9 @@ fn main() {
         }
         if use_page_rotation {
             hipcc_args.push("-DBRAIDINFER_USE_PAGE_ROTATION".to_string());
+        }
+        if let Some(ref aux) = kv_load_aux {
+            hipcc_args.push(format!("-DBRAIDINFER_KV_LOAD_AUX={aux}"));
         }
         hipcc_args.push("-o".to_string());
 

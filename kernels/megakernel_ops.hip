@@ -18,6 +18,27 @@
 #define BF16_ROUND_F32(x) (x)
 #endif
 
+// 77r.2.4 (reframed): -DBRAIDINFER_KV_LOAD_AUX=N replaces plain `k_base[i]`
+// and `v_base[i]` reads in op_attn_paged with an explicit raw_buffer_load
+// carrying the cache-hint aux byte N. Encoding (RDNA3 ISA §4.1.1):
+//   bit 0 (0x1) = GLC, bit 1 (0x2) = SLC, bit 2 (0x4) = DLC.
+// CK GFX1100_ARCH §5.0.4 measured up to -67% regression from dlc=1 on
+// glm-like (gqa=12) shapes; gqa=4-8 (our model mix) expected somewhere
+// between negligible and substantial. Helper constructs a buffer-resource
+// on the fly with num_records=2^31 (so OOB never triggers).
+#ifdef BRAIDINFER_KV_LOAD_AUX
+template<int AUX>
+__device__ __forceinline__ float load_f32_kv_aux(const float* __restrict__ p) {
+    __amdgpu_buffer_rsrc_t rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        (void*)p, 0, 0x80000000u, 0);
+    unsigned bits = __builtin_amdgcn_raw_buffer_load_b32(rsrc, 0, 0, AUX);
+    return __builtin_bit_cast(float, bits);
+}
+#define KV_LOAD_F32(p) load_f32_kv_aux<BRAIDINFER_KV_LOAD_AUX>(p)
+#else
+#define KV_LOAD_F32(p) (*(p))
+#endif
+
 // 77r.2.15: -DBRAIDINFER_USE_DOT2 wires v_dot2_f32_bf16 into op_linear_proj
 // inner loops. Replaces the scalar bf16->f32 + f32 FMA pattern with a
 // single VOP3P dot2 instruction per pair of elements (kb 77r-2-13: 2.5x
@@ -1798,7 +1819,7 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
 
             // Load K into shared memory (head_dim == block_size == 256, one element per thread)
             if (tid < head_dim) {
-                sh_k[tid] = k_base[token_idx * head_dim + tid];
+                sh_k[tid] = KV_LOAD_F32(&k_base[token_idx * head_dim + tid]);
             }
             __syncthreads();
 
@@ -1870,7 +1891,7 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
 
             // V accumulation (no RoPE on V)
             if (tid < head_dim) {
-                float vval = v_base[(kv_head * chunk_tokens + t) * head_dim + tid];
+                float vval = KV_LOAD_F32(&v_base[(kv_head * chunk_tokens + t) * head_dim + tid]);
                 v_acc = v_acc * correction + w * vval;
             }
             m = m_new;
