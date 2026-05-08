@@ -7,6 +7,7 @@
 #include "moe_work_queue.h"      // MoeWorkerConfig + MoeExpertEntry types for OP_MOE_FFN_REMOTE
 #include "watchdog.h"
 #include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
+#include "op_profile.h"          // OP_PROFILE_BEGIN/END (no-op when -DBRAIDINFER_OP_PROFILE unset)
 
 // Per-TU GridBarrierState for atomic_block_barrier. Allocated in cache-coherent
 // VRAM by the loader (zero-initialized __device__ static). Replaces grid.sync()
@@ -35,6 +36,10 @@ struct WorkerQueue {
     volatile uint32_t done;         // kernel writes 1 when exiting (for Drop polling)
     volatile uint32_t progress_pc;  // worker writes pc before each instruction (for timeout diagnosis)
     uint32_t _pad2;
+    // op_profile: GPU-resident DeviceBuffer<u64> base pointer, size 2 *
+    // BRAIDINFER_OP_PROFILE_NUM_SLOTS. Null when -DBRAIDINFER_OP_PROFILE
+    // is unset. See kernels/op_profile.h. Plan: PLAN-op-profile.md.
+    uint64_t* op_profile;
 };
 
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
@@ -111,6 +116,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         u32 opcode = inst_opcode(inst);
         u32 grid_x = inst_grid_x(inst);
 
+        // Per-instruction-dispatch profiling. "One call" = one opcode
+        // dispatch including its post-op grid barrier. Macros are no-ops
+        // unless -DBRAIDINFER_OP_PROFILE is set. See PLAN-op-profile.md.
+        OP_PROFILE_BEGIN(opcode, queue->op_profile);
+
         if (opcode == OP_BARRIER) {
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         } else if (opcode == OP_MOE_FFN) {
@@ -174,6 +184,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             }
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
+
+        OP_PROFILE_END(opcode, queue->op_profile);
 
         } // end for (pc = 0; pc < num_inst; pc++)
 

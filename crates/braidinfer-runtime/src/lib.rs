@@ -7,6 +7,7 @@ pub mod megakernel;
 pub mod model;
 pub mod moe_p2p;
 pub mod multi_gpu;
+pub mod op_profile;
 pub mod paged_kv;
 pub mod persistent_dispatch;
 pub mod quant;

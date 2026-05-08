@@ -704,10 +704,13 @@ impl MegakernelProgram {
         let mut prog_ptr: *const c_void = prog_buf.as_ptr().cast();
         let mut num_inst = instructions.len() as i32;
         let mut wd_ptr: *mut c_void = self.wd_dev_ptr;
-        let mut args: [*mut c_void; 3] = [
+        // op_profile counter pointer (null = profiling disabled). See PLAN-op-profile.md.
+        let mut op_profile_ptr: *mut c_void = crate::op_profile::get_global() as *mut c_void;
+        let mut args: [*mut c_void; 4] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),
             std::ptr::addr_of_mut!(wd_ptr).cast(),
+            std::ptr::addr_of_mut!(op_profile_ptr).cast(),
         ];
         func.launch_cooperative(
             (self.num_blocks, 1, 1),

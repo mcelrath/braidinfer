@@ -32,6 +32,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_KV_LOAD_AUX");
     let kv_load_aux = env::var("BRAIDINFER_KV_LOAD_AUX").ok();
 
+    // braidinfer-xiu: per-op cycle profiling inside the persistent megakernel.
+    // Set BRAIDINFER_OP_PROFILE=1 to enable. Adds ~5% perf cost from the
+    // atomic accumulators; intended for diagnostics, not production.
+    // See PLAN-op-profile.md and kernels/op_profile.h.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_OP_PROFILE");
+    let op_profile = env::var("BRAIDINFER_OP_PROFILE").is_ok();
+
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
     let kernels = [
         "rmsnorm",
@@ -86,6 +93,9 @@ fn main() {
         }
         if let Some(ref aux) = kv_load_aux {
             hipcc_args.push(format!("-DBRAIDINFER_KV_LOAD_AUX={aux}"));
+        }
+        if op_profile {
+            hipcc_args.push("-DBRAIDINFER_OP_PROFILE".to_string());
         }
         hipcc_args.push("-o".to_string());
 

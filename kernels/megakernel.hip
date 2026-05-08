@@ -3,6 +3,7 @@
 #include "megakernel_common.h"
 #include "watchdog.h"
 #include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
+#include "op_profile.h"          // OP_PROFILE_BEGIN/END (no-op when -DBRAIDINFER_OP_PROFILE unset)
 
 // Megakernel: persistent cooperative kernel that executes a program of instructions.
 // Launched once with max cooperative blocks (384 on gfx1100 with 256 threads).
@@ -172,7 +173,8 @@ __device__ void dump_instruction_output(
 extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     const u64* __restrict__ program,
     int num_instructions,
-    WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable
+    WatchdogState* watchdog,  // host-mapped watchdog state; NULL to disable
+    uint64_t* op_profile      // op_profile counter buffer (null = disabled)
 ) {
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
@@ -218,7 +220,16 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         u32 grid_x = inst_grid_x(inst);
 
         if (opcode == OP_HALT) break;
-        if (opcode == OP_BARRIER) { braidinfer::rdna3::atomic_block_barrier(&g_gbs); continue; }
+        // Per-instruction-dispatch profiling. "One call" = one opcode dispatch
+        // including its post-op grid barrier. No-op when -DBRAIDINFER_OP_PROFILE
+        // is unset. See PLAN-op-profile.md.
+        OP_PROFILE_BEGIN(opcode, op_profile);
+
+        if (opcode == OP_BARRIER) {
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+            OP_PROFILE_END(opcode, op_profile);
+            continue;
+        }
 
         // OP_MOE_FFN manages its own blocks and grid.sync() internally
         if (opcode == OP_MOE_FFN) {
@@ -228,6 +239,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
                 dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
                 braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             }
+            OP_PROFILE_END(opcode, op_profile);
             continue;
         }
 
@@ -237,12 +249,14 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             op_linear_proj_pcg32_full(inst, grid_x);
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); braidinfer::rdna3::atomic_block_barrier(&g_gbs); }
+            OP_PROFILE_END(opcode, op_profile);
             continue;
         }
         if (opcode == OP_LINEAR_PROJ_RNF4) {
             op_linear_proj_rnf4_full(inst, grid_x);
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
             if (dump_base) { dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc); braidinfer::rdna3::atomic_block_barrier(&g_gbs); }
+            OP_PROFILE_END(opcode, op_profile);
             continue;
         }
 
@@ -250,6 +264,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         // Manages its own grid.sync() internally.
         if (opcode == OP_MOE_DISPATCH) {
             op_moe_dispatch(inst, grid, &g_gbs, watchdog);
+            OP_PROFILE_END(opcode, op_profile);
             continue;
         }
 
@@ -257,6 +272,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
         // Fired AFTER CPU wait_ack on workers + after PRE batch completes.
         if (opcode == OP_MOE_DISPATCH_POST) {
             op_moe_dispatch_post(inst, grid, &g_gbs, watchdog);
+            OP_PROFILE_END(opcode, op_profile);
             continue;
         }
 
@@ -315,6 +331,7 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
             dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
+        OP_PROFILE_END(opcode, op_profile);
     }
 
     // Signal clean exit so host watchdog pauses its no-progress timer until

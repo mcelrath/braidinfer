@@ -399,10 +399,12 @@ impl MegakernelProgram {
         let mut num_inst = (self.instructions.len() + extra) as i32;
 
         let mut wd_ptr: *mut c_void = self.wd_dev_ptr;
-        let mut args: [*mut c_void; 3] = [
+        let mut op_profile_ptr: *mut c_void = crate::op_profile::get_global() as *mut c_void;
+        let mut args: [*mut c_void; 4] = [
             std::ptr::addr_of_mut!(prog_ptr).cast(),
             std::ptr::addr_of_mut!(num_inst).cast(),
             std::ptr::addr_of_mut!(wd_ptr).cast(),
+            std::ptr::addr_of_mut!(op_profile_ptr).cast(),
         ];
 
         func.launch_cooperative(

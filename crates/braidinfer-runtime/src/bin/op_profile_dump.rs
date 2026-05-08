@@ -1,0 +1,82 @@
+// Profile a model decode by per-op cyc/call. Build with
+// BRAIDINFER_OP_PROFILE=1 to enable; without the flag this binary still
+// runs but the OP_PROFILE_BEGIN/END macros are no-ops in the kernels and
+// every counter reads as zero.
+//
+// Usage:
+//   MODEL=models/qwen35_2b.q4.bqnt MAX_TOKENS=100 \
+//     python3 scripts/launch-gpu.py --timeout 600 -- \
+//     cargo run --release -p braidinfer-runtime --bin op_profile_dump
+//
+// The CLI installs a process-global OpProfile, runs the model's standard
+// generate path, drops the dispatcher (which shuts down the persistent
+// worker), then reads the counters and prints a sorted table.
+
+use std::path::Path;
+
+use braidinfer_core::types::DeviceId;
+use braidinfer_runtime::generate::{TokenConfig, greedy_generate, load_tokenizer};
+use braidinfer_runtime::model::Model;
+use braidinfer_runtime::op_profile;
+
+fn main() {
+    let model_path = std::env::var("MODEL").expect("set MODEL=<bqnt or hf-dir path>");
+    let prompt = std::env::args().nth(1)
+        .unwrap_or_else(|| "The history of computing began long before".to_string());
+    let max_tokens: usize = std::env::var("MAX_TOKENS")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(100);
+
+    // Resolve HF dir same as generate.rs does
+    let model_dir_path = if model_path.ends_with(".bqnt") {
+        let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(Path::new(&model_path))
+            .expect("open bqnt");
+        let model_name = bqnt.model_name().expect("bqnt missing model_name");
+        if model_name.starts_with('/') && Path::new(&model_name).is_dir() {
+            model_name
+        } else {
+            let hf_name = model_name.replace('/', "--");
+            let cache_dir = dirs::home_dir().expect("home dir")
+                .join(".cache/huggingface/hub")
+                .join(format!("models--{hf_name}"))
+                .join("snapshots");
+            std::fs::read_dir(&cache_dir).expect("read snapshots")
+                .filter_map(|e| e.ok())
+                .find(|e| e.path().join("tokenizer.json").exists())
+                .map(|e| e.path().to_string_lossy().to_string())
+                .expect("no snapshot with tokenizer found")
+        }
+    } else {
+        model_path.clone()
+    };
+    if model_path.ends_with(".bqnt") {
+        unsafe { std::env::set_var("BQNT_PATH", &model_path); }
+    }
+
+    // Allocate the OpProfile BEFORE Model::load (which may lazy-create
+    // the persistent worker on first decode call). install_global sets
+    // the process-global pointer that PersistentDispatch::add_device reads.
+    let device = DeviceId(0);
+    let profile = op_profile::OpProfile::alloc(device).expect("alloc OpProfile");
+    op_profile::install_global(&profile);
+    eprintln!("[op_profile] installed counter buffer on GPU 0 ({} slots)", op_profile::NUM_SLOTS);
+
+    let model_dir = Path::new(&model_dir_path);
+    let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
+    let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
+    let mut model = Model::load(model_dir, device).expect("load model");
+
+    eprintln!("[op_profile] running greedy_generate, max_tokens={max_tokens}");
+    let result = greedy_generate(&mut model, &tokenizer, &token_config, &prompt, max_tokens)
+        .expect("generate");
+    eprintln!("[op_profile] generated {} tokens", result.tokens.len());
+
+    // Drop the model — this drops PersistentDispatch, shutting down the
+    // persistent worker and flushing all atomic ops. Only then can we
+    // hipMemcpy the counters out without deadlocking.
+    drop(model);
+    eprintln!("[op_profile] model dropped, persistent worker shut down");
+
+    // SAFETY: persistent worker is gone (Model dropped). hipMemcpy is safe.
+    let stats = unsafe { profile.dump_after_shutdown() }.expect("dump");
+    println!("\n{}", op_profile::format_table(&stats));
+}

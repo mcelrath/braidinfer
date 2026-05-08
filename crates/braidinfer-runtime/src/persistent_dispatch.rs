@@ -88,7 +88,19 @@ pub struct WorkerQueueLayout {
     pub done: u32, // kernel writes 1 when exiting after shutdown (for Drop polling)
     pub progress_pc: u32, // kernel writes pc before each instruction (for timeout diagnosis)
     pub _pad2: u32,
+    // op_profile: GPU-resident u64 buffer for per-op cycle profiling.
+    // Null when BRAIDINFER_OP_PROFILE build flag is unset. See
+    // crates/braidinfer-runtime/src/op_profile.rs and kernels/op_profile.h.
+    pub op_profile: *mut u64,
 }
+
+// Static check that WorkerQueueLayout matches the C struct size.
+// 4*4 (head) + MAX_BATCH_INSTRUCTIONS*INST_SIZE*8 (inst) + 4*4 (tail) + 8 (op_profile)
+const _: () = assert!(
+    std::mem::size_of::<WorkerQueueLayout>()
+        == 16 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8,
+    "WorkerQueueLayout size mismatch — verify C struct in kernels/persistent_worker.hip matches"
+);
 
 /// Per-GPU worker state.
 pub struct GpuWorker {
@@ -119,7 +131,17 @@ pub struct PersistentDispatch {
     /// Host-side watchdog thread polling all persistent kernel WatchdogState pages.
     /// Dropped after workers to ensure the thread stops before the state pages are freed.
     pub watchdog: WatchdogThread,
+    /// Optional per-op profile counter device pointer. Null when
+    /// BRAIDINFER_OP_PROFILE build flag is unset (or set but no OpProfile
+    /// passed in). Written into each WorkerQueue::op_profile field at
+    /// worker launch in `add_device`. See crates/.../op_profile.rs.
+    pub op_profile_dev_ptr: *mut u64,
 }
+
+// Raw pointer in PersistentDispatch — caller must keep the underlying
+// DeviceBuffer alive until after this dispatch is dropped.
+unsafe impl Send for PersistentDispatch {}
+unsafe impl Sync for PersistentDispatch {}
 
 fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
     // hipDeviceAttributeMultiprocessorCount = 63 in the HIP enum (verified via hipcc)
@@ -162,11 +184,20 @@ impl PersistentDispatch {
             workers: std::mem::take(&mut workers),
             moe_output_slot: MappedHostBuffer::<f32>::alloc(1)?,
             watchdog,
+            op_profile_dev_ptr: std::ptr::null_mut(),
         };
         for &device in devices {
             dispatch.add_device(device, shared_mem)?;
         }
         Ok(dispatch)
+    }
+
+    /// Set the per-op profile counter device pointer (op_profile.rs). Must be
+    /// called BEFORE init_with_total / add_device — the pointer is written
+    /// into each WorkerQueue's op_profile field at launch time, and the
+    /// kernel reads it via `queue->op_profile`.
+    pub fn set_op_profile_ptr(&mut self, ptr: *mut u64) {
+        self.op_profile_dev_ptr = ptr;
     }
 
     /// Single-GPU init helper (unchanged signature for non-MoE callers).
@@ -187,6 +218,19 @@ impl PersistentDispatch {
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         Device::set_current(device)?;
         let queue = MappedHostBuffer::<u8>::alloc(queue_size)?;
+        // Write the op_profile counter pointer into the queue BEFORE launch.
+        // Per-instance pointer (set_op_profile_ptr) takes priority; falls
+        // back to the process-global (op_profile::install_global) if unset.
+        // Null disables profiling on this worker. See PLAN-op-profile.md.
+        unsafe {
+            let profile_ptr = if !self.op_profile_dev_ptr.is_null() {
+                self.op_profile_dev_ptr
+            } else {
+                crate::op_profile::get_global()
+            };
+            let q = queue.host_ptr() as *mut WorkerQueueLayout;
+            std::ptr::addr_of_mut!((*q).op_profile).write(profile_ptr);
+        }
         let stream = Stream::new(device)?;
         let module = Module::load(device, &kernel_dir.join("persistent_worker.hsaco"))?;
         let func = module.get_function("persistent_worker")?;
