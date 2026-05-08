@@ -18,6 +18,27 @@
 #define BF16_ROUND_F32(x) (x)
 #endif
 
+// 77r.2.15: -DBRAIDINFER_USE_DOT2 wires v_dot2_f32_bf16 into op_linear_proj
+// inner loops. Replaces the scalar bf16->f32 + f32 FMA pattern with a
+// single VOP3P dot2 instruction per pair of elements (kb 77r-2-13: 2.5x
+// cyc/FMA at K>=1024). Weight stays bf16 (bit-exact reinterpret); input
+// f32 is downcast to bf16 just before the intrinsic call (precision loss
+// validated by 77r-2-14).
+typedef short bf16x2_t __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ bf16x2_t pack_bf16x2_from_u16(unsigned short a, unsigned short b) {
+    bf16x2_t v;
+    v[0] = (short)a;
+    v[1] = (short)b;
+    return v;
+}
+__device__ __forceinline__ bf16x2_t f32_pair_to_bf16x2(float a, float b) {
+    bf16x2_t v;
+    v[0] = (short)(__builtin_bit_cast(unsigned, a) >> 16);
+    v[1] = (short)(__builtin_bit_cast(unsigned, b) >> 16);
+    return v;
+}
+
 // Wave32 warp-reduce sum (RDNA3/gfx1100). Works within a 32-thread wavefront.
 // Now backed by braidinfer::rdna3::wave32_reduce_sum (DPP + permlanex16, ~3.85x
 // faster than the prior __shfl_down butterfly; same lane pairings → bit-exact
@@ -133,8 +154,18 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
             unsigned short ws[8];
             __builtin_memcpy(ws, &wv, 16);
             int base = vi * vec_elements;
+#ifdef BRAIDINFER_USE_DOT2
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                bf16x2_t wp = pack_bf16x2_from_u16(ws[2*p], ws[2*p + 1]);
+                bf16x2_t ip = f32_pair_to_bf16x2(
+                    input_base[base + 2*p], input_base[base + 2*p + 1]);
+                acc = __builtin_amdgcn_fdot2_f32_bf16(wp, ip, acc, false);
+            }
+#else
             #pragma unroll
             for (int j = 0; j < 8; j++) acc += bf16_to_f32(ws[j]) * BF16_ROUND_F32(input_base[base + j]);
+#endif
         }
         int rem = vec_count * vec_elements;
         for (int i = rem + tid; i < in_dim; i += stride) acc += bf16_to_f32(w[i]) * BF16_ROUND_F32(input_base[i]);
@@ -163,16 +194,33 @@ __device__ __attribute__((noinline)) void op_linear_proj(const u64* inst, u32 vb
             ull2 wv = __builtin_nontemporal_load(&w_vec[vi]);
             unsigned short ws[8];
             __builtin_memcpy(ws, &wv, 16);
+            int base = vi * vec_elements;
+#ifdef BRAIDINFER_USE_DOT2
+            // Pack weights once as 4 bf16x2 and reuse across all batch tiles.
+            bf16x2_t wp[4];
+            #pragma unroll
+            for (int p = 0; p < 4; p++) {
+                wp[p] = pack_bf16x2_from_u16(ws[2*p], ws[2*p + 1]);
+            }
+            for (int t = 0; t < tile_size; t++) {
+                const float* inp = input_base + (long long)(b0 + t) * in_dim + base;
+                #pragma unroll
+                for (int p = 0; p < 4; p++) {
+                    bf16x2_t ip = f32_pair_to_bf16x2(inp[2*p], inp[2*p + 1]);
+                    acc[t] = __builtin_amdgcn_fdot2_f32_bf16(wp[p], ip, acc[t], false);
+                }
+            }
+#else
             float wf[8];
             #pragma unroll
             for (int j = 0; j < 8; j++) wf[j] = bf16_to_f32(ws[j]);
 
-            int base = vi * vec_elements;
             for (int t = 0; t < tile_size; t++) {
                 const float* inp = input_base + (long long)(b0 + t) * in_dim + base;
                 #pragma unroll
                 for (int j = 0; j < 8; j++) acc[t] += wf[j] * BF16_ROUND_F32(inp[j]);
             }
+#endif
         }
         int rem = vec_count * vec_elements;
         for (int i = rem + tid; i < in_dim; i += stride) {

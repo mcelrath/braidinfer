@@ -19,6 +19,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_BF16_INPUT_PROBE");
     let bf16_probe = env::var("BRAIDINFER_BF16_INPUT_PROBE").is_ok();
 
+    // 77r.2.15: optional define that wires __builtin_amdgcn_fdot2_f32_bf16
+    // into op_linear_proj (kb 77r-2-13: 2.5x cyc/FMA at K>=1024). Coherence
+    // gated by 77r.2.14 (12/12 byte-identical outputs across 3 models).
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_USE_DOT2");
+    let use_dot2 = env::var("BRAIDINFER_USE_DOT2").is_ok();
+
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
     let kernels = [
         "rmsnorm",
@@ -67,6 +73,9 @@ fn main() {
         ];
         if bf16_probe {
             hipcc_args.push("-DBRAIDINFER_BF16_INPUT_PROBE".to_string());
+        }
+        if use_dot2 {
+            hipcc_args.push("-DBRAIDINFER_USE_DOT2".to_string());
         }
         hipcc_args.push("-o".to_string());
 
