@@ -33,6 +33,14 @@ struct WorkerQueue {
     // BRAIDINFER_OP_PROFILE_NUM_SLOTS. Null when -DBRAIDINFER_OP_PROFILE
     // is unset. See kernels/op_profile.h.
     uint64_t* op_profile;
+    // Trace-dump infrastructure (zqw): set by Rust PersistentDispatch::add_device
+    // when Model::trace is active. dispatch_opcode reads these to drive
+    // dump_instruction_output. Null base = trace disabled.
+    // Field order chosen to avoid internal padding (8-byte ptrs first).
+    char* dump_base;
+    int*  dump_count;
+    int   dump_capacity;
+    uint32_t _pad3;
 };
 
 #endif  // BRAIDINFER_WORKER_QUEUE_H

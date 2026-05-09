@@ -231,14 +231,24 @@ pub struct WorkerQueueLayout {
     // Null when BRAIDINFER_OP_PROFILE build flag is unset. See
     // crates/braidinfer-runtime/src/op_profile.rs and kernels/op_profile.h.
     pub op_profile: *mut u64,
+    // Trace-dump infrastructure (zqw): set by add_device when Model::trace
+    // is active. The unified dispatch_opcode in kernels/megakernel_dispatch.hip
+    // reads these to drive dump_instruction_output. Null base = trace disabled.
+    // Field order matches C side (worker_queue.h) — pointers first to avoid
+    // internal padding.
+    pub dump_base: *mut std::ffi::c_void, // char* in C
+    pub dump_count: *mut i32,
+    pub dump_capacity: i32,
+    pub _pad3: u32,
 }
 
 // Static check that WorkerQueueLayout matches the C struct size.
 // 4*4 (head) + MAX_BATCH_INSTRUCTIONS*INST_SIZE*8 (inst) + 4*4 (tail) + 8 (op_profile)
+//   + 8 (dump_base) + 4 (dump_capacity) + 8 (dump_count) + 4 (_pad3) = +24
 const _: () = assert!(
     std::mem::size_of::<WorkerQueueLayout>()
-        == 16 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8,
-    "WorkerQueueLayout size mismatch — verify C struct in kernels/persistent_worker.hip matches"
+        == 16 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8 + 24,
+    "WorkerQueueLayout size mismatch — verify C struct in kernels/worker_queue.h matches"
 );
 
 /// Per-GPU worker state.
@@ -361,6 +371,9 @@ impl PersistentDispatch {
         // Per-instance pointer (set_op_profile_ptr) takes priority; falls
         // back to the process-global (op_profile::install_global) if unset.
         // Null disables profiling on this worker. See PLAN-op-profile.md.
+        // Also zero the trace-dump fields (zqw) — populated by Model when
+        // trace is active via set_trace_dump_ptrs(...). Until then the
+        // unified dispatch_opcode treats null dump_base as "trace disabled".
         unsafe {
             let profile_ptr = if !self.op_profile_dev_ptr.is_null() {
                 self.op_profile_dev_ptr
@@ -369,6 +382,9 @@ impl PersistentDispatch {
             };
             let q = queue.host_ptr() as *mut WorkerQueueLayout;
             std::ptr::addr_of_mut!((*q).op_profile).write(profile_ptr);
+            std::ptr::addr_of_mut!((*q).dump_base).write(std::ptr::null_mut());
+            std::ptr::addr_of_mut!((*q).dump_count).write(std::ptr::null_mut());
+            std::ptr::addr_of_mut!((*q).dump_capacity).write(0);
         }
         let stream = Stream::new(device)?;
         let module = Module::load(device, &kernel_dir.join("persistent_worker.hsaco"))?;
