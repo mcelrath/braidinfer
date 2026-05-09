@@ -64,9 +64,10 @@ fn main() {
         "moe_gate",
         "moe_prefill",
         "dot_sigmoid_scale_add",
+        // megakernel.hsaco contains BOTH megakernel_f32 and persistent_worker
+        // entry points (zqw merge: kernels/megakernel.hip).
         "megakernel",
         "peer_copy",
-        "persistent_worker",
         "deinterleave",
         "sync_flag",
     ];

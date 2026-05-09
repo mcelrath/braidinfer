@@ -18,6 +18,7 @@ __device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
 #include "megakernel_moe_dispatch.hip"
+#include "worker_queue.h"               // struct WorkerQueue (persistent_worker entry)
 #include "megakernel_dispatch.hip"  // unified dispatch_opcode helper (zqw)
 
 // ============================================================
@@ -90,4 +91,118 @@ extern "C" __global__ __launch_bounds__(256) void megakernel_f32(
     // the next launch (otherwise it spuriously fires on the frozen
     // progress_counter during inter-segment dispatch gaps).
     if (watchdog) watchdog_signal_exited(watchdog);
+}
+
+// ---- persistent_worker entry point (zqw merge) ----
+// Persistent cooperative worker kernel: polls host-mapped WorkerQueue for
+// operations. CPU-scheduled via memory writes (no HIP API calls in hot path).
+// One instance per GPU, launched once at init, runs for model lifetime.
+//
+// Same op-dispatch chain as megakernel_f32 above (via dispatch_opcode helper).
+// Differences from megakernel_f32 are confined to the driver loop:
+//   - mailbox-poll lifecycle (wait for seq_num, ack on completion)
+//   - per-batch L1 invalidation
+//   - per-pc instruction copy to LDS
+//   - shutdown-flag handling
+//   - __launch_bounds__(256, 2) instead of (256) for cooperative occupancy
+extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
+    volatile WorkerQueue* queue,
+    WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("persistent_worker: started, queue=%p\n", (void*)queue);
+    }
+
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+
+    uint32_t last_seq = 0;
+    uint32_t watchdog_beat_ctr = 0;
+
+    while (true) {
+        // Mark idle BEFORE entering the inner poll loop. Distinguishes idle
+        // wait (no batch yet) from hang for the host watchdog.
+        if (watchdog) watchdog_signal_exited(watchdog);
+
+        // Single-thread poll to avoid PCIe storm
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            while (true) {
+                if (queue->shutdown) {
+                    // Sentinel: set seq to max so all threads see shutdown
+                    queue->seq_num = 0xFFFFFFFFu;
+                    break;
+                }
+                uint32_t s = queue->seq_num;
+                if (s > last_seq) break;
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+        // Clear `exited` — kernel is now actively processing a batch.
+        if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
+
+        // Watchdog: cooperative exit if force_exit set.
+        if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
+            watchdog_signal_exit(&queue->done);
+            return;
+        }
+        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
+
+        uint32_t seq = queue->seq_num;
+        if (seq == 0xFFFFFFFFu) {
+            if (threadIdx.x == 0 && blockIdx.x == 0) queue->done = 1;
+            return;
+        }
+
+        uint32_t num_inst = queue->num_instructions;
+        if (num_inst == 0) num_inst = 1; // backward compat: 0 means 1
+
+        // bz0 fix: invalidate per-WGP L1 at batch boundary. Activation buffer writes by
+        // prior batch may leave stale L1 lines on different WGPs.
+        if (threadIdx.x == 0) {
+            asm volatile("buffer_gl1_inv" ::: "memory");
+        }
+        __syncthreads();
+
+        // Snapshot trace-dump pointers for this batch (zqw): C-style cast
+        // strips volatile from the queue's field types. Set by Rust
+        // PersistentDispatch when Model::trace is active; null = trace disabled.
+        char* dump_base = (char*)queue->dump_base;
+        int dump_capacity = (int)queue->dump_capacity;
+        int* dump_count = (int*)queue->dump_count;
+        uint64_t* op_profile = (uint64_t*)queue->op_profile;
+
+        // Process batch of instructions; dispatch helper handles opcode routing,
+        // post-op barrier, and trace dump.
+        for (uint32_t pc = 0; pc < num_inst; pc++) {
+            // Report progress so CPU can identify stuck instruction on timeout.
+            if (threadIdx.x == 0 && blockIdx.x == 0) queue->progress_pc = pc;
+            // Copy instruction to shared memory (avoids PCIe reads in virtual block loop)
+            __shared__ u64 sinst[INST_SIZE_WORDS];
+            const u64* src = (const u64*)(queue->inst + pc * INST_SIZE_WORDS);
+            if (threadIdx.x < INST_SIZE_WORDS) {
+                sinst[threadIdx.x] = src[threadIdx.x];
+            }
+            __syncthreads();
+            const u64* inst = sinst;
+
+            dispatch_opcode(
+                inst, grid, &g_gbs,
+                dump_base, dump_capacity, dump_count,
+                op_profile, (int)pc, watchdog
+            );
+        }
+
+        // Ack: flush ALL threads' writes to system-visible memory, then write ack.
+        // grid.sync() ensures all threads completed (device-scope). But P2P readers on
+        // GPUs 1-3 bypass GPU 0's L2 and read VRAM directly. grid.sync() alone does NOT
+        // flush L2 → VRAM for P2P visibility. __threadfence() from EACH thread
+        // ensures that thread's cache lines are written back to system-visible memory.
+        // Must be called by ALL threads (not just thread 0,0) to cover all written cache lines.
+        __threadfence();
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            queue->ack = seq;
+        }
+        last_seq = seq;
+    }
 }
