@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
+#include "worker_queue.h"        // struct WorkerQueue + MAX_BATCH_INSTRUCTIONS
 #include "moe_work_queue.h"      // MoeWorkerConfig + MoeExpertEntry types for OP_MOE_FFN_REMOTE
 #include "watchdog.h"
 #include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
@@ -21,26 +22,6 @@ __device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 #include "moe_expert_ops.h"      // coop_* helpers shared with moe_worker (used by OP_MOE_FFN_REMOTE)
 #include "megakernel_moe.hip"
 #include "megakernel_moe_dispatch.hip"
-
-// Work queue for CPU → GPU communication (host-mapped memory).
-// CPU writes an instruction + increments seq_num. Worker polls seq_num.
-#define MAX_BATCH_INSTRUCTIONS 256
-
-struct WorkerQueue {
-    volatile uint32_t seq_num;      // monotonic counter, triggers worker
-    volatile uint32_t shutdown;     // 1 = exit
-    uint32_t num_instructions;      // instructions in this batch (1..64)
-    uint32_t _pad;
-    uint64_t inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]; // instruction batch
-    volatile uint32_t ack;          // worker writes seq_num when done
-    volatile uint32_t done;         // kernel writes 1 when exiting (for Drop polling)
-    volatile uint32_t progress_pc;  // worker writes pc before each instruction (for timeout diagnosis)
-    uint32_t _pad2;
-    // op_profile: GPU-resident DeviceBuffer<u64> base pointer, size 2 *
-    // BRAIDINFER_OP_PROFILE_NUM_SLOTS. Null when -DBRAIDINFER_OP_PROFILE
-    // is unset. See kernels/op_profile.h. Plan: PLAN-op-profile.md.
-    uint64_t* op_profile;
-};
 
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     volatile WorkerQueue* queue,
