@@ -9,6 +9,7 @@
 #include "watchdog.h"
 #include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
 #include "op_profile.h"          // OP_PROFILE_BEGIN/END (no-op when -DBRAIDINFER_OP_PROFILE unset)
+#include "dump.h"                // dump_instruction_output (used by megakernel_dispatch)
 
 // Per-TU GridBarrierState for atomic_block_barrier. Allocated in cache-coherent
 // VRAM by the loader (zero-initialized __device__ static). Replaces grid.sync()
@@ -22,6 +23,7 @@ __device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 #include "moe_expert_ops.h"      // coop_* helpers shared with moe_worker (used by OP_MOE_FFN_REMOTE)
 #include "megakernel_moe.hip"
 #include "megakernel_moe_dispatch.hip"
+#include "megakernel_dispatch.hip"  // unified dispatch_opcode helper (zqw)
 
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     volatile WorkerQueue* queue,
