@@ -137,6 +137,15 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         } else if (opcode == OP_LINEAR_PROJ_RNF4) {
             op_linear_proj_rnf4_full(inst, grid_x);
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+        } else if (opcode == OP_LM_HEAD) {
+            // braidinfer-bfd: full-grid bf16 lm_head with LDS-staged input.
+            // Bypasses the virtual block loop (rows iterated internally).
+            // Mirror of megakernel.hip's top-level OP_LM_HEAD case — without
+            // this branch the persistent_worker hit OP_LM_HEAD via the
+            // switch below (case at line 158), executing the full-grid
+            // sweep redundantly per-virtual-block (~250× regression).
+            op_lm_head(inst, grid_x);
+            braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         } else {
             // Virtual block loop
             for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
@@ -155,7 +164,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                     case OP_FFN_GATE_UP:  op_ffn_gate_up(inst, vb); break;
                     case OP_FFN_DOWN_RES: op_ffn_down_res(inst, vb); break;
                     case OP_EMBEDDING:    op_embedding(inst, vb); break;
-                    case OP_LM_HEAD:      op_lm_head(inst, vb); break;
                     case OP_D2D_COPY:     op_d2d_copy(inst, vb); break;
                     case OP_ATTN_PAGED:   op_attn_paged(inst, vb); break;
                     case OP_ATTN_PREFILL: op_attn_prefill(inst, vb); break;
