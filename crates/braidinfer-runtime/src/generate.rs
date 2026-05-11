@@ -188,13 +188,6 @@ pub fn generate_from_ids(
     prompt_ids: &[u32],
     max_tokens: usize,
 ) -> Result<GenerateResult, ModelError> {
-    // Opt-in RT scheduling for the dispatch (= main) thread. Idempotent,
-    // no-op without BRAIDINFER_DISPATCH_RT=1. See README.md and
-    // crates/braidinfer-runtime/src/persistent_dispatch.rs.
-    if let Err(msg) = crate::persistent_dispatch::try_promote_dispatch_thread() {
-        eprintln!("[braidinfer] dispatch RT promotion failed: {msg}");
-    }
-
     let n_prompt = prompt_ids.len();
     let last_logits = if n_prompt == 0 {
         return Ok(GenerateResult {
@@ -206,6 +199,16 @@ pub fn generate_from_ids(
     } else {
         model.prefill(prompt_ids)?
     };
+
+    // Opt-in RT scheduling for the dispatch (= main) thread. Promoted AFTER
+    // the first dispatch so the persistent worker launch + watchdog thread
+    // spawn happen at SCHED_OTHER. If we promote earlier, the watchdog
+    // (spawned by PersistentDispatch::add_device) inherits SCHED_FIFO via
+    // PTHREAD_INHERIT_SCHED and the cooperative launch wedges (braidinfer-q0h).
+    // Idempotent, no-op without BRAIDINFER_DISPATCH_RT=1. See README.md.
+    if let Err(msg) = crate::persistent_dispatch::try_promote_dispatch_thread() {
+        eprintln!("[braidinfer] dispatch RT promotion failed: {msg}");
+    }
 
     // Debug: print top-5 logits and dump hidden state for first token
     if model.debug_nan {
