@@ -414,6 +414,12 @@ __device__ __attribute__((noinline)) void op_linear_proj_rnf4_full(const u64* in
         const int n_tiles = (num_groups + groups_per_tile - 1) / groups_per_tile;
         const int num_pairs = in_dim / 2;
 
+        // braidinfer-i2s: 1 sub-wave per row, 8 rows in parallel (mirror r9q
+        // for PCG32). Each warp's wave32_reduce_sum gives partial in lane 0.
+        const int warp_id = tid >> 5;
+        const int lane    = tid & 31;
+        const int num_warps = (int)blockDim.x >> 5;
+
         for (int t = 0; t < n_tiles; t++) {
             int g0 = t * groups_per_tile;
             int g1 = min(g0 + groups_per_tile, num_groups);
@@ -424,43 +430,37 @@ __device__ __attribute__((noinline)) void op_linear_proj_rnf4_full(const u64* in
             for (int i = tid; i < tile_len; i += stride) lds_tile[i] = input_base[tile_start + i];
             __syncthreads();
 
-            int ri = 0;
-            for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x, ri++) {
-                const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+            int p0 = tile_start / 2;
+            int p1 = min((g1 * group_size) / 2, num_pairs);
+
+            for (int rc = 0; rc < num_rows; rc += num_warps) {
+                int ri = rc + warp_id;
                 float acc = 0.0f;
-                // process pairs covering this tile's groups
-                int p0 = (tile_start) / 2;
-                int p1 = min((g1 * group_size) / 2, num_pairs);
-                for (int pair = p0 + tid; pair < p1; pair += stride) {
-                    int elem = pair * 2;
-                    int g = elem >> 7;        // elem / 128
-                    int local_pair = (elem & 127) >> 1;
-                    const unsigned char* gp = row_data + g * group_bytes;
-                    float am1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
-                    float am2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
-                    unsigned char b1 = gp[local_pair];
-                    unsigned char b2 = gp[66 + local_pair];
-                    float v0 = NF4_TABLE[b1 & 0xF] * am1 + NF4_TABLE[b2 & 0xF] * am2;
-                    float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * am1 + NF4_TABLE[(b2 >> 4) & 0xF] * am2;
-                    int local_elem = elem - tile_start;
-                    acc += v0 * lds_tile[local_elem] + v1 * lds_tile[local_elem + 1];
+                if (ri < num_rows) {
+                    u32 row = blockIdx.x + (u32)ri * gridDim.x;
+                    const unsigned char* row_data =
+                        weight + (long long)row * num_groups * group_bytes;
+                    for (int pair = p0 + lane; pair < p1; pair += 32) {
+                        int elem = pair * 2;
+                        int g = elem >> 7;        // elem / 128
+                        int local_pair = (elem & 127) >> 1;
+                        const unsigned char* gp = row_data + g * group_bytes;
+                        float am1 = bf16_to_f32(*(const unsigned short*)(gp + 64));
+                        float am2 = bf16_to_f32(*(const unsigned short*)(gp + 130));
+                        unsigned char b1 = gp[local_pair];
+                        unsigned char b2 = gp[66 + local_pair];
+                        float v0 = NF4_TABLE[b1 & 0xF] * am1 + NF4_TABLE[b2 & 0xF] * am2;
+                        float v1 = NF4_TABLE[(b1 >> 4) & 0xF] * am1 + NF4_TABLE[(b2 >> 4) & 0xF] * am2;
+                        int local_elem = elem - tile_start;
+                        acc += v0 * lds_tile[local_elem] + v1 * lds_tile[local_elem + 1];
+                    }
                 }
                 acc = braidinfer::rdna3::wave32_reduce_sum(acc);
-                if ((tid & 31) == 0) shared[tid >> 5] = acc;
-                __syncthreads();
-                // Reduce 8 warp partials with thread 0 only. The previous code did
-                // __shfl_down inside an `if (tid < 8)` block — on RDNA3 wave32, shfl
-                // from an inactive lane is undefined and observably non-deterministic
-                // (AMD ISA: lane reads source register; if source lane is masked off
-                // its register state is implementation-defined). bz0 Source 3 root cause.
-                if (tid == 0) {
-                    float total = shared[0] + shared[1] + shared[2] + shared[3]
-                                + shared[4] + shared[5] + shared[6] + shared[7];
-                    row_partial[ri] += total;
+                if (lane == 0 && ri < num_rows) {
+                    row_partial[ri] += acc;
                 }
                 __syncthreads();
             }
-            __syncthreads();  // Before overwriting lds_tile with next tile
         }
 
         for (u32 row = blockIdx.x, ri = 0; row < (u32)out_dim; row += gridDim.x, ri++) {
