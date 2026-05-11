@@ -625,65 +625,67 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32_full(const u64* i
         const int groups_per_tile = LPROJ_TILE_FLOATS / group_size;  // 240
         const int n_tiles = (num_groups + groups_per_tile - 1) / groups_per_tile;
 
+        // braidinfer-r9q: 1 sub-wave (32 lanes) per row, 8 rows in parallel.
+        // Eliminates per-row __syncthreads cycle (one per row-chunk of 8).
+        // bz0-safe: each warp reduces independently via wave32_reduce_sum
+        // (DPP, no ds_bpermute same-VGPR hazard), no cross-warp shfl.
+        const int warp_id = tid >> 5;
+        const int lane    = tid & 31;
+        const int num_warps = (int)blockDim.x >> 5;
+
         for (int t = 0; t < n_tiles; t++) {
             int g0 = t * groups_per_tile;
             int g1 = min(g0 + groups_per_tile, num_groups);
             int tile_start = g0 * group_size;
             int tile_len = min((g1 - g0) * group_size, in_dim - tile_start);
 
-            // Load input tile cooperatively
             for (int i = tid; i < tile_len; i += stride) lds_tile[i] = input_base[tile_start + i];
             __syncthreads();
 
-            int ri = 0;
-            for (u32 row = blockIdx.x; row < (u32)out_dim; row += gridDim.x, ri++) {
-                const unsigned char* row_data = weight + (long long)row * num_groups * group_bytes;
+            for (int rc = 0; rc < num_rows; rc += num_warps) {
+                int ri = rc + warp_id;
                 float acc = 0.0f;
-                for (int g = g0 + tid; g < g1; g += stride) {
-                    const unsigned char* gp = row_data + g * group_bytes;
+                if (ri < num_rows) {
+                    u32 row = blockIdx.x + (u32)ri * gridDim.x;
+                    const unsigned char* row_data =
+                        weight + (long long)row * num_groups * group_bytes;
+                    // Each lane covers groups g0+lane, g0+lane+32, ... within [g0, g1).
                     // braidinfer-cle: 4× u32 reads of 16-byte nibble pack
                     // (group_bytes=20 is 4-byte aligned). Meta word: low 16 =
                     // mn bf16, high 16 = sc bf16. Assumes in_dim % group_size
-                    // == 0 (true for all production models: 1024, 2048, 4096,
-                    // 5120 — all multiples of 32).
-                    uint32_t w0 = *(const uint32_t*)(gp + 0);
-                    uint32_t w1 = *(const uint32_t*)(gp + 4);
-                    uint32_t w2 = *(const uint32_t*)(gp + 8);
-                    uint32_t w3 = *(const uint32_t*)(gp + 12);
-                    uint32_t mw = *(const uint32_t*)(gp + 16);
-                    float mn = bf16_to_f32((unsigned short)(mw & 0xFFFFu));
-                    float sc = bf16_to_f32((unsigned short)(mw >> 16));
-                    int local_base = (g - g0) * group_size;
-                    uint32_t words[4] = {w0, w1, w2, w3};
-                    #pragma unroll
-                    for (int wi = 0; wi < 4; wi++) {
-                        uint32_t w = words[wi];
+                    // == 0 (true for all production models: 1024/2048/4096/5120).
+                    for (int g = g0 + lane; g < g1; g += 32) {
+                        const unsigned char* gp = row_data + g * group_bytes;
+                        uint32_t w0 = *(const uint32_t*)(gp + 0);
+                        uint32_t w1 = *(const uint32_t*)(gp + 4);
+                        uint32_t w2 = *(const uint32_t*)(gp + 8);
+                        uint32_t w3 = *(const uint32_t*)(gp + 12);
+                        uint32_t mw = *(const uint32_t*)(gp + 16);
+                        float mn = bf16_to_f32((unsigned short)(mw & 0xFFFFu));
+                        float sc = bf16_to_f32((unsigned short)(mw >> 16));
+                        int local_base = (g - g0) * group_size;
+                        uint32_t words[4] = {w0, w1, w2, w3};
                         #pragma unroll
-                        for (int bi = 0; bi < 4; bi++) {
-                            unsigned char byte = (unsigned char)((w >> (8 * bi)) & 0xFFu);
-                            int i = (wi * 4 + bi) * 2;
-                            float v0 = (float)(byte & 0xF) * sc + mn;
-                            float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
-                            acc += v0 * lds_tile[local_base + i] + v1 * lds_tile[local_base + i + 1];
+                        for (int wi = 0; wi < 4; wi++) {
+                            uint32_t w = words[wi];
+                            #pragma unroll
+                            for (int bi = 0; bi < 4; bi++) {
+                                unsigned char byte = (unsigned char)((w >> (8 * bi)) & 0xFFu);
+                                int i = (wi * 4 + bi) * 2;
+                                float v0 = (float)(byte & 0xF) * sc + mn;
+                                float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                                acc += v0 * lds_tile[local_base + i]
+                                     + v1 * lds_tile[local_base + i + 1];
+                            }
                         }
                     }
                 }
                 acc = braidinfer::rdna3::wave32_reduce_sum(acc);
-                if ((tid & 31) == 0) shared[tid >> 5] = acc;
-                __syncthreads();
-                // Reduce 8 warp partials with thread 0 only. The previous code did
-                // __shfl_down inside an `if (tid < 8)` block — on RDNA3 wave32, shfl
-                // from an inactive lane is undefined and observably non-deterministic
-                // (AMD ISA: lane reads source register; if source lane is masked off
-                // its register state is implementation-defined). bz0 Source 3 root cause.
-                if (tid == 0) {
-                    float total = shared[0] + shared[1] + shared[2] + shared[3]
-                                + shared[4] + shared[5] + shared[6] + shared[7];
-                    row_partial[ri] += total;
+                if (lane == 0 && ri < num_rows) {
+                    row_partial[ri] += acc;
                 }
                 __syncthreads();
             }
-            __syncthreads();  // Before overwriting lds_tile with next tile
         }
 
         for (u32 row = blockIdx.x, ri = 0; row < (u32)out_dim; row += gridDim.x, ri++) {
