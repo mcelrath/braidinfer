@@ -59,19 +59,37 @@ struct GpuMailbox {
     uint32_t          _pad[12];      // pad to 64 bytes
 };
 
+// Simulates WatchdogState — host-mapped UC, modified by kernel each outer iter.
+struct FakeWatchdogState {
+    volatile uint32_t force_exit;
+    volatile uint32_t exited;
+    volatile uint64_t progress_counter;
+    volatile uint32_t last_op_id;
+    uint32_t          _pad[3];
+};
+
 extern "C" __global__ __launch_bounds__(256, 2) void idle_barrier_kernel(
     volatile GpuMailbox* __restrict__ mbox,
     GridBarrierState*    __restrict__ gbs,
     int                              total_iters,
     int                              barriers_per_iter,
     float*               __restrict__ p2p_target,  // GPU 0 UC, can be null
-    int                              gpu_id)
+    int                              gpu_id,
+    FakeWatchdogState*   __restrict__ ws  // host-mapped UC, simulates production watchdog
+)
 {
+    // EXPERIMENT (c): construct cg::grid_group to mirror production. Production's
+    // persistent_worker calls cg::this_grid() which emits global_atomic_cmpswap_b64
+    // for HSA cooperative-grid handle init. If this CAS interacts badly with
+    // multi-GPU PCIe traffic / scheduler, it could be the wedge trigger.
+    cg::grid_group grid = cg::this_grid();
+    (void)grid;  // prevent unused warning; we never call grid.sync()
+
     const int tid = threadIdx.x;
     const int bid = blockIdx.x;
 
     if (tid == 0 && bid == 0) {
-        printf("[gpu] idle_barrier_kernel started: blocks=%d, total_iters=%d, barriers_per_iter=%d\n",
+        printf("[gpu] idle_barrier_kernel started: blocks=%d, total_iters=%d, barriers_per_iter=%d (with cg::this_grid)\n",
                gridDim.x, total_iters, barriers_per_iter);
     }
 
@@ -208,6 +226,30 @@ int main(int argc, char** argv) {
             streams[g]));
     }
 
+    // Spawn host-side PCIe contention threads to mimic production's
+    // shutdown-poll + dispatch-batch traffic: N threads doing volatile reads
+    // on UC mailboxes + writes to a "scratch" mailbox field, hammering
+    // host→GPU PCIe channels concurrently with the kernel.
+    std::atomic<bool> contention_stop{false};
+    std::vector<std::thread> contention_threads;
+    constexpr int kContentionThreadsPerGpu = 2;  // 8 total for 4-GPU
+    for (int g = 0; g < num_gpus; g++) {
+        for (int t = 0; t < kContentionThreadsPerGpu; t++) {
+            contention_threads.emplace_back([&, g]() {
+                volatile uint32_t* sink_read = &host_mboxes[g]->progress_stage;
+                volatile uint32_t* sink_write = &host_mboxes[g]->_pad[0];
+                uint32_t spin = 0;
+                while (!contention_stop.load(std::memory_order_relaxed)) {
+                    uint32_t v = *sink_read;
+                    *sink_write = v ^ spin;
+                    spin++;
+                    // Pace at production-like ~10kHz to avoid CPU starvation.
+                    if ((spin & 0xff) == 0) std::this_thread::yield();
+                }
+            });
+        }
+    }
+
     // Drive iterations.
     int wedges = 0;
     int max_wedge_stage = -1;
@@ -270,6 +312,10 @@ int main(int argc, char** argv) {
                max_wedge_gpu, max_wedge_iter, max_wedge_stage);
         printf("  (stage 99=saw shutdown, 100=about to barrier, 101=passed barrier, 200=clean)\n");
     }
+
+    // Stop contention threads first so they don't keep racing during shutdown.
+    contention_stop.store(true, std::memory_order_relaxed);
+    for (auto& t : contention_threads) t.join();
 
     // Signal shutdown so kernels exit cleanly.
     for (int g = 0; g < num_gpus; g++) {
