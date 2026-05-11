@@ -860,6 +860,16 @@ impl Drop for PersistentDispatch {
         // libc::exit never completes. We can't reliably detect the wedge
         // from host. Multi-GPU = always fast-exit via _exit. The OS reclaims
         // memory and amdgpu force-releases GPUs.
+        // braidinfer-4fg.3: for multi-GPU, abort BEFORE Stream/Module/Buffer
+        // drops. The kernel-internal atomic_block_barrier wedge can leave the
+        // cooperative kernel running even after the worker thread set done=1
+        // (kb rdna3-atomic-block-barrier-multi-gpu-fundamental-issue). When
+        // that happens, hipStreamDestroy blocks waiting for the kernel to
+        // release CUs. We can't reliably detect the wedge from host. Multi-GPU
+        // = always fast-exit via _exit. Verified bounded ~4s exit (vs 600s+
+        // hang). Investigation in braidinfer-4fg.3/awj/setprio didn't isolate
+        // the root cause — possibly HW-level scheduler/cache interaction
+        // under cross-GPU PCIe pressure that's not addressable in software.
         if self.workers.len() > 1 {
             self.watchdog.force_exit_all();
             std::thread::sleep(std::time::Duration::from_millis(200));
