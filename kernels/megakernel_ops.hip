@@ -641,15 +641,31 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32_full(const u64* i
                 float acc = 0.0f;
                 for (int g = g0 + tid; g < g1; g += stride) {
                     const unsigned char* gp = row_data + g * group_bytes;
-                    float mn = bf16_to_f32(*(const unsigned short*)(gp + 16));
-                    float sc = bf16_to_f32(*(const unsigned short*)(gp + 18));
+                    // braidinfer-cle: 4× u32 reads of 16-byte nibble pack
+                    // (group_bytes=20 is 4-byte aligned). Meta word: low 16 =
+                    // mn bf16, high 16 = sc bf16. Assumes in_dim % group_size
+                    // == 0 (true for all production models: 1024, 2048, 4096,
+                    // 5120 — all multiples of 32).
+                    uint32_t w0 = *(const uint32_t*)(gp + 0);
+                    uint32_t w1 = *(const uint32_t*)(gp + 4);
+                    uint32_t w2 = *(const uint32_t*)(gp + 8);
+                    uint32_t w3 = *(const uint32_t*)(gp + 12);
+                    uint32_t mw = *(const uint32_t*)(gp + 16);
+                    float mn = bf16_to_f32((unsigned short)(mw & 0xFFFFu));
+                    float sc = bf16_to_f32((unsigned short)(mw >> 16));
                     int local_base = (g - g0) * group_size;
-                    int count = min(group_size, in_dim - g * group_size);
-                    for (int i = 0; i < count; i += 2) {
-                        unsigned char byte = gp[i / 2];
-                        float v0 = (float)(byte & 0xF) * sc + mn;
-                        float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
-                        acc += v0 * lds_tile[local_base + i] + v1 * lds_tile[local_base + i + 1];
+                    uint32_t words[4] = {w0, w1, w2, w3};
+                    #pragma unroll
+                    for (int wi = 0; wi < 4; wi++) {
+                        uint32_t w = words[wi];
+                        #pragma unroll
+                        for (int bi = 0; bi < 4; bi++) {
+                            unsigned char byte = (unsigned char)((w >> (8 * bi)) & 0xFFu);
+                            int i = (wi * 4 + bi) * 2;
+                            float v0 = (float)(byte & 0xF) * sc + mn;
+                            float v1 = (float)((byte >> 4) & 0xF) * sc + mn;
+                            acc += v0 * lds_tile[local_base + i] + v1 * lds_tile[local_base + i + 1];
+                        }
                     }
                 }
                 acc = braidinfer::rdna3::wave32_reduce_sum(acc);
