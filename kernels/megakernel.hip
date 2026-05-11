@@ -130,6 +130,14 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                 if (queue->shutdown) {
                     // Sentinel: set seq to max so all threads see shutdown
                     queue->seq_num = 0xFFFFFFFFu;
+                    // braidinfer-4fg: signal done IMMEDIATELY so the host's
+                    // shutdown poll completes regardless of whether the
+                    // subsequent atomic_block_barrier wedges (multi-GPU MoE
+                    // shutdown wedge — see kb rdna3-atomic-block-barrier-
+                    // multi-gpu-fundamental-issue). Idempotent: the cooperative
+                    // exit path below also sets done=1 when reached.
+                    queue->done = 1;
+                    __threadfence();
                     break;
                 }
                 uint32_t s = queue->seq_num;

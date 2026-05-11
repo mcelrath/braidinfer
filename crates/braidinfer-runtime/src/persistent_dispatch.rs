@@ -821,11 +821,25 @@ impl Drop for PersistentDispatch {
         }
 
         // Log any workers that still didn't exit (will be leaked).
+        // Read queue state for diagnosis — reveals whether worker is stuck
+        // mid-batch (progress_pc > 0, ack < seq) or idle-not-honoring-shutdown
+        // (progress_pc == 0, ack == seq, shutdown == 1).
         for (idx, slot) in self.workers.iter().enumerate() {
             if !worker_done[idx] {
                 if let Some(worker) = slot.as_ref() {
+                    let q_ptr = worker.queue.host_ptr() as *const WorkerQueueLayout;
+                    let (seq, ack, progress_pc, num_inst, shutdown, done) = unsafe {(
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).seq_num)),
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).ack)),
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc)),
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).num_instructions)),
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).shutdown)),
+                        std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).done)),
+                    )};
                     eprintln!(
-                        "braidinfer: persistent worker shutdown timeout on GPU {} (leaking) {}",
+                        "braidinfer: persistent worker shutdown timeout on GPU {} (leaking) {} \
+                         [seq={seq} ack={ack} progress_pc={progress_pc} num_inst={num_inst} \
+                         shutdown={shutdown} done={done}]",
                         worker.device.0,
                         if panicking { "[panic]" } else { "" }
                     );
@@ -833,13 +847,46 @@ impl Drop for PersistentDispatch {
             }
         }
 
-        // Free HIP resources only for workers that confirmed exit. Timed-out
-        // workers are intentionally leaked to avoid deadlocking on HIP cleanup.
-        // braidinfer-4fg: clear the PERSISTENT_WORKER_ACTIVE bit BEFORE running
-        // ManuallyDrop — the worker's MappedHostBuffer<u8> queue checks this
-        // mask in its Drop impl to skip hipHostFree when a worker is leaked.
-        // If the bit is still set during the drop, the queue is needlessly
-        // leaked even on clean shutdown.
+        // On panic, terminate the process AFTER the best-effort shutdown above. This
+        // matches the original behavior (panic = abort) but ensures we attempted the
+        // shutdown signal first so the kernel has a chance to release the GPU.
+        if panicking {
+            std::process::exit(1);
+        }
+
+        // braidinfer-4fg: abort BEFORE any HIP resource cleanup (Stream/Module
+        // drop) for multi-GPU sessions. The kernel may still be running on
+        // the GPU even if the host saw done=1 (kb rdna3-atomic-block-barrier-
+        // multi-gpu-fundamental-issue: barrier wedge can leave kernel running
+        // after the worker thread set done=1). hipStreamDestroy /
+        // hipModuleUnload then block waiting for CUs to be released, which
+        // never happens. We can't reliably distinguish "cleanly exited
+        // kernel" from "kernel-wedged-after-done-flag" so be conservative:
+        // multi-GPU = always abort to guarantee bounded process exit. The OS
+        // reclaims memory and amdgpu force-releases GPU contexts on SIGABRT.
+        if self.workers.len() > 1 {
+            eprintln!(
+                "braidinfer: multi-GPU session ({} GPUs); firing force_exit \
+                 on all workers then aborting (kb rdna3-atomic-block-barrier-\
+                 multi-gpu-fundamental-issue).",
+                self.workers.len()
+            );
+            // Fire force_exit on every worker before exiting — this gives
+            // the kernel a chance to terminate cooperatively.
+            self.watchdog.force_exit_all();
+            // Brief window for kernel to honor force_exit.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Use unistd _exit directly: bypasses libc/atexit/Rust runtime
+            // cleanup that would call into amdgpu and block. _exit is a
+            // direct syscall that triggers amdgpu context teardown
+            // immediately. std::process::abort sends SIGABRT which can
+            // still go through signal-handler cleanup on the way out.
+            unsafe { libc::_exit(134); }
+        }
+
+        // Single-GPU clean path: free HIP resources. The done=1 flag really
+        // means the kernel exited (no atomic_block_barrier wedge has been
+        // observed on single-GPU per kb).
         for (idx, slot) in self.workers.iter_mut().enumerate() {
             if worker_done[idx] {
                 if let Some(mut worker) = slot.take() {
@@ -852,22 +899,9 @@ impl Drop for PersistentDispatch {
             }
         }
 
-        // On panic, terminate the process AFTER the best-effort shutdown above. This
-        // matches the original behavior (panic = abort) but ensures we attempted the
-        // shutdown signal first so the kernel has a chance to release the GPU.
-        if panicking {
-            std::process::exit(1);
-        }
-
-        // braidinfer-4fg: if any worker leaked (cooperative shutdown timed out
-        // and we never set its bit in PERSISTENT_WORKER_ACTIVE_MASK to false),
-        // the kernel is still holding GPU CUs. Continuing the normal Drop chain
-        // would block on libc::exit waiting for amdgpu to release the GPU
-        // context, which can't happen while a kernel is mid-flight. The only
-        // recovery on RDNA3/gfx1100 is process abort, which triggers amdgpu
-        // driver teardown and force-releases the GPU. (CLAUDE.md "Recovery
-        // model"; verified by exterior_algebra/scripts/watchdog_recovery_test.hip.)
-        // Subsequent Drops are skipped — the OS reclaims memory on process exit.
+        // braidinfer-4fg: even on single-GPU, if a worker leaked (cooperative
+        // shutdown timed out), the kernel is still holding GPU CUs. Continuing
+        // the Drop chain blocks on libc::exit waiting for amdgpu. Abort.
         if braidinfer_hip::any_persistent_worker_active() {
             eprintln!(
                 "braidinfer: at least one persistent worker leaked; aborting process \
