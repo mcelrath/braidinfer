@@ -128,14 +128,13 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             while (true) {
                 if (queue->shutdown) {
-                    // Sentinel: set seq to max so all threads see shutdown
+                    // Sentinel: set seq to max so all threads see shutdown.
+                    // braidinfer-4fg: write done=1 + __threadfence so host's
+                    // shutdown poll completes regardless of barrier wedge
+                    // (kb rdna3-atomic-block-barrier-multi-gpu-fundamental-issue).
+                    // The cooperative exit at the bottom of this iteration
+                    // sets done=1 again — idempotent.
                     queue->seq_num = 0xFFFFFFFFu;
-                    // braidinfer-4fg: signal done IMMEDIATELY so the host's
-                    // shutdown poll completes regardless of whether the
-                    // subsequent atomic_block_barrier wedges (multi-GPU MoE
-                    // shutdown wedge — see kb rdna3-atomic-block-barrier-
-                    // multi-gpu-fundamental-issue). Idempotent: the cooperative
-                    // exit path below also sets done=1 when reached.
                     queue->done = 1;
                     __threadfence();
                     break;
@@ -149,18 +148,27 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         // Clear `exited` — kernel is now actively processing a batch.
         if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
-        // Watchdog: cooperative exit if force_exit set.
-        if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
-            watchdog_signal_exit(&queue->done);
-            return;
-        }
-        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
-
+        // braidinfer-4fg.3: check sentinel FIRST, before watchdog_poll_and_check.
+        // Back-to-back atomic_block_barriers (line 148 + the one inside
+        // watchdog_poll_and_check) intermittently wedge on multi-GPU (kb
+        // rdna3-atomic-block-barrier-multi-gpu-fundamental-issue, root cause
+        // empirically isolated via stage-marker diag). For shutdown (seq ==
+        // sentinel), we don't need the watchdog check — sentinel path returns
+        // immediately. This eliminates the second back-to-back barrier in the
+        // shutdown path. Force_exit (without shutdown) still flows through
+        // watchdog_poll_and_check, but that's a rare path.
         uint32_t seq = queue->seq_num;
         if (seq == 0xFFFFFFFFu) {
             if (threadIdx.x == 0 && blockIdx.x == 0) queue->done = 1;
             return;
         }
+
+        // Watchdog: cooperative exit if force_exit set (non-shutdown path).
+        if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
+            watchdog_signal_exit(&queue->done);
+            return;
+        }
+        if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
 
         uint32_t num_inst = queue->num_instructions;
         if (num_inst == 0) num_inst = 1; // backward compat: 0 means 1

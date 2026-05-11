@@ -821,9 +821,6 @@ impl Drop for PersistentDispatch {
         }
 
         // Log any workers that still didn't exit (will be leaked).
-        // Read queue state for diagnosis — reveals whether worker is stuck
-        // mid-batch (progress_pc > 0, ack < seq) or idle-not-honoring-shutdown
-        // (progress_pc == 0, ack == seq, shutdown == 1).
         for (idx, slot) in self.workers.iter().enumerate() {
             if !worker_done[idx] {
                 if let Some(worker) = slot.as_ref() {
@@ -854,39 +851,23 @@ impl Drop for PersistentDispatch {
             std::process::exit(1);
         }
 
-        // braidinfer-4fg: abort BEFORE any HIP resource cleanup (Stream/Module
-        // drop) for multi-GPU sessions. The kernel may still be running on
-        // the GPU even if the host saw done=1 (kb rdna3-atomic-block-barrier-
-        // multi-gpu-fundamental-issue: barrier wedge can leave kernel running
-        // after the worker thread set done=1). hipStreamDestroy /
-        // hipModuleUnload then block waiting for CUs to be released, which
-        // never happens. We can't reliably distinguish "cleanly exited
-        // kernel" from "kernel-wedged-after-done-flag" so be conservative:
-        // multi-GPU = always abort to guarantee bounded process exit. The OS
-        // reclaims memory and amdgpu force-releases GPU contexts on SIGABRT.
+        // braidinfer-4fg.3: for multi-GPU, abort BEFORE Stream/Module/Buffer
+        // drops. Even though the kernel reorder (sentinel check before
+        // watchdog_poll_and_check) eliminates the common back-to-back-barrier
+        // wedge, the outer barrier (line 148 of megakernel.hip) can still
+        // wedge intermittently (~1/5 runs observed). When that happens,
+        // hipStreamDestroy blocks waiting for the kernel to release CUs,
+        // libc::exit never completes. We can't reliably detect the wedge
+        // from host. Multi-GPU = always fast-exit via _exit. The OS reclaims
+        // memory and amdgpu force-releases GPUs.
         if self.workers.len() > 1 {
-            eprintln!(
-                "braidinfer: multi-GPU session ({} GPUs); firing force_exit \
-                 on all workers then aborting (kb rdna3-atomic-block-barrier-\
-                 multi-gpu-fundamental-issue).",
-                self.workers.len()
-            );
-            // Fire force_exit on every worker before exiting — this gives
-            // the kernel a chance to terminate cooperatively.
             self.watchdog.force_exit_all();
-            // Brief window for kernel to honor force_exit.
             std::thread::sleep(std::time::Duration::from_millis(200));
-            // Use unistd _exit directly: bypasses libc/atexit/Rust runtime
-            // cleanup that would call into amdgpu and block. _exit is a
-            // direct syscall that triggers amdgpu context teardown
-            // immediately. std::process::abort sends SIGABRT which can
-            // still go through signal-handler cleanup on the way out.
             unsafe { libc::_exit(134); }
         }
 
-        // Single-GPU clean path: free HIP resources. The done=1 flag really
-        // means the kernel exited (no atomic_block_barrier wedge has been
-        // observed on single-GPU per kb).
+        // Single-GPU clean path: drop workers normally. No multi-GPU wedge
+        // observed on single-GPU per kb.
         for (idx, slot) in self.workers.iter_mut().enumerate() {
             if worker_done[idx] {
                 if let Some(mut worker) = slot.take() {
@@ -899,15 +880,14 @@ impl Drop for PersistentDispatch {
             }
         }
 
-        // braidinfer-4fg: even on single-GPU, if a worker leaked (cooperative
-        // shutdown timed out), the kernel is still holding GPU CUs. Continuing
-        // the Drop chain blocks on libc::exit waiting for amdgpu. Abort.
+        // Single-GPU leak (rare): fast-exit.
         if braidinfer_hip::any_persistent_worker_active() {
             eprintln!(
-                "braidinfer: at least one persistent worker leaked; aborting process \
-                 to force amdgpu GPU release (CLAUDE.md 'Recovery model')."
+                "braidinfer: single-GPU worker leaked; fast-exiting via _exit(134)."
             );
-            std::process::abort();
+            self.watchdog.force_exit_all();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            unsafe { libc::_exit(134); }
         }
     }
 }
