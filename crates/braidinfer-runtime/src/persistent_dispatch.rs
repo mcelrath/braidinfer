@@ -835,14 +835,19 @@ impl Drop for PersistentDispatch {
 
         // Free HIP resources only for workers that confirmed exit. Timed-out
         // workers are intentionally leaked to avoid deadlocking on HIP cleanup.
+        // braidinfer-4fg: clear the PERSISTENT_WORKER_ACTIVE bit BEFORE running
+        // ManuallyDrop — the worker's MappedHostBuffer<u8> queue checks this
+        // mask in its Drop impl to skip hipHostFree when a worker is leaked.
+        // If the bit is still set during the drop, the queue is needlessly
+        // leaked even on clean shutdown.
         for (idx, slot) in self.workers.iter_mut().enumerate() {
             if worker_done[idx] {
                 if let Some(mut worker) = slot.take() {
                     let device = worker.device;
+                    braidinfer_hip::set_persistent_worker_active(device, false);
                     unsafe {
                         std::mem::ManuallyDrop::drop(&mut worker);
                     }
-                    braidinfer_hip::set_persistent_worker_active(device, false);
                 }
             }
         }
@@ -852,6 +857,23 @@ impl Drop for PersistentDispatch {
         // shutdown signal first so the kernel has a chance to release the GPU.
         if panicking {
             std::process::exit(1);
+        }
+
+        // braidinfer-4fg: if any worker leaked (cooperative shutdown timed out
+        // and we never set its bit in PERSISTENT_WORKER_ACTIVE_MASK to false),
+        // the kernel is still holding GPU CUs. Continuing the normal Drop chain
+        // would block on libc::exit waiting for amdgpu to release the GPU
+        // context, which can't happen while a kernel is mid-flight. The only
+        // recovery on RDNA3/gfx1100 is process abort, which triggers amdgpu
+        // driver teardown and force-releases the GPU. (CLAUDE.md "Recovery
+        // model"; verified by exterior_algebra/scripts/watchdog_recovery_test.hip.)
+        // Subsequent Drops are skipped — the OS reclaims memory on process exit.
+        if braidinfer_hip::any_persistent_worker_active() {
+            eprintln!(
+                "braidinfer: at least one persistent worker leaked; aborting process \
+                 to force amdgpu GPU release (CLAUDE.md 'Recovery model')."
+            );
+            std::process::abort();
         }
     }
 }

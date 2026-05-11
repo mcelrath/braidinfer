@@ -240,6 +240,17 @@ pub fn memcpy_d2d(dst: *mut u8, src: *const u8, len: usize) -> HipResult<()> {
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
+            // braidinfer-4fg: if THIS GPU still has a (possibly leaked)
+            // persistent worker, hipFree blocks on SyncAllStreams which
+            // waits for the worker to release CUs. Skip and accept leak.
+            if crate::is_persistent_worker_active(self.device) {
+                eprintln!(
+                    "braidinfer: leaking {}B on {:?} (persistent worker active)",
+                    self.size_bytes(),
+                    self.device
+                );
+                return;
+            }
             if crate::device::Device::set_current(self.device).is_err() {
                 // Accept leak rather than free on wrong device
                 eprintln!(
@@ -405,21 +416,44 @@ impl<T> MappedHostBuffer<T> {
 
 impl<T> Drop for MappedHostBuffer<T> {
     fn drop(&mut self) {
-        if !self.host_ptr.is_null() {
-            let err = unsafe { ffi::hipHostFree(self.host_ptr.cast()) };
-            if err != 0 {
-                eprintln!(
-                    "braidinfer: hipHostFree failed (error {}) for mapped buffer",
-                    err,
-                );
-            }
+        if self.host_ptr.is_null() {
+            return;
+        }
+        // braidinfer-4fg: if any persistent worker is still active (including
+        // a leaked one whose cooperative-shutdown timed out), hipHostFree
+        // deadlocks because the worker still holds the device pointer to this
+        // page. Skip the free and let the OS reclaim on process exit.
+        if crate::any_persistent_worker_active() {
+            eprintln!(
+                "braidinfer: skipping hipHostFree (persistent worker leaked; \
+                 buffer will be reclaimed by OS at process exit)"
+            );
+            return;
+        }
+        let err = unsafe { ffi::hipHostFree(self.host_ptr.cast()) };
+        if err != 0 {
+            eprintln!(
+                "braidinfer: hipHostFree failed (error {}) for mapped buffer",
+                err,
+            );
         }
     }
 }
 
 impl<T> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if self.ptr.is_null() {
+            return;
+        }
+        // braidinfer-4fg: same hipHostFree deadlock as MappedHostBuffer.
+        if crate::any_persistent_worker_active() {
+            eprintln!(
+                "braidinfer: leaking {}B pinned buffer (persistent worker active)",
+                self.len * std::mem::size_of::<T>()
+            );
+            return;
+        }
+        {
             let err = unsafe { ffi::hipHostFree(self.ptr.cast()) };
             if err != 0 {
                 eprintln!(

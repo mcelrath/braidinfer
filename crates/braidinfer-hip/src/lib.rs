@@ -32,9 +32,18 @@ pub fn set_persistent_worker_active(device: DeviceId, active: bool) {
     }
 }
 
-fn is_persistent_worker_active(device: DeviceId) -> bool {
+pub fn is_persistent_worker_active(device: DeviceId) -> bool {
     let bit = 1u32 << device.0;
     PERSISTENT_WORKER_ACTIVE_MASK.load(Ordering::SeqCst) & bit != 0
+}
+
+/// True if any GPU currently has a live persistent worker (including any that
+/// was leaked because cooperative shutdown timed out). Used by
+/// `MappedHostBuffer::drop` to decide whether to call `hipHostFree` — if a
+/// leaked worker may still be reading the host-mapped page, hipHostFree
+/// deadlocks. See braidinfer-4fg.
+pub fn any_persistent_worker_active() -> bool {
+    PERSISTENT_WORKER_ACTIVE_MASK.load(Ordering::SeqCst) != 0
 }
 
 /// Panics if a persistent worker is active on the given GPU.
