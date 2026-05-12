@@ -394,10 +394,33 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     }
 
     // 4. P2P-write accumulated output to GPU 0's output_slot.
-    // __threadfence() ensures all blocks' writes to lo are flushed to local
-    // VRAM before the cross-GPU copy, and the coop_copy below issues writes
-    // visible across PCIe by the time grid.sync() returns at copy end.
+    //
+    // §11.4 HAZARD avoidance (Phase 0b braidinfer-pky.2 fix, 2026-05-12):
+    // coop_copy's trailing atomic_block_barrier would stall on
+    // s_waitcnt_vscnt here because the destination is GPU 0's output_slots
+    // (UC memory) — cross-GPU PCIe writes under multi-GPU pressure don't
+    // drain before the barrier's leading vscnt wait. Diagnosed via
+    // BRAIDINFER_P0B_DIAG=1: per-batch coop launches wedge at the next
+    // try_wait_acks_many after this barrier.
+    //
+    // The within-kernel barrier is redundant here: after op_moe_ffn_remote
+    // returns, dispatch_opcode returns (no trailing barrier on the
+    // OP_MOE_FFN_REMOTE non-dump path), then megakernel_f32 / persistent_worker's
+    // main loop. For Phase 0b's per-batch coop, kernel exit completes the
+    // dispatch — its AQL trailer fence handles cross-GPU visibility. For the
+    // persistent_worker path, the next mailbox iteration's batch-boundary
+    // buffer_gl1_inv (megakernel.hip:185) re-invalidates the writer-side L1.
+    //
+    // Strict invariant: every block must complete its writes before kernel
+    // exit. The cooperative kernel only retires when all blocks return,
+    // which guarantees the loop below has completed in every block. The
+    // __threadfence forces local VRAM stores (`lo`) to be visible at agent
+    // scope before any thread starts the cross-GPU copy.
     __threadfence();
-    coop_copy(out_p2p, lo, gupd, grid, gbs);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;
+         idx += gridDim.x * blockDim.x) {
+        out_p2p[idx] = lo[idx];
+    }
+    __threadfence();
 }
 
