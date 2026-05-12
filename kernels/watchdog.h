@@ -104,11 +104,13 @@ __device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local
         // read instead — the WatchdogState page is host-mapped MTYPE=UC, so
         // the read goes directly to system memory bypassing GPU L2.
         *local_counter = *(volatile uint64_t*)&ws->progress_counter;
-        // Clear the exited flag — kernel is now running again. SYSTEM-scope
-        // store works on gfx1100 (per watchdog.h comment); use it for explicit
-        // release ordering.
+        // 4fg.5: AGENT scope (was SYSTEM). The WatchdogState page is
+        // host-mapped MTYPE=UC, so any write propagates to host via PCIe
+        // regardless of scope. SYSTEM scope's s_waitcnt_vscnt handshake is
+        // the source of the multi-GPU barrier wedge (PCIe-write-before-
+        // barrier hazard). AGENT scope omits the handshake.
         __hip_atomic_store(&ws->exited, 0u,
-                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     }
 }
 
@@ -120,8 +122,9 @@ __device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local
 // next-segment compile between mk.execute() calls).
 __device__ __forceinline__ void watchdog_signal_exited(WatchdogState* ws) {
     if (threadIdx.x == 0 && blockIdx.x == 0 && ws) {
+        // 4fg.5: AGENT scope (was SYSTEM). See watchdog_init comment.
         __hip_atomic_store(&ws->exited, 1u,
-                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     }
 }
 
@@ -132,8 +135,9 @@ __device__ __forceinline__ void watchdog_beat(WatchdogState* ws, uint32_t* local
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         uint32_t c = ++(*local_counter);
         if ((c % 100) == 0) {
+            // 4fg.5: AGENT scope (was SYSTEM). See watchdog_init comment.
             __hip_atomic_store(&ws->progress_counter, (uint64_t)c,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
         }
     }
 }

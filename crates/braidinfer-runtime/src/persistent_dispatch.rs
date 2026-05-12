@@ -712,35 +712,21 @@ impl PersistentDispatch {
     /// during decode. Replaces the OUT-OF-BAND queue->shutdown flag path
     /// that wedges intermittently at the post-poll atomic_block_barrier.
     pub fn send_halt_all(&mut self) {
-        // OP_HALT = 16 (per kernels/opcodes.h, generated as OP_HALT in
-        // opcodes.rs). Build the same shape Instruction would: opcode in
-        // word 0, rest zeros. Use raw word writes to avoid pulling in
-        // Instruction's constructor here.
-        const OP_HALT_VAL: u64 = 16;
+        // 4fg.5: switch from OP_HALT-instruction dispatch to the legacy
+        // queue->shutdown=1 path. The worker's inner-poll detects shutdown
+        // first, sets g_shutdown_seen via AGENT-scope (no PCIe), post-poll
+        // barrier delivers it, and ALL blocks early-return — skipping
+        // watchdog_poll_and_check's internal atomic_block_barrier. The
+        // OP_HALT path required reading queue->inst and going through
+        // back-to-back barriers (post-poll + watchdog), which kb 4fg-3
+        // identified as wedge-prone.
         for slot in self.workers.iter_mut() {
             let Some(worker) = slot.as_mut() else { continue };
             let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
             unsafe {
-                // Write OP_HALT into instruction slot 0; clear remaining
-                // words for hygiene.
                 std::ptr::write_volatile(
-                    std::ptr::addr_of_mut!((*q_ptr).inst[0]),
-                    OP_HALT_VAL,
-                );
-                for j in 1..INST_SIZE {
-                    std::ptr::write_volatile(
-                        std::ptr::addr_of_mut!((*q_ptr).inst[j]),
-                        0u64,
-                    );
-                }
-                std::ptr::write_volatile(
-                    std::ptr::addr_of_mut!((*q_ptr).num_instructions),
+                    std::ptr::addr_of_mut!((*q_ptr).shutdown),
                     1u32,
-                );
-                worker.seq_counter = worker.seq_counter.wrapping_add(1);
-                std::ptr::write_volatile(
-                    std::ptr::addr_of_mut!((*q_ptr).seq_num),
-                    worker.seq_counter,
                 );
             }
         }
