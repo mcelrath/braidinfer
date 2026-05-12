@@ -99,6 +99,15 @@ pub struct MoeP2pContext {
     pub gpu0_scratch_gate: DeviceBuffer<f32>,
     pub gpu0_scratch_up: DeviceBuffer<f32>,
     pub gpu0_scratch_act: DeviceBuffer<f32>,
+    /// GPU 0 cached-local accumulator for op_moe_dispatch (PRE). Workers
+    /// already stage into local `lo` and barrierless-copy to UC `out_p2p`
+    /// at exit (megakernel_moe.hip op_moe_ffn_remote). Mirror that pattern
+    /// on GPU 0: stage zero/accumulate into `gpu0_acc` (cached), then
+    /// final barrierless copy to UC `output_slots[0..gupd]`. Eliminates
+    /// the §11.4 PCIe-write-before-barrier hazard at coop_zero and
+    /// per-expert coop_weighted_acc sites. Size = hidden_size (the slot
+    /// stride; gupd ≤ hs).
+    pub gpu0_acc: DeviceBuffer<f32>,
     /// Per-worker MoE state for GPUs 1..N-1. No kernel modules — workers run
     /// `persistent_worker.hsaco` via `PersistentDispatch`.
     pub workers: Vec<MoeWorkerGpu>,
@@ -204,6 +213,8 @@ impl MoeP2pContext {
         let gpu0_scratch_gate = DeviceBuffer::<f32>::alloc(gpu0, scratch_gate_size)?;
         let gpu0_scratch_up = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
         let gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
+        // §11.4 HAZARD avoidance for op_moe_dispatch — see field doc.
+        let gpu0_acc = DeviceBuffer::<f32>::alloc(gpu0, hidden_size)?;
 
         // Allocate per-worker MoE state on each worker GPU. No kernel launch —
         // workers run `persistent_worker.hsaco` via `PersistentDispatch`, dispatched
@@ -287,6 +298,7 @@ impl MoeP2pContext {
             gpu0_scratch_gate,
             gpu0_scratch_up,
             gpu0_scratch_act,
+            gpu0_acc,
             workers,
             num_gpus,
             hidden_size,

@@ -1616,7 +1616,7 @@ impl MegakernelProgram {
                 scratch_act: p2p.gpu0_scratch_act.as_ptr() as u64,
                 num_gpus: num_gpus as u64,
                 gate_up_in_dim: gupd as u64,
-                _pad: 0,
+                gpu0_acc: p2p.gpu0_acc.as_ptr() as u64,
             }.into_inst();
         }
 
@@ -1688,7 +1688,9 @@ impl MegakernelProgram {
                         scratch_act: p2p.gpu0_scratch_act.as_ptr() as u64,
                         num_gpus: num_gpus as u64,
                         gate_up_in_dim: gupd as u64,
-                        _pad: 0,
+                        // OP_MOE_DISPATCH_POST doesn't use gpu0_acc, but
+                        // the field is non-optional in the struct layout.
+                        gpu0_acc: 0,
                     }.into_inst());
 
                     // The rest of the post-MoE insertions only apply to Nemotron-H

@@ -530,7 +530,11 @@ typedef struct {
     uint64_t scratch_act;
     uint64_t num_gpus;
     uint64_t gate_up_in_dim;
-    uint64_t _pad;
+    // §11.4 HAZARD avoidance for op_moe_dispatch: cached-local accumulator
+    // (size = hs). op_moe_dispatch stages per-expert accumulation here and
+    // does a final barrierless copy to UC output_slots[0..gupd]. Unused
+    // by OP_MOE_DISPATCH_POST (which only reads output_slots).
+    uint64_t gpu0_acc;
 } MoeDispatchInst;
 static_assert(sizeof(MoeDispatchInst) == INST_SIZE_WORDS * 8, "MoeDispatchInst size mismatch");
 

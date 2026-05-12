@@ -67,14 +67,21 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
     int gupd = (int)i->gate_up_in_dim;
     if (gupd == 0) gupd = hs;  // backward compat: default to hidden_size
 
-    // GPU 0's output slot is at index 0 in output_slots (stride = hs for consistent slot layout)
-    float* gpu0_output = output_slots; // [0..gupd)
+    // GPU 0's output slot is at index 0 in output_slots (stride = hs for consistent slot layout).
+    // §11.4 HAZARD avoidance (braidinfer-pky.2 Phase 0b followup): the
+    // per-expert accumulation stages into `gpu0_acc` (cached local VRAM)
+    // and does ONE barrierless copy to UC `gpu0_output` at the end. The
+    // intermediate coop_zero / coop_weighted_acc barriers now operate on
+    // cached memory — no PCIe-write-before-barrier hazard. Mirrors the
+    // worker-side pattern in op_moe_ffn_remote (megakernel_moe.hip:401).
+    float* gpu0_output = output_slots; // [0..gupd) — final UC destination
+    float* gpu0_acc = (float*)(uintptr_t)i->gpu0_acc; // [0..gupd) — cached local
 
-    // 1. Zero GPU 0's output slot.
+    // 1. Zero the cached accumulator (not the UC slot).
     // Do NOT zero final_output — the sum loop overwrites it completely.
     // Do NOT zero worker output slots — those were P2P-written by workers and the
     // CPU has waited for their ack before firing this op.
-    coop_zero(gpu0_output, gupd, grid, gbs);
+    coop_zero(gpu0_acc, gupd, grid, gbs);
 
     // (Worker-trigger section removed — CPU now drives OP_MOE_FFN_REMOTE on workers
     //  before this op fires, and CPU waits for worker ack before this batch dispatch.)
@@ -126,17 +133,28 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
             coop_gemv_pcg32(scratch_gate, down_data, scratch_act, gupd, eis, grid, gbs);
         }
 
-        coop_weighted_acc(gpu0_output, scratch_gate, ew, gupd, grid, gbs);
+        coop_weighted_acc(gpu0_acc, scratch_gate, ew, gupd, grid, gbs);
     }
 
-    // PRE complete: GPU 0 has zeroed slot 0 and accumulated its local experts there.
-    // Sum is performed by OP_MOE_DISPATCH_POST after the CPU has wait_ack'd workers.
-    // Use compiler hint to suppress unused warnings on fields we don't read here.
+    // PRE complete: GPU 0 has accumulated its local experts into `gpu0_acc`.
+    // Final step: barrierless copy gpu0_acc → output_slots[0..gupd] (cross-
+    // type write: cached → UC). No trailing atomic_block_barrier — kernel
+    // exit / persistent_worker's next batch-boundary buffer_gl1_inv handles
+    // visibility. The __threadfence pair flushes (a) cached stores before
+    // copy starts and (b) UC stores before kernel exit. Mirrors
+    // op_moe_ffn_remote's exit pattern (megakernel_moe.hip:425-432).
+    // Sum is performed by OP_MOE_DISPATCH_POST after the CPU has wait_ack'd
+    // workers + GPU 0 PRE — POST reads `output_slots`, so the kernel-exit
+    // fence between this op and POST guarantees visibility.
     (void)final_output;
     (void)total_gpus;
 
     __threadfence();
-    braidinfer::rdna3::atomic_block_barrier(gbs);
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;
+         idx += gridDim.x * blockDim.x) {
+        gpu0_output[idx] = gpu0_acc[idx];
+    }
+    __threadfence();
 }
 
 // OP_MOE_DISPATCH_POST (opcode 45): sum output_slots across all GPUs into final_output.

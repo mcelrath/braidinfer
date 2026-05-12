@@ -931,7 +931,11 @@ pub(crate) struct MoeDispatchInst {
     pub scratch_act: u64,
     pub num_gpus: u64,
     pub gate_up_in_dim: u64,
-    pub _pad: u64,
+    /// Cached-local accumulator buffer (size = hs). op_moe_dispatch stages
+    /// the per-expert accumulation here and does a final barrierless copy
+    /// to UC `output_slots[0..gupd]`. See moe_p2p.rs `MoeP2pContext::gpu0_acc`.
+    /// Unused by OP_MOE_DISPATCH_POST (it only reads output_slots).
+    pub gpu0_acc: u64,
 }
 assert_inst_size!(MoeDispatchInst);
 impl_inst!(MoeDispatchInst);
