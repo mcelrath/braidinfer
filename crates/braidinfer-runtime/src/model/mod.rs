@@ -65,6 +65,11 @@ pub struct Model {
     pub(crate) debug_nan: bool,
     pub(crate) has_moe: bool,          // cached at load time: any layer has FfnType::MoE
     pub(crate) persistent: bool,       // cached from PERSISTENT env var at load time
+    /// KV_DISPATCH_MODE=per_batch_coop: replace persistent_worker mailbox with
+    /// one-shot `megakernel_f32` cooperative launch per decode step (Phase 0a of
+    /// braidinfer-pky). Lets the kernel exit between steps, drain L2, reset MES
+    /// state — the architectural hypothesis for retiring the 5ax decode bug class.
+    pub(crate) per_batch_coop: bool,
     pub(crate) kv_quant: bool,         // cached from KV_QUANT env var at load time
     pub(crate) sync_debug: bool,       // cached from SYNC_DEBUG env var at load time
     pub(crate) debug_p2p_hidden: bool, // cached from DEBUG_P2P_HIDDEN env var at load time
@@ -169,7 +174,10 @@ impl Model {
     /// GPU-resident argmax: run decode step and return token ID without transferring logits.
     pub fn decode_step_token(&mut self, token_id: u32, position: u32) -> Result<u32, ModelError> {
         let logits = self.decode_step(token_id, position)?;
-        if self.persistent_workers.is_some() {
+        // per_batch_coop also writes logits to host-mapped logits_mapped (not
+        // self.activations.logits), so it shares the CPU-argmax path with
+        // persistent.
+        if self.persistent_workers.is_some() || self.per_batch_coop {
             let nan_count = logits.iter().filter(|v| v.is_nan()).count();
             if nan_count > 0 {
                 eprintln!("WARN: {nan_count}/{} NaN in logits", logits.len());

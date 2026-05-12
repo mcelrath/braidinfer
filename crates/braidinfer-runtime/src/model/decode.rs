@@ -17,6 +17,14 @@ impl Model {
         token_id: u32,
         position: u32,
     ) -> Result<Vec<f32>, ModelError> {
+        // Phase 0a of braidinfer-pky: KV_DISPATCH_MODE=per_batch_coop reroutes
+        // single-GPU decode through one-shot `megakernel_f32` launches instead
+        // of the persistent worker mailbox. Smoke test for the architectural
+        // migration; the 5ax determinism validation happens on multi-GPU
+        // (Phase 0b).
+        if self.per_batch_coop {
+            return self.decode_step_per_batch_coop(token_id, position);
+        }
         use crate::persistent_dispatch::PersistentDispatch;
 
         // Lazy-init: compile PAGED megakernel FIRST (needs GPU queries),
@@ -108,6 +116,108 @@ impl Model {
             let alloc_mut = self.page_allocator.as_mut().unwrap();
             mk.post_step_paged(position, seq_mut, alloc_mut, None, &self.config, &self.stream)
                 .map_err(ModelError::Hip)?;
+        }
+
+        self.seq_len = position + 1;
+        Ok(logits)
+    }
+
+    /// Phase 0a of braidinfer-pky: one-shot cooperative `megakernel_f32`
+    /// launch per decode step instead of dispatching through the persistent
+    /// worker mailbox.
+    ///
+    /// Identical state lifecycle to `decode_step_persistent`, but:
+    ///   - No `PersistentDispatch::init` (skips persistent worker launch).
+    ///   - `update_step_paged` (with `hipMemcpyAsync` upload) replaces
+    ///     `update_step_paged_no_upload`. Safe because no cooperative kernel
+    ///     is holding CUs.
+    ///   - `mk.execute(&self.stream)` + `stream.synchronize()` replaces the
+    ///     mailbox round-trip. `megakernel_f32` breaks on the trailing
+    ///     `OP_HALT` and returns normally.
+    ///   - Logits read from host-mapped `logits_mapped` (lm_head was patched
+    ///     to write there at first-compile time).
+    ///
+    /// Phase 0a is a smoke test for the dispatch wiring; single-GPU paged
+    /// decode is already deterministic. The 5ax determinism validation
+    /// happens on multi-GPU MoE (Phase 0b).
+    fn decode_step_per_batch_coop(
+        &mut self,
+        token_id: u32,
+        position: u32,
+    ) -> Result<Vec<f32>, ModelError> {
+        if self.megakernel_paged.is_none() {
+            let max_chunks = self.max_paged_chunks();
+            let mut mk = MegakernelProgram::compile_paged(self)?;
+            mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
+            self.megakernel_paged = Some(mk);
+        }
+
+        // Patch lm_head to write host-mapped logits_mapped so the CPU reads
+        // logits directly without a hipMemcpy after each launch. MUST run
+        // every step (idempotent) because prefill_paged also compiles
+        // megakernel_paged without patching this — the persistent path
+        // hit the same trap (see decode_step_persistent comment).
+        // Layout: [..., OP_LM_HEAD, OP_HALT] — second-to-last is lm_head.
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let n_inst = mk.instructions.len();
+            let lm_head_idx = n_inst - 2;
+            mk.instructions[lm_head_idx].words[1] =
+                self.activations.logits_mapped.as_write_ptr() as u64;
+        }
+
+        self.ensure_paged_decode_state(false)?;
+        self.set_position(position).map_err(ModelError::Hip)?;
+
+        {
+            let seq_mut = self.paged_seq.as_mut().unwrap();
+            let alloc_mut = self.page_allocator.as_mut().unwrap();
+            seq_mut
+                .append_token(position as i32, alloc_mut)
+                .map_err(ModelError::Hip)?;
+        }
+
+        // Per-step instruction patching + hipMemcpyAsync upload to device_program.
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let seq = self.paged_seq.as_ref().unwrap();
+            let allocator = self.page_allocator.as_ref().unwrap();
+            mk.update_step_paged(token_id, position, seq, allocator, &self.stream)
+                .map_err(ModelError::Hip)?;
+        }
+
+        // One-shot cooperative launch + sync. megakernel_f32 exits on the
+        // trailing OP_HALT — control returns to host with logits_mapped
+        // fully written.
+        {
+            let mk = self.megakernel_paged.as_ref().unwrap();
+            mk.execute(&self.stream).map_err(ModelError::Hip)?;
+        }
+        self.stream.synchronize().map_err(ModelError::Hip)?;
+
+        let logits = unsafe {
+            std::slice::from_raw_parts(
+                self.activations.logits_mapped.host_ptr(),
+                self.config.vocab_size,
+            )
+        }
+        .to_vec();
+
+        // Chunk-seal lifecycle (stream.synchronize internal — safe here, no
+        // cooperative kernel is running).
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let seq_mut = self.paged_seq.as_mut().unwrap();
+            let alloc_mut = self.page_allocator.as_mut().unwrap();
+            mk.post_step_paged(
+                position,
+                seq_mut,
+                alloc_mut,
+                None,
+                &self.config,
+                &self.stream,
+            )
+            .map_err(ModelError::Hip)?;
         }
 
         self.seq_len = position + 1;
