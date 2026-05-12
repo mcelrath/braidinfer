@@ -24,6 +24,10 @@ pub struct Model {
     // MUST be declared first: dropped first, shuts down cooperative kernels before any hipFree.
     // DeviceBuffer::drop → hipFree → SyncAllStreams blocks if cooperative kernel is still running.
     pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
+    /// Per-batch coop dispatcher (braidinfer-pky Phase 0b). Mutually
+    /// exclusive with `persistent_workers` at runtime — at most one is
+    /// `Some`. Selected via `Model::per_batch_coop` (KV_DISPATCH_MODE env).
+    pub(crate) per_batch_dispatch: Option<crate::per_batch_dispatch::PerBatchDispatch>,
     // GPU-native P2P MoE dispatch: cooperative kernels on GPUs 1-3. Drop before other GPU 1-3 resources.
     pub(crate) moe_p2p: Option<crate::moe_p2p::MoeP2pContext>,
     pub config: ModelConfig,
@@ -211,12 +215,31 @@ impl Model {
             // Single-GPU trace: use per-layer path with full per-layer checkpoints.
             return self.decode_step_trace(token_id, position);
         }
+        // braidinfer-pky Phase 0a/0b: KV_DISPATCH_MODE=per_batch_coop reroutes
+        // every persistent decode path (single-GPU + multi-GPU MoE) through
+        // one-shot `megakernel_f32` cooperative launches. The branch is at
+        // the top of decode_step so it can intercept BOTH the multi-GPU MoE
+        // path (decode_step_persistent_multi_gpu → decode_step_p2p) and the
+        // single-GPU paged path (decode_step_persistent). Trace is excluded
+        // because per-layer checkpoints require the legacy non-persistent
+        // decode_step_trace path.
+        if self.per_batch_coop && self.trace.is_none() {
+            if self.kv_quant {
+                return Err(ModelError::InvalidConfig(
+                    "KV_QUANT=1 with KV_DISPATCH_MODE=per_batch_coop not yet wired".into(),
+                ));
+            }
+            if is_multi_gpu {
+                return self.decode_step_per_batch_coop_multi_gpu(token_id, position);
+            }
+            return self.decode_step_per_batch_coop(token_id, position);
+        }
         if is_multi_gpu {
             if self.persistent {
                 return self.decode_step_persistent_multi_gpu(token_id, position);
             }
             return Err(ModelError::InvalidConfig(
-                "Multi-GPU inference requires persistent mode (set PERSISTENT=1)".to_string(),
+                "Multi-GPU inference requires persistent mode (set PERSISTENT=1) or KV_DISPATCH_MODE=per_batch_coop".to_string(),
             ));
         }
         if self.persistent {

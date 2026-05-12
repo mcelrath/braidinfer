@@ -1121,6 +1121,7 @@ impl Model {
             moe_p2p: None,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
+            per_batch_dispatch: None,
         })
     }
 

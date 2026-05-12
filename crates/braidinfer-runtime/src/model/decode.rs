@@ -1,6 +1,7 @@
 use braidinfer_hip::memory::DeviceBuffer;
 
 use crate::megakernel::{MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
+use crate::persistent_dispatch::BatchDispatcher;
 
 use super::Model;
 use super::ModelError;
@@ -17,14 +18,6 @@ impl Model {
         token_id: u32,
         position: u32,
     ) -> Result<Vec<f32>, ModelError> {
-        // Phase 0a of braidinfer-pky: KV_DISPATCH_MODE=per_batch_coop reroutes
-        // single-GPU decode through one-shot `megakernel_f32` launches instead
-        // of the persistent worker mailbox. Smoke test for the architectural
-        // migration; the 5ax determinism validation happens on multi-GPU
-        // (Phase 0b).
-        if self.per_batch_coop {
-            return self.decode_step_per_batch_coop(token_id, position);
-        }
         use crate::persistent_dispatch::PersistentDispatch;
 
         // Lazy-init: compile PAGED megakernel FIRST (needs GPU queries),
@@ -140,7 +133,7 @@ impl Model {
     /// Phase 0a is a smoke test for the dispatch wiring; single-GPU paged
     /// decode is already deterministic. The 5ax determinism validation
     /// happens on multi-GPU MoE (Phase 0b).
-    fn decode_step_per_batch_coop(
+    pub(super) fn decode_step_per_batch_coop(
         &mut self,
         token_id: u32,
         position: u32,
@@ -224,6 +217,75 @@ impl Model {
         Ok(logits)
     }
 
+    /// Phase 0b of braidinfer-pky: multi-GPU per-batch coop decode. Mirrors
+    /// `decode_step_persistent_multi_gpu` but routes through
+    /// [`PerBatchDispatch`](crate::per_batch_dispatch::PerBatchDispatch)
+    /// instead of [`PersistentDispatch`](crate::persistent_dispatch::PersistentDispatch).
+    ///
+    /// Lazy-init initializes:
+    ///   - `moe_p2p` and `megakernel_multi_gpu_p2p` (shared with persistent
+    ///     path; the megakernel program is identical between the two
+    ///     dispatch backends — only the dispatch mechanism changes).
+    ///   - `per_batch_dispatch` with ALL N GPUs as one-shot coop workers.
+    ///     Unlike persistent which incrementally adds GPU 0 on first decode,
+    ///     per-batch coop has no kernel-lifetime conflict, so we can register
+    ///     all GPUs at once on first decode.
+    ///
+    /// `decode_step_p2p` (shared with persistent path) reads
+    /// `self.per_batch_coop` at each dispatch site to choose the active
+    /// backend via [`BatchDispatcher`](crate::persistent_dispatch::BatchDispatcher).
+    pub(super) fn decode_step_per_batch_coop_multi_gpu(
+        &mut self,
+        token_id: u32,
+        position: u32,
+    ) -> Result<Vec<f32>, ModelError> {
+        use crate::per_batch_dispatch::PerBatchDispatch;
+
+        let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
+        let moe_worker_shared_mem = 1024u32 * 4 + 256;
+        let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
+        let hs = self.config.hidden_size;
+        let gate_up_in_dim = self.config.moe_latent_size.unwrap_or(hs);
+
+        // Lazy-init MoE P2P + per-batch dispatcher via the shared helper.
+        // `ensure_moe_workers_started` reads `self.per_batch_coop` and
+        // initializes PerBatchDispatch (not PersistentDispatch) when set —
+        // so prefill MoE goes through per-batch coop too.
+        self.ensure_moe_workers_started()?;
+
+        // GPU 0 wasn't included in the prefill init (kbk launches conflict
+        // with cooperative kernels mid-prefill). Add it now — per-batch coop
+        // has no lifetime hazard since each launch exits.
+        if let Some(dispatch) = self.per_batch_dispatch.as_mut() {
+            if !dispatch.has_worker(0) {
+                dispatch
+                    .add_device(self.device, shared_mem)
+                    .map_err(ModelError::Hip)?;
+            }
+        } else {
+            // Non-MoE multi-GPU: ensure_moe_workers_started no-ops (no MoE).
+            // Allocate per_batch_dispatch with all GPUs from scratch here.
+            let all_devices: Vec<_> = (0..num_gpus)
+                .map(|i| braidinfer_core::types::DeviceId(i as u32))
+                .collect();
+            let dispatch = PerBatchDispatch::init_with_total(num_gpus, &all_devices, shared_mem)
+                .map_err(ModelError::Hip)?;
+            self.per_batch_dispatch = Some(dispatch);
+            eprintln!(
+                "  Per-batch coop dispatch armed: {} GPUs (Phase 0b, non-MoE)",
+                num_gpus
+            );
+        }
+
+        if self.megakernel_multi_gpu_p2p.is_some() {
+            return self.decode_step_p2p(token_id, position);
+        }
+        // Non-MoE multi-GPU not yet supported through per-batch path.
+        Err(ModelError::InvalidConfig(
+            "KV_DISPATCH_MODE=per_batch_coop currently requires has_moe + multi_gpu".into(),
+        ))
+    }
+
     /// Multi-GPU persistent worker decode for MoE models.
     /// Initializes P2P workers on first call, then delegates to decode_step_p2p.
     pub(super) fn decode_step_persistent_multi_gpu(
@@ -256,7 +318,14 @@ impl Model {
     /// Lazily start MoE expert workers (GPUs 1-3) without launching the GPU 0 decode
     /// persistent cooperative kernel. Safe to call during prefill (no cooperative kernel
     /// running on GPU 0 yet, so hipMalloc is allowed).
+    ///
+    /// Under `per_batch_coop` mode, workers are armed via
+    /// [`PerBatchDispatch`](crate::per_batch_dispatch::PerBatchDispatch)
+    /// instead — no persistent cooperative kernel runs on worker GPUs, so
+    /// the Phase 0b decode path can `launch_cooperative` `megakernel_f32`
+    /// per sub-batch without contending with a CU-holding worker.
     pub(super) fn ensure_moe_workers_started(&mut self) -> Result<(), ModelError> {
+        use crate::per_batch_dispatch::PerBatchDispatch;
         use crate::persistent_dispatch::PersistentDispatch;
         if self.moe_p2p.is_some() {
             return Ok(());
@@ -309,20 +378,37 @@ impl Model {
         self.moe_p2p = Some(p2p);
         self.megakernel_multi_gpu_p2p = Some(mk_p2p);
 
-        // Launch persistent_worker on each WORKER GPU (1..N-1) — but NOT GPU 0.
+        // Arm worker dispatchers on each WORKER GPU (1..N-1) — but NOT GPU 0.
         // GPU 0 still runs kbk launches during prefill (kernels.linear_proj.forward
-        // in moe_ffn_forward / compile_prefill_segment paths). Its persistent
-        // worker is added on first decode call by `init_multi_gpu_persistent`.
-        let dispatch = PersistentDispatch::init_with_total(
-            num_gpus,
-            &worker_devices,
-            shared_mem_persistent,
-            hs,
-        )
-        .map_err(ModelError::Hip)?;
-        // Hand to model state.
-        self.persistent_workers = Some(dispatch);
-        eprintln!("  MoE P2P dispatch initialized: {} worker GPUs (prefill path)", num_gpus - 1);
+        // in moe_ffn_forward / compile_prefill_segment paths). Its dispatcher
+        // worker is added on first decode call (init_multi_gpu_persistent for the
+        // persistent path; decode_step_per_batch_coop_multi_gpu for per-batch).
+        if self.per_batch_coop {
+            let dispatch = PerBatchDispatch::init_with_total(
+                num_gpus,
+                &worker_devices,
+                shared_mem_persistent,
+            )
+            .map_err(ModelError::Hip)?;
+            self.per_batch_dispatch = Some(dispatch);
+            eprintln!(
+                "  MoE P2P per-batch dispatch armed: {} worker GPUs (prefill path)",
+                num_gpus - 1
+            );
+        } else {
+            let dispatch = PersistentDispatch::init_with_total(
+                num_gpus,
+                &worker_devices,
+                shared_mem_persistent,
+                hs,
+            )
+            .map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
+            eprintln!(
+                "  MoE P2P dispatch initialized: {} worker GPUs (prefill path)",
+                num_gpus - 1
+            );
+        }
         Ok(())
     }
 
@@ -536,7 +622,11 @@ impl Model {
                 // Fire GPU 0 batch async (PRE included). All chunks except the LAST
                 // use synchronous dispatch_batch (waits per-chunk); the last chunk
                 // uses dispatch_batch_fire so PRE runs concurrently with workers.
-                let dispatch = self.persistent_workers.as_mut().unwrap();
+                let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
+                    self.per_batch_dispatch.as_mut().unwrap()
+                } else {
+                    self.persistent_workers.as_mut().unwrap()
+                };
                 let mut chunks = combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS).peekable();
                 let mut gpu0_seq: Option<u32> = None;
                 while let Some(chunk) = chunks.next() {
@@ -567,13 +657,18 @@ impl Model {
                     let seg_end = i + 1;
                     {
                         let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end];
+                        let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
+                            self.per_batch_dispatch.as_mut().unwrap()
+                        } else {
+                            self.persistent_workers.as_mut().unwrap()
+                        };
                         if pending_gather.is_empty() {
-                            self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, mk_insts);
+                            dispatch.dispatch_batch_slice(0, mk_insts);
                         } else {
                             // Fuse pending gather with this segment: one combined dispatch
                             let mut combined = std::mem::take(&mut pending_gather);
                             combined.extend_from_slice(mk_insts);
-                            self.persistent_workers.as_mut().unwrap().dispatch_batch_slice(0, &combined);
+                            dispatch.dispatch_batch_slice(0, &combined);
                         }
                     }
                     pending_gather = self.dispatch_head_parallel_attention(attn_i, position)?;
@@ -592,34 +687,30 @@ impl Model {
             let debug_hidden = self.debug_p2p_hidden;
             let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
             let mut batch_idx = 0usize;
-            if pending_gather.is_empty() {
-                for chunk in mk_insts.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-                    self.persistent_workers.as_mut().unwrap().dispatch_batch(0, chunk);
-                    if debug_hidden {
-                        let src = self.activations.hidden.as_ptr() as *const u8;
-                        let mut buf = [0u8; 8];
-                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
-                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
-                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
-                        eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
-                        batch_idx += 1;
-                    }
-                }
+            // Combine pending gather + remaining segment into one owned Vec
+            // so the dispatcher borrow doesn't conflict with mk_insts.
+            let combined: Vec<crate::megakernel::Instruction> = if pending_gather.is_empty() {
+                mk_insts.to_vec()
             } else {
-                // Fuse pending gather with remaining segment
-                let mut combined = pending_gather;
-                combined.extend_from_slice(mk_insts);
-                for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-                    self.persistent_workers.as_mut().unwrap().dispatch_batch(0, chunk);
-                    if debug_hidden {
-                        let src = self.activations.hidden.as_ptr() as *const u8;
-                        let mut buf = [0u8; 8];
-                        braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
-                        let v0 = f32::from_ne_bytes([buf[0],buf[1],buf[2],buf[3]]);
-                        let v1 = f32::from_ne_bytes([buf[4],buf[5],buf[6],buf[7]]);
-                        eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
-                        batch_idx += 1;
-                    }
+                let mut c = pending_gather;
+                c.extend_from_slice(mk_insts);
+                c
+            };
+            let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
+                self.per_batch_dispatch.as_mut().unwrap()
+            } else {
+                self.persistent_workers.as_mut().unwrap()
+            };
+            for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                dispatch.dispatch_batch(0, chunk);
+                if debug_hidden {
+                    let src = self.activations.hidden.as_ptr() as *const u8;
+                    let mut buf = [0u8; 8];
+                    braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
+                    let v0 = f32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                    let v1 = f32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                    eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
+                    batch_idx += 1;
                 }
             }
         }
@@ -966,27 +1057,31 @@ impl Model {
                 }
             }
 
-            // All GPUs (including workers 1..N-1) dispatch via persistent_worker
-            // mailbox. The unified-worker design eliminates the kbk fallback.
+            // All GPUs (including workers 1..N-1) dispatch via the active
+            // BatchDispatcher (persistent_worker mailbox or per-batch coop
+            // launch per `self.per_batch_coop`).
             assert!(
                 batch.len() <= MAX_BATCH_INSTRUCTIONS,
                 "attn batch overflow gpu={} len={}",
                 gpu_i, batch.len()
             );
-            let seq = self
-                .persistent_workers
-                .as_mut()
-                .unwrap()
-                .dispatch_batch_fire(gpu_i, &batch);
+            let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
+                self.per_batch_dispatch.as_mut().unwrap()
+            } else {
+                self.persistent_workers.as_mut().unwrap()
+            };
+            let seq = dispatch.dispatch_batch_fire(gpu_i, &batch);
             seq_nums.push((gpu_i, seq));
         }
 
-        // Wait for all GPUs' persistent workers to complete attention.
+        // Wait for all GPUs' dispatchers to complete attention.
+        let dispatch: &dyn BatchDispatcher = if self.per_batch_coop {
+            self.per_batch_dispatch.as_ref().unwrap()
+        } else {
+            self.persistent_workers.as_ref().unwrap()
+        };
         for &(gpu_i, seq) in &seq_nums {
-            self.persistent_workers
-                .as_ref()
-                .unwrap()
-                .wait_ack(gpu_i, seq);
+            dispatch.wait_ack(gpu_i, seq);
         }
 
         // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.
@@ -1098,7 +1193,11 @@ impl Model {
         // [GPU0, GPU1, ..., GPU(num_gpus-1)] in PersistentDispatch::workers).
         let _ = num_gpus;
 
-        let dispatch = self.persistent_workers.as_mut().unwrap();
+        let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
+            self.per_batch_dispatch.as_mut().unwrap()
+        } else {
+            self.persistent_workers.as_mut().unwrap()
+        };
         let mut seq_per_gpu: Vec<(usize, u32)> = Vec::with_capacity(num_workers + 1);
         for (gpu_idx, inst) in &insts {
             // dispatch_batch_fire takes a slice; one OP_MOE_FFN_REMOTE per worker.

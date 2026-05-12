@@ -214,6 +214,37 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
+/// Surface common to both [`PersistentDispatch`] and
+/// [`crate::per_batch_dispatch::PerBatchDispatch`]. Lets `decode_step_p2p`
+/// route through either backend selected by `Model::per_batch_coop`
+/// (braidinfer-pky Phase 0b).
+///
+/// All methods are intentionally object-safe: the Phase 0b plumbing uses
+/// `&mut dyn BatchDispatcher` to avoid duplicating call sites in the
+/// multi-GPU decode path.
+pub(crate) trait BatchDispatcher {
+    /// Fire a single batch asynchronously and return a per-GPU seq token.
+    /// Caller must `wait_ack(gpu, seq)` before reading any buffer the
+    /// batch writes to.
+    fn dispatch_batch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32;
+    /// Fire + wait in one call. Equivalent to dispatch_batch_fire +
+    /// wait_ack(returned seq).
+    fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]);
+    /// Chunk into MAX_BATCH_INSTRUCTIONS slices, dispatch each via
+    /// dispatch_batch (synchronous chunks). Used for combined-segment
+    /// dispatches that exceed MAX_BATCH (rare).
+    fn dispatch_batch_slice(&mut self, gpu_idx: usize, instructions: &[Instruction]);
+    /// Block until the given seq has acked on `gpu_idx`. Per-GPU FIFO,
+    /// so any seq drains everything queued ≤ it.
+    fn wait_ack(&self, gpu_idx: usize, seq: u32);
+    /// Wait for multiple (gpu, seq) targets in a single pass. Implementers
+    /// may parallel-poll (PersistentDispatch) or deduplicate by GPU then
+    /// per-stream synchronize (PerBatchDispatch).
+    fn try_wait_acks_many(&self, targets: &[(usize, u32)]) -> Result<(), DispatchError>;
+    fn has_worker(&self, gpu_idx: usize) -> bool;
+    fn num_gpus(&self) -> usize;
+}
+
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
 /// Layout must match exactly (repr(C)).
 #[repr(C)]
@@ -735,6 +766,30 @@ impl PersistentDispatch {
     /// Number of GPUs with launched workers.
     pub fn num_gpus(&self) -> usize {
         self.workers.iter().filter(|s| s.is_some()).count()
+    }
+}
+
+impl BatchDispatcher for PersistentDispatch {
+    fn dispatch_batch_fire(&mut self, gpu_idx: usize, instructions: &[Instruction]) -> u32 {
+        PersistentDispatch::dispatch_batch_fire(self, gpu_idx, instructions)
+    }
+    fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        PersistentDispatch::dispatch_batch(self, gpu_idx, instructions)
+    }
+    fn dispatch_batch_slice(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        PersistentDispatch::dispatch_batch_slice(self, gpu_idx, instructions)
+    }
+    fn wait_ack(&self, gpu_idx: usize, seq: u32) {
+        PersistentDispatch::wait_ack(self, gpu_idx, seq)
+    }
+    fn try_wait_acks_many(&self, targets: &[(usize, u32)]) -> Result<(), DispatchError> {
+        PersistentDispatch::try_wait_acks_many(self, targets)
+    }
+    fn has_worker(&self, gpu_idx: usize) -> bool {
+        PersistentDispatch::has_worker(self, gpu_idx)
+    }
+    fn num_gpus(&self) -> usize {
+        PersistentDispatch::num_gpus(self)
     }
 }
 

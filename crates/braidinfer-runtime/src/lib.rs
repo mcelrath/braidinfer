@@ -9,6 +9,7 @@ pub mod moe_p2p;
 pub mod multi_gpu;
 pub mod op_profile;
 pub mod paged_kv;
+pub mod per_batch_dispatch;
 pub mod persistent_dispatch;
 pub mod quant;
 pub mod sampling;
