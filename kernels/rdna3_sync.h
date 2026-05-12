@@ -168,6 +168,23 @@ struct GridBarrierState {
 };
 
 __device__ __forceinline__ void atomic_block_barrier(GridBarrierState* state) {
+#ifdef BRAIDINFER_USE_GRID_SYNC
+    // braidinfer-pky.2 Phase 0b diagnostic (2026-05-12): swap to
+    // cooperative_groups::grid_group::sync to test whether the wedge is
+    // specific to atomic_block_barrier's atomic-add+spin protocol or a
+    // broader RDNA3 multi-GPU synchronization issue. Per kb
+    // rdna3-grid-sync-vs-atomic-block-barrier-gfx1100, cg::grid.sync is
+    // ~115-155x slower per call (~11k cyc at 192 blocks vs ~96 cyc) — but
+    // if it sidesteps the wedge, the +2% end-to-end cost is acceptable on
+    // multi-GPU MoE decode. Build with BRAIDINFER_USE_GRID_SYNC=1.
+    //
+    // The function still takes `state` to keep call sites unchanged; the
+    // pointer is unused. cooperative_groups::this_grid().sync() must run
+    // on a cooperative launch, which both megakernel_f32 and
+    // persistent_worker entries are.
+    (void)state;
+    cooperative_groups::this_grid().sync();
+#else
     __syncthreads();
     __shared__ unsigned int s_target_gen;
 
@@ -204,7 +221,88 @@ __device__ __forceinline__ void atomic_block_barrier(GridBarrierState* state) {
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
     }
     __syncthreads();
+#endif
 }
+
+// Phase-2 variant: identical to atomic_block_barrier but replaces the
+// __builtin_amdgcn_fence(__ATOMIC_RELEASE,"agent") release fence with
+// inline GCN that emits only s_waitcnt lgkmcnt(0)+vmcnt(0) + s_barrier,
+// deliberately OMITTING s_waitcnt_vscnt null,0x0.
+//
+// Motivation (exterior_algebra-zuk Phase 2, 2026-05-12):
+//   Phase 1 disassembly confirmed that the compiler inserts
+//   `s_waitcnt_vscnt null, 0x0` immediately before every `s_barrier` in
+//   the inlined atomic_block_barrier body.  That instruction drains the
+//   SYSTEM-scope vector-store completion counter (tracks stores issued with
+//   SYSTEM scope across PCIe).  Under 4-GPU PCIe pressure the counter does
+//   not drain promptly, blocking the wave indefinitely — the wedge.
+//
+// Trade-off: in-flight SYSTEM-scope stores are not guaranteed visible to
+// peer GPUs at barrier exit.  Callers that read cross-GPU data must ensure
+// the producer side has completed its UC/peer write before the consumer
+// issues its load (the 4fg.5 deferred-read pattern).  For the current MoE
+// decode megakernel, peer reads follow a separate signalling flag (not this
+// barrier), so the relaxed guarantee is safe.
+//
+// Enable via -DBRAIDINFER_BARRIER_V2 (see macro below, or build.rs).
+__device__ __forceinline__ void atomic_block_barrier_v2(GridBarrierState* state) {
+    __syncthreads();
+    __shared__ unsigned int s_target_gen;
+
+    if (threadIdx.x == 0) {
+        // Drain this block's stores visible at agent scope WITHOUT draining
+        // the SYSTEM-scope vscnt counter.  s_waitcnt lgkmcnt(0) ensures LDS
+        // and scalar writes are complete; vmcnt(0) ensures vector memory
+        // (global_load/store) writes are visible within the agent (device).
+        // The s_barrier that follows serialises the wave with other waves in
+        // the CU — keeping the subsequent atomicAdd from racing with still-
+        // in-flight intra-device stores — without stalling on inter-GPU PCIe.
+        asm volatile(
+            "s_waitcnt lgkmcnt(0) vmcnt(0)\n\t"
+            "s_barrier\n\t"
+            "buffer_gl0_inv\n\t"
+            ::: "memory");
+
+        unsigned int target_gen =
+            __hip_atomic_load(&state->generation, __ATOMIC_RELAXED,
+                              __HIP_MEMORY_SCOPE_AGENT) + 1u;
+        s_target_gen = target_gen;
+        unsigned int prev =
+            __hip_atomic_fetch_add(&state->arrived, 1u, __ATOMIC_ACQ_REL,
+                                   __HIP_MEMORY_SCOPE_AGENT);
+        if (prev + 1u == (unsigned int)gridDim.x) {
+            // Last arriver: reset counter, then release-store generation.
+            __hip_atomic_store(&state->arrived, 0u, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+            __hip_atomic_store(&state->generation, target_gen,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            // Non-last block: spin on generation.
+            for (;;) {
+                unsigned int g =
+                    __hip_atomic_load(&state->generation, __ATOMIC_ACQUIRE,
+                                      __HIP_MEMORY_SCOPE_AGENT);
+                if (g == target_gen) break;
+                __builtin_amdgcn_s_sleep(0);
+            }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+    }
+    __syncthreads();
+}
+
+// Phase-2 compile-time A/B switch.  Pass -DBRAIDINFER_BARRIER_V2 to hipcc
+// (or set BRAIDINFER_BARRIER_V2=1 when building with Cargo, which gates the
+// define in build.rs) to route all atomic_block_barrier() call sites to
+// atomic_block_barrier_v2() without touching any caller.  The macro MUST be
+// placed after both function definitions so the function bodies compile with
+// their canonical names (placing it before causes a redefinition error because
+// the function-body declaration of atomic_block_barrier would itself expand to
+// atomic_block_barrier_v2, colliding with the explicit definition above).
+// Call sites in .hip files that include this header will see the redirect.
+#ifdef BRAIDINFER_BARRIER_V2
+#define atomic_block_barrier atomic_block_barrier_v2
+#endif
 
 // ASM-tightened grid barrier. Same protocol as atomic_block_barrier but
 // avoids the C-level memory model (uses explicit s_waitcnt + global_atomic).
@@ -260,6 +358,80 @@ __device__ __forceinline__ void asm_block_barrier(GridBarrierState* state) {
     }
     __syncthreads();
 }
+
+// Phase-3' compile-time A/B switch.  Pass -DBRAIDINFER_BARRIER_ASM to hipcc
+// (or set BRAIDINFER_BARRIER_ASM=1 when building with Cargo, which gates the
+// define in build.rs) to route all atomic_block_barrier() call sites to
+// asm_block_barrier() without touching any caller.  The macro MUST be placed
+// after asm_block_barrier's function body (above) so the function compiles
+// with its canonical name before the redirect takes effect.
+// Root cause this targets (exterior_algebra-zuk Phase 2', 2026-05-12):
+//   atomic_block_barrier's spin loop does:
+//     global_load -> s_waitcnt vmcnt(0) -> buffer_gl1_inv
+//   i.e. INVALIDATE AFTER LOAD — each iteration reads stale GL1 (per-shader-
+//   array L1) and never sees the updated state->generation.
+//   asm_block_barrier's spin loop does:
+//     buffer_gl1_inv -> s_waitcnt vmcnt(0) -> load
+//   i.e. INVALIDATE BEFORE LOAD — forces a fresh L2 read every iteration.
+#ifdef BRAIDINFER_BARRIER_ASM
+#define atomic_block_barrier asm_block_barrier
+#endif
+
+// Phase-4 variant: same as asm_block_barrier but the spin loop omits
+// s_sleep 0. Reason: s_sleep on gfx1100 causes hardware preemption — when
+// ALL blocks of a cooperative grid hit the same s_sleep in their spin path,
+// the entire grid preempts simultaneously and no block advances
+// state->generation. Replacing s_sleep with s_nop (or nothing) keeps the
+// wave resident in the CU. s_setprio 0 (already present) prevents the
+// spinning wave from monopolizing CU resources.
+//
+// Root cause (exterior_algebra-zuk Phase 2'', 2026-05-12): Phase 2'' agent
+// disassembled persistent_worker.hsaco and found the wave parks at PC 0x1C88
+// = `s_sleep 0` in atomic_block_barrier spin loop. s_sleep on gfx1100 causes
+// HARDWARE PREEMPTION — saves wave registers to memory, marks CU idle. ALL
+// blocks of cooperative grid preempt simultaneously at the same s_sleep; no
+// last-arriver advances state->generation. Classic cooperative-grid +
+// preemption deadlock. Both v1 and asm_block_barrier contain this point.
+// Enable via -DBRAIDINFER_BARRIER_V4 (see macro below, or build.rs).
+__device__ __forceinline__ void atomic_block_barrier_v4(GridBarrierState* state) {
+    __syncthreads();
+    __shared__ unsigned int s_target_gen;
+    if (threadIdx.x == 0) {
+        asm volatile("s_waitcnt vmcnt(0)\n"
+                     "buffer_gl1_inv\n"
+                     "s_waitcnt_vscnt null, 0x0\n"
+                     ::: "memory");
+        unsigned int target_gen = state->generation + 1u;
+        s_target_gen = target_gen;
+        unsigned int prev = atomicAdd(&state->arrived, 1u);
+        if (prev + 1u == (unsigned int)gridDim.x) {
+            __hip_atomic_store(&state->arrived, 0u, __ATOMIC_RELAXED,
+                               __HIP_MEMORY_SCOPE_AGENT);
+            asm volatile("s_waitcnt vmcnt(0)\n"
+                         "buffer_gl1_inv\n"
+                         "s_waitcnt_vscnt null, 0x0\n"
+                         ::: "memory");
+            __hip_atomic_store(&state->generation, target_gen,
+                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        } else {
+            asm volatile("s_setprio 0" ::: "memory");
+            unsigned int g;
+            do {
+                asm volatile("s_nop 0x7f\n"        // NOP delay, no preemption
+                             "buffer_gl1_inv\n"
+                             "s_waitcnt vmcnt(0)\n" ::: "memory");
+                g = __hip_atomic_load(&state->generation, __ATOMIC_ACQUIRE,
+                                      __HIP_MEMORY_SCOPE_AGENT);
+            } while (g != target_gen);
+            asm volatile("s_setprio 1" ::: "memory");
+        }
+    }
+    __syncthreads();
+}
+
+#ifdef BRAIDINFER_BARRIER_V4
+#define atomic_block_barrier atomic_block_barrier_v4
+#endif
 
 // ---------------------------------------------------------------------------
 // Diagnostic helpers (not for production)

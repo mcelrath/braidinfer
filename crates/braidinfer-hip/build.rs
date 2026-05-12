@@ -39,6 +39,44 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_OP_PROFILE");
     let op_profile = env::var("BRAIDINFER_OP_PROFILE").is_ok();
 
+    // braidinfer-pky.2 Phase 0b diagnostic: swap atomic_block_barrier for
+    // cooperative_groups::grid_group::sync. Per kb
+    // rdna3-grid-sync-vs-atomic-block-barrier-gfx1100 grid.sync is ~115x
+    // slower per call but may sidestep the multi-GPU wedge documented in
+    // kb rdna3-atomic-block-barrier-multi-gpu-fundamental-issue. Build
+    // with BRAIDINFER_USE_GRID_SYNC=1 to enable; ships off by default
+    // because of the perf cost on single-GPU paths.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_USE_GRID_SYNC");
+    let use_grid_sync = env::var("BRAIDINFER_USE_GRID_SYNC").is_ok();
+
+    // exterior_algebra-zuk Phase 2 (2026-05-12): inline-GCN barrier variant
+    // that omits s_waitcnt_vscnt null,0x0 to bypass the SYSTEM-scope vscnt
+    // drain suspected of wedging the 4-GPU q8 MoE decode megakernel on
+    // gfx1100 under PCIe pressure.  Set BRAIDINFER_BARRIER_V2=1 to route
+    // all atomic_block_barrier() call sites to atomic_block_barrier_v2()
+    // via the #define in kernels/rdna3_sync.h.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_BARRIER_V2");
+    let barrier_v2 = env::var("BRAIDINFER_BARRIER_V2").is_ok();
+
+    // exterior_algebra-zuk Phase 3' (2026-05-12): ASM barrier variant that
+    // fixes the GL1-cache-invalidation ordering in the spin loop.  The v1
+    // atomic_block_barrier does: load -> s_waitcnt -> buffer_gl1_inv (stale
+    // reads).  asm_block_barrier does: buffer_gl1_inv -> s_waitcnt -> load
+    // (fresh L2 read every iteration).  Set BRAIDINFER_BARRIER_ASM=1 to
+    // route all atomic_block_barrier() call sites to asm_block_barrier().
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_BARRIER_ASM");
+    let barrier_asm = env::var("BRAIDINFER_BARRIER_ASM").is_ok();
+
+    // exterior_algebra-zuk Phase 4' (2026-05-12): v4 barrier removes s_sleep 0
+    // from the spin loop. Root cause: s_sleep on gfx1100 causes hardware
+    // preemption — all blocks of a cooperative grid preempt simultaneously at
+    // the same s_sleep; no last-arriver advances state->generation. v4 uses
+    // s_nop 0x7f instead to keep the wave resident in the CU. Set
+    // BRAIDINFER_BARRIER_V4=1 to route all atomic_block_barrier() call sites
+    // to atomic_block_barrier_v4() via the #define in kernels/rdna3_sync.h.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_BARRIER_V4");
+    let barrier_v4 = env::var("BRAIDINFER_BARRIER_V4").is_ok();
+
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
     let kernels = [
         "rmsnorm",
@@ -97,6 +135,18 @@ fn main() {
         }
         if op_profile {
             hipcc_args.push("-DBRAIDINFER_OP_PROFILE".to_string());
+        }
+        if use_grid_sync {
+            hipcc_args.push("-DBRAIDINFER_USE_GRID_SYNC".to_string());
+        }
+        if barrier_v2 {
+            hipcc_args.push("-DBRAIDINFER_BARRIER_V2".to_string());
+        }
+        if barrier_asm {
+            hipcc_args.push("-DBRAIDINFER_BARRIER_ASM".to_string());
+        }
+        if barrier_v4 {
+            hipcc_args.push("-DBRAIDINFER_BARRIER_V4".to_string());
         }
         hipcc_args.push("-o".to_string());
 
