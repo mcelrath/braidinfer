@@ -216,6 +216,76 @@ impl Model {
         Ok(())
     }
 
+    /// 5ax-decode MTYPE audit: dump (memory_type, alloc_flags) for every
+    /// cross-agent or reused buffer in the multi-GPU decode path. Per
+    /// GFX1100_ARCH.md §5.5 Rule 5 — `mem_type=2 alloc_flags=0x0` ==
+    /// cached device buffer == L2-stale candidate. `0x3` = UC. `1` = host.
+    fn dump_mtype_audit(&self) {
+        eprintln!("=== MTYPE audit (5ax-decode) ===");
+        eprintln!("Legend: mem_type 1=Host 2=Device | alloc_flags 0x0=cached 0x1=fine-grained 0x3=UC");
+        let dev = |b: &braidinfer_hip::DeviceBuffer<f32>, name: &str| {
+            match b.pointer_attributes() {
+                Ok((t, f)) => eprintln!("  {name:46} mem_type={t} alloc_flags=0x{f:x}"),
+                Err(e) => eprintln!("  {name:46} ERR {e:?}"),
+            }
+        };
+        let host = |b: &braidinfer_hip::MappedHostBuffer<f32>, name: &str| {
+            match b.pointer_attributes() {
+                Ok((t, f)) => eprintln!("  {name:46} mem_type={t} alloc_flags=0x{f:x}"),
+                Err(e) => eprintln!("  {name:46} ERR {e:?}"),
+            }
+        };
+
+        eprintln!("-- activations (GPU 0) --");
+        dev(&self.activations.hidden, "activations.hidden");
+        dev(&self.activations.normed, "activations.normed");
+        host(&self.activations.normed_stage, "activations.normed_stage");
+        dev(&self.activations.q_attn, "activations.q_attn");
+        dev(&self.activations.k_attn, "activations.k_attn");
+        dev(&self.activations.v_attn, "activations.v_attn");
+        dev(&self.activations.gate_attn, "activations.gate_attn");
+        dev(&self.activations.attn_out, "activations.attn_out");
+        dev(&self.activations.gated_out, "activations.gated_out");
+        dev(&self.activations.residual, "activations.residual");
+
+        if let Some(legacy) = self.legacy_kv_caches.as_ref() {
+            eprintln!("-- legacy_kv_caches (GPU 0, prefill K/V) --");
+            for (i, kv) in legacy.iter().enumerate() {
+                dev(&kv.k, &format!("legacy_kv_caches[{i}].k"));
+                if i == 0 { dev(&kv.v, &format!("legacy_kv_caches[{i}].v")); }
+                if i >= 2 { eprintln!("  ... ({} total layers)", legacy.len()); break; }
+            }
+        }
+
+        if let Some(mgpu) = self.multi_gpu.as_ref() {
+            for (gpu_i, w) in mgpu.workers.iter().enumerate() {
+                eprintln!("-- worker[{gpu_i}] (device {}) --", w.device.0);
+                if let Some(b) = w.attn_normed.as_ref() { dev(b, &format!("workers[{gpu_i}].attn_normed")); }
+                if let Some(b) = w.attn_q_gate.as_ref() { dev(b, &format!("workers[{gpu_i}].attn_q_gate")); }
+                if let Some(b) = w.attn_k.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_k")); }
+                if let Some(b) = w.attn_v.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_v")); }
+                if let Some(b) = w.attn_gate.as_ref()   { dev(b, &format!("workers[{gpu_i}].attn_gate")); }
+                if let Some(b) = w.attn_out.as_ref()    { dev(b, &format!("workers[{gpu_i}].attn_out")); }
+                for (i, kv) in w.attn_kv_caches.iter().enumerate() {
+                    if i < 2 {
+                        dev(&kv.k, &format!("workers[{gpu_i}].attn_kv_caches[{i}].k"));
+                        dev(&kv.v, &format!("workers[{gpu_i}].attn_kv_caches[{i}].v"));
+                    }
+                }
+                if w.attn_kv_caches.len() > 2 {
+                    eprintln!("  ... ({} attn_kv_cache layers)", w.attn_kv_caches.len());
+                }
+            }
+        }
+
+        if let Some(p2p) = self.moe_p2p.as_ref() {
+            eprintln!("-- moe_p2p --");
+            dev(&p2p.output_slots, "moe_p2p.output_slots");
+            host(&p2p.activation_staging, "moe_p2p.activation_staging");
+        }
+        eprintln!("=== end MTYPE audit ===");
+    }
+
     fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
 
@@ -255,6 +325,19 @@ impl Model {
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
     /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        // 5ax-decode probe: BRAIDINFER_MTYPE_AUDIT=1 dumps the MTYPE table
+        // for all cross-agent and reused buffers in the decode path. Runs
+        // once on the first decode step. Surfaces buffers that should be
+        // UC but aren't (mem_type=2 device + alloc_flags=0 means cached,
+        // the canonical L2-stale candidate). Uses static AtomicBool to
+        // run only once even though decode_step_p2p is called per step.
+        static AUDITED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if std::env::var("BRAIDINFER_MTYPE_AUDIT").is_ok()
+            && !AUDITED.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.dump_mtype_audit();
+        }
         self.set_position(position).map_err(ModelError::Hip)?;
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)

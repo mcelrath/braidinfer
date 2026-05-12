@@ -143,6 +143,18 @@ impl<T> DeviceBuffer<T> {
         self.len
     }
 
+    /// Diagnostic: query allocation type + flags via hipPointerGetAttributes.
+    /// Returns (memory_type, allocation_flags). memory_type: 1=Host, 2=Device,
+    /// 3=Managed. allocation_flags: e.g. 0x3 = hipDeviceMallocUncached,
+    /// 0x0 = default hipMalloc.
+    pub fn pointer_attributes(&self) -> HipResult<(u32, u32)> {
+        let mut attr = ffi::HipPointerAttribute::default();
+        error::check(unsafe {
+            ffi::hipPointerGetAttributes(&mut attr, self.ptr as *const std::ffi::c_void)
+        })?;
+        Ok((attr.mem_type, attr.allocation_flags))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -399,6 +411,16 @@ impl<T> MappedHostBuffer<T> {
     /// Returns *mut T from &self for GPU instruction packing (see DeviceBuffer::as_write_ptr).
     pub fn as_write_ptr(&self) -> *mut T {
         self.device_ptr
+    }
+
+    /// Diagnostic: query allocation type + flags via hipPointerGetAttributes
+    /// on the GPU-side pointer. Returns (memory_type, allocation_flags).
+    pub fn pointer_attributes(&self) -> HipResult<(u32, u32)> {
+        let mut attr = ffi::HipPointerAttribute::default();
+        error::check(unsafe {
+            ffi::hipPointerGetAttributes(&mut attr, self.device_ptr as *const std::ffi::c_void)
+        })?;
+        Ok((attr.mem_type, attr.allocation_flags))
     }
 
     /// Typed-pointer view of the GPU-side address. Tagged

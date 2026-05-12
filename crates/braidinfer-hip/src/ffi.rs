@@ -9,6 +9,21 @@ pub type hipFunction_t = *mut c_void;
 pub type hipDeviceptr_t = *mut c_void;
 pub type hipEvent_t = *mut c_void;
 
+/// Mirror of HIP's hipPointerAttribute_t struct (per hip_runtime_api.h:257).
+/// type: hipMemoryType (0=Unregistered, 1=Host, 2=Device, 3=Managed)
+/// allocationFlags: the flags passed at allocation time (e.g.
+/// hipDeviceMallocUncached=0x3 for DeviceBuffer::alloc_uncached).
+#[repr(C)]
+#[derive(Default)]
+pub struct HipPointerAttribute {
+    pub mem_type: c_uint,    // hipMemoryType enum value
+    pub device: c_int,
+    pub device_pointer: *mut c_void,
+    pub host_pointer: *mut c_void,
+    pub is_managed: c_int,
+    pub allocation_flags: c_uint,
+}
+
 pub type hipError_t = c_uint;
 
 pub const hipSuccess: hipError_t = 0;
@@ -54,6 +69,10 @@ unsafe extern "C" {
     pub fn hipHostRegister(host_ptr: *mut c_void, size_bytes: usize, flags: c_uint) -> hipError_t;
     pub fn hipHostUnregister(host_ptr: *mut c_void) -> hipError_t;
     pub fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> hipError_t;
+    pub fn hipPointerGetAttributes(
+        attributes: *mut HipPointerAttribute,
+        ptr: *const c_void,
+    ) -> hipError_t;
     pub fn hipMemsetAsync(
         dst: *mut c_void,
         value: c_int,
