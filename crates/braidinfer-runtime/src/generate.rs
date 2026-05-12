@@ -244,10 +244,29 @@ pub fn generate_from_ids(
     let mut text_pieces: Vec<String> = Vec::new();
     let mut position = n_prompt as u32;
 
+    // 5ax-decode probe: BRAIDINFER_LOGIT_TRACE=path logs per-step logit
+    // hash + next-token to identify the first divergent decode step
+    // across runs.
+    let logit_trace_path = std::env::var("BRAIDINFER_LOGIT_TRACE").ok();
+    let log_logits = |step: usize, tok: u32, logits: &[f32], trace: &Option<String>| {
+        if let Some(p) = trace {
+            let mut h: u64 = 0xcbf29ce484222325;
+            for x in logits {
+                h ^= (*x).to_bits() as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "step={} tok={} logit_hash={:016x}", step, tok, h);
+            }
+        }
+    };
+
     // First token from prefill/decode logits (already on CPU)
     let mut next_token = argmax(&last_logits);
+    log_logits(0, next_token, &last_logits, &logit_trace_path);
 
-    for _ in 0..max_tokens {
+    for step in 0..max_tokens {
         if token_config.is_stop_token(next_token) {
             break;
         }
@@ -256,8 +275,13 @@ pub fn generate_from_ids(
         let piece = tokenizer.decode(&[next_token], false).unwrap_or_default();
         text_pieces.push(piece);
 
-        // GPU-resident argmax: only transfers 4 bytes instead of vocab_size×4
-        next_token = model.decode_step_token(next_token, position)?;
+        if logit_trace_path.is_some() {
+            let logits = model.decode_step(next_token, position)?;
+            next_token = argmax(&logits);
+            log_logits(step + 1, next_token, &logits, &logit_trace_path);
+        } else {
+            next_token = model.decode_step_token(next_token, position)?;
+        }
         position += 1;
     }
 

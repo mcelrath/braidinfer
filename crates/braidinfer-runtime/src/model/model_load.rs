@@ -880,10 +880,21 @@ impl Model {
                 nqh * hd * if config.has_output_gate { 2 } else { 1 },
             )?,
             q_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
-            gate_attn: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
+            // 5ax-decode fix: gate_attn is also workers-write → GPU 0-read
+            // when has_output_gate is true. Same UC treatment as attn_out.
+            gate_attn: DeviceBuffer::<f32>::alloc_uncached(device, nqh * hd)?,
             k_attn: DeviceBuffer::<f32>::alloc(device, nkh * hd)?,
             v_attn: DeviceBuffer::<f32>::alloc(device, nkh * hd)?,
-            attn_out: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
+            // 5ax-decode fix per GFX1100_ARCH.md §5.4: attn_out is the
+            // canonical "pool-cycled scratch reused every decode step" L2-
+            // stale candidate. Workers P2P-write via UC peer mapping; GPU 0
+            // reads back. With cached alloc, GPU 0's L2 holds the previous
+            // step's attn_out — workers' fresh write lands in VRAM but
+            // GPU 0 reads stale from L2 (gfx1100 has no buffer_gl2_inv).
+            // alloc_uncached forces both write-target and read-source to
+            // bypass L2 → GPU 0 reads fresh VRAM. gate_attn has same role
+            // when has_output_gate=true (Qwen-style).
+            attn_out: DeviceBuffer::<f32>::alloc_uncached(device, nqh * hd)?,
             gated_out: DeviceBuffer::<f32>::alloc(device, nqh * hd)?,
             ffn_gate: DeviceBuffer::<f32>::alloc(device, is)?,
             ffn_up: DeviceBuffer::<f32>::alloc(device, is)?,
