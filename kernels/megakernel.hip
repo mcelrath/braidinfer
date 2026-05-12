@@ -202,6 +202,23 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             __syncthreads();
             const u64* inst = sinst;
 
+            // braidinfer-4fg.4: in-band shutdown via OP_HALT.
+            // Replaces the OUT-OF-BAND queue->shutdown flag + atomic_block_barrier
+            // wedge path. The dispatcher fires a final batch containing one
+            // OP_HALT instruction. All blocks read the same instruction from
+            // shared mem; each block returns from the kernel independently.
+            // No cooperative barrier needed for the exit transition itself —
+            // the post-op atomic_block_barrier from the previous instruction
+            // (if any) already coordinated all blocks.
+            u32 opcode = inst_opcode(inst);
+            if (opcode == OP_HALT) {
+                if (threadIdx.x == 0 && blockIdx.x == 0) {
+                    queue->done = 1;
+                    __threadfence();
+                }
+                if (watchdog) watchdog_signal_exited(watchdog);
+                return;
+            }
             dispatch_opcode(
                 inst, grid, &g_gbs,
                 dump_base, dump_capacity, dump_count,

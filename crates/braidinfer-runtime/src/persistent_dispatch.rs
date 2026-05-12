@@ -705,6 +705,47 @@ impl PersistentDispatch {
         self.request_shutdown();
     }
 
+    /// braidinfer-4fg.4: in-band shutdown via OP_HALT instruction batches.
+    /// Dispatches a single-instruction OP_HALT batch to each worker queue.
+    /// The kernel processes OP_HALT in its normal pc loop and exits naturally
+    /// — same code path as every other op dispatch, which is proven to work
+    /// during decode. Replaces the OUT-OF-BAND queue->shutdown flag path
+    /// that wedges intermittently at the post-poll atomic_block_barrier.
+    pub fn send_halt_all(&mut self) {
+        // OP_HALT = 16 (per kernels/opcodes.h, generated as OP_HALT in
+        // opcodes.rs). Build the same shape Instruction would: opcode in
+        // word 0, rest zeros. Use raw word writes to avoid pulling in
+        // Instruction's constructor here.
+        const OP_HALT_VAL: u64 = 16;
+        for slot in self.workers.iter_mut() {
+            let Some(worker) = slot.as_mut() else { continue };
+            let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
+            unsafe {
+                // Write OP_HALT into instruction slot 0; clear remaining
+                // words for hygiene.
+                std::ptr::write_volatile(
+                    std::ptr::addr_of_mut!((*q_ptr).inst[0]),
+                    OP_HALT_VAL,
+                );
+                for j in 1..INST_SIZE {
+                    std::ptr::write_volatile(
+                        std::ptr::addr_of_mut!((*q_ptr).inst[j]),
+                        0u64,
+                    );
+                }
+                std::ptr::write_volatile(
+                    std::ptr::addr_of_mut!((*q_ptr).num_instructions),
+                    1u32,
+                );
+                worker.seq_counter = worker.seq_counter.wrapping_add(1);
+                std::ptr::write_volatile(
+                    std::ptr::addr_of_mut!((*q_ptr).seq_num),
+                    worker.seq_counter,
+                );
+            }
+        }
+    }
+
     /// Number of GPUs with launched workers.
     pub fn num_gpus(&self) -> usize {
         self.workers.iter().filter(|s| s.is_some()).count()
@@ -755,7 +796,15 @@ impl Drop for PersistentDispatch {
             std::time::Duration::from_secs(30)
         };
 
-        self.request_shutdown();
+        // braidinfer-4fg.4: in-band shutdown via OP_HALT instead of
+        // out-of-band queue->shutdown flag. The kernel processes OP_HALT in
+        // its normal pc loop and exits naturally — same code path as every
+        // other op dispatch, which is proven to work during decode. The
+        // previous shutdown=1 flag path hit a wedge at the first
+        // atomic_block_barrier after the inner-poll exit. Crucially we do
+        // NOT call request_shutdown here — that triggers the wedge-prone
+        // path. OP_HALT alone is sufficient.
+        self.send_halt_all();
         let start = std::time::Instant::now();
         let phase1_deadline = start + phase1_timeout;
         let total_deadline = start + total_timeout;
@@ -870,6 +919,16 @@ impl Drop for PersistentDispatch {
         // hang). Investigation in braidinfer-4fg.3/awj/setprio didn't isolate
         // the root cause — possibly HW-level scheduler/cache interaction
         // under cross-GPU PCIe pressure that's not addressable in software.
+        // braidinfer-4fg.4: multi-GPU always fast-aborts. The host's done=1
+        // signal turns out to be NECESSARY but NOT SUFFICIENT — observed
+        // 20% of runs where worker writes done=1 but the cooperative
+        // kernel still isn't fully terminated (some blocks lingering),
+        // and hipStreamDestroy blocks waiting for the kernel. Without a
+        // reliable kernel-termination signal, the only safe choice is to
+        // skip the Stream/Module cleanup entirely on multi-GPU and let the
+        // OS reclaim on process exit. OP_HALT still fires (cleaner GPU
+        // release when the kernel actually does terminate cleanly) but
+        // we don't depend on it for bounded exit.
         if self.workers.len() > 1 {
             self.watchdog.force_exit_all();
             std::thread::sleep(std::time::Duration::from_millis(200));
