@@ -14,6 +14,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "rdna3_sync.h"
+#include "rdna3_coherence.h"
 
 struct WatchdogState {
     volatile uint32_t force_exit;        // host writes 1 to request emergency exit
@@ -109,8 +110,7 @@ __device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local
         // regardless of scope. SYSTEM scope's s_waitcnt_vscnt handshake is
         // the source of the multi-GPU barrier wedge (PCIe-write-before-
         // barrier hazard). AGENT scope omits the handshake.
-        __hip_atomic_store(&ws->exited, 0u,
-                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        braidinfer::rdna3::host_uc_store_agent(&ws->exited, 0u);
     }
 }
 
@@ -123,8 +123,7 @@ __device__ __forceinline__ void watchdog_init(WatchdogState* ws, uint32_t* local
 __device__ __forceinline__ void watchdog_signal_exited(WatchdogState* ws) {
     if (threadIdx.x == 0 && blockIdx.x == 0 && ws) {
         // 4fg.5: AGENT scope (was SYSTEM). See watchdog_init comment.
-        __hip_atomic_store(&ws->exited, 1u,
-                           __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        braidinfer::rdna3::host_uc_store_agent(&ws->exited, 1u);
     }
 }
 
@@ -136,8 +135,7 @@ __device__ __forceinline__ void watchdog_beat(WatchdogState* ws, uint32_t* local
         uint32_t c = ++(*local_counter);
         if ((c % 100) == 0) {
             // 4fg.5: AGENT scope (was SYSTEM). See watchdog_init comment.
-            __hip_atomic_store(&ws->progress_counter, (uint64_t)c,
-                               __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            braidinfer::rdna3::host_uc_store_agent(&ws->progress_counter, (uint64_t)c);
         }
     }
 }
