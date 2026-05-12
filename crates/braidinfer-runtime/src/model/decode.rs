@@ -521,6 +521,12 @@ impl Model {
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
     /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        // Phase 0b diagnostic — pinpoint which dispatch wedges in the
+        // per-batch coop path. Remove once Phase 0b passes.
+        let p0b_diag = self.per_batch_coop && std::env::var("BRAIDINFER_P0B_DIAG").is_ok();
+        if p0b_diag {
+            eprintln!("[p0b] decode_step_p2p: token_id={token_id} position={position}");
+        }
         // 5ax-decode probe: BRAIDINFER_MTYPE_AUDIT=1 dumps the MTYPE table
         // for all cross-agent and reused buffers in the decode path. Runs
         // once on the first decode step. Surfaces buffers that should be
@@ -609,6 +615,9 @@ impl Model {
             //      have written output_slots).
             if moe_i < moe_boundaries.len() && i == moe_boundaries[moe_i].0 {
                 let layer_idx = moe_boundaries[moe_i].1;
+                if p0b_diag {
+                    eprintln!("[p0b] MoE boundary moe_i={moe_i} i={i} layer={layer_idx} seg=[{seg_start}..{}]", i + 1);
+                }
                 // Build combined GPU 0 segment [seg_start..=i] (including PRE).
                 let seg_end_inclusive = i + 1;
                 let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end_inclusive];
@@ -629,18 +638,32 @@ impl Model {
                 };
                 let mut chunks = combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS).peekable();
                 let mut gpu0_seq: Option<u32> = None;
+                let mut chunk_idx = 0usize;
                 while let Some(chunk) = chunks.next() {
+                    if p0b_diag {
+                        eprintln!("[p0b]   GPU0 PRE chunk {chunk_idx} ({} insts)", chunk.len());
+                    }
                     if chunks.peek().is_none() {
                         // Last chunk — fire async, hold seq for wait_ack below.
                         gpu0_seq = Some(dispatch.dispatch_batch_fire(0, chunk));
                     } else {
                         dispatch.dispatch_batch(0, chunk);
                     }
+                    if p0b_diag {
+                        eprintln!("[p0b]   GPU0 PRE chunk {chunk_idx} fired");
+                    }
+                    chunk_idx += 1;
+                }
+                if p0b_diag {
+                    eprintln!("[p0b]   dispatch_moe_workers_decode_async layer={layer_idx} gpu0_seq={gpu0_seq:?}");
                 }
                 // Concurrently dispatch OP_MOE_FFN_REMOTE on each worker (async).
                 // dispatch_moe_workers_decode_async returns the per-worker seqs;
                 // we then wait_ack for all (workers + GPU 0 PRE).
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
+                if p0b_diag {
+                    eprintln!("[p0b]   MoE workers acked");
+                }
                 // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
                 seg_start = i + 1;
                 moe_i += 1;
@@ -652,6 +675,9 @@ impl Model {
             if has_head_parallel && attn_i < attn_boundaries.len() {
                 let (flush_idx, resume_idx) = attn_boundaries[attn_i];
                 if i == flush_idx {
+                    if p0b_diag {
+                        eprintln!("[p0b] attn boundary attn_i={attn_i} flush={flush_idx} resume={resume_idx}");
+                    }
                     // Include this instruction in the segment, then flush.
                     // Prepend any pending gather from previous attention layer.
                     let seg_end = i + 1;
@@ -682,6 +708,9 @@ impl Model {
             i += 1;
         }
 
+        if p0b_diag {
+            eprintln!("[p0b] main loop done; tail seg=[{seg_start}..{i}] pending_gather.len={}", pending_gather.len());
+        }
         // Dispatch remaining segment, prepending any pending gather
         if seg_start < i || !pending_gather.is_empty() {
             let debug_hidden = self.debug_p2p_hidden;

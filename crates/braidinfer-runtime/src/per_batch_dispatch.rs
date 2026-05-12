@@ -181,6 +181,21 @@ impl PerBatchDispatch {
             instructions.len(),
             MAX_BATCH_INSTRUCTIONS
         );
+        let p0b_diag = std::env::var("BRAIDINFER_P0B_DIAG").is_ok();
+        if p0b_diag {
+            let op0 = instructions
+                .first()
+                .map(|i| i.words[0] as u32)
+                .unwrap_or(0);
+            let op_last = instructions
+                .last()
+                .map(|i| i.words[0] as u32)
+                .unwrap_or(0);
+            eprintln!(
+                "[p0b]     dispatch_batch_fire gpu={gpu_idx} n={} op0={op0} op_last={op_last}",
+                instructions.len()
+            );
+        }
         let op_profile_ptr = self.op_profile_dev_ptr;
         // Save current device so we can restore it after the launch. Callers
         // outside the dispatcher (e.g. moe_ffn_forward_prefill_batched's GPU
@@ -233,6 +248,9 @@ impl PerBatchDispatch {
 
         w.launch_counter += 1;
         let seq = w.launch_counter;
+        if p0b_diag {
+            eprintln!("[p0b]     dispatch_batch_fire gpu={gpu_idx} launched seq={seq}");
+        }
         // Restore caller's device. `w` borrow ends here naturally; the
         // Device::set_current call doesn't touch `self`.
         Device::set_current(prior_device).expect("Device::set_current(prior) failed");
@@ -272,16 +290,27 @@ impl BatchDispatcher for PerBatchDispatch {
     /// `seq` is informational only — per-GPU streams are FIFO, so
     /// `stream.synchronize()` drains everything ≤ `launch_counter`.
     fn wait_ack(&self, gpu_idx: usize, _seq: u32) {
+        let p0b_diag = std::env::var("BRAIDINFER_P0B_DIAG").is_ok();
+        if p0b_diag {
+            eprintln!("[p0b]     wait_ack gpu={gpu_idx} seq={_seq} (stream.synchronize start)");
+        }
         self.worker(gpu_idx)
             .stream
             .synchronize()
             .expect("stream.synchronize failed");
+        if p0b_diag {
+            eprintln!("[p0b]     wait_ack gpu={gpu_idx} seq={_seq} done");
+        }
     }
 
     /// Wait for multiple per-GPU sequence targets in one pass. Each per-GPU
     /// stream is independent, so this is just per-GPU `stream.synchronize`
     /// (deduplicated by GPU index).
     fn try_wait_acks_many(&self, targets: &[(usize, u32)]) -> Result<(), DispatchError> {
+        let p0b_diag = std::env::var("BRAIDINFER_P0B_DIAG").is_ok();
+        if p0b_diag {
+            eprintln!("[p0b]     try_wait_acks_many targets={targets:?}");
+        }
         let mut seen = vec![false; self.workers.len()];
         for &(gpu, seq) in targets {
             if gpu >= seen.len() {
