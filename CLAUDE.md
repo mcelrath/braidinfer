@@ -32,7 +32,12 @@ python3 scripts/launch-gpu.py -g 2 -- cargo test ...
 # Status/cleanup:
 python3 scripts/launch-gpu.py --status
 python3 scripts/launch-gpu.py --cleanup
+
+# Kill your OWN stuck processes (session-scoped via CLAUDE_SESSION_ID):
+python3 scripts/launch-gpu.py --kill
 ```
+
+**If YOUR OWN job wedges** (kernel spin-loops, dispatcher deadlock, etc.) and is holding GPUs you need: kill it with `python3 scripts/launch-gpu.py --kill`. The script scopes the kill to this session's processes only — it WILL NOT touch other users or services. This is the only allowed way to kill a GPU-holding process; never `kill`, `kill -9`, or `pkill` directly.
 
 **GPU waiting is automatic**: The script blocks until GPUs are free (polls every 5s). GPUs may be busy for hours — that is expected and correct. Never reduce timeouts to work around busy GPUs.
 
@@ -60,9 +65,9 @@ Use `Bash run_in_background=true` and `timeout=600000`. The launch script waits 
 | Short timeouts (`--timeout 60`) when GPUs are busy | GPUs may be busy for hours; use `--timeout 43200` |
 | Checking VRAM to see if GPUs are "almost free" | The script polls automatically; don't second-guess it |
 | Trying different `HIP_VISIBLE_DEVICES` values | The script selects the best GPU; manual selection conflicts |
-| Killing processes that hold GPU VRAM | Other sessions/services depend on those processes. NEVER kill. |
+| Killing OTHER sessions' processes (via `kill`, `kill -9`, `pkill`, etc.) | Other sessions/services depend on those processes. NEVER touch directly. To kill YOUR OWN stuck process, use `launch-gpu.py --kill` — it's session-scoped via `CLAUDE_SESSION_ID` and won't affect anyone else. |
 | Using `fuser` to find GPU process owners | Same as rocm-smi — don't probe GPU state manually |
-| Asking the user to kill processes for GPU access | Just queue with launch-gpu.py and wait. GPUs free eventually. |
+| Asking the user to kill processes for GPU access | If it's your own process, run `launch-gpu.py --kill`. Otherwise queue with launch-gpu.py and wait. |
 
 **If GPUs are busy**: Queue your command with `launch-gpu.py --timeout 43200` and WAIT. Do not investigate what's using them, do not ask to kill processes, do not probe VRAM. The script handles everything. Other users and services share these GPUs and their work is equally important.
 
