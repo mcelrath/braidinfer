@@ -59,10 +59,16 @@ struct WedgeReproQueue {
     // V5-only: outer-loop watchdog liveness write. Production's
     // watchdog_signal_exited equivalent (kernels/watchdog.h). UC store
     // FROM the worker TO host memory at the top of every outer iteration,
-    // BEFORE the inner poll. Suspected §11.4 trigger that the V0 skeleton
-    // elides.
+    // BEFORE the inner poll.
     volatile uint32_t watchdog_alive;
     uint32_t _pad;
+    // V7-only: peer-GPU UC store target. Pointer into GPU 0's UC device
+    // buffer (allocated via hipExtMallocWithFlags(hipDeviceMallocUncached)).
+    // Each worker writes to its own slot. The store immediately precedes
+    // atomic_block_barrier — exactly the §11.4 hazard pattern that
+    // op_moe_ffn_remote's final coop_copy hit before commit 37be418 deferred
+    // it past the barrier. nullptr for V0-V5.
+    volatile uint32_t* peer_uc_target;
 };
 
 // Variant tag. Keep in sync with host_runner.cpp + README.md.
@@ -74,6 +80,12 @@ struct WedgeReproQueue {
 // V5: V0 + outer-loop top UC watchdog write (suspected §11.4 trigger that
 // V0 elides). Bare V0 doesn't reproduce the wedge (udi bridge msg #4/#6).
 #define VARIANT_V5_PERSIST_BARRIER_WATCHDOG 5
+// V7: V0 + cross-GPU peer UC write before post-poll barrier. Re-creates
+// the original 4fg.5 / commit 37be418 site (op_moe_ffn_remote final
+// coop_copy to peer GPU's output_slots followed by trailing barrier).
+// Both V0 and V5 negative at n=10; V7 tests whether cross-GPU peer-write
+// is the missing factor.
+#define VARIANT_V7_PERSIST_BARRIER_PEERUC 7
 
 // Sentinel progress_pc values. Match production kernels/megakernel.hip values
 // so a future investigator reading both logs gets identical semantics.
@@ -130,7 +142,29 @@ void persistent_worker_skeleton(
             host_uc_store_agent(&q->progress_pc, PC_POST_POLL);
         }
 
-        // V0/V1/V3/V5: post-poll grid barrier. V2 skips to isolate whether
+        // V7: cross-GPU peer UC store immediately before the barrier. Each
+        // worker writes its outer_iter value into its slot in GPU 0's UC
+        // output_slots buffer. This is the EXACT pattern that production
+        // op_moe_ffn_remote final coop_copy hit before commit 37be418
+        // moved the store past the barrier. ALL threads write (not just
+        // thread 0) — coop_copy distributed the writes across the block,
+        // we mirror that fan-out so vscnt accumulates the way production
+        // would.
+        if (variant == VARIANT_V7_PERSIST_BARRIER_PEERUC && q->peer_uc_target != nullptr) {
+            // Per-thread cross-GPU UC store. AGENT scope (no SYSTEM-vscnt
+            // emit on the store itself); the trailing barrier's leading
+            // s_waitcnt_vscnt is what stalls if vscnt doesn't drain.
+            // gridDim.x * blockDim.x parallel writers, ~96*256 ≈ 24k stores
+            // per iteration, sufficient PCIe fan-out to test the hazard.
+            uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+            // Slot stride 1 (one u32 per worker). Worker's own slot is set
+            // by host pointer arithmetic; all this worker's threads write
+            // to the same slot — last write wins, content irrelevant for
+            // the wedge test.
+            host_uc_store_agent(q->peer_uc_target, tid);
+        }
+
+        // V0/V1/V3/V5/V7: post-poll grid barrier. V2 skips to isolate whether
         // the barrier interaction is load-bearing for the wedge.
         // The barrier's RELEASE+ACQUIRE fence pair propagates the shutdown
         // flag set by block 0 thread 0 to all blocks, enabling cooperative

@@ -42,8 +42,9 @@ struct WedgeReproQueue {
     volatile uint32_t completed_dispatches;
     volatile uint32_t watchdog_alive;  // V5-only signal
     uint32_t _pad;
+    volatile uint32_t* peer_uc_target; // V7-only: GPU 0 UC slot for this worker
 };
-static_assert(sizeof(WedgeReproQueue) == 32, "WedgeReproQueue layout drift");
+static_assert(sizeof(WedgeReproQueue) == 40, "WedgeReproQueue layout drift");
 
 extern "C" __global__ void persistent_worker_skeleton(
     volatile WedgeReproQueue* q, int variant);
@@ -56,6 +57,7 @@ static const char* variant_name(int v) {
         case 3: return "V3";
         case 4: return "V4";
         case 5: return "V5";
+        case 7: return "V7";
         default: return "Vunknown";
     }
 }
@@ -67,6 +69,7 @@ static int parse_variant(const char* s) {
     if (strcmp(s, "V3") == 0) return 3;
     if (strcmp(s, "V4") == 0) return 4;
     if (strcmp(s, "V5") == 0) return 5;
+    if (strcmp(s, "V7") == 0) return 7;
     return -1;
 }
 
@@ -127,9 +130,9 @@ int main(int argc, char** argv) {
             n_trials = atoi(argv[++i]);
         }
     }
-    if (variant < 0 || variant > 5 || n_gpus < 1) {
+    if (variant < 0 || variant == 6 || variant > 7 || n_gpus < 1) {
         fprintf(stderr,
-                "usage: %s --variant V0|V1|V2|V3|V4|V5 --n-gpus N [--n-trials 1]\n",
+                "usage: %s --variant V0|V1|V2|V3|V4|V5|V7 --n-gpus N [--n-trials 1]\n",
                 argv[0]);
         return 1;
     }
@@ -202,12 +205,55 @@ int main(int argc, char** argv) {
         gpus[g].num_blocks = (uint32_t)(bpsm * num_cus);
     }
 
+    // V7 setup: allocate UC device buffer on GPU 0 (§5.5 Rule 1a — Canonical
+    // device-resident UC for cross-GPU peer writes). Enable P2P from each
+    // worker GPU to GPU 0. Stamp peer_uc_target into each worker's queue.
+    // For other variants, peer_uc_target stays nullptr (kernel checks).
+    uint32_t* uc_target_base = nullptr;
+    if (variant == 7) {
+        CHECK(hipSetDevice(0));
+        // hipDeviceMallocUncached = 0x3.
+        const unsigned int HIP_DEVICE_MALLOC_UNCACHED = 0x3u;
+        void* p = nullptr;
+        CHECK(hipExtMallocWithFlags(&p, sizeof(uint32_t) * n_gpus,
+                                    HIP_DEVICE_MALLOC_UNCACHED));
+        uc_target_base = (uint32_t*)p;
+        // Initialize to known sentinel for diagnostic (workers overwrite).
+        CHECK(hipMemset(uc_target_base, 0, sizeof(uint32_t) * n_gpus));
+
+        // Enable P2P from every worker GPU (1..n_gpus-1) to GPU 0.
+        // GPU 0 also writes through its own UC mapping (no P2P needed).
+        for (int g = 1; g < n_gpus; g++) {
+            CHECK(hipSetDevice(g));
+            int can = 0;
+            CHECK(hipDeviceCanAccessPeer(&can, g, 0));
+            if (!can) {
+                fprintf(stderr, "V7: GPU %d cannot access GPU 0 peer; skipping enable\n", g);
+                continue;
+            }
+            hipError_t e = hipDeviceEnablePeerAccess(0, 0);
+            if (e != hipSuccess && e != hipErrorPeerAccessAlreadyEnabled) {
+                fprintf(stderr,
+                        "V7: hipDeviceEnablePeerAccess GPU %d->0 failed: %s\n",
+                        g, hipGetErrorString(e));
+                return 1;
+            }
+        }
+        // Stamp per-worker slot pointer into each queue.
+        for (int g = 0; g < n_gpus; g++) {
+            gpus[g].host_ptr->peer_uc_target = uc_target_base + g;
+        }
+    }
+
     int wedge_count = 0;
     int complete_count = 0;
     for (int trial = 1; trial <= n_trials; trial++) {
-        // Reset queues.
+        // Reset queues. memset clobbers peer_uc_target; re-stamp for V7.
         for (int g = 0; g < n_gpus; g++) {
             memset(gpus[g].host_ptr, 0, sizeof(WedgeReproQueue));
+            if (variant == 7 && uc_target_base != nullptr) {
+                gpus[g].host_ptr->peer_uc_target = uc_target_base + g;
+            }
         }
 
         // Launch cooperative kernel on each GPU.
