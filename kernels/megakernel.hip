@@ -168,6 +168,12 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000002u);
             while (true) {
+                // Phase 0b host->GPU coherence experiment 2026-05-13: force L0/L1
+                // invalidation every poll iteration. If L1 staleness on the
+                // worker side is the wedge mechanism (host-mapped queue line
+                // cached at L1), this clears it; if wedge persists, mechanism
+                // is L2 / PCIe-coherence / driver-firmware, not worker L1.
+                asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
                 if (queue->shutdown) {
                     g_shutdown_seen = 1u;
                     break;

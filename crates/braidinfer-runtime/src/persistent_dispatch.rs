@@ -459,6 +459,21 @@ impl PersistentDispatch {
             device.0
         );
         braidinfer_hip::set_persistent_worker_active(device, true);
+        // Phase 0b host->GPU coherence experiment 2026-05-13: dump queue mtype
+        // to verify the doc claim that MappedHostBuffer::alloc gives MTYPE_UC
+        // on the allocating GPU. mem_type 2=Device, alloc_flags 0x0=cached
+        // (NC), 0x3=UC. If alloc_flags here is 0x0, worker L2 caches the
+        // queue line and the wedge is L2 staleness (gfx1100 has no
+        // buffer_gl2_inv to refresh from kernel).
+        if std::env::var("BRAIDINFER_P0B_VERIFY_HOST_WRITE").is_ok() {
+            match queue.pointer_attributes() {
+                Ok((t, f)) => eprintln!(
+                    "[p0b-mtype] GPU {} worker queue: mem_type={t} alloc_flags=0x{f:x}",
+                    device.0
+                ),
+                Err(e) => eprintln!("[p0b-mtype] GPU {} pointer_attributes failed: {e:?}", device.0),
+            }
+        }
         let slot = device.0 as usize;
         if slot >= self.workers.len() {
             self.workers.resize_with(slot + 1, || None);
@@ -742,6 +757,20 @@ impl PersistentDispatch {
         let seq = w.seq_counter;
         unsafe {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
+        }
+        // Phase 0b host->GPU coherence experiment 2026-05-13: readback the
+        // CPU's own store to confirm it landed in host RAM. If readback != seq,
+        // the CPU side itself never wrote (compiler or memory-system issue).
+        // Logs on mismatch only to keep noise low in the steady state.
+        if std::env::var("BRAIDINFER_P0B_VERIFY_HOST_WRITE").is_ok() {
+            let observed = unsafe {
+                std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).seq_num))
+            };
+            if observed != seq {
+                eprintln!(
+                    "[p0b-fire] gpu={gpu_idx} wrote seq={seq} but CPU readback={observed} (host write failed)"
+                );
+            }
         }
         seq
     }
