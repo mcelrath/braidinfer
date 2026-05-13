@@ -39,7 +39,8 @@
 //                                    = moe_latent_size for Nemotron-H)
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
-#include "watchdog.h"
+#define RDNA3_PERSISTENT_POLLING_VALIDATED 1
+#include "rdna3/rdna3_persistent.h"
 #include "rdna3/rdna3_barrier.h"
 
 __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid,

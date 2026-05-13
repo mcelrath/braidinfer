@@ -1,3 +1,31 @@
+// SPDX-License-Identifier: MIT
+// rdna3_persistent.h — Persistent cooperative kernel primitives for gfx1100.
+// Migrated from kernels/watchdog.h (2026-05-13).
+//
+// CANONICAL HAZARD (GFX1100_ARCH.md §11.4 + persistent_skeleton_repro):
+//   Persistent cooperative kernels poll host-mapped memory between top-level
+//   instructions. The polling-loop discipline is non-obvious; bugs produce
+//   intermittent multi-GPU wedges. Required invariants:
+//     - WatchdogState is allocated hipHostMallocMapped|hipHostMallocCoherent.
+//     - force_exit polling uses volatile reads (NOT __hip_atomic_load) —
+//       gfx1100 SYSTEM-scope atomic loads hang on host-mapped memory.
+//     - Cross-block flag propagation uses __device__ globals + barrier;
+//       __shared__ does not propagate across blocks.
+//     - watchdog_signal_exited fires at every kernel exit (clean or
+//       force-exit) or the host's no-progress timer fires spuriously
+//       across the launch gap.
+//     - host-mapped UC stores use AGENT scope (host_uc_store_agent in
+//       rdna3/rdna3_peer.h), NOT SYSTEM — SYSTEM's s_waitcnt_vscnt drain
+//       wedges under multi-GPU PCIe pressure.
+//
+// To enable, define RDNA3_PERSISTENT_POLLING_VALIDATED before #include
+// (authoring-discipline gate; prevents accidental adoption without going
+// through the validation checklist).
+
+#ifndef RDNA3_PERSISTENT_POLLING_VALIDATED
+#  error "rdna3_persistent.h: confirm polling-loop invariants (see header) by defining RDNA3_PERSISTENT_POLLING_VALIDATED before #include."
+#endif
+
 #pragma once
 // Shared watchdog primitive for all persistent cooperative kernels.
 //

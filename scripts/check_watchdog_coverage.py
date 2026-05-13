@@ -19,7 +19,7 @@ KERNELS_DIR = Path(__file__).parent.parent / "kernels"
 
 COOPERATIVE_PAT  = re.compile(r'\bcg::this_grid\s*\(\s*\)')
 PERSISTENT_PAT   = re.compile(r'\bwhile\s*\(\s*true\s*\)')
-INCLUDE_PAT      = re.compile(r'#\s*include\s+[<"](?:[^"<>]*/)?watchdog\.h[">]')
+INCLUDE_PAT      = re.compile(r'#\s*include\s+[<"](?:[^"<>]*/)?(?:watchdog\.h|rdna3_persistent\.h)[">]')
 POLL_CHECK_PAT   = re.compile(r'\bwatchdog_poll_and_check\b')
 
 failures = []
@@ -34,7 +34,7 @@ for hip_file in sorted(KERNELS_DIR.glob("*.hip")):
     if not has_include or not has_poll_check:
         missing_parts = []
         if not has_include:
-            missing_parts.append('#include "watchdog.h"')
+            missing_parts.append('#include "rdna3/rdna3_persistent.h"')
         if not has_poll_check:
             missing_parts.append('watchdog_poll_and_check() call')
         failures.append((hip_file.name, missing_parts))

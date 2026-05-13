@@ -7,7 +7,8 @@
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
 #include "moe_expert_ops.h"
-#include "watchdog.h"
+#define RDNA3_PERSISTENT_POLLING_VALIDATED 1
+#include "rdna3/rdna3_persistent.h"
 #include "rdna3_reduce.h"
 #include "rdna3/rdna3_barrier.h"
 
