@@ -346,17 +346,29 @@ int main(int argc, char** argv) {
         uint64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             trial_end - dispatch_t0).count();
 
+        // Canonical wedge metric (udi bridge msg #13): seq_completed == false
+        // means the worker didn't fully complete the dispatch even if it
+        // observed seq and wrote ack. V7 wedge symptom: ack=1 visible to
+        // host BUT completed_dispatches=0 BUT progress_pc=0x10000005 — kernel
+        // got past the post-poll barrier and partway through the post-ack
+        // sequence before vscnt-drain hang resolved (or didn't). The
+        // existing wedged field stays as "host timed out waiting for ack"
+        // for backward compat; seq_completed is the metric the aggregator
+        // should bin on.
+        bool seq_completed = (completed > 0);
         printf("{\"variant\":\"%s\",\"trial\":%d,\"wedged\":%s,"
+               "\"seq_completed\":%s,"
                "\"wedge_signature\":{\"seq\":%u,\"ack\":%u,"
                "\"progress_pc\":\"0x%08x\",\"block_alive_count\":%u,"
                "\"gpu_id\":%d,\"elapsed_ms\":%llu},"
                "\"completed_dispatches\":%u}\n",
                variant_name(variant), trial,
                wedged ? "true" : "false",
+               seq_completed ? "true" : "false",
                seq, ack, progress_pc, block_alive_count,
                sig_gpu, (unsigned long long)elapsed_ms, completed);
         fflush(stdout);
-        if (wedged) wedge_count++; else complete_count++;
+        if (wedged || !seq_completed) wedge_count++; else complete_count++;
 
         // Signal shutdown to all workers so they exit cleanly before next
         // trial / process exit. Workers see shutdown=1, write ack=0xFFFFFFFF,
