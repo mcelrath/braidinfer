@@ -29,7 +29,7 @@
 #include <vector>
 #include <algorithm>
 
-#include "../../rdna3_sync.h"
+#include "../../rdna3/rdna3_barrier.h"
 
 #define CHECK(call) do { hipError_t e = (call); if (e != hipSuccess) { \
     fprintf(stderr, "HIP error %s at %s:%d\n", hipGetErrorString(e), __FILE__, __LINE__); \

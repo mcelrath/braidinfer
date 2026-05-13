@@ -8,7 +8,7 @@
 #include "bf16_utils.h"
 #include "quant_consts.h"
 #include "rdna3_reduce.h"
-#include "rdna3_sync.h"
+#include "rdna3/rdna3_barrier.h"
 
 // Runtime dispatch for sub-wave sum reduction. tpg ∈ {1,2,4,8,16}.
 // W==1: input is already the per-thread "sum" (no reduction needed).

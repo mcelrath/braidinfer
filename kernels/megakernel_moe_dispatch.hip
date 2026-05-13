@@ -40,7 +40,7 @@
 #include "moe_work_queue.h"
 #include "moe_expert_ops.h"
 #include "watchdog.h"
-#include "rdna3_sync.h"
+#include "rdna3/rdna3_barrier.h"
 
 __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, cooperative_groups::grid_group& grid,
                                                             braidinfer::rdna3::GridBarrierState* gbs,

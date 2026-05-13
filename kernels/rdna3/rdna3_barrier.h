@@ -1,3 +1,18 @@
+// SPDX-License-Identifier: MIT
+// rdna3_barrier.h — RDNA3 (gfx1100, wave32) synchronization primitives.
+// Migrated from kernels/rdna3_sync.h (2026-05-13).
+//
+// CANONICAL HAZARD (composable_kernel/GFX1100_ARCH.md §11.4):
+//   atomic_block_barrier (default) is the production primitive. The V2/ASM/V4
+//   variants and BRAIDINFER_USE_GRID_SYNC produce wrong or wedge-prone output
+//   on multi-GPU MoE workloads (exterior_algebra-zuk Phase 2/2'/2''
+//   2026-05-12; persistent_skeleton_repro V7 3/10 wedge 2026-05-13). They are
+//   preserved as durable A/B scaffolding for future investigators but require
+//   RDNA3_I_KNOW_WHAT_IM_DOING to enable, preventing accidental reintroduction.
+//
+// To enable any variant: define BOTH the variant macro AND
+// RDNA3_I_KNOW_WHAT_IM_DOING.
+//
 // RDNA3 (gfx1100, wave32) synchronization primitives.
 //
 // Provides scope-explicit fence wrappers and faster grid-wide barrier
@@ -167,6 +182,12 @@ struct GridBarrierState {
     unsigned int generation;
 };
 
+#ifdef BRAIDINFER_USE_GRID_SYNC
+#  ifndef RDNA3_I_KNOW_WHAT_IM_DOING
+#    error "BRAIDINFER_USE_GRID_SYNC: cg::grid_group::sync produces incorrect output on multi-GPU MoE decode (zuk Phase 2 2026-05-12). Define RDNA3_I_KNOW_WHAT_IM_DOING to enable for A/B testing."
+#  endif
+#endif
+
 __device__ __forceinline__ void atomic_block_barrier(GridBarrierState* state) {
 #ifdef BRAIDINFER_USE_GRID_SYNC
     // braidinfer-pky.2 Phase 0b diagnostic (2026-05-12): swap to
@@ -301,6 +322,9 @@ __device__ __forceinline__ void atomic_block_barrier_v2(GridBarrierState* state)
 // atomic_block_barrier_v2, colliding with the explicit definition above).
 // Call sites in .hip files that include this header will see the redirect.
 #ifdef BRAIDINFER_BARRIER_V2
+#  ifndef RDNA3_I_KNOW_WHAT_IM_DOING
+#    error "BRAIDINFER_BARRIER_V2: omits s_waitcnt_vscnt; not safe for cross-GPU consumers. Define RDNA3_I_KNOW_WHAT_IM_DOING to enable."
+#  endif
 #define atomic_block_barrier atomic_block_barrier_v2
 #endif
 
@@ -374,6 +398,9 @@ __device__ __forceinline__ void asm_block_barrier(GridBarrierState* state) {
 //     buffer_gl1_inv -> s_waitcnt vmcnt(0) -> load
 //   i.e. INVALIDATE BEFORE LOAD — forces a fresh L2 read every iteration.
 #ifdef BRAIDINFER_BARRIER_ASM
+#  ifndef RDNA3_I_KNOW_WHAT_IM_DOING
+#    error "BRAIDINFER_BARRIER_ASM: experimental asm spin loop; superseded by V4 (omits s_sleep preemption). Define RDNA3_I_KNOW_WHAT_IM_DOING to enable."
+#  endif
 #define atomic_block_barrier asm_block_barrier
 #endif
 
@@ -430,6 +457,9 @@ __device__ __forceinline__ void atomic_block_barrier_v4(GridBarrierState* state)
 }
 
 #ifdef BRAIDINFER_BARRIER_V4
+#  ifndef RDNA3_I_KNOW_WHAT_IM_DOING
+#    error "BRAIDINFER_BARRIER_V4: experimental variant (omits s_sleep, INVALIDATE-BEFORE-LOAD). Default atomic_block_barrier is the production primitive. Define RDNA3_I_KNOW_WHAT_IM_DOING to enable."
+#  endif
 #define atomic_block_barrier atomic_block_barrier_v4
 #endif
 

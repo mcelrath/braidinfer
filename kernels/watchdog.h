@@ -13,7 +13,7 @@
 // Use volatile reads for polling host-mapped memory. __hip_atomic_store(SYSTEM) works.
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
-#include "rdna3_sync.h"
+#include "rdna3/rdna3_barrier.h"
 #include "rdna3/rdna3_peer.h"
 
 struct WatchdogState {

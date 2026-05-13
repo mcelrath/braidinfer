@@ -52,6 +52,6 @@
 // Order: independent headers first, then dependents.
 #include "rdna3_memory.h"
 #include "rdna3_lane.h"
-#include "rdna3_sync.h"
+#include "rdna3/rdna3_barrier.h"
 #include "rdna3_reduce.h"
 #include "rdna3_compute.h"   // depends on rdna3_reduce.h

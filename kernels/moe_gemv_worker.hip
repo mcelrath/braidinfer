@@ -9,7 +9,7 @@
 #include "moe_expert_ops.h"
 #include "watchdog.h"
 #include "rdna3_reduce.h"
-#include "rdna3_sync.h"
+#include "rdna3/rdna3_barrier.h"
 
 // Per-TU GridBarrierState: zero-init __device__ static, cache-coherent VRAM.
 __device__ static braidinfer::rdna3::GridBarrierState g_gbs;

@@ -2,7 +2,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include "megakernel_common.h"
 #include "watchdog.h"
-#include "rdna3_sync.h"          // braidinfer::rdna3::atomic_block_barrier
+#include "rdna3/rdna3_barrier.h"          // braidinfer::rdna3::atomic_block_barrier
 #include "op_profile.h"          // OP_PROFILE_BEGIN/END (no-op when -DBRAIDINFER_OP_PROFILE unset)
 #include "dump.h"                // dump_instruction_output (used by megakernel_dispatch)
 

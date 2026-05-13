@@ -28,7 +28,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include <cstdint>
 
-#include "../../rdna3_sync.h"
+#include "../../rdna3/rdna3_barrier.h"
 #include "../../rdna3/rdna3_peer.h"
 
 namespace cg = cooperative_groups;

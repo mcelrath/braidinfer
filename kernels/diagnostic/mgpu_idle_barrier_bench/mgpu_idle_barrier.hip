@@ -41,7 +41,7 @@
 #include <vector>
 #include <atomic>
 
-#include "../../rdna3_sync.h"
+#include "../../rdna3/rdna3_barrier.h"
 
 namespace cg = cooperative_groups;
 using braidinfer::rdna3::GridBarrierState;
