@@ -29,7 +29,7 @@
 #include <cstdint>
 
 #include "../../rdna3_sync.h"
-#include "../../rdna3_coherence.h"
+#include "../../rdna3/rdna3_peer.h"
 
 namespace cg = cooperative_groups;
 using braidinfer::rdna3::GridBarrierState;

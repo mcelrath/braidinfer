@@ -14,7 +14,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
 #include "rdna3_sync.h"
-#include "rdna3_coherence.h"
+#include "rdna3/rdna3_peer.h"
 
 struct WatchdogState {
     volatile uint32_t force_exit;        // host writes 1 to request emergency exit
