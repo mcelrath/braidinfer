@@ -167,6 +167,20 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             }
             return;
         }
+
+        // Phase 2' deferred-ack pattern: write ack for the PREVIOUS batch
+        // AFTER the barrier, not before it (4fg.5 exemplar, commit 8cf8084).
+        // The previous iteration stored the completed seq in last_seq;
+        // writing it now (post-barrier) ensures no s_waitcnt_vscnt from
+        // this UC store precedes the leading vscnt of THIS barrier.
+        // last_seq == 0 on first iteration — writing ack=0 is a no-op for
+        // the host (it initialises ack to 0 and only transitions on seq > 0).
+        // AGENT scope: UC write reaches host DRAM via PCIe regardless of scope;
+        // SYSTEM scope would emit vscnt before watchdog_poll_and_check's barrier.
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            braidinfer::rdna3::host_uc_store_agent(&queue->ack, last_seq);
+        }
+
         uint32_t seq = queue->seq_num;
 
         // Watchdog: cooperative exit if force_exit set (non-shutdown path).
@@ -219,9 +233,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             // poll picks them up.
             //
             // IMPORTANT: progress_pc=pc must NOT be written before the
-            // OP_HALT check — that store is PCIe-bound and would stall the
-            // OP_HALT barrier's leading s_waitcnt_vscnt. Defer to past the
-            // OP_HALT check below.
+            // OP_HALT check — that store (even AGENT-scope) precedes the
+            // OP_HALT barrier if placed here. Defer to past the OP_HALT
+            // check below.
             u32 opcode = inst_opcode(inst);
             if (opcode == OP_HALT) {
                 braidinfer::rdna3::atomic_block_barrier(&g_gbs);
@@ -230,28 +244,40 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                 }
                 return;
             }
-            // Report progress so CPU can identify stuck instruction on
-            // timeout. Safe to write here: dispatch_opcode does significant
-            // compute before its trailing barrier, so the PCIe write drains
-            // before any s_waitcnt_vscnt fires.
-            if (threadIdx.x == 0 && blockIdx.x == 0) queue->progress_pc = pc;
+            // Report progress AFTER dispatch_opcode returns (Phase 2' fix).
+            // Writing progress_pc BEFORE dispatch_opcode would put a UC
+            // volatile store before the trailing atomic_block_barrier inside
+            // dispatch_opcode, emitting s_waitcnt_vscnt before the barrier's
+            // leading vscnt — the wedge site under 4-GPU PCIe pressure.
+            // Deferring past dispatch_opcode means the trailing barrier of
+            // the PREVIOUS op has already completed; the next barrier is the
+            // trailing barrier of THIS op, which follows significant compute.
+            // The CPU reads progress_pc only on timeout, so one-instruction
+            // staleness is acceptable.
             dispatch_opcode(
                 inst, grid, &g_gbs,
                 dump_base, dump_capacity, dump_count,
                 op_profile, (int)pc, watchdog
             );
+            // Phase 2': AGENT scope (was volatile). Diagnostic write only;
+            // CPU reads on timeout, not real-time. Same reasoning as 4fg.5
+            // watchdog_beat: UC memory needs no SYSTEM fence, and SYSTEM scope
+            // emits s_waitcnt_vscnt before the next dispatch's trailing barrier.
+            if (threadIdx.x == 0 && blockIdx.x == 0)
+                braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, (uint32_t)pc);
         }
 
-        // Ack: flush ALL threads' writes to system-visible memory, then write ack.
-        // grid.sync() ensures all threads completed (device-scope). But P2P readers on
-        // GPUs 1-3 bypass GPU 0's L2 and read VRAM directly. grid.sync() alone does NOT
-        // flush L2 → VRAM for P2P visibility. __threadfence() from EACH thread
-        // ensures that thread's cache lines are written back to system-visible memory.
-        // Must be called by ALL threads (not just thread 0,0) to cover all written cache lines.
+        // Flush all threads' writes to system-visible memory.
+        // P2P readers on GPUs 1-3 bypass GPU 0's L2 and read VRAM directly.
+        // __threadfence() from EACH thread ensures that thread's cache lines
+        // are written back to system-visible memory.
+        // NOTE: queue->ack is NOT written here — deferred to post-barrier at
+        // the top of the next outer-loop iteration (Phase 2' fix). Writing
+        // ack here would be a UC volatile write before the leading
+        // s_waitcnt_vscnt of the next atomic_block_barrier, which stalls
+        // indefinitely under multi-GPU PCIe pressure (same root cause as
+        // 4fg.5).
         __threadfence();
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            queue->ack = seq;
-        }
         last_seq = seq;
     }
 }

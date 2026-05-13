@@ -82,7 +82,12 @@ __device__ __forceinline__ bool watchdog_poll_and_check(
         // Volatile read: avoids __hip_atomic_load SYSTEM scope hang on gfx1100.
         uint32_t fe = *(volatile uint32_t*)&ws->force_exit;
         __watchdog_should_exit = (fe != 0);
-        ws->last_op_id = op_id;
+        // Phase 2': AGENT scope (was plain volatile). WatchdogState is
+        // host-mapped UC; writes propagate via PCIe regardless of scope.
+        // Plain volatile / SYSTEM scope emits s_waitcnt_vscnt before the
+        // immediately-following atomic_block_barrier — the wedge site.
+        // AGENT scope omits the handshake (same fix as 4fg.5 watchdog_beat).
+        braidinfer::rdna3::host_uc_store_agent(&ws->last_op_id, op_id);
     }
     braidinfer::rdna3::atomic_block_barrier(gbs);
     return __watchdog_should_exit;

@@ -14,6 +14,11 @@
 // Per-TU GridBarrierState: zero-init __device__ static, cache-coherent VRAM.
 __device__ static braidinfer::rdna3::GridBarrierState g_gbs;
 
+// Phase 2' cross-block shutdown flag (AGENT-scope cached VRAM).
+// Set by block 0 thread 0 in poll loop; read by all blocks post-barrier.
+// Same pattern as g_shutdown_seen in megakernel.hip (commit 8cf8084).
+__device__ static uint32_t g_mgw_shutdown_seen;
+
 #define MOE_MAX_BATCH 16
 
 struct MoeWorkerQueue {
@@ -87,15 +92,43 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
         // grid.sync() at TOP — all blocks converge here before block 0 polls.
         // Same pattern as persistent_worker.hip. This ensures inner grid.sync()
         // calls in the OP_EXPERT_FFN phases are safe.
+        //
+        // Phase 2' fix: NO UC writes inside the poll loop or before this
+        // barrier. queue->seq_num=sentinel deferred to after the barrier
+        // (same 4fg.5 pattern as megakernel.hip). Shutdown communicated via
+        // g_mgw_shutdown_seen (__device__ global, AGENT-scope VRAM, no PCIe).
+        // The barrier's RELEASE+ACQUIRE fence pair makes it visible to all
+        // blocks after the barrier returns.
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             while (true) {
-                if (queue->shutdown) { queue->seq_num = 0xFFFFFFFFu; break; }
+                if (queue->shutdown) { g_mgw_shutdown_seen = 1u; break; }
                 uint32_t s = queue->seq_num;
                 if (s > last_seq) break;
                 __builtin_amdgcn_s_sleep(1);
             }
         }
         braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+
+        // Phase 2' deferred-ack: write ack for the PREVIOUS batch AFTER
+        // the barrier so no vscnt stall precedes this barrier. AGENT scope:
+        // UC memory reaches host DRAM via PCIe regardless of scope; SYSTEM
+        // scope would emit vscnt before the watchdog/dispatch barrier that
+        // follows. last_seq == 0 on first iteration; writing ack=0 is no-op.
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            braidinfer::rdna3::host_uc_store_agent(&queue->ack, last_seq);
+        }
+
+        // Shutdown: sentinel + done written POST-barrier (4fg.5 pattern).
+        // No barrier follows these writes so no vscnt stall.
+        // All blocks read g_mgw_shutdown_seen (set pre-barrier, visible post-
+        // barrier via the fence pair), so all blocks return together.
+        if (g_mgw_shutdown_seen) {
+            if (threadIdx.x == 0 && blockIdx.x == 0) {
+                queue->seq_num = 0xFFFFFFFFu;
+                queue->done = 1;
+            }
+            return;
+        }
 
         // Watchdog: cooperative exit if force_exit set.
         if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
@@ -170,8 +203,8 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
 
+        // Phase 2': queue->ack is written at the TOP of the next outer-loop
+        // iteration AFTER the barrier (not here). See deferred-ack comment above.
         last_seq = seq;
-        if (threadIdx.x == 0 && blockIdx.x == 0)
-            queue->ack = seq;  // volatile write to MTYPE_UC GART → immediately CPU-visible
     }
 }
