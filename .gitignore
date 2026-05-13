@@ -36,3 +36,8 @@ kernels/diagnostic/bpermute_repro
 profile_results/
 benchmark_results/
 .rocprofv3/
+
+# Bob's workflow
+.claude
+.worktrees
+kernels/diagnostic/persistent_skeleton_repro/host_runner
