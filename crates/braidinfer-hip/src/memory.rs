@@ -369,6 +369,23 @@ impl<T> MappedHostBuffer<T> {
         Self::alloc_impl(len, ffi::hipHostMallocMapped | ffi::hipHostMallocPortable)
     }
 
+    /// Force fine-grained coherent host-mapped memory. CPU writes are
+    /// immediately visible to the GPU (and vice versa) — no L2 caching on
+    /// either side. Use for tight CPU↔GPU polling protocols where the
+    /// default `alloc` doc-claim of "MTYPE_UC on allocating GPU" may not
+    /// hold under multi-GPU ROCm firmware configurations.
+    ///
+    /// L2-staleness test (braidinfer-pky.2 / phase-5-prime-zuk-q9z-2026-05-12):
+    /// the persistent worker's volatile poll of `queue->seq_num` may wedge
+    /// because the worker L2 caches a stale line under multi-GPU PCIe
+    /// pressure. `alloc_coherent` forces immediate visibility.
+    pub fn alloc_coherent(len: usize) -> HipResult<Self> {
+        Self::alloc_impl(
+            len,
+            ffi::hipHostMallocMapped | ffi::hipHostMallocCoherent,
+        )
+    }
+
     fn alloc_impl(len: usize, flags: u32) -> HipResult<Self> {
         let size = len * std::mem::size_of::<T>();
         let mut host_ptr: *mut std::ffi::c_void = ptr::null_mut();

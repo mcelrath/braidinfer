@@ -40,6 +40,14 @@ pub const hipMemcpyDeviceToDevice: c_uint = 3;
 pub const hipHostMallocDefault: c_uint = 0;
 pub const hipHostMallocPortable: c_uint = 1;
 pub const hipHostMallocMapped: c_uint = 2;
+/// Forces fine-grained coherent allocation (CPU writes immediately visible
+/// to GPU and vice versa, bypassing GPU L2 caching). Used to test the
+/// L2-staleness hypothesis for the multi-GPU worker-poll wedge (kb
+/// phase-5-prime-zuk-q9z-2026-05-12): default `Mapped` may be MTYPE_NC
+/// on the worker side under some ROCm/firmware configurations, in which
+/// case the worker's volatile poll of `queue->seq_num` reads a stale
+/// L2-cached line indefinitely.
+pub const hipHostMallocCoherent: c_uint = 0x40000000;
 
 unsafe extern "C" {
     // Device management
