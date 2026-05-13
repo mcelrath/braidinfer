@@ -40,7 +40,8 @@ struct WedgeReproQueue {
     volatile uint32_t block_alive_count;
     volatile uint32_t shutdown;
     volatile uint32_t completed_dispatches;
-    uint32_t _pad[2];
+    volatile uint32_t watchdog_alive;  // V5-only signal
+    uint32_t _pad;
 };
 static_assert(sizeof(WedgeReproQueue) == 32, "WedgeReproQueue layout drift");
 
@@ -54,6 +55,7 @@ static const char* variant_name(int v) {
         case 2: return "V2";
         case 3: return "V3";
         case 4: return "V4";
+        case 5: return "V5";
         default: return "Vunknown";
     }
 }
@@ -64,6 +66,7 @@ static int parse_variant(const char* s) {
     if (strcmp(s, "V2") == 0) return 2;
     if (strcmp(s, "V3") == 0) return 3;
     if (strcmp(s, "V4") == 0) return 4;
+    if (strcmp(s, "V5") == 0) return 5;
     return -1;
 }
 
@@ -124,9 +127,9 @@ int main(int argc, char** argv) {
             n_trials = atoi(argv[++i]);
         }
     }
-    if (variant < 0 || variant > 4 || n_gpus < 1) {
+    if (variant < 0 || variant > 5 || n_gpus < 1) {
         fprintf(stderr,
-                "usage: %s --variant V0|V1|V2|V3|V4 --n-gpus N [--n-trials 1]\n",
+                "usage: %s --variant V0|V1|V2|V3|V4|V5 --n-gpus N [--n-trials 1]\n",
                 argv[0]);
         return 1;
     }
