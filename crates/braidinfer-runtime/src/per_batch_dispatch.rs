@@ -328,6 +328,7 @@ impl BatchDispatcher for PerBatchDispatch {
                     seq,
                     ack: 0,
                     progress_pc: 0,
+                    block_alive_count: 0,
                 })?;
         }
         Ok(())

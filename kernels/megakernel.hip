@@ -116,6 +116,14 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     volatile WorkerQueue* queue,
     WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable
 ) {
+    // Phase 0b wedge diagnostic 2026-05-13 (#5 disambiguation): every block's
+    // thread 0 increments block_alive_count at kernel entry, BEFORE any
+    // barrier or poll. DispatchError::Timeout reads this on the host side:
+    //   count <  num_blocks  => cooperative grid never fully scheduled
+    //   count == num_blocks  => all blocks running; wedge is downstream
+    if (threadIdx.x == 0) {
+        atomicAdd((unsigned int*)&queue->block_alive_count, 1u);
+    }
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         printf("persistent_worker: started, queue=%p\n", (void*)queue);
     }
@@ -126,7 +134,25 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     uint32_t last_seq = 0;
     uint32_t watchdog_beat_ctr = 0;
 
+    // Phase 0b wedge diagnostic 2026-05-13: sentinel values written to
+    // progress_pc at distinguishing code points (>= 0x10000000 so they
+    // never collide with valid pc values 0..255). Lets the host's
+    // DispatchError::Timeout message pinpoint the wedge site:
+    //   0                  -> block 0 thread 0 never wrote (extreme #5 / kernel didn't run)
+    //   0x10000001 OUTER   -> entered outer while(true), wedged before poll
+    //   0x10000002 IN_POLL -> wedged inside inner spin, never saw seq>last_seq
+    //   0x10000003 POST_POLL -> saw seq, exited poll, wedged before barrier
+    //   0x10000004 POST_BAR -> barrier completed, wedged before instruction loop
+    //   0x10000005 PRE_LOOP -> about to read first instruction
+    //   0..255 (pc value)  -> wedged downstream during dispatch_opcode
+    //
+    // Writes use host_uc_store_agent (AGENT scope) — same pattern as ack /
+    // progress_pc writes elsewhere; avoids the SYSTEM-scope vscnt emit that
+    // is §11.4-hazardous before atomic_block_barrier.
+
     while (true) {
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000001u);
         // Mark idle BEFORE entering the inner poll loop. Distinguishes idle
         // wait (no batch yet) from hang for the host watchdog.
         if (watchdog) watchdog_signal_exited(watchdog);
@@ -140,6 +166,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         // PCIe). The barrier's RELEASE+ACQUIRE fence pair makes the
         // pre-barrier store visible to all blocks post-barrier.
         if (threadIdx.x == 0 && blockIdx.x == 0) {
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000002u);
             while (true) {
                 if (queue->shutdown) {
                     g_shutdown_seen = 1u;
@@ -149,8 +176,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
                 if (s > last_seq) break;
                 __builtin_amdgcn_s_sleep(1);
             }
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000003u);
         }
         braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000004u);
         // Clear `exited` — kernel is now actively processing a batch.
         if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
@@ -207,6 +237,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         int dump_capacity = (int)queue->dump_capacity;
         int* dump_count = (int*)queue->dump_count;
         uint64_t* op_profile = (uint64_t*)queue->op_profile;
+
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000005u);
 
         // Process batch of instructions; dispatch helper handles opcode routing,
         // post-op barrier, and trace dump.

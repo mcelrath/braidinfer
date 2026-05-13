@@ -23,7 +23,11 @@ struct WorkerQueue {
     volatile uint32_t seq_num;      // monotonic counter, triggers worker
     volatile uint32_t shutdown;     // 1 = exit
     uint32_t num_instructions;      // instructions in this batch (1..MAX_BATCH_INSTRUCTIONS)
-    uint32_t _pad;
+    // Diagnostic: each block's thread 0 atomicAdds 1 at kernel entry. Lets the
+    // host tell whether the cooperative grid is fully scheduled (count == num_blocks)
+    // or only some blocks made it onto the GPU (count < num_blocks). braidinfer-pky.2
+    // Phase 0b wedge diagnostic 2026-05-13.
+    volatile uint32_t block_alive_count;
     uint64_t inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]; // instruction batch
     volatile uint32_t ack;          // worker writes seq_num when done
     volatile uint32_t done;         // kernel writes 1 when exiting (for Drop polling)

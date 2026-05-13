@@ -189,6 +189,11 @@ pub enum DispatchError {
         seq: u32,
         ack: u32,
         progress_pc: u32,
+        /// Phase 0b wedge diagnostic 2026-05-13: count of blocks that
+        /// reached the kernel's first instruction (atomicAdd at entry).
+        /// Compare to launched num_blocks: smaller = cooperative grid
+        /// never fully scheduled (#5 hypothesis); equal = wedge downstream.
+        block_alive_count: u32,
     },
 }
 
@@ -204,9 +209,10 @@ impl std::fmt::Display for DispatchError {
                 seq,
                 ack,
                 progress_pc,
+                block_alive_count,
             } => write!(
                 f,
-                "dispatch timeout gpu={gpu} seq={seq} ack={ack} progress_pc={progress_pc}"
+                "dispatch timeout gpu={gpu} seq={seq} ack={ack} progress_pc={progress_pc:#010x} block_alive_count={block_alive_count}"
             ),
         }
     }
@@ -252,7 +258,11 @@ pub struct WorkerQueueLayout {
     pub seq_num: u32,
     pub shutdown: u32,
     pub num_instructions: u32, // how many instructions in this batch (1..MAX_BATCH)
-    pub _pad: u32,
+    /// Diagnostic counter: each block's thread 0 atomicAdds 1 at kernel
+    /// entry. Tells the host whether the cooperative grid is fully
+    /// scheduled (count == num_blocks) or only some blocks landed
+    /// (count < num_blocks). Read in DispatchError::Timeout message.
+    pub block_alive_count: u32,
     pub inst: [u64; MAX_BATCH_INSTRUCTIONS * INST_SIZE], // instruction batch buffer
     pub ack: u32,
     pub done: u32, // kernel writes 1 when exiting after shutdown (for Drop polling)
@@ -489,11 +499,15 @@ impl PersistentDispatch {
                 let progress_pc = unsafe {
                     std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).progress_pc))
                 };
+                let block_alive_count = unsafe {
+                    std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).block_alive_count))
+                };
                 return Err(DispatchError::Timeout {
                     gpu: gpu_idx,
                     seq,
                     ack,
                     progress_pc,
+                    block_alive_count,
                 });
             }
             std::hint::spin_loop();
@@ -570,11 +584,15 @@ impl PersistentDispatch {
                         let progress_pc = unsafe {
                             std::ptr::read_volatile(std::ptr::addr_of!((*q_ptrs[i]).progress_pc))
                         };
+                        let block_alive_count = unsafe {
+                            std::ptr::read_volatile(std::ptr::addr_of!((*q_ptrs[i]).block_alive_count))
+                        };
                         return Err(DispatchError::Timeout {
                             gpu,
                             seq,
                             ack,
                             progress_pc,
+                            block_alive_count,
                         });
                     }
                 }
