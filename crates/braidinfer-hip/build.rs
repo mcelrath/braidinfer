@@ -110,6 +110,24 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_DUMP_POLL_VALUE");
     let dump_poll_value = env::var("BRAIDINFER_DUMP_POLL_VALUE").is_ok();
 
+    // braidinfer-snl Phase 2: dump output_slots state on entry to
+    // OP_MOE_DISPATCH_POST. Used for the multi-GPU MoE non-determinism
+    // investigation. See kernels/megakernel_moe_dispatch.hip.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_DUMP_MOE_POST");
+    let dump_moe_post = env::var("BRAIDINFER_DUMP_MOE_POST").is_ok();
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_MOE_POST_PREDELAY");
+    let moe_post_predelay = env::var("BRAIDINFER_MOE_POST_PREDELAY").ok();
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_MOE_WORKER_DRAIN_VSCNT");
+    let moe_worker_drain_vscnt = env::var("BRAIDINFER_MOE_WORKER_DRAIN_VSCNT").is_ok();
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_ACK_DRAIN_VSCNT");
+    let ack_drain_vscnt = env::var("BRAIDINFER_ACK_DRAIN_VSCNT").is_ok();
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_MOE_WORKER_READBACK_FENCE");
+    let moe_worker_readback_fence = env::var("BRAIDINFER_MOE_WORKER_READBACK_FENCE").is_ok();
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_DUMP_MOE_INPUT");
+    let dump_moe_input = env::var("BRAIDINFER_DUMP_MOE_INPUT").is_ok();
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_MOE_WORKER_FENCE_SYSTEM");
+    let moe_worker_fence_system = env::var("BRAIDINFER_MOE_WORKER_FENCE_SYSTEM").is_ok();
+
     println!("cargo:rerun-if-env-changed=BRAIDINFER_QUEUE_LINE_ISOLATE");
     let queue_line_isolate = env::var("BRAIDINFER_QUEUE_LINE_ISOLATE").is_ok();
     println!("cargo::rustc-check-cfg=cfg(queue_line_isolate)");
@@ -202,6 +220,27 @@ fn main() {
         }
         if dump_poll_value {
             hipcc_args.push("-DBRAIDINFER_DUMP_POLL_VALUE".to_string());
+        }
+        if dump_moe_post {
+            hipcc_args.push("-DBRAIDINFER_DUMP_MOE_POST".to_string());
+        }
+        if let Some(n) = moe_post_predelay.as_ref() {
+            hipcc_args.push(format!("-DBRAIDINFER_MOE_POST_PREDELAY={n}"));
+        }
+        if moe_worker_drain_vscnt {
+            hipcc_args.push("-DBRAIDINFER_MOE_WORKER_DRAIN_VSCNT".to_string());
+        }
+        if ack_drain_vscnt {
+            hipcc_args.push("-DBRAIDINFER_ACK_DRAIN_VSCNT".to_string());
+        }
+        if moe_worker_readback_fence {
+            hipcc_args.push("-DBRAIDINFER_MOE_WORKER_READBACK_FENCE".to_string());
+        }
+        if dump_moe_input {
+            hipcc_args.push("-DBRAIDINFER_DUMP_MOE_INPUT".to_string());
+        }
+        if moe_worker_fence_system {
+            hipcc_args.push("-DBRAIDINFER_MOE_WORKER_FENCE_SYSTEM".to_string());
         }
         if queue_line_isolate {
             hipcc_args.push("-DBRAIDINFER_QUEUE_LINE_ISOLATE".to_string());

@@ -155,7 +155,14 @@ __device__ __attribute__((noinline)) void op_moe_dispatch(const u64* inst, coope
          idx += gridDim.x * blockDim.x) {
         gpu0_output[idx] = gpu0_acc[idx];
     }
+#ifdef BRAIDINFER_MOE_WORKER_FENCE_SYSTEM
+    // braidinfer-snl Option (E): SYSTEM-scope fence after the PRE
+    // final write to output_slots[0..gupd]. Same rationale as worker-
+    // side fence in op_moe_ffn_remote.
+    __threadfence_system();
+#else
     __threadfence();
+#endif
 }
 
 // OP_MOE_DISPATCH_POST (opcode 45): sum output_slots across all GPUs into final_output.
@@ -182,6 +189,31 @@ __device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, 
     int total_gpus = (int)i->num_gpus;
     int gupd = (int)i->gate_up_in_dim;
     if (gupd == 0) gupd = hs;
+
+#ifdef BRAIDINFER_DUMP_MOE_POST
+    // braidinfer-snl Phase 2: dump output_slots state on entry to POST.
+    // Optional BRAIDINFER_MOE_POST_PREDELAY=N s_sleep cycles before
+    // reading — timing-race discriminator.
+    static __device__ uint64_t mp_seq = 0;
+#ifdef BRAIDINFER_MOE_POST_PREDELAY
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        for (int i = 0; i < BRAIDINFER_MOE_POST_PREDELAY; i++)
+            __builtin_amdgcn_s_sleep(127);
+    }
+    __syncthreads();
+#endif
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        uint64_t seq = atomicAdd((unsigned long long*)&mp_seq, 1ull);
+        for (int g = 0; g < total_gpus; g++) {
+            float s0 = output_slots[g * hs + 0];
+            float s1 = output_slots[g * hs + 1];
+            float s2 = output_slots[g * hs + 2];
+            float s3 = output_slots[g * hs + 3];
+            printf("[MOEPOST seq=%llu g=%d gupd=%d hs=%d] %.6e %.6e %.6e %.6e\n",
+                   (unsigned long long)seq, g, gupd, hs, s0, s1, s2, s3);
+        }
+    }
+#endif
 
     // Sum gupd elements per slot, slot stride = hs.
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;

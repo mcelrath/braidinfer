@@ -144,6 +144,24 @@ persistent_iter_poll_barrier(
 template <typename Queue>
 __device__ __forceinline__ void
 persistent_iter_ack(volatile Queue* queue, uint32_t seq) {
+#ifdef BRAIDINFER_ACK_DRAIN_VSCNT
+    // braidinfer-snl Option (D): drain SYSTEM-scope vector store counter
+    // before ack. Ensures any cross-GPU PCIe writes from this iter
+    // (e.g., MoE activation production on GPU 0, or expert output
+    // writes from workers) are visible to OTHER GPUs before the
+    // host sees ack=seq. Without this, multi-GPU MoE shows ~33%
+    // non-determinism (benchmark_results/regression/2026-05-14_post_wedge_fix/
+    // pky2_moe_4gpu_30runs.log).
+    //
+    // §11.4 risk: vscnt drain on a thread that diverges across blocks
+    // (rare) could stall multi-block convergence at the next barrier.
+    // Mitigation: only block 0 thread 0 drains here, and the NEXT
+    // barrier is at the top of the next outer iter (post-poll, many
+    // ops away). Single-thread drain — no cross-block dependency.
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
+    }
+#endif
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         host_uc_store_agent(&queue->ack, seq);
     }
