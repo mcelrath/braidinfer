@@ -95,6 +95,17 @@ struct WedgeReproQueue {
 #define PC_POST_BARRIER 0x10000004u
 #define PC_PRE_ACK     0x10000005u
 
+// pky.2 probe kernel 2026-05-13: minimal non-cooperative kernel that does a
+// tiny atomic touch. Used between cooperative-kernel trials to test whether
+// any GPU work clears the cooperative-kernel priming state. Launched as a
+// plain hipLaunchKernelGGL (NOT hipLaunchCooperativeKernel) with 1 block.
+extern "C" __global__
+void probe_noncoop_kernel(volatile uint32_t* scratch) {
+    if (threadIdx.x == 0) {
+        atomicAdd((unsigned int*)scratch, 1u);
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256, 2)
 void persistent_worker_skeleton(
     volatile WedgeReproQueue* q,

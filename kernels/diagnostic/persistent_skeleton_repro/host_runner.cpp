@@ -22,6 +22,21 @@
 #include <vector>
 #include <string>
 #include <atomic>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <dirent.h>
+#include <linux/types.h>
+
+// pky.2 Design D ioctl (per udi #117) — defined locally to avoid kernel-header
+// dependency at build time. Must match include/uapi/linux/kfd_ioctl.h in the
+// patched kernel.
+struct kfd_ioctl_reset_cooperative_state_args {
+    __u32 gpu_id;
+    __u32 pad;
+};
+#define BRAIDINFER_AMDKFD_IOC_RESET_COOP \
+    _IOWR('K', 0x28, struct kfd_ioctl_reset_cooperative_state_args)
 
 #define CHECK(call)                                                          \
     do {                                                                     \
@@ -45,6 +60,8 @@ struct WedgeReproQueue {
     volatile uint32_t* peer_uc_target; // V7-only: GPU 0 UC slot for this worker
 };
 static_assert(sizeof(WedgeReproQueue) == 40, "WedgeReproQueue layout drift");
+
+extern "C" __global__ void probe_noncoop_kernel(volatile uint32_t* scratch);
 
 extern "C" __global__ void persistent_worker_skeleton(
     volatile WedgeReproQueue* q, int variant);
@@ -247,7 +264,53 @@ int main(int argc, char** argv) {
 
     int wedge_count = 0;
     int complete_count = 0;
+    // pky.2 2026-05-14: BRAIDINFER_PERSISTENT_KERNEL=1 keeps ONE persistent
+    // worker alive across all trials — each trial increments seq, worker
+    // dispatches without exit/relaunch. Tests whether wedge fires within
+    // a single kernel lifecycle or only on cooperative-grid RELAUNCH.
+    bool persistent_mode = std::getenv("BRAIDINFER_PERSISTENT_KERNEL") != nullptr;
+
+    // In persistent mode, queue alloc + kernel launch happens ONCE outside loop.
+    if (persistent_mode) {
+        for (int g = 0; g < n_gpus; g++) {
+            memset(gpus[g].host_ptr, 0, sizeof(WedgeReproQueue));
+            if (variant == 7 && uc_target_base != nullptr) {
+                gpus[g].host_ptr->peer_uc_target = uc_target_base + g;
+            }
+        }
+        for (int g = 0; g < n_gpus; g++) {
+            CHECK(hipSetDevice(g));
+            void* dev_ptr = gpus[g].dev_ptr;
+            int v = variant;
+            void* args[2] = {&dev_ptr, &v};
+            dim3 grid(gpus[g].num_blocks, 1, 1);
+            dim3 block(256, 1, 1);
+            CHECK(hipLaunchCooperativeKernel(
+                (const void*)persistent_worker_skeleton,
+                grid, block, args, 0, gpus[g].stream));
+        }
+        // Wait for all blocks to come alive.
+        auto pstart = std::chrono::steady_clock::now();
+        bool all_alive = false;
+        while (!all_alive) {
+            all_alive = true;
+            for (int g = 0; g < n_gpus; g++) {
+                if (gpus[g].host_ptr->block_alive_count < gpus[g].num_blocks) {
+                    all_alive = false; break;
+                }
+            }
+            if (all_alive) break;
+            if (std::chrono::steady_clock::now() - pstart > std::chrono::seconds(5)) {
+                fprintf(stderr, "persistent mode: blocks didn't come alive\n");
+                return 1;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        fprintf(stderr, "persistent mode: ONE cooperative kernel launched, all blocks alive\n");
+    }
+
     for (int trial = 1; trial <= n_trials; trial++) {
+      if (!persistent_mode) {
         // Reset queues. memset clobbers peer_uc_target; re-stamp for V7.
         for (int g = 0; g < n_gpus; g++) {
             memset(gpus[g].host_ptr, 0, sizeof(WedgeReproQueue));
@@ -268,7 +331,9 @@ int main(int argc, char** argv) {
                 (const void*)persistent_worker_skeleton,
                 grid, block, args, 0, gpus[g].stream));
         }
+      }
 
+      if (!persistent_mode) {
         // Wait until all blocks of each kernel have called atomicAdd on
         // block_alive_count. Bounded wait: 5 seconds. Lets us distinguish
         // "kernel hadn't started yet when we wrote seq" from "kernel started,
@@ -294,14 +359,39 @@ int main(int argc, char** argv) {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
+      }
+        // In persistent_mode, expected_ack tracks the seq we're firing
+        // (1, 2, 3, ...). In non-persistent, it's always 1.
+        uint32_t fire_seq = persistent_mode ? (uint32_t)trial : 1u;
 
-        // Fire seq=1 to each worker simultaneously.
+        // pky.2 probe 2026-05-13: BRAIDINFER_SKIP_DISPATCH_TRIALS=K means the
+        // first K trials skip the seq=1 write entirely — kernel launches,
+        // sees shutdown=1 right away, exits cleanly via skeleton's shutdown
+        // path. Tests whether the wedge priming requires a completed dispatch
+        // or just the cooperative-kernel launch+exit cycle.
+        int skip_dispatch_trials = 0;
+        if (const char* env = std::getenv("BRAIDINFER_SKIP_DISPATCH_TRIALS")) {
+            skip_dispatch_trials = atoi(env);
+        }
+        bool skip_this_trial = (trial <= skip_dispatch_trials);
+
         auto dispatch_t0 = std::chrono::steady_clock::now();
-        for (int g = 0; g < n_gpus; g++) {
-            // Plain volatile store via host pointer. Same pattern as
-            // crates/braidinfer-runtime/src/persistent_dispatch.rs
-            // dispatch_batch_fire (write_volatile).
-            __atomic_store_n(&gpus[g].host_ptr->seq_num, 1u, __ATOMIC_RELEASE);
+        if (skip_this_trial) {
+            // No seq=1; just shutdown=1 so kernel exits cleanly via the
+            // shutdown path (no dispatch completion in this trial).
+            for (int g = 0; g < n_gpus; g++) {
+                __atomic_store_n(&gpus[g].host_ptr->shutdown, 1u,
+                                 __ATOMIC_RELEASE);
+            }
+        } else {
+            // Fire seq=fire_seq to each worker simultaneously.
+            for (int g = 0; g < n_gpus; g++) {
+                // Plain volatile store via host pointer. Same pattern as
+                // crates/braidinfer-runtime/src/persistent_dispatch.rs
+                // dispatch_batch_fire (write_volatile).
+                __atomic_store_n(&gpus[g].host_ptr->seq_num, fire_seq,
+                                 __ATOMIC_RELEASE);
+            }
         }
 
         // Spin-poll each worker's ack with 30s timeout. Match production
@@ -316,7 +406,7 @@ int main(int argc, char** argv) {
             for (int g = 0; g < n_gpus; g++) {
                 if (done[g]) continue;
                 uint32_t a = gpus[g].host_ptr->ack;
-                if (a == 1u) {
+                if (a == fire_seq) {
                     done[g] = true;
                     ack_seen[g] = a;
                 } else {
@@ -370,20 +460,136 @@ int main(int argc, char** argv) {
         fflush(stdout);
         if (wedged || !seq_completed) wedge_count++; else complete_count++;
 
-        // Signal shutdown to all workers so they exit cleanly before next
-        // trial / process exit. Workers see shutdown=1, write ack=0xFFFFFFFF,
-        // return. Then stream sync drains.
-        for (int g = 0; g < n_gpus; g++) {
-            __atomic_store_n(&gpus[g].host_ptr->shutdown, 1u, __ATOMIC_RELEASE);
+        // In persistent_mode, the worker keeps running across trials. Only
+        // send shutdown after the LAST trial. Otherwise we'd kill the
+        // persistent worker after trial 1 and lose the test.
+        bool last_trial = (trial == n_trials);
+        if (!persistent_mode || last_trial) {
+            // Signal shutdown to all workers so they exit cleanly before next
+            // trial / process exit. Workers see shutdown=1, write ack=0xFFFFFFFF,
+            // return. Then stream sync drains.
+            for (int g = 0; g < n_gpus; g++) {
+                __atomic_store_n(&gpus[g].host_ptr->shutdown, 1u, __ATOMIC_RELEASE);
+            }
+            // Best-effort sync. If the kernel is wedged, sync hangs — accept
+            // that for now; the outer wrapper script kills the process on
+            // launch timeout.
+            if (!wedged) {
+                for (int g = 0; g < n_gpus; g++) {
+                    CHECK(hipSetDevice(g));
+                    CHECK(hipStreamSynchronize(gpus[g].stream));
+                }
+            }
         }
-        // Best-effort sync. If the kernel is wedged, sync hangs — accept
-        // that for now; the outer wrapper script kills the process on
-        // launch timeout.
-        if (!wedged) {
+
+        // pky.2 probe 2026-05-13: BRAIDINFER_INTERLEAVE_NONCOOP=1 launches a
+        // small non-cooperative kernel between trials. Tests whether any
+        // non-cooperative-kernel work clears the priming state set by the
+        // prior cooperative-kernel launch+exit cycle.
+        // pky.2 probe 2026-05-13: BRAIDINFER_ROTATE_STREAM=1 destroys and
+        // recreates the HIP stream between trials. If the priming state is
+        // per-HQD (allocated by hipStreamCreate via kfd CREATE_QUEUE ioctl),
+        // a fresh HQD should clear it and trial N+1 should succeed. If
+        // state is per-PASID, rotation won't help. Discriminator probe per
+        // user direction.
+        // pky.2 Design D ioctl call (per udi msg #117): after each trial,
+        // call AMDKFD_IOC_RESET_COOPERATIVE_STATE to ask MES to NOTIFY_TO_
+        // UNMAP_PROCESSES then NOTIFY_WORK_ON_UNMAPPED_QUEUE. Should clear
+        // the per-PASID MES SRAM state at -0x3dc and let the next trial's
+        // cooperative kernel run cleanly.
+        if (std::getenv("BRAIDINFER_RESET_COOP_STATE")) {
+            // Open /dev/kfd directly. KFD allows multiple fds per process;
+            // they share the kfd_process struct keyed on mm_struct so the
+            // ioctl operates on the same process state HIP set up.
+            int kfd_fd = open("/dev/kfd", O_RDWR);
+            if (kfd_fd < 0) {
+                fprintf(stderr, "trial %d: open /dev/kfd FAILED errno=%d\n",
+                        trial, errno);
+            } else {
+                // Iterate KFD topology nodes; for each GPU node, issue ioctl.
+                // The ioctl returns -EINVAL for nodes we have no PDD on, so
+                // we'll just hit-or-miss. For single-GPU test only one will
+                // succeed.
+                int success_count = 0;
+                DIR* d = opendir("/sys/class/kfd/kfd/topology/nodes");
+                if (d) {
+                    struct dirent* e;
+                    while ((e = readdir(d)) != nullptr) {
+                        if (e->d_name[0] == '.') continue;
+                        char path[256];
+                        snprintf(path, sizeof(path),
+                                 "/sys/class/kfd/kfd/topology/nodes/%s/gpu_id",
+                                 e->d_name);
+                        FILE* fp = fopen(path, "r");
+                        if (!fp) continue;
+                        unsigned int gpu_id = 0;
+                        if (fscanf(fp, "%u", &gpu_id) == 1 && gpu_id != 0) {
+                            kfd_ioctl_reset_cooperative_state_args args = {};
+                            args.gpu_id = gpu_id;
+                            args.pad = 0;
+                            int r = ioctl(kfd_fd,
+                                          BRAIDINFER_AMDKFD_IOC_RESET_COOP,
+                                          &args);
+                            fprintf(stderr,
+                                    "trial %d: ioctl RESET_COOP gpu_id=%u rc=%d errno=%d\n",
+                                    trial, gpu_id, r, errno);
+                            if (r == 0) success_count++;
+                        }
+                        fclose(fp);
+                    }
+                    closedir(d);
+                }
+                fprintf(stderr, "trial %d: RESET_COOP fired on %d gpu(s)\n",
+                        trial, success_count);
+                close(kfd_fd);
+            }
+        }
+        if (std::getenv("BRAIDINFER_ROTATE_STREAM")) {
             for (int g = 0; g < n_gpus; g++) {
                 CHECK(hipSetDevice(g));
-                CHECK(hipStreamSynchronize(gpus[g].stream));
+                // Stream destroy waits for outstanding work. Worker should
+                // have exited via shutdown above so this is fast.
+                CHECK(hipStreamDestroy(gpus[g].stream));
             }
+            // pky.2 2026-05-14: BRAIDINFER_ZERO_QUEUE_DELAY_MS lets us validate
+            // udi Design A hypothesis from userspace. Sleep BETWEEN destroy and
+            // recreate, giving MES scheduler tick time to notice "PASID has
+            // zero process-created queues" and (per udi's f000ad50 trace) run
+            // the clear at -0x3dc. If wedge clears: Design A path empirically
+            // validated. If wedges: queue-destroy-without-explicit-clear-packet
+            // path doesn't work; Design C (explicit MES packet) is required.
+            int delay_ms = 0;
+            if (const char* env = std::getenv("BRAIDINFER_ZERO_QUEUE_DELAY_MS")) {
+                delay_ms = atoi(env);
+            }
+            if (delay_ms > 0) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(delay_ms));
+                fprintf(stderr, "trial %d: zero-queue delay %d ms\n",
+                        trial, delay_ms);
+            }
+            for (int g = 0; g < n_gpus; g++) {
+                CHECK(hipSetDevice(g));
+                CHECK(hipStreamCreate(&gpus[g].stream));
+            }
+            fprintf(stderr, "trial %d: rotated stream (delay=%dms)\n",
+                    trial, delay_ms);
+        }
+        if (std::getenv("BRAIDINFER_INTERLEAVE_NONCOOP")) {
+            for (int g = 0; g < n_gpus; g++) {
+                CHECK(hipSetDevice(g));
+                uint32_t* scratch = nullptr;
+                CHECK(hipMalloc(&scratch, sizeof(uint32_t)));
+                CHECK(hipMemsetAsync(scratch, 0, sizeof(uint32_t),
+                                     gpus[g].stream));
+                hipLaunchKernelGGL(probe_noncoop_kernel,
+                                   dim3(1, 1, 1), dim3(64, 1, 1),
+                                   0, gpus[g].stream, scratch);
+                CHECK(hipStreamSynchronize(gpus[g].stream));
+                CHECK(hipFree(scratch));
+            }
+            fprintf(stderr, "trial %d: interleaved non-coop probe kernel done\n",
+                    trial);
         }
     }
 
