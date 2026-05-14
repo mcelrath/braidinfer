@@ -110,14 +110,11 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
         }
         braidinfer::rdna3::atomic_block_barrier(&g_gbs);
 
-        // Phase 2' deferred-ack: write ack for the PREVIOUS batch AFTER
-        // the barrier so no vscnt stall precedes this barrier. AGENT scope:
-        // UC memory reaches host DRAM via PCIe regardless of scope; SYSTEM
-        // scope would emit vscnt before the watchdog/dispatch barrier that
-        // follows. last_seq == 0 on first iteration; writing ack=0 is no-op.
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            braidinfer::rdna3::host_uc_store_agent(&queue->ack, last_seq);
-        }
+        // Phase 2' deferred-ack pattern REMOVED 2026-05-14 — same
+        // protocol deadlock as megakernel.hip persistent_worker (ack=N
+        // never reached host because iter N+1 inner-poll blocked on
+        // seq=N+1 which host wouldn't send before observing ack=N).
+        // Ack write now at END of this iter (see below). See GFX1100_ARCH §11.15.
 
         // Shutdown: sentinel + done written POST-barrier (4fg.5 pattern).
         // No barrier follows these writes so no vscnt stall.
@@ -204,8 +201,13 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
 
-        // Phase 2': queue->ack is written at the TOP of the next outer-loop
-        // iteration AFTER the barrier (not here). See deferred-ack comment above.
+        // Immediate ack=seq write. AGENT scope avoids §11.4 SYSTEM-scope
+        // vscnt hazard with the next iter's barrier while breaking the
+        // Phase 2' deferred-ack deadlock. See GFX1100_ARCH §11.15.
+        __threadfence();
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            braidinfer::rdna3::host_uc_store_agent(&queue->ack, seq);
+        }
         last_seq = seq;
     }
 }

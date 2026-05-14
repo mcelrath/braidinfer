@@ -21,30 +21,33 @@ from pathlib import Path
 
 KERNELS = Path(__file__).parent.parent / "kernels"
 
-# Files declaring a persistent_worker-style entry: __global__ taking
-# volatile WorkerQueue*.
+# Files declaring a persistent-worker-style entry: __global__ taking
+# any volatile *Queue* pointer (WorkerQueue, MoeWorkerQueue, future variants).
 SYMBOL_PAT = re.compile(
-    r'__global__\s+[^{]*\b\w+\s*\(\s*volatile\s+WorkerQueue\s*\*',
+    r'__global__\s+[^{]*\b\w+\s*\(\s*volatile\s+\w*Queue\s*\*',
     re.MULTILINE,
 )
 
-# Acceptable ack-write patterns:
-#   1. canonical helper call
-#   2. immediate ack=seq write (per-iter, with seq sourced from queue->seq_num)
+# Acceptable ack-write patterns. Matches any local queue pointer name.
 ACCEPT_PATTERNS = [
     re.compile(r'persistent_iter_ack\s*\('),
-    re.compile(r'host_uc_store_agent\s*\(\s*[^)]*\bqueue\s*->\s*ack\s*,\s*seq\b'),
-    re.compile(r'\bqueue\s*->\s*ack\s*=\s*seq\b'),
+    re.compile(r'host_uc_store_agent\s*\(\s*[^)]*\b\w+\s*->\s*ack\s*,\s*seq\b'),
+    re.compile(r'\b\w+\s*->\s*ack\s*=\s*seq\b'),
 ]
 
-# Forbidden patterns (the deferred-ack deadlock):
+# Forbidden patterns (the deferred-ack deadlock).
 FORBID_PATTERNS = [
-    re.compile(r'host_uc_store_agent\s*\(\s*[^)]*\bqueue\s*->\s*ack\s*,\s*last_seq\b'),
-    re.compile(r'\bqueue\s*->\s*ack\s*=\s*last_seq\b'),
+    re.compile(r'host_uc_store_agent\s*\(\s*[^)]*\b\w+\s*->\s*ack\s*,\s*last_seq\b'),
+    re.compile(r'\b\w+\s*->\s*ack\s*=\s*last_seq\b'),
 ]
+
+# Exclude diagnostic-only worker fixtures (not production hot path).
+EXCLUDE_DIRS = {"diagnostic"}
 
 failures = []
-for hip in sorted(KERNELS.glob("*.hip")):
+hip_files = [p for p in KERNELS.rglob("*.hip")
+             if not any(part in EXCLUDE_DIRS for part in p.relative_to(KERNELS).parts)]
+for hip in sorted(hip_files):
     text = hip.read_text(errors="replace")
     if not SYMBOL_PAT.search(text):
         continue
