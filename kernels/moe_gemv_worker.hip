@@ -11,6 +11,7 @@
 #include "rdna3/rdna3_persistent.h"
 #include "rdna3_reduce.h"
 #include "rdna3/rdna3_barrier.h"
+#include "rdna3/rdna3_persistent_protocol.h"
 
 // Per-TU GridBarrierState: zero-init __device__ static, cache-coherent VRAM.
 __device__ static braidinfer::rdna3::GridBarrierState g_gbs;
@@ -90,41 +91,16 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
     uint32_t watchdog_beat_ctr = 0;
 
     while (true) {
-        // grid.sync() at TOP — all blocks converge here before block 0 polls.
-        // Same pattern as persistent_worker.hip. This ensures inner grid.sync()
-        // calls in the OP_EXPERT_FFN phases are safe.
-        //
-        // Phase 2' fix: NO UC writes inside the poll loop or before this
-        // barrier. queue->seq_num=sentinel deferred to after the barrier
-        // (same 4fg.5 pattern as megakernel.hip). Shutdown communicated via
-        // g_mgw_shutdown_seen (__device__ global, AGENT-scope VRAM, no PCIe).
-        // The barrier's RELEASE+ACQUIRE fence pair makes it visible to all
-        // blocks after the barrier returns.
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            while (true) {
-                if (queue->shutdown) { g_mgw_shutdown_seen = 1u; break; }
-                uint32_t s = queue->seq_num;
-                if (s > last_seq) break;
-                __builtin_amdgcn_s_sleep(1);
-            }
-        }
-        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
-
-        // Phase 2' deferred-ack pattern REMOVED 2026-05-14 — same
-        // protocol deadlock as megakernel.hip persistent_worker (ack=N
-        // never reached host because iter N+1 inner-poll blocked on
-        // seq=N+1 which host wouldn't send before observing ack=N).
-        // Ack write now at END of this iter (see below). See GFX1100_ARCH §11.15.
-
-        // Shutdown: sentinel + done written POST-barrier (4fg.5 pattern).
-        // No barrier follows these writes so no vscnt stall.
-        // All blocks read g_mgw_shutdown_seen (set pre-barrier, visible post-
-        // barrier via the fence pair), so all blocks return together.
-        if (g_mgw_shutdown_seen) {
-            if (threadIdx.x == 0 && blockIdx.x == 0) {
-                queue->seq_num = 0xFFFFFFFFu;
-                queue->done = 1;
-            }
+        // Canonical poll/barrier (rdna3_persistent_protocol.h). MoeWorkerQueue
+        // uses debug_stage as the diagnostic progress field. Shutdown
+        // propagation uses g_mgw_shutdown_seen (__device__ global). Helper
+        // owns the inner-poll loop, atomic_block_barrier, and ack-write
+        // contract; this kernel only supplies the dispatch loop body.
+        uint32_t seq, num_inst;
+        if (braidinfer::rdna3::persistent_iter_poll_barrier(
+                queue, &queue->debug_stage, &g_gbs, last_seq,
+                &g_mgw_shutdown_seen, &seq, &num_inst)
+                == braidinfer::rdna3::kPersistentShutdown) {
             return;
         }
 
@@ -134,15 +110,6 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
             return;
         }
         if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
-
-        uint32_t seq = queue->seq_num;
-        if (seq == 0xFFFFFFFFu) {
-            if (threadIdx.x == 0 && blockIdx.x == 0) queue->done = 1;
-            return;
-        }
-
-        uint32_t num_inst = queue->num_instructions;
-        if (num_inst == 0) num_inst = 1;
 
         __shared__ u64 sinst[INST_SIZE_WORDS];
         for (uint32_t pc = 0; pc < num_inst; pc++) {
@@ -201,13 +168,9 @@ extern "C" __global__ __launch_bounds__(256) void moe_gemv_worker(
             braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         }
 
-        // Immediate ack=seq write. AGENT scope avoids §11.4 SYSTEM-scope
-        // vscnt hazard with the next iter's barrier while breaking the
-        // Phase 2' deferred-ack deadlock. See GFX1100_ARCH §11.15.
+        // Canonical ack write (AGENT scope inside helper).
         __threadfence();
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            braidinfer::rdna3::host_uc_store_agent(&queue->ack, seq);
-        }
+        braidinfer::rdna3::persistent_iter_ack(queue, seq);
         last_seq = seq;
     }
 }

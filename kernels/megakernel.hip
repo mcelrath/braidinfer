@@ -161,7 +161,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         // synchronized. See kernels/rdna3/rdna3_persistent_protocol.h.
         uint32_t seq, num_inst;
         if (braidinfer::rdna3::persistent_iter_poll_barrier(
-                queue, &g_gbs, last_seq, &g_shutdown_seen, &seq, &num_inst)
+                queue, &queue->progress_pc, &g_gbs, last_seq,
+                &g_shutdown_seen, &seq, &num_inst)
                 == braidinfer::rdna3::kPersistentShutdown) {
             return;
         }

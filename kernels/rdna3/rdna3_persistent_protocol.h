@@ -73,9 +73,20 @@ enum PersistentIterResult : uint32_t {
 // `shutdown_seen_flag` is a pointer to a __device__ static uint32_t in
 // the calling TU; it is set by block 0 thread 0 when host shutdown is
 // observed, and all blocks read it post-barrier.
+// Queue type must expose, at compatible offsets:
+//   volatile uint32_t seq_num         // host triggers
+//   volatile uint32_t shutdown        // host requests exit
+//   uint32_t num_instructions         // batch size
+//   volatile uint32_t ack             // worker publishes
+//   volatile uint32_t done            // worker writes 1 on exit
+// progress_pc_field is a host-readable diagnostic field, may be nullptr.
+// For WorkerQueue use &queue->progress_pc; for MoeWorkerQueue use
+// &queue->debug_stage; for queues without one, pass nullptr.
+template <typename Queue>
 __device__ __forceinline__ PersistentIterResult
 persistent_iter_poll_barrier(
-    volatile WorkerQueue* queue,
+    volatile Queue* queue,
+    volatile uint32_t* progress_pc_field,
     GridBarrierState* gbs,
     uint32_t last_seq,
     uint32_t* shutdown_seen_flag,
@@ -83,8 +94,10 @@ persistent_iter_poll_barrier(
     uint32_t* num_inst_out
 ) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        host_uc_store_agent(&queue->progress_pc, BRAIDINFER_PC_OUTER);
-        host_uc_store_agent(&queue->progress_pc, BRAIDINFER_PC_IN_POLL);
+        if (progress_pc_field) {
+            host_uc_store_agent(progress_pc_field, BRAIDINFER_PC_OUTER);
+            host_uc_store_agent(progress_pc_field, BRAIDINFER_PC_IN_POLL);
+        }
         while (true) {
             // L0/L1 invalidation is documented silently no-op on gfx11+ in
             // cooperative-kernel polling context (kb gl-inv-noop-gfx11) but
@@ -98,11 +111,12 @@ persistent_iter_poll_barrier(
             if (s > last_seq) break;
             __builtin_amdgcn_s_sleep(1);
         }
-        host_uc_store_agent(&queue->progress_pc, BRAIDINFER_PC_POST_POLL);
+        if (progress_pc_field)
+            host_uc_store_agent(progress_pc_field, BRAIDINFER_PC_POST_POLL);
     }
     atomic_block_barrier(gbs);
-    if (threadIdx.x == 0 && blockIdx.x == 0)
-        host_uc_store_agent(&queue->progress_pc, BRAIDINFER_PC_POST_BARRIER);
+    if (threadIdx.x == 0 && blockIdx.x == 0 && progress_pc_field)
+        host_uc_store_agent(progress_pc_field, BRAIDINFER_PC_POST_BARRIER);
 
     if (*shutdown_seen_flag) {
         if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -119,16 +133,17 @@ persistent_iter_poll_barrier(
     if (num_inst == 0) num_inst = 1;  // backward compat
     *seq_out = seq;
     *num_inst_out = num_inst;
-    if (threadIdx.x == 0 && blockIdx.x == 0)
-        host_uc_store_agent(&queue->progress_pc, BRAIDINFER_PC_PRE_DISPATCH);
+    if (threadIdx.x == 0 && blockIdx.x == 0 && progress_pc_field)
+        host_uc_store_agent(progress_pc_field, BRAIDINFER_PC_PRE_DISPATCH);
     return kPersistentContinue;
 }
 
 // Canonical ack write. Call AFTER the dispatch_opcode loop completes and
 // AFTER a __threadfence(). AGENT scope is mandatory — SYSTEM-scope wedges
 // across the next iter's barrier under multi-GPU PCIe pressure.
+template <typename Queue>
 __device__ __forceinline__ void
-persistent_iter_ack(volatile WorkerQueue* queue, uint32_t seq) {
+persistent_iter_ack(volatile Queue* queue, uint32_t seq) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         host_uc_store_agent(&queue->ack, seq);
     }
