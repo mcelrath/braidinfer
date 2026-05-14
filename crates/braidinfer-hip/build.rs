@@ -77,6 +77,46 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_BARRIER_V4");
     let barrier_v4 = env::var("BRAIDINFER_BARRIER_V4").is_ok();
 
+    // pky.2 L2-bypass probe (2026-05-13): replace the worker inner-poll C-level
+    // volatile load (queue->shutdown / queue->seq_num) with hand-coded
+    // `global_load_b32 ... glc dlc` that bypasses BOTH L1 and L2 on RDNA3.
+    // Tests whether L2 staleness on the host-mapped queue line is the wedge
+    // mechanism that 963cd76 couldn't probe (no buffer_gl2_inv ISA).
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_POLL_LOAD_L2_BYPASS");
+    let poll_load_l2_bypass = env::var("BRAIDINFER_POLL_LOAD_L2_BYPASS").is_ok();
+
+    // pky.2 A1 probe (2026-05-13): replace inner-poll volatile load with
+    // `global_atomic_or` with 0 — engages atomic-coherence FSM (separate
+    // hardware path from regular load FSM on RDNA3).
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_POLL_ATOMIC_LOAD");
+    let poll_atomic_load = env::var("BRAIDINFER_POLL_ATOMIC_LOAD").is_ok();
+
+    // pky.2 A2 probe (2026-05-13): cache-line isolate seq_num in WorkerQueue.
+    // Emits BOTH a hipcc define (for the C struct layout in worker_queue.h)
+    // AND a cargo cfg flag (for the Rust mirror struct in persistent_dispatch.rs).
+    // pky.2 A5 probe (2026-05-13): poll-load via global_load_b128 (16-byte fetch).
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_POLL_LOAD_WIDE");
+    let poll_load_wide = env::var("BRAIDINFER_POLL_LOAD_WIDE").is_ok();
+
+    // pky.2 A6 probe (2026-05-13): inject ~256 cycles of vector compute between
+    // polls. Tests tight-cadence hypothesis.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_POLL_INJECT_COMPUTE");
+    let poll_inject_compute = env::var("BRAIDINFER_POLL_INJECT_COMPUTE").is_ok();
+
+    // udi #161: at the poll site, store back the observed seq_num value into
+    // progress_pc as 0xDEAD<low16> so the host can disambiguate "GPU reads
+    // 0 forever" (coherence) vs "GPU reads fresh value but doesn't break"
+    // (compiler/branch/SP) on wedge timeout.
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_DUMP_POLL_VALUE");
+    let dump_poll_value = env::var("BRAIDINFER_DUMP_POLL_VALUE").is_ok();
+
+    println!("cargo:rerun-if-env-changed=BRAIDINFER_QUEUE_LINE_ISOLATE");
+    let queue_line_isolate = env::var("BRAIDINFER_QUEUE_LINE_ISOLATE").is_ok();
+    println!("cargo::rustc-check-cfg=cfg(queue_line_isolate)");
+    if queue_line_isolate {
+        println!("cargo:rustc-cfg=queue_line_isolate");
+    }
+
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading
     let kernels = [
         "rmsnorm",
@@ -147,6 +187,24 @@ fn main() {
         }
         if barrier_v4 {
             hipcc_args.push("-DBRAIDINFER_BARRIER_V4".to_string());
+        }
+        if poll_load_l2_bypass {
+            hipcc_args.push("-DBRAIDINFER_POLL_LOAD_L2_BYPASS".to_string());
+        }
+        if poll_atomic_load {
+            hipcc_args.push("-DBRAIDINFER_POLL_ATOMIC_LOAD".to_string());
+        }
+        if poll_load_wide {
+            hipcc_args.push("-DBRAIDINFER_POLL_LOAD_WIDE".to_string());
+        }
+        if poll_inject_compute {
+            hipcc_args.push("-DBRAIDINFER_POLL_INJECT_COMPUTE".to_string());
+        }
+        if dump_poll_value {
+            hipcc_args.push("-DBRAIDINFER_DUMP_POLL_VALUE".to_string());
+        }
+        if queue_line_isolate {
+            hipcc_args.push("-DBRAIDINFER_QUEUE_LINE_ISOLATE".to_string());
         }
         hipcc_args.push("-o".to_string());
 

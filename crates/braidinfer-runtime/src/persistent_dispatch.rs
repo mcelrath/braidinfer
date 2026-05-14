@@ -256,6 +256,12 @@ pub(crate) trait BatchDispatcher {
 #[repr(C)]
 pub struct WorkerQueueLayout {
     pub seq_num: u32,
+    // pky.2 A2 probe 2026-05-13: padding to align seq_num to its own 64-byte
+    // cache line under BRAIDINFER_QUEUE_LINE_ISOLATE. Must match the C-side
+    // #ifdef gate in kernels/worker_queue.h. When the gate is off, this is
+    // a zero-sized array (no-op).
+    #[cfg(queue_line_isolate)]
+    pub _seq_line_pad: [u32; 15],
     pub shutdown: u32,
     pub num_instructions: u32, // how many instructions in this batch (1..MAX_BATCH)
     /// Diagnostic counter: each block's thread 0 atomicAdds 1 at kernel
@@ -286,10 +292,19 @@ pub struct WorkerQueueLayout {
 // Static check that WorkerQueueLayout matches the C struct size.
 // 4*4 (head) + MAX_BATCH_INSTRUCTIONS*INST_SIZE*8 (inst) + 4*4 (tail) + 8 (op_profile)
 //   + 8 (dump_base) + 4 (dump_capacity) + 8 (dump_count) + 4 (_pad3) = +24
+// pky.2 A2: + 60 bytes seq-line padding when BRAIDINFER_QUEUE_LINE_ISOLATE.
+#[cfg(not(queue_line_isolate))]
 const _: () = assert!(
     std::mem::size_of::<WorkerQueueLayout>()
         == 16 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8 + 24,
     "WorkerQueueLayout size mismatch — verify C struct in kernels/worker_queue.h matches"
+);
+#[cfg(queue_line_isolate)]
+const _: () = assert!(
+    // 16 (head) + 60 (seq_line_pad) + 4 (implicit u64-alignment) + INST + 16 + 8 + 24
+    std::mem::size_of::<WorkerQueueLayout>()
+        == 16 + 60 + 4 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8 + 24,
+    "WorkerQueueLayout size mismatch (queue_line_isolate variant)"
 );
 
 /// Per-GPU worker state.
@@ -407,7 +422,17 @@ impl PersistentDispatch {
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         Device::set_current(device)?;
-        let queue = MappedHostBuffer::<u8>::alloc(queue_size)?;
+        // pky.2 IOMMU/GART probe: BRAIDINFER_QUEUE_HOSTREGISTER_HUGETLB=1
+        // routes the WorkerQueue alloc through mmap(MAP_HUGETLB)+hipHostRegister
+        // instead of hipHostMalloc. Different kernel-driver pin path. If the
+        // §11.4 wedge mechanism is IOMMU/GART state specific to hipHostMalloc's
+        // path, this should sidestep it; otherwise wedge persists with same
+        // fingerprint and we narrow further.
+        let queue = if std::env::var("BRAIDINFER_QUEUE_HOSTREGISTER_HUGETLB").is_ok() {
+            MappedHostBuffer::<u8>::alloc_hostregister_hugetlb(queue_size)?
+        } else {
+            MappedHostBuffer::<u8>::alloc(queue_size)?
+        };
         // Write the op_profile counter pointer into the queue BEFORE launch.
         // Per-instance pointer (set_op_profile_ptr) takes priority; falls
         // back to the process-global (op_profile::install_global) if unset.
@@ -446,7 +471,13 @@ impl PersistentDispatch {
             .map(|v| v.clamp(1, bpsm_max as u32) as usize)
             .unwrap_or(bpsm_max as usize);
         let num_cus = multiprocessor_count(device)?;
-        let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
+        // pky.2 probe 2026-05-13: BRAIDINFER_PERSISTENT_BLOCKS=N override
+        // for testing "wedge requires all-CUs cooperative-kernel residency"
+        // hypothesis. Default (no env var) preserves bpsm * num_cus = 96.
+        let num_blocks = std::env::var("BRAIDINFER_PERSISTENT_BLOCKS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or((bpsm as u32 * num_cus).max(num_cus));
         func.launch_cooperative(
             (num_blocks, 1, 1),
             (256, 1, 1),
@@ -675,6 +706,42 @@ impl PersistentDispatch {
         let seq = w.seq_counter;
         unsafe {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
+            // pky.2 B1 probe 2026-05-13: follower write to force PCIe posted-write
+            // drain. RESULT: WEDGED — ruled out.
+            if std::env::var("BRAIDINFER_WRITE_FOLLOWER").is_ok() {
+                std::ptr::write_volatile(
+                    std::ptr::addr_of_mut!((*q_ptr).block_alive_count),
+                    0xFFFF_0000u32 | seq,
+                );
+            }
+            // pky.2 B4 probe 2026-05-13: explicit x86 memory fence after the
+            // volatile write. hipHostMallocMapped may map host memory as Write-
+            // Combined on CPU side; WC buffers don't flush on simple writes until
+            // an SFENCE or coalescing event. If the wedge is "WC buffer not
+            // drained until something else flushes it", mfence after the write
+            // should fix it.
+            if std::env::var("BRAIDINFER_WRITE_MFENCE").is_ok() {
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    std::arch::x86_64::_mm_mfence();
+                }
+            }
+            // pky.2 B2 probe 2026-05-13: explicit CLFLUSH on the cache line
+            // containing seq_num. If the CPU side has the line in any cached
+            // state (despite hipHostMallocMapped's claim of UC), this forces
+            // eviction → next access goes to memory, which forces PCIe push.
+            // For host-mapped UC this should be a no-op; if it FIXES the wedge,
+            // the actual mapping isn't UC on the CPU side.
+            if std::env::var("BRAIDINFER_WRITE_CLFLUSH").is_ok() {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    std::arch::x86_64::_mm_clflush(
+                        std::ptr::addr_of!((*q_ptr).seq_num) as *const u8
+                    );
+                    std::arch::x86_64::_mm_mfence();
+                }
+            }
         }
 
         // Wait for ack via the shared try_wait_ack path, panicking to
@@ -685,7 +752,7 @@ impl PersistentDispatch {
             // Augment timeout messages with the original instruction-level
             // diagnostics that the old inline path produced.
             if let DispatchError::Timeout {
-                progress_pc, ack, ..
+                progress_pc, ack, block_alive_count, ..
             } = e
             {
                 let opcode0 = instructions[0].words[0] as u32;
@@ -700,7 +767,8 @@ impl PersistentDispatch {
                 panic!(
                     "dispatch_batch timeout gpu={gpu_idx} seq={seq} n={} ack={ack} \
                      opcode0={opcode0} stuck_pc={progress_pc} stuck_op={stuck_op} \
-                     stuck_grid_x={stuck_grid_x}",
+                     stuck_grid_x={stuck_grid_x} \
+                     probe_s_full=0x{block_alive_count:08x}",
                     instructions.len()
                 );
             }

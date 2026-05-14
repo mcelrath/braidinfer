@@ -169,11 +169,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000002u);
             while (true) {
-                // Phase 0b host->GPU coherence experiment 2026-05-13: force L0/L1
-                // invalidation every poll iteration. If L1 staleness on the
-                // worker side is the wedge mechanism (host-mapped queue line
-                // cached at L1), this clears it; if wedge persists, mechanism
-                // is L2 / PCIe-coherence / driver-firmware, not worker L1.
+                // Per-iteration L0/L1 invalidation. Documented silently no-op
+                // on gfx11+ in cooperative-kernel context (kb 2026-05-14
+                // gl-inv-noop-gfx11) but retained for code intent.
                 asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
                 if (queue->shutdown) {
                     g_shutdown_seen = 1u;
@@ -205,19 +203,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             return;
         }
 
-        // Phase 2' deferred-ack pattern: write ack for the PREVIOUS batch
-        // AFTER the barrier, not before it (4fg.5 exemplar, commit 8cf8084).
-        // The previous iteration stored the completed seq in last_seq;
-        // writing it now (post-barrier) ensures no s_waitcnt_vscnt from
-        // this UC store precedes the leading vscnt of THIS barrier.
-        // last_seq == 0 on first iteration — writing ack=0 is a no-op for
-        // the host (it initialises ack to 0 and only transitions on seq > 0).
-        // AGENT scope: UC write reaches host DRAM via PCIe regardless of scope;
-        // SYSTEM scope would emit vscnt before watchdog_poll_and_check's barrier.
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            braidinfer::rdna3::host_uc_store_agent(&queue->ack, last_seq);
-        }
-
+        // Phase 2' deferred-ack pattern REMOVED 2026-05-14 — it caused a
+        // protocol deadlock (ack=N written at top of iter N+1 AFTER iter
+        // N+1's inner-poll, but host blocked on ack=N before sending
+        // seq=N+1). Ack write now lives post-dispatch at the END of this
+        // iter (see below). See GFX1100_ARCH.md §11.15.
         uint32_t seq = queue->seq_num;
 
         // Watchdog: cooperative exit if force_exit set (non-shutdown path).
@@ -308,16 +298,66 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         }
 
         // Flush all threads' writes to system-visible memory.
-        // P2P readers on GPUs 1-3 bypass GPU 0's L2 and read VRAM directly.
-        // __threadfence() from EACH thread ensures that thread's cache lines
-        // are written back to system-visible memory.
-        // NOTE: queue->ack is NOT written here — deferred to post-barrier at
-        // the top of the next outer-loop iteration (Phase 2' fix). Writing
-        // ack here would be a UC volatile write before the leading
-        // s_waitcnt_vscnt of the next atomic_block_barrier, which stalls
-        // indefinitely under multi-GPU PCIe pressure (same root cause as
-        // 4fg.5).
         __threadfence();
+        // Immediate ack=seq. The Phase 2' deferred-ack pattern (ack written
+        // at top of next iter's body at line 225) deadlocks: ack=N is only
+        // written in iter N+1, but iter N+1's inner poll waits for seq=N+1
+        // which the host won't send until ack=N visible. Verified empirically
+        // 2026-05-14 via standalone prod_kernel_test. AGENT scope avoids
+        // §11.4 SYSTEM-scope hazard with the next iter's barrier.
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            braidinfer::rdna3::host_uc_store_agent(&queue->ack, seq);
+        }
         last_seq = seq;
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2)
+void simple_persistent_worker(
+    volatile WorkerQueue* queue,
+    WatchdogState* watchdog
+) {
+    if (threadIdx.x == 0) {
+        atomicAdd((unsigned int*)&queue->block_alive_count, 1u);
+    }
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        printf("simple_persistent_worker: started, queue=%p\n", (void*)queue);
+    }
+    namespace cg = cooperative_groups;
+    cg::grid_group grid = cg::this_grid();
+    // Force dispatch_opcode body to be present in this function via an
+    // unreachable branch. Tests whether the size/register-pressure of
+    // having that body inlined changes correctness of the inner poll loop.
+    if (queue->shutdown == 0xDEADBEEFu) {
+        const u64 fake_inst[INST_SIZE_WORDS] = {0};
+        dispatch_opcode(fake_inst, grid, &g_gbs,
+                        nullptr, 0, nullptr, nullptr, 0, nullptr);
+    }
+    uint32_t last_seq = 0;
+    while (true) {
+        if (threadIdx.x == 0 && blockIdx.x == 0)
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000001u);
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            // Same write pattern as production: host_uc_store_agent.
+            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000002u);
+            while (true) {
+                if (queue->shutdown) {
+                    queue->ack = 0xFFFFFFFFu;
+                    queue->done = 1u;
+                    return;
+                }
+                uint32_t s = queue->seq_num;
+                if (s > last_seq) break;
+                __builtin_amdgcn_s_sleep(1);
+            }
+            queue->progress_pc = 0x10000003u;
+        }
+        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
+        if (threadIdx.x == 0 && blockIdx.x == 0) {
+            uint32_t seq = queue->seq_num;
+            queue->ack = seq;
+            last_seq = seq;
+        }
+        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
     }
 }
