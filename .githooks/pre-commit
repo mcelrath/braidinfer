@@ -1,0 +1,36 @@
+#!/bin/bash
+# braidinfer pre-commit hook: fast static gates on touched files.
+#
+# Enable for this clone:
+#   git config core.hooksPath .githooks
+#
+# Runtime gates (scripts/check_persistent_protocol.sh) are NOT run here
+# because they require a free GPU. Run scripts/check_all.sh manually
+# pre-merge.
+
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+CHANGED_HIP=$(git diff --cached --name-only --diff-filter=ACMR | \
+              grep -E '\.(hip|h)$' || true)
+
+if [[ -z "$CHANGED_HIP" ]]; then
+    exit 0
+fi
+
+echo "pre-commit: .hip/.h changed, running static gates..."
+
+if ! python3 scripts/check_watchdog_coverage.py; then
+    echo "ABORT: scripts/check_watchdog_coverage.py failed. Fix or skip with --no-verify." >&2
+    exit 1
+fi
+
+if ! python3 scripts/check_persistent_protocol_static.py; then
+    echo "ABORT: scripts/check_persistent_protocol_static.py failed. Fix or skip with --no-verify." >&2
+    exit 1
+fi
+
+echo "pre-commit: static gates OK"
+exit 0
