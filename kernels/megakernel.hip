@@ -4,6 +4,7 @@
 #define RDNA3_PERSISTENT_POLLING_VALIDATED 1
 #include "rdna3/rdna3_persistent.h"
 #include "rdna3/rdna3_barrier.h"          // braidinfer::rdna3::atomic_block_barrier
+#include "rdna3/rdna3_persistent_protocol.h"  // canonical poll/ack helper
 #include "op_profile.h"          // OP_PROFILE_BEGIN/END (no-op when -DBRAIDINFER_OP_PROFILE unset)
 #include "dump.h"                // dump_instruction_output (used by megakernel_dispatch)
 
@@ -152,63 +153,21 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     // is §11.4-hazardous before atomic_block_barrier.
 
     while (true) {
-        if (threadIdx.x == 0 && blockIdx.x == 0)
-            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000001u);
-        // Mark idle BEFORE entering the inner poll loop. Distinguishes idle
-        // wait (no batch yet) from hang for the host watchdog.
+        // Mark idle BEFORE the canonical poll/barrier.
         if (watchdog) watchdog_signal_exited(watchdog);
 
-        // Single-thread poll to avoid PCIe storm.
-        // 4fg.5: NO PCIe writes here — the upcoming atomic_block_barrier
-        // emits s_waitcnt_vscnt that stalls indefinitely under multi-GPU
-        // PCIe pressure if a SYSTEM-scope UC write is in flight. Defer
-        // queue->seq_num=sentinel and queue->done=1 to AFTER the barrier.
-        // Communicate shutdown via g_shutdown_seen (AGENT-scope VRAM, no
-        // PCIe). The barrier's RELEASE+ACQUIRE fence pair makes the
-        // pre-barrier store visible to all blocks post-barrier.
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000002u);
-            while (true) {
-                // Per-iteration L0/L1 invalidation. Documented silently no-op
-                // on gfx11+ in cooperative-kernel context (kb 2026-05-14
-                // gl-inv-noop-gfx11) but retained for code intent.
-                asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
-                if (queue->shutdown) {
-                    g_shutdown_seen = 1u;
-                    break;
-                }
-                uint32_t s = queue->seq_num;
-                if (s > last_seq) break;
-                __builtin_amdgcn_s_sleep(1);
-            }
-            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000003u);
-        }
-        braidinfer::rdna3::atomic_block_barrier(&g_gbs);
-        if (threadIdx.x == 0 && blockIdx.x == 0)
-            braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000004u);
-        // Clear `exited` — kernel is now actively processing a batch.
-        if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
-
-        // 4fg.5: shutdown detection via g_shutdown_seen (AGENT-scope, set
-        // before barrier; visible to all blocks via barrier's fence pair).
-        // The host-mapped writes (queue->seq_num=sentinel, queue->done=1)
-        // happen AFTER all barriers — no more PCIe-write-before-barrier
-        // hazard. No fence after the writes: host poll will see them within
-        // microseconds via natural PCIe propagation.
-        if (g_shutdown_seen) {
-            if (threadIdx.x == 0 && blockIdx.x == 0) {
-                queue->seq_num = 0xFFFFFFFFu;
-                queue->done = 1;
-            }
+        // Canonical poll-barrier: handles inner-poll, shutdown propagation,
+        // grid barrier, and reads seq+num_inst once all blocks are
+        // synchronized. See kernels/rdna3/rdna3_persistent_protocol.h.
+        uint32_t seq, num_inst;
+        if (braidinfer::rdna3::persistent_iter_poll_barrier(
+                queue, &g_gbs, last_seq, &g_shutdown_seen, &seq, &num_inst)
+                == braidinfer::rdna3::kPersistentShutdown) {
             return;
         }
 
-        // Phase 2' deferred-ack pattern REMOVED 2026-05-14 — it caused a
-        // protocol deadlock (ack=N written at top of iter N+1 AFTER iter
-        // N+1's inner-poll, but host blocked on ack=N before sending
-        // seq=N+1). Ack write now lives post-dispatch at the END of this
-        // iter (see below). See GFX1100_ARCH.md §11.15.
-        uint32_t seq = queue->seq_num;
+        // Clear `exited` — kernel is now actively processing a batch.
+        if (watchdog) watchdog_init(watchdog, &watchdog_beat_ctr);
 
         // Watchdog: cooperative exit if force_exit set (non-shutdown path).
         if (watchdog && watchdog_poll_and_check(watchdog, &g_gbs, 0u)) {
@@ -216,9 +175,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             return;
         }
         if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
-
-        uint32_t num_inst = queue->num_instructions;
-        if (num_inst == 0) num_inst = 1; // backward compat: 0 means 1
 
         // bz0 fix: invalidate per-WGP L1 at batch boundary. Activation buffer writes by
         // prior batch may leave stale L1 lines on different WGPs.
@@ -299,15 +255,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
 
         // Flush all threads' writes to system-visible memory.
         __threadfence();
-        // Immediate ack=seq. The Phase 2' deferred-ack pattern (ack written
-        // at top of next iter's body at line 225) deadlocks: ack=N is only
-        // written in iter N+1, but iter N+1's inner poll waits for seq=N+1
-        // which the host won't send until ack=N visible. Verified empirically
-        // 2026-05-14 via standalone prod_kernel_test. AGENT scope avoids
-        // §11.4 SYSTEM-scope hazard with the next iter's barrier.
-        if (threadIdx.x == 0 && blockIdx.x == 0) {
-            braidinfer::rdna3::host_uc_store_agent(&queue->ack, seq);
-        }
+        // Canonical ack write. AGENT scope inside the helper.
+        braidinfer::rdna3::persistent_iter_ack(queue, seq);
         last_seq = seq;
     }
 }
