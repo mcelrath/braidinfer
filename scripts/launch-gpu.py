@@ -305,14 +305,53 @@ def _kill_pid(pid, grace_s=KILL_GRACE_S):
     )
 
 
+def _find_orphans_by_proc_env(current_session):
+    """Walk /proc/*/environ for processes whose CLAUDE_SESSION_ID matches
+    `current_session`. Returns a list of PIDs. Catches orphans whose
+    parent launcher died (so lockfile is already released) but children
+    keep running outside any process group we can killpg.
+    """
+    orphans = []
+    my_uid = os.getuid()
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        pid = int(p.name)
+        if pid == os.getpid():
+            continue
+        try:
+            st = p.stat()
+            if st.st_uid != my_uid:
+                continue
+            env_bytes = (p / "environ").read_bytes()
+        except (OSError, PermissionError):
+            continue
+        # /proc/<pid>/environ is NUL-separated KEY=VAL entries.
+        for entry in env_bytes.split(b"\0"):
+            if entry.startswith(b"CLAUDE_SESSION_ID="):
+                val = entry.split(b"=", 1)[1].decode(errors="replace")
+                if val == current_session:
+                    orphans.append(pid)
+                break
+    return orphans
+
+
 def do_kill(session_id=None):
-    """Kill processes launched by this session (or a specified session)."""
+    """Kill processes launched by this session (or a specified session).
+
+    Two-phase:
+      1. Lockfile sweep: kill anything tracked by a session-matching lock.
+      2. Orphan sweep (/proc): kill any process owned by us with
+         CLAUDE_SESSION_ID matching — catches children whose parent
+         launcher died and released the flock but child is still alive.
+    """
     if not LOCK_DIR.exists():
         print("No lock directory.")
         return
     current_session = session_id or os.environ.get("CLAUDE_SESSION_ID", "unknown")
     killed = 0
     skipped = 0
+    killed_pids = set()
     for lp in LOCK_DIR.glob("gpu-*.lock"):
         try:
             info = json.loads(lp.read_text())
@@ -326,9 +365,27 @@ def do_kill(session_id=None):
         if is_pid_alive(pid):
             print(f"Killing PID {pid} (GPU {info.get('gpu', '?')}, session {lock_session})")
             _kill_pid(pid)
+            killed_pids.add(pid)
             killed += 1
         lp.unlink(missing_ok=True)
-    print(f"Killed {killed} process(es)." + (f" Skipped {skipped} from other sessions." if skipped else ""))
+
+    # Phase 2: orphan sweep via /proc/<pid>/environ.
+    orphan_killed = 0
+    if current_session != "unknown":
+        for opid in _find_orphans_by_proc_env(current_session):
+            if opid in killed_pids:
+                continue  # already targeted
+            if is_pid_alive(opid):
+                print(f"Killing orphan PID {opid} (session {current_session}, no lockfile)")
+                _kill_pid(opid)
+                orphan_killed += 1
+
+    summary = f"Killed {killed} process(es)"
+    if orphan_killed:
+        summary += f" + {orphan_killed} orphan(s)"
+    if skipped:
+        summary += f". Skipped {skipped} from other sessions"
+    print(summary + ".")
 
 
 def do_cleanup(silent=False):
