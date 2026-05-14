@@ -1,0 +1,52 @@
+model	run	outcome	toks_s	output
+deepseek-v2-lite-mixed.bqnt	1	WEIGHT_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: MissingWeight("none of [\"model.layers.0.self_attn.k_proj.weight\", \"model.layers.0.mixer.k_proj.weight\"] f
+deepseek-v2-lite-mixed.bqnt	2	WEIGHT_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: MissingWeight("none of [\"model.layers.0.self_attn.k_proj.weight\", \"model.layers.0.mixer.k_proj.weight\"] f
+deepseek-v2-lite-mixed.bqnt	3	WEIGHT_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: MissingWeight("none of [\"model.layers.0.self_attn.k_proj.weight\", \"model.layers.0.mixer.k_proj.weight\"] f
+devstral-small-q4.bqnt	1	UNKNOWN	NA	Could not resolve HF cache dir for /home/mcelrath/Projects/ai/braidinfer/models/devstral-small-q4.bqnt
+devstral-small-q4.bqnt	2	UNKNOWN	NA	Could not resolve HF cache dir for /home/mcelrath/Projects/ai/braidinfer/models/devstral-small-q4.bqnt
+devstral-small-q4.bqnt	3	UNKNOWN	NA	Could not resolve HF cache dir for /home/mcelrath/Projects/ai/braidinfer/models/devstral-small-q4.bqnt
+leanstral-mixed.bqnt	1	TOKENIZER_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:113:47:load tokenizer: "failed to load tokenizer from \"/home/mcelrath/.cache/huggingface/hub/models--mistralai--Leanstral-2603/
+leanstral-mixed.bqnt	2	TOKENIZER_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:113:47:load tokenizer: "failed to load tokenizer from \"/home/mcelrath/.cache/huggingface/hub/models--mistralai--Leanstral-2603/
+leanstral-mixed.bqnt	3	TOKENIZER_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:113:47:load tokenizer: "failed to load tokenizer from \"/home/mcelrath/.cache/huggingface/hub/models--mistralai--Leanstral-2603/
+mistral-7b-q4.bqnt	1	PASS	12.3	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)acityoflights,thecityoflove,thecityoffashion,thecityofart,
+mistral-7b-q4.bqnt	2	PASS	12.3	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)acityoflights,thecityoflove,thecityoffashion,thecityofart,
+mistral-7b-q4.bqnt	3	PASS	12.0	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)acityoflights,thecityoflove,thecityoffashion,thecityofart,
+mistral-nemo-q4.bqnt	1	PASS	8.2	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) a city that is located in the north of France. The city is the most populous city in
+mistral-nemo-q4.bqnt	2	PASS	8.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) a city that is located in the north of France. The city is the most populous city in
+mistral-nemo-q4.bqnt	3	PASS	8.0	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) a city that is located in the north of France. The city is the most populous city in
+nemotron_cascade_30b.q4.bqnt	1	PASS	20.0	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris. The capital of France is Paris. The capital of France is Paris. The capital of France
+nemotron_cascade_30b.q4.bqnt	2	PASS	20.4	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris. The capital of France is Paris. The capital of France is Paris. The capital of France
+nemotron_cascade_30b.q4.bqnt	3	PASS	19.9	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris. The capital of France is Paris. The capital of France is Paris. The capital of France
+nemotron_super_120b.q4.bqnt	1	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+nemotron_super_120b.q4.bqnt	2	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+nemotron_super_120b.q4.bqnt	3	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen35-0.8b-mixed.bqnt	1	PASS	55.6	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris, and the capital of the United States is Washington, D.C.The capital of the
+qwen35-0.8b-mixed.bqnt	2	PASS	54.7	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris, and the capital of the United States is Washington, D.C.The capital of the
+qwen35-0.8b-mixed.bqnt	3	PASS	62.5	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris, and the capital of the United States is Washington, D.C.The capital of the
+qwen35_08b.q4.bqnt	1	PASS	65.5	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris, and the capital of the United States is Washington, D.C.The capital of the
+qwen35_08b.q4.bqnt	2	PASS	61.8	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris, and the capital of the United States is Washington, D.C.The capital of the
+qwen35_08b.q4.bqnt	3	PASS	60.5	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris, and the capital of the United States is Washington, D.C.The capital of the
+qwen35_122b_a10b.q4.bqnt	1	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen35_122b_a10b.q4.bqnt	2	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen35_122b_a10b.q4.bqnt	3	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen35_27b.q4.bqnt	1	PASS	4.2	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.<think>Thinking Process:1.  **Analyze the Request:**   
+qwen35_27b.q4.bqnt	2	PASS	4.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.<think>Thinking Process:1.  **Analyze the Request:**   
+qwen35_27b.q4.bqnt	3	PASS	4.2	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.<think>Thinking Process:1.  **Analyze the Request:**   
+qwen35_2b.q4.bqnt	1	PASS	32.9	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom
+qwen35_2b.q4.bqnt	2	PASS	36.9	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom
+qwen35_2b.q4.bqnt	3	PASS	35.9	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris. The capital of the United States is Washington, D.C. The capital of the United Kingdom
+qwen35_35b_a3b.q4.bqnt	1	PASS	13.5	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.The capital of France is Paris.The capital of France is Paris.The
+qwen35_35b_a3b.q4.bqnt	2	PASS	11.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.The capital of France is Paris.The capital of France is Paris.The
+qwen35_35b_a3b.q4.bqnt	3	PASS	11.6	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.The capital of France is Paris.The capital of France is Paris.The
+qwen36_27b.q4.bqnt	1	PASS	4.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.The capital of France is Paris.The capital of France is Paris.The
+qwen36_27b.q4.bqnt	2	PASS	4.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.The capital of France is Paris.The capital of France is Paris.The
+qwen36_27b.q4.bqnt	3	PASS	4.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.The capital of France is Paris.The capital of France is Paris.The
+qwen36_27b.q8.bqnt	1	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen36_27b.q8.bqnt	2	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen36_27b.q8.bqnt	3	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen36_35b_a3b.q4.bqnt	1	PASS	13.6	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.
+qwen36_35b_a3b.q4.bqnt	2	PASS	13.2	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.
+qwen36_35b_a3b.q4.bqnt	3	PASS	13.1	  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48) Paris.
+qwen36_35b_a3b.q8.bqnt	1	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen36_35b_a3b.q8.bqnt	2	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+qwen36_35b_a3b.q8.bqnt	3	OOM_FAIL	NA	thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:load model: Hip(HipError(2))note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,35 @@
+Reserved GPUs: 0,1,2,3 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24534MiB)
+ 1  e1202f001c25      NA
+ 2  8357e6ef9a3b    13.2
+ 3  26ca5ce6f148    13.7
+ 4  e076bebeceaa      NA
+ 5  8357e6ef9a3b    12.7
+ 6  8357e6ef9a3b    13.3
+ 7  e78022050ea8    12.8
+ 8  8357e6ef9a3b    13.1
+ 9  8357e6ef9a3b    12.9
+10  8357e6ef9a3b    13.2
+11  8357e6ef9a3b    13.4
+12  8357e6ef9a3b    13.5
+13  687042878d8f      NA
+14  f23e0cc18802    12.6
+15  e9d036e36101    13.1
+16  8357e6ef9a3b    13.4
+17  8357e6ef9a3b    12.7
+18  365a5fbb6eae    13.4
+19  8357e6ef9a3b    13.0
+20  8357e6ef9a3b    13.0
+21  8357e6ef9a3b    13.2
+22  8357e6ef9a3b    12.9
+23  8357e6ef9a3b    13.5
+24  38adfa2ae4e6    13.6
+25  4f8970b8756a    11.8
+26  f23e0cc18802    12.0
+27  8357e6ef9a3b    11.1
+28  8357e6ef9a3b    12.2
+29  8357e6ef9a3b    13.1
+30  f23e0cc18802    13.1
+---
+Distinct outputs:
+11
+Total runs: 30

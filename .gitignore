@@ -32,10 +32,14 @@ kernels/diagnostic/bpermute_repro
 # Activation traces (regenerated via TRACE=... target/release/generate)
 *.bin
 
-# Profiling / benchmark outputs
+# Profiling / benchmark outputs (ad-hoc; not committed)
 profile_results/
-benchmark_results/
+benchmark_results/*
 .rocprofv3/
+# Carve-out: regression artifacts captured to prove a fix or document
+# a reproducible behavior live in benchmark_results/regression/ and
+# ARE committed. Anything else under benchmark_results/ stays ignored.
+!benchmark_results/regression/
 
 # Bob's workflow
 .claude

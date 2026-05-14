@@ -1,0 +1,114 @@
+=== qwen35_2b.q4.bqnt ===
+, I am a 19 year old male
+10 tokens in 0.285s = 35.1 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x147b6b150000
+
+=== qwen35_08b.q4.bqnt ===
+I am a student of the University of
+10 tokens in 0.204s = 49.1 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14e693160000
+
+=== qwen35-0.8b-mixed.bqnt ===
+, I am a student of the 10
+10 tokens in 0.199s = 50.2 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14aa57570000
+
+=== mistral-7b-q4.bqnt ===
+Ihave
+10 tokens in 0.785s = 12.7 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14e1b4358000
+
+=== devstral-small-q4.bqnt ===
+Could not resolve HF cache dir for /home/mcelrath/Projects/ai/braidinfer/models/devstral-small-q4.bqnt
+
+=== mistral-nemo-q4.bqnt ===
+, I am new to this forum and I am
+10 tokens in 1.125s = 8.9 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14ffbb190000
+
+=== leanstral-mixed.bqnt ===
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:113:47:
+load tokenizer: "failed to load tokenizer from \"/home/mcelrath/.cache/huggingface/hub/models--mistralai--Leanstral-2603/snapshots/2680dd278dcfc20398231b52e9396b07d3cacf4f/tokenizer.json\": No such file or directory (os error 2)"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== qwen35_27b.q4.bqnt ===
+, I have a question about the following code.
+10 tokens in 2.187s = 4.6 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x1500fb8c0000
+
+=== qwen36_27b.q4.bqnt ===
+, Hello, Hello, Hello, Hello, Hello
+10 tokens in 2.328s = 4.3 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x147cbdad8000
+
+=== qwen36_27b.q8.bqnt ===
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/qwen36_27b.q8.bqnt (522 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:
+load model: Hip(HipError(2))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== deepseek-v2-lite-mixed.bqnt ===
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/deepseek-v2-lite-mixed.bqnt (5209 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:
+load model: MissingWeight("none of [\"model.layers.0.self_attn.k_proj.weight\", \"model.layers.0.mixer.k_proj.weight\"] found")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== qwen35_35b_a3b.q4.bqnt ===
+, high school students! Today, let’s explore
+10 tokens in 0.672s = 14.9 tok/s
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14ff51c70000
+
+=== qwen36_35b_a3b.q4.bqnt ===
+[watchdog] stopped.
+[watchdog] stopped.
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14da69ac0000
+
+=== qwen36_35b_a3b.q8.bqnt ===
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/qwen36_35b_a3b.q8.bqnt (536 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:
+load model: Hip(HipError(2))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== nemotron_cascade_30b.q4.bqnt ===
+[watchdog] stopped.
+[watchdog] stopped.
+[watchdog] stopped.
+[watchdog] stopped.
+persistent_worker: started, queue=0x14f652090000
+
+=== qwen35_122b_a10b.q4.bqnt ===
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/qwen35_122b_a10b.q4.bqnt (1384 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:
+load model: Hip(HipError(2))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+=== nemotron_super_120b.q4.bqnt ===
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/nemotron_super_120b.q4.bqnt (42308 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:173:70:
+load model: Hip(HipError(2))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
