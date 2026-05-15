@@ -26,8 +26,34 @@ __pycache__
 *-host-x86_64-pc-linux-gnu.o
 *.hip-hip-amdgcn-amd-amdhsa.hipfb
 
-# Diagnostic reproducer binaries (built via kernels/diagnostic/build_repro.sh)
+# Stray top-level hipfb (left from ad-hoc hipcc invocations)
+/*.hipfb
+
+# Diagnostic reproducer binaries (built ELF outputs from each kernels/diagnostic/<bench>/)
+# Listed by basename so .hip / .cpp / .sh sources are still tracked.
 kernels/diagnostic/bpermute_repro
+kernels/diagnostic/atomic_failure_envelope/atomic_failure_envelope
+kernels/diagnostic/dma_under_persistent_bench/dma_under_persistent_bench
+kernels/diagnostic/host_mapped_coh_bench/host_mapped_coh_bench
+kernels/diagnostic/lane_bench/rdna3_lane_bench
+kernels/diagnostic/mgpu_idle_barrier_bench/mgpu_idle_barrier
+kernels/diagnostic/mrope_repro/mrope_atomic_barrier_repro
+kernels/diagnostic/mrope_repro/mrope_coop_repro
+kernels/diagnostic/mrope_repro/mrope_p2p_repro
+kernels/diagnostic/mrope_repro/mrope_repro
+kernels/diagnostic/mtype_c_p2p_coh_bench/mtype_c_p2p_coh_bench
+kernels/diagnostic/p2p_multicast_bench/p2p_multicast_bench
+kernels/diagnostic/p2p_read_bw_bench/p2p_read_bw_bench
+kernels/diagnostic/packed_fma_bench/packed_fma_bench
+kernels/diagnostic/persistent_skeleton_repro/bulk_write_repro
+kernels/diagnostic/persistent_skeleton_repro/fork_test
+kernels/diagnostic/persistent_skeleton_repro/prod_kernel_test
+kernels/diagnostic/rdna3_compute_bench/rdna3_compute_bench
+kernels/diagnostic/rdna3_memory_bench/rdna3_memory_bench
+kernels/diagnostic/rdna3_sync_bench/rdna3_sync_bench
+kernels/diagnostic/reduce_bench/correctness_probe
+kernels/diagnostic/reduce_bench/header_smoke
+kernels/diagnostic/reduce_bench/reduce_bench
 
 # Activation traces (regenerated via TRACE=... target/release/generate)
 *.bin
