@@ -11,6 +11,35 @@ use crate::config::{FfnType, ModelConfig};
 /// Default HF snapshot used when no `MODEL` / `BQNT_PATH` is supplied.
 pub const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
+/// Strip recognized CLI flags from `argv` in place and return the parsed
+/// values. Pilot helper for the eventual env-var → CLI-args migration
+/// (braidinfer-wuf.16). Today this handles only `--audit-mtypes` to take
+/// MTYPE_AUDIT off the env-var surface; future flags get added here.
+///
+/// The flag is removed from `argv` so positional args (prompt, model
+/// path) keep their existing index semantics.
+#[derive(Default, Debug)]
+pub struct CliFlags {
+    pub audit_mtypes: bool,
+}
+
+pub fn extract_cli_flags(argv: &mut Vec<String>) -> CliFlags {
+    let mut flags = CliFlags::default();
+    argv.retain(|a| {
+        if a == "--audit-mtypes" {
+            flags.audit_mtypes = true;
+            false
+        } else {
+            true
+        }
+    });
+    // Back-compat: legacy BRAIDINFER_MTYPE_AUDIT env var still honored.
+    if flags.audit_mtypes && std::env::var("BRAIDINFER_MTYPE_AUDIT").is_err() {
+        unsafe { std::env::set_var("BRAIDINFER_MTYPE_AUDIT", "1") };
+    }
+    flags
+}
+
 /// Resolve the HF snapshot directory that contains the tokenizer + config for
 /// a given `.bqnt`. The bqnt records the model_name in its metadata; this
 /// either points directly at an absolute snapshot path or names a HF repo

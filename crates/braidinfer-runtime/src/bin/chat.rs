@@ -4,7 +4,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::cli::{apply_auto_modes, resolve_model_arg};
+use braidinfer_runtime::cli::{apply_auto_modes, extract_cli_flags, resolve_model_arg};
 use braidinfer_runtime::generate::{
     ChatMessage, TokenConfig, apply_chat_template_thinking, load_tokenizer,
 };
@@ -19,9 +19,9 @@ async fn main() {
 
     let system_prompt = std::env::var("SYSTEM").ok();
 
-    let model_arg = std::env::var("MODEL")
-        .ok()
-        .or_else(|| std::env::args().nth(1));
+    let mut args: Vec<String> = std::env::args().collect();
+    let _flags = extract_cli_flags(&mut args);
+    let model_arg = std::env::var("MODEL").ok().or_else(|| args.into_iter().nth(1));
     let resolved = resolve_model_arg(model_arg);
     let model_dir = resolved.model_dir.as_path();
 

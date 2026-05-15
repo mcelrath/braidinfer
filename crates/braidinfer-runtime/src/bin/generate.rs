@@ -1,13 +1,14 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::cli::{
-    apply_auto_modes, resolve_model_arg, vram_usage_mb,
+    apply_auto_modes, extract_cli_flags, resolve_model_arg, vram_usage_mb,
 };
 use braidinfer_runtime::generate::{TokenConfig, chat_generate, greedy_generate, load_tokenizer};
 use braidinfer_runtime::model::Model;
 use std::time::Instant;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let _flags = extract_cli_flags(&mut args);
     let prompt = if args.len() > 1 {
         args[1..].join(" ")
     } else {

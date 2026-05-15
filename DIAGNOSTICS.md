@@ -85,7 +85,7 @@ Used for layer-by-layer reference comparison (e.g. vs an HF transformers run).
 
 | Variable | Effect |
 |---|---|
-| `BRAIDINFER_MTYPE_AUDIT` | At allocation time, run `hipPointerGetAttributes` on every device buffer and log the memory type + flags. Catches MTYPE_UC vs MTYPE_NC vs cached mismatches that would otherwise surface as cross-GPU coherence bugs. Used heavily during the 2026-05 P2P investigations. **Planned to migrate to a startup `--audit-mtypes` flag instead of an env var** once CLI options replace env vars. |
+| `BRAIDINFER_MTYPE_AUDIT` | At allocation time, run `hipPointerGetAttributes` on every device buffer and log the memory type + flags. Catches MTYPE_UC vs MTYPE_NC vs cached mismatches that would otherwise surface as cross-GPU coherence bugs. Used heavily during the 2026-05 P2P investigations. **Preferred invocation is the `--audit-mtypes` CLI flag** added by braidinfer-wuf.16 (chat + generate); the env var is retained as a back-compat path and is automatically set when the flag is present. |
 
 ---
 
