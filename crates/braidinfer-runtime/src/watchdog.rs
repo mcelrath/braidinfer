@@ -153,10 +153,12 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
     let no_progress = Duration::from_millis(cfg.no_progress_ms);
     let grace = Duration::from_millis(cfg.grace_ms);
 
-    eprintln!(
-        "[watchdog] started: poll={}ms no_progress={}ms grace={}ms",
-        cfg.poll_interval_ms, cfg.no_progress_ms, cfg.grace_ms
-    );
+    // Per-thread "[watchdog] started" / "[watchdog] stopped" prints used
+    // to fire on every WatchdogThread::spawn — which happens at every
+    // megakernel dispatch site (~10 sites × N segments per prefill chunk
+    // on hybrid models). The spam was the user-visible complaint that
+    // motivated wuf.4. Architectural fix (one shared watchdog on Model
+    // instead of per-spawn threads) is tracked separately as a follow-up.
 
     loop {
         std::thread::sleep(poll);
@@ -272,8 +274,6 @@ fn watchdog_thread_main(entries: Arc<Mutex<Vec<WatchdogEntry>>>, stop: Arc<Atomi
             dump_telemetry_and_abort(wedged_device, op_id, counter);
         }
     }
-
-    eprintln!("[watchdog] stopped.");
 }
 
 fn dump_telemetry_and_abort(device: DeviceId, last_op_id: u32, last_counter: u64) -> ! {
