@@ -192,5 +192,43 @@ pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
         eprintln!("Auto: PERSISTENT enabled ({reason})");
         unsafe { std::env::set_var("PERSISTENT", "1") };
     }
+
+    validate_env_combos(multi_gpu, persistent);
     (multi_gpu, persistent)
+}
+
+/// Reject combinations of env vars that are guaranteed to crash at runtime
+/// or load time. Surfacing these at startup (after MULTI_GPU/PERSISTENT have
+/// been resolved) gives the user an immediate, actionable error instead of
+/// a panic or InvalidConfig after several seconds of model load.
+fn validate_env_combos(multi_gpu: bool, persistent: bool) {
+    // WEIGHT_QUANT=rnf4|mixed is incompatible with the megakernel path
+    // (LinearWeight::as_bf16_ptr panics on Packed). The megakernel is the
+    // backbone of persistent + multi-GPU paths. Fail fast.
+    match std::env::var("WEIGHT_QUANT").as_deref() {
+        Ok("rnf4") | Ok("mixed") if persistent => {
+            eprintln!(
+                "Error: WEIGHT_QUANT={} is not supported on the megakernel path \
+                 (auto-enabled via PERSISTENT=1 / multi-GPU). Either unset \
+                 WEIGHT_QUANT, or set PERSISTENT=0 and run a single-GPU MoE model.",
+                std::env::var("WEIGHT_QUANT").unwrap_or_default()
+            );
+            std::process::exit(1);
+        }
+        _ => {}
+    }
+    // KV_QUANT is not yet wired through the persistent or multi-GPU paths
+    // (paged-only). Both binaries can hit this; centralize the guard here
+    // so generate doesn't also silently produce wrong output.
+    let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
+    if kv_quant && multi_gpu {
+        eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");
+        eprintln!("  KV quantization only works in single-GPU mode.");
+        std::process::exit(1);
+    }
+    if kv_quant && persistent {
+        eprintln!("Error: KV_QUANT=1 is not yet supported with PERSISTENT=1");
+        eprintln!("  Either unset KV_QUANT or set PERSISTENT=0.");
+        std::process::exit(1);
+    }
 }

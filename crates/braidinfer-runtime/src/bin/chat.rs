@@ -43,16 +43,8 @@ async fn main() {
 
     let (multi_gpu, _persistent) = apply_auto_modes(model_dir);
 
-    let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
-    if kv_quant {
+    if std::env::var("KV_QUANT").as_deref() == Ok("1") {
         eprintln!("KV_QUANT enabled (residual_pc int4)");
-    }
-    // KV quantization requires the paged KV path; multi-GPU paged dispatch
-    // is not implemented.
-    if kv_quant && multi_gpu {
-        eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");
-        eprintln!("  KV quantization only works in single-GPU mode.");
-        std::process::exit(1);
     }
 
     let mut model =
