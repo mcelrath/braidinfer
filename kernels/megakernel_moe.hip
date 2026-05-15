@@ -448,14 +448,17 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
 #endif
 #ifdef BRAIDINFER_MOE_WORKER_READBACK_FENCE
-    // Option (C) per udi #199: PCIe non-posted read from GPU 0 forces
-    // worker's prior posted writes to GPU 0 to complete before the
-    // read returns. act_p2p is a stable GPU 0 VRAM address worker
-    // already read earlier in this op. Re-reading 1 word costs ~1µs
-    // PCIe round-trip but provides the producer-consumer ordering
-    // guarantee per PCIe §2.4.
+    // Option (C) per udi #199/#236: PCIe non-posted read from GPU 0
+    // forces worker's prior posted writes to same target to complete
+    // before the read returns (PCIe §2.4 producer-consumer rule).
+    // Anchor = out_p2p[0]: same GPU 0 UC buffer we just wrote to;
+    // reading our own writes back forces same-requester same-target
+    // ordering. Earlier `act_p2p[0]` anchor page-faulted on gfx1100
+    // (HSA agent fault) despite the bulk copy reading act_p2p
+    // successfully — switching to out_p2p[0] (UC, written by us this
+    // call) avoids the fault while preserving §2.4 semantics.
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        volatile float probe = act_p2p[0];
+        volatile float probe = out_p2p[0];
         (void)probe;
     }
 #endif
