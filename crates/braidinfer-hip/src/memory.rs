@@ -386,6 +386,24 @@ impl<T> MappedHostBuffer<T> {
         )
     }
 
+    /// Portable + fine-grained coherent: device_ptr valid via
+    /// hipHostGetDevicePointer from every GPU's context AND CPU writes
+    /// are immediately visible to GPUs on all of them (and vice versa).
+    /// Used for cross-GPU shared buffers where multiple GPUs both write
+    /// and read (e.g. moe output_slots, activation handoffs).
+    ///
+    /// Combines all three flags: Mapped (device-accessible) + Portable
+    /// (per-context dev_ptr usable from every GPU) + Coherent (no L2
+    /// caching on writer side → no MTYPE_NC fallback).
+    pub fn alloc_portable_coherent(len: usize) -> HipResult<Self> {
+        Self::alloc_impl(
+            len,
+            ffi::hipHostMallocMapped
+                | ffi::hipHostMallocPortable
+                | ffi::hipHostMallocCoherent,
+        )
+    }
+
     /// pky.2 IOMMU/GART probe (2026-05-13): allocate via `mmap(MAP_HUGETLB)`
     /// + `hipHostRegister(Mapped)` instead of `hipHostMalloc(Mapped)`.
     ///

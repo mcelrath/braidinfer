@@ -95,6 +95,24 @@ pub struct MoeP2pContext {
     /// pointer; even with `hipHostMallocPortable` the address is valid
     /// only for the GPU context that was current at the time of the call.
     pub output_slots_dev_ptrs: Vec<*mut f32>,
+    /// Host-mapped UC staging buffer for the MoE activation input
+    /// (`act.normed` for standard MoE, `act.moe_latent` for Nemotron-H).
+    ///
+    /// **Input-side companion to `output_slots`** (snl 2026-05-15 follow-up).
+    /// Workers previously P2P-READ from GPU 0's cached `act.normed` (cross-
+    /// GPU peer-VRAM read of cached memory). At 4+ GPUs concurrent worker
+    /// reads pressure GPU 0's L2 and the PCIe root-complex non-posted-read
+    /// path (ea bridge #242 mechanism: posted-write congestion in the
+    /// upstream port stalls non-posted MMIO reads → MES driver-side
+    /// timeout). Moving the read source to host-mapped UC removes the
+    /// cross-GPU peer path entirely.
+    ///
+    /// Sized `MAX_PREFILL_BATCH × hidden_size`. Decode uses only first hs.
+    pub moe_act_uc_handoff: MappedHostBuffer<f32>,
+    /// Per-GPU device pointer to `moe_act_uc_handoff`. Index 0 = GPU 0,
+    /// 1.. = workers in worker-index order. Same pattern as
+    /// `output_slots_dev_ptrs`.
+    pub moe_act_uc_handoff_dev_ptrs: Vec<*mut f32>,
     /// GPU 0 per-layer config pointer array on GPU 0 VRAM: `MoeWorkerConfig*[num_layers]`.
     pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
     /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
@@ -195,7 +213,7 @@ impl MoeP2pContext {
         // alloc_coherent (hipHostMallocCoherent) forces fine-grained UC on
         // BOTH CPU and GPU sides; alloc_portable may use MTYPE_NC (cached)
         // and would defeat the no-L2-staleness intent.
-        let output_slots = MappedHostBuffer::<f32>::alloc_coherent(
+        let output_slots = MappedHostBuffer::<f32>::alloc_portable_coherent(
             MAX_PREFILL_BATCH * num_gpus * hidden_size,
         )?;
         let mut output_slots_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_gpus);
@@ -209,6 +227,24 @@ impl MoeP2pContext {
             ))?;
         }
         output_slots_dev_ptrs.push(gpu0_output_slots_dev as *mut f32);
+
+        // Input-side companion (snl 2026-05-15): host-mapped UC for the
+        // MoE activation handoff. Sized for max prefill batch × hidden_size
+        // (decode uses first hs only). Same allocator + per-GPU dev-ptr
+        // pattern as output_slots.
+        let moe_act_uc_handoff = MappedHostBuffer::<f32>::alloc_portable_coherent(
+            MAX_PREFILL_BATCH * hidden_size,
+        )?;
+        let mut moe_act_uc_handoff_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_gpus);
+        let mut gpu0_handoff_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                &mut gpu0_handoff_dev,
+                moe_act_uc_handoff.host_ptr() as *mut std::ffi::c_void,
+                0,
+            ))?;
+        }
+        moe_act_uc_handoff_dev_ptrs.push(gpu0_handoff_dev as *mut f32);
 
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
@@ -285,6 +321,17 @@ impl MoeP2pContext {
                 ))?;
             }
             output_slots_dev_ptrs.push(out_dev_ptr as *mut f32);
+            // Per-worker device pointer to the MoE activation handoff buffer
+            // (snl input-side fix, follow-up to output_slots).
+            let mut handoff_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+            unsafe {
+                braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                    &mut handoff_dev,
+                    moe_act_uc_handoff.host_ptr() as *mut std::ffi::c_void,
+                    0,
+                ))?;
+            }
+            moe_act_uc_handoff_dev_ptrs.push(handoff_dev as *mut f32);
 
             let (layer_config_ptrs, config_storage) = build_layer_configs(
                 device,
@@ -334,6 +381,8 @@ impl MoeP2pContext {
 
         Ok(MoeP2pContext {
             output_slots_dev_ptrs,
+            moe_act_uc_handoff,
+            moe_act_uc_handoff_dev_ptrs,
             work_queue,
             seq_counter,
             output_slots,

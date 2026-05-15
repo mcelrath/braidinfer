@@ -426,24 +426,25 @@ impl Model {
                     c.extend_from_slice(mk_insts);
                     c
                 };
-                // Fire GPU 0 batch async (PRE included). All chunks except the LAST
-                // use synchronous dispatch_batch (waits per-chunk); the last chunk
-                // uses dispatch_batch_fire so PRE runs concurrently with workers.
+                // snl 2026-05-15 ordering fix: workers P2P-read from the
+                // host-mapped `moe_act_uc_handoff` buffer; the D2D copy that
+                // populates it runs inside GPU 0's PRE batch. If workers
+                // fire concurrently with GPU 0 (via dispatch_batch_fire),
+                // they can race the D2D and read uninitialized/stale data
+                // → NaN propagation. Force GPU 0's batch to ack BEFORE
+                // dispatching workers. Sacrifices the PRE/worker overlap
+                // documented above but is required for correctness; the
+                // overlap optimization can be restored once an in-megakernel
+                // signal-then-fire mechanism replaces CPU-side fan-out.
                 let dispatch: &mut dyn BatchDispatcher =
                     self.persistent_workers.as_mut().unwrap();
-                let mut chunks = combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS).peekable();
-                let mut gpu0_seq: Option<u32> = None;
-                while let Some(chunk) = chunks.next() {
-                    if chunks.peek().is_none() {
-                        // Last chunk — fire async, hold seq for wait_ack below.
-                        gpu0_seq = Some(dispatch.dispatch_batch_fire(0, chunk));
-                    } else {
-                        dispatch.dispatch_batch(0, chunk);
-                    }
+                for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                    dispatch.dispatch_batch(0, chunk);
                 }
-                // Concurrently dispatch OP_MOE_FFN_REMOTE on each worker (async).
-                // dispatch_moe_workers_decode_async returns the per-worker seqs;
-                // we then wait_ack for all (workers + GPU 0 PRE).
+                let gpu0_seq: Option<u32> = None;
+                // Dispatch OP_MOE_FFN_REMOTE on each worker. Workers run in
+                // parallel with each other (their dispatches are still async)
+                // but only after GPU 0's PRE has completed.
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
                 // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
                 seg_start = i + 1;
@@ -951,7 +952,14 @@ impl Model {
         let k = (inst.words[8] & 0xFFFFFFFF) as usize;
         let eis = (inst.words[9] >> 32) as usize;
         let has_gate = (inst.words[9] & 0xFFFFFFFF) != 0;
-        let activation = inst.words[10] as *const f32;
+        // inst.words[10] holds act.normed.as_ptr() — cached GPU 0 VRAM.
+        // Workers previously P2P-read from there (cross-GPU peer-VRAM read
+        // of cached memory) which pressures GPU 0's L2 + PCIe non-posted
+        // path at 4+ GPUs (snl follow-up: ea bridge #242 mechanism).
+        // Workers now read from a per-worker device pointer to the
+        // host-mapped UC handoff buffer; the megakernel program stages
+        // `act.normed → moe_act_uc_handoff` via OP_D2D_COPY at MoE entry.
+        let _activation_cached = inst.words[10] as *const f32;
         let mut gupd = inst.words[16] as usize;
         if gupd == 0 { gupd = hs; }
         // Standard MoE has gate→silu_mul; non-gated path uses relu_squared.
@@ -969,6 +977,8 @@ impl Model {
         let insts: Vec<(usize, crate::megakernel::Instruction)> = (0..num_workers).map(|w| {
             let gpu_id = w + 1;
             let out_slot = unsafe { output_slots.add(gpu_id * hs) };
+            // Per-worker device pointer to the host-mapped activation handoff.
+            let activation = p2p.moe_act_uc_handoff_dev_ptrs[gpu_id] as *const f32;
             let inst = p2p.build_ffn_remote_inst(
                 w,
                 layer_idx,

@@ -1563,8 +1563,24 @@ impl MegakernelProgram {
                             gupd as i32, hs as i32, 0,
                         ).into_inst();
                     } else {
-                        // NOP: no normed_stage copy needed in P2P path
-                        prog.instructions[barrier_idx - 2] = Instruction::new(OP_D2D_COPY, 0);
+                        // snl input-side fix (2026-05-15): stage `act.normed`
+                        // into the host-mapped UC handoff buffer so workers
+                        // P2P-read from host memory, not from GPU 0 cached
+                        // VRAM. Eliminates the cross-GPU peer-VRAM-cached
+                        // read pressure that wedges PCIe at 4+ GPUs (per
+                        // ea bridge #242). Companion to commit 7c97069 which
+                        // moved output_slots the same way. grid_x = ceil(hs/256)
+                        // so the kernel covers all `hs` elements with the
+                        // 256-thread block; earlier UC handoff attempt with
+                        // grid_x=1 failed because only the first 256 elements
+                        // were copied.
+                        prog.instructions[barrier_idx - 2] = D2dCopyInst::new(
+                            div_ceil(hs as u32, 256),
+                            p2p.moe_act_uc_handoff_dev_ptrs[0],
+                            act.normed.as_ptr(),
+                            hs as i32,
+                        )
+                        .into_inst();
                     }
                 }
             }
