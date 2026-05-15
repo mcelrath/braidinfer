@@ -573,12 +573,14 @@ impl Model {
             let bases: Vec<*mut f32> = (0..p2p.workers.len())
                 .map(|w| p2p.activation_staging_dev_ptr_for(w))
                 .collect();
-            (
-                p2p.output_slots.as_mut_ptr(),
-                p2p.num_gpus,
-                p2p.workers.len(),
-                bases,
-            )
+            // Per-worker device pointer to output_slots. Each worker reads
+            // through ITS GPU's context-resolved device pointer (snl §11.4
+            // fix). output_slots_dev_ptrs[0] = GPU 0, [1..] = workers in
+            // worker-index order.
+            let out_bases: Vec<*mut f32> = (0..p2p.workers.len())
+                .map(|w| p2p.output_slots_dev_ptrs[w + 1])
+                .collect();
+            (out_bases, p2p.num_gpus, p2p.workers.len(), bases)
         };
         // Write all_activations directly to the host-mapped staging buffer.
         // No DMA, no kernel launch — CPU stores land in pinned host RAM and
@@ -620,7 +622,7 @@ impl Model {
                 self.persistent_workers.as_mut().unwrap();
             for w in 0..num_workers {
                 let gpu_id = w + 1;
-                let out_slot = unsafe { output_slots_raw.add((t * num_gpus + gpu_id) * hs) };
+                let out_slot = unsafe { output_slots_raw[w].add((t * num_gpus + gpu_id) * hs) };
                 // Per-worker device pointer (portable host-mapped requires
                 // per-context device pointers on AMD ROCm).
                 let act_p2p = unsafe {
@@ -736,10 +738,13 @@ impl Model {
                 }
             }
 
-            // D2D copy ffn_down → output_slots[(t * num_gpus + 0) * hs]
+            // D2D copy ffn_down → output_slots[(t * num_gpus + 0) * hs].
+            // GPU 0 is the source context; use its host-mapped device
+            // pointer (the moe_p2p::output_slots_dev_ptrs[0] entry).
+            let gpu0_out = self.moe_p2p.as_ref().unwrap().output_slots_dev_ptrs[0];
             unsafe {
                 let rc = braidinfer_hip::ffi::hipMemcpyAsync(
-                    output_slots_raw.add(t * num_gpus * hs) as *mut std::ffi::c_void,
+                    gpu0_out.add(t * num_gpus * hs) as *mut std::ffi::c_void,
                     self.activations.ffn_down.as_ptr() as *const std::ffi::c_void,
                     latent_size * 4,
                     braidinfer_hip::ffi::hipMemcpyDeviceToDevice,

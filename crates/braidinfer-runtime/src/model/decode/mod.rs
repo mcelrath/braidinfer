@@ -283,7 +283,7 @@ impl Model {
 
         if let Some(p2p) = self.moe_p2p.as_ref() {
             eprintln!("-- moe_p2p --");
-            dev(&p2p.output_slots, "moe_p2p.output_slots");
+            host(&p2p.output_slots, "moe_p2p.output_slots");
             host(&p2p.activation_staging, "moe_p2p.activation_staging");
         }
         eprintln!("=== end MTYPE audit ===");

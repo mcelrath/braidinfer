@@ -77,8 +77,24 @@ pub struct MoeP2pContext {
     pub work_queue: MappedHostBuffer<u8>,
     /// Monotonic dispatch sequence counter (GART, host-mapped u32).
     pub seq_counter: MappedHostBuffer<u32>,
-    /// Expert output accumulation buffer on GPU 0 VRAM: `float[num_gpus * hidden_size]`.
-    pub output_slots: DeviceBuffer<f32>,
+    /// Expert output accumulation buffer. Workers P2P-write expert outputs
+    /// here; GPU 0's POST op reads them.
+    ///
+    /// **Memory class — 2026-05-14 fix for braidinfer-snl §11.4 wedge:**
+    /// Was `DeviceBuffer<f32>::alloc_uncached(gpu0, ...)` (GPU 0 UC VRAM).
+    /// That made worker writes cross-GPU peer-VRAM UC stores, which per
+    /// `kernels/rdna3/rdna3_peer.h` V7 reproducer evidence wedge MES at 4+
+    /// GPUs under multi-GPU PCIe pressure. Switched to portable host-
+    /// mapped UC: the hazard envelope says host-mapped UC has never
+    /// reproduced the wedge across V0/V5 n=10 4-GPU trials. Workers still
+    /// write cross-PCIe (now to host memory instead of peer VRAM); GPU 0's
+    /// POST reads back through hipHostGetDevicePointer.
+    pub output_slots: MappedHostBuffer<f32>,
+    /// Per-GPU device pointer to `output_slots` (one per device, including
+    /// GPU 0). hipHostGetDevicePointer returns a device-context-specific
+    /// pointer; even with `hipHostMallocPortable` the address is valid
+    /// only for the GPU context that was current at the time of the call.
+    pub output_slots_dev_ptrs: Vec<*mut f32>,
     /// GPU 0 per-layer config pointer array on GPU 0 VRAM: `MoeWorkerConfig*[num_layers]`.
     pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
     /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
@@ -168,12 +184,31 @@ impl MoeP2pContext {
         let seq_counter = MappedHostBuffer::<u32>::alloc(1)?;
         // Output slots sized for MAX_PREFILL_BATCH × num_gpus × hidden_size.
         // Decode uses only the first (0 * num_gpus + gpu) * hs slot (batch_size=1).
-        // MTYPE=UC (uncached) for cross-GPU coherence: workers P2P-write expert
-        // outputs here, GPU 0 reads back. Without UC, GPU 0's L2 may serve stale
-        // entries (sew-class bug, see commit 57af4a3 + GFX1100_ARCH.md §5.1).
-        // gfx1100 has no usable __threadfence_system (compiles same as
-        // __threadfence per commit 843e84a), so MTYPE=UC is the only mechanism.
-        let output_slots = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * num_gpus * hidden_size)?;
+        //
+        // 2026-05-14 (braidinfer-snl §11.4 fix): allocated as portable host-
+        // mapped UC instead of GPU 0 UC VRAM. kernels/rdna3/rdna3_peer.h
+        // documents that cross-GPU peer-VRAM UC stores wedge MES at 4+ GPUs
+        // under multi-GPU PCIe pressure (V7 reproducer, 3/10 wedge rate at
+        // 4-GPU), but host-mapped UC alone never reproduced the wedge
+        // across V0/V5 trials. Per-worker + GPU 0 device pointers via
+        // hipHostGetDevicePointer in the worker-launch loop below.
+        // alloc_coherent (hipHostMallocCoherent) forces fine-grained UC on
+        // BOTH CPU and GPU sides; alloc_portable may use MTYPE_NC (cached)
+        // and would defeat the no-L2-staleness intent.
+        let output_slots = MappedHostBuffer::<f32>::alloc_coherent(
+            MAX_PREFILL_BATCH * num_gpus * hidden_size,
+        )?;
+        let mut output_slots_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_gpus);
+        // GPU 0 first.
+        let mut gpu0_output_slots_dev: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe {
+            braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                &mut gpu0_output_slots_dev,
+                output_slots.host_ptr() as *mut std::ffi::c_void,
+                0,
+            ))?;
+        }
+        output_slots_dev_ptrs.push(gpu0_output_slots_dev as *mut f32);
 
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
@@ -240,6 +275,16 @@ impl MoeP2pContext {
                 ))?;
             }
             activation_staging_dev_ptrs.push(act_dev_ptr as *mut f32);
+            // Per-worker device pointer to output_slots (snl §11.4 fix).
+            let mut out_dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            unsafe {
+                braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                    &mut out_dev_ptr,
+                    output_slots.host_ptr() as *mut std::ffi::c_void,
+                    0,
+                ))?;
+            }
+            output_slots_dev_ptrs.push(out_dev_ptr as *mut f32);
 
             let (layer_config_ptrs, config_storage) = build_layer_configs(
                 device,
@@ -288,6 +333,7 @@ impl MoeP2pContext {
         Device::set_current(gpu0)?;
 
         Ok(MoeP2pContext {
+            output_slots_dev_ptrs,
             work_queue,
             seq_counter,
             output_slots,

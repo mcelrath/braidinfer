@@ -1588,7 +1588,7 @@ impl MegakernelProgram {
             prog.instructions[barrier_idx] = MoeDispatchInst {
                 opcode_gridx: OP_MOE_DISPATCH as u64,
                 work_queue: p2p.work_queue.device_ptr() as u64,
-                output_slots: p2p.output_slots.as_ptr() as u64,
+                output_slots: p2p.output_slots_dev_ptrs[0] as u64,
                 final_output: final_output_ptr,
                 expert_ids: act.moe_expert_ids.as_ptr() as u64,
                 expert_weights: act.moe_expert_weights.as_ptr() as u64,
@@ -1660,7 +1660,7 @@ impl MegakernelProgram {
                     new_instructions.push(MoeDispatchInst {
                         opcode_gridx: OP_MOE_DISPATCH_POST as u64,
                         work_queue: p2p.work_queue.device_ptr() as u64,
-                        output_slots: p2p.output_slots.as_ptr() as u64,
+                        output_slots: p2p.output_slots_dev_ptrs[0] as u64,
                         final_output: final_output_ptr,
                         expert_ids: act.moe_expert_ids.as_ptr() as u64,
                         expert_weights: act.moe_expert_weights.as_ptr() as u64,
