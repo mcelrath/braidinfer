@@ -252,12 +252,6 @@ pub(crate) trait BatchDispatcher {
 #[repr(C)]
 pub struct WorkerQueueLayout {
     pub seq_num: u32,
-    // pky.2 A2 probe 2026-05-13: padding to align seq_num to its own 64-byte
-    // cache line under BRAIDINFER_QUEUE_LINE_ISOLATE. Must match the C-side
-    // #ifdef gate in kernels/worker_queue.h. When the gate is off, this is
-    // a zero-sized array (no-op).
-    #[cfg(queue_line_isolate)]
-    pub _seq_line_pad: [u32; 15],
     pub shutdown: u32,
     pub num_instructions: u32, // how many instructions in this batch (1..MAX_BATCH)
     /// Diagnostic counter: each block's thread 0 atomicAdds 1 at kernel
@@ -288,19 +282,10 @@ pub struct WorkerQueueLayout {
 // Static check that WorkerQueueLayout matches the C struct size.
 // 4*4 (head) + MAX_BATCH_INSTRUCTIONS*INST_SIZE*8 (inst) + 4*4 (tail) + 8 (op_profile)
 //   + 8 (dump_base) + 4 (dump_capacity) + 8 (dump_count) + 4 (_pad3) = +24
-// pky.2 A2: + 60 bytes seq-line padding when BRAIDINFER_QUEUE_LINE_ISOLATE.
-#[cfg(not(queue_line_isolate))]
 const _: () = assert!(
     std::mem::size_of::<WorkerQueueLayout>()
         == 16 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8 + 24,
     "WorkerQueueLayout size mismatch — verify C struct in kernels/worker_queue.h matches"
-);
-#[cfg(queue_line_isolate)]
-const _: () = assert!(
-    // 16 (head) + 60 (seq_line_pad) + 4 (implicit u64-alignment) + INST + 16 + 8 + 24
-    std::mem::size_of::<WorkerQueueLayout>()
-        == 16 + 60 + 4 + MAX_BATCH_INSTRUCTIONS * INST_SIZE * 8 + 16 + 8 + 24,
-    "WorkerQueueLayout size mismatch (queue_line_isolate variant)"
 );
 
 /// Per-GPU worker state.
@@ -486,21 +471,6 @@ impl PersistentDispatch {
             device.0
         );
         braidinfer_hip::set_persistent_worker_active(device, true);
-        // Phase 0b host->GPU coherence experiment 2026-05-13: dump queue mtype
-        // to verify the doc claim that MappedHostBuffer::alloc gives MTYPE_UC
-        // on the allocating GPU. mem_type 2=Device, alloc_flags 0x0=cached
-        // (NC), 0x3=UC. If alloc_flags here is 0x0, worker L2 caches the
-        // queue line and the wedge is L2 staleness (gfx1100 has no
-        // buffer_gl2_inv to refresh from kernel).
-        if std::env::var("BRAIDINFER_P0B_VERIFY_HOST_WRITE").is_ok() {
-            match queue.pointer_attributes() {
-                Ok((t, f)) => eprintln!(
-                    "[p0b-mtype] GPU {} worker queue: mem_type={t} alloc_flags=0x{f:x}",
-                    device.0
-                ),
-                Err(e) => eprintln!("[p0b-mtype] GPU {} pointer_attributes failed: {e:?}", device.0),
-            }
-        }
         let slot = device.0 as usize;
         if slot >= self.workers.len() {
             self.workers.resize_with(slot + 1, || None);
@@ -702,42 +672,6 @@ impl PersistentDispatch {
         let seq = w.seq_counter;
         unsafe {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
-            // pky.2 B1 probe 2026-05-13: follower write to force PCIe posted-write
-            // drain. RESULT: WEDGED — ruled out.
-            if std::env::var("BRAIDINFER_WRITE_FOLLOWER").is_ok() {
-                std::ptr::write_volatile(
-                    std::ptr::addr_of_mut!((*q_ptr).block_alive_count),
-                    0xFFFF_0000u32 | seq,
-                );
-            }
-            // pky.2 B4 probe 2026-05-13: explicit x86 memory fence after the
-            // volatile write. hipHostMallocMapped may map host memory as Write-
-            // Combined on CPU side; WC buffers don't flush on simple writes until
-            // an SFENCE or coalescing event. If the wedge is "WC buffer not
-            // drained until something else flushes it", mfence after the write
-            // should fix it.
-            if std::env::var("BRAIDINFER_WRITE_MFENCE").is_ok() {
-                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-                #[cfg(target_arch = "x86_64")]
-                {
-                    std::arch::x86_64::_mm_mfence();
-                }
-            }
-            // pky.2 B2 probe 2026-05-13: explicit CLFLUSH on the cache line
-            // containing seq_num. If the CPU side has the line in any cached
-            // state (despite hipHostMallocMapped's claim of UC), this forces
-            // eviction → next access goes to memory, which forces PCIe push.
-            // For host-mapped UC this should be a no-op; if it FIXES the wedge,
-            // the actual mapping isn't UC on the CPU side.
-            if std::env::var("BRAIDINFER_WRITE_CLFLUSH").is_ok() {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    std::arch::x86_64::_mm_clflush(
-                        std::ptr::addr_of!((*q_ptr).seq_num) as *const u8
-                    );
-                    std::arch::x86_64::_mm_mfence();
-                }
-            }
         }
 
         // Wait for ack via the shared try_wait_ack path, panicking to
@@ -821,20 +755,6 @@ impl PersistentDispatch {
         let seq = w.seq_counter;
         unsafe {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
-        }
-        // Phase 0b host->GPU coherence experiment 2026-05-13: readback the
-        // CPU's own store to confirm it landed in host RAM. If readback != seq,
-        // the CPU side itself never wrote (compiler or memory-system issue).
-        // Logs on mismatch only to keep noise low in the steady state.
-        if std::env::var("BRAIDINFER_P0B_VERIFY_HOST_WRITE").is_ok() {
-            let observed = unsafe {
-                std::ptr::read_volatile(std::ptr::addr_of!((*q_ptr).seq_num))
-            };
-            if observed != seq {
-                eprintln!(
-                    "[p0b-fire] gpu={gpu_idx} wrote seq={seq} but CPU readback={observed} (host write failed)"
-                );
-            }
         }
         seq
     }

@@ -351,18 +351,6 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
 
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
     coop_copy(la, act_p2p, gupd, grid, gbs);
-#ifdef BRAIDINFER_DUMP_MOE_INPUT
-    // braidinfer-snl Phase 2: dump act_p2p[0..3] as worker sees it.
-    // Compare across runs: if values differ, input-side race confirmed.
-    static __device__ uint64_t mi_seq = 0;
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        uint64_t seq = atomicAdd((unsigned long long*)&mi_seq, 1ull);
-        printf("[MOEINPUT seq=%llu gupd=%d] la=[%.6e %.6e %.6e %.6e] act_p2p=[%.6e %.6e %.6e %.6e]\n",
-               (unsigned long long)seq, gupd,
-               la[0], la[1], la[2], la[3],
-               act_p2p[0], act_p2p[1], act_p2p[2], act_p2p[3]);
-    }
-#endif
 
     // 2. Zero accumulator.
     coop_zero(lo, gupd, grid, gbs);
@@ -433,20 +421,7 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
          idx += gridDim.x * blockDim.x) {
         out_p2p[idx] = lo[idx];
     }
-#ifdef BRAIDINFER_MOE_WORKER_FENCE_SYSTEM
-    // braidinfer-snl Option (E): SYSTEM-scope fence after cross-GPU write.
-    // DEVICE-scope __threadfence only flushes this GPU's L1/L2 to its
-    // local memory; it does NOT guarantee cross-GPU PCIe arrival or
-    // write-combine buffer drain. SYSTEM scope is the strongest.
-    __threadfence_system();
-#else
     __threadfence();
-#endif
-#ifdef BRAIDINFER_MOE_WORKER_DRAIN_VSCNT
-    // Option (A): drain SYSTEM-scope vscnt before kernel exit. Doesn't
-    // guarantee cross-GPU arrival, only this GPU's egress.
-    asm volatile("s_waitcnt_vscnt null, 0x0" ::: "memory");
-#endif
 #ifdef BRAIDINFER_MOE_WORKER_READBACK_FENCE
     // Option (C) per udi #199/#236: PCIe non-posted read from GPU 0
     // forces worker's prior posted writes to same target to complete

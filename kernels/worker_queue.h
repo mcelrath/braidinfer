@@ -21,13 +21,6 @@
 
 struct WorkerQueue {
     volatile uint32_t seq_num;      // monotonic counter, triggers worker
-#ifdef BRAIDINFER_QUEUE_LINE_ISOLATE
-    // pky.2 A2 probe 2026-05-13: pad seq_num to its own 64-byte cache line.
-    // If host writes to seq_num share a line with concurrent updates to
-    // adjacent fields (shutdown, num_instructions, etc.), the GPU's view
-    // may pick up a stale line image. Isolation eliminates this hypothesis.
-    uint32_t _seq_line_pad[15];     // 60 bytes → seq_num alone on line 0
-#endif
     volatile uint32_t shutdown;     // 1 = exit
     uint32_t num_instructions;      // instructions in this batch (1..MAX_BATCH_INSTRUCTIONS)
     // Diagnostic: each block's thread 0 atomicAdds 1 at kernel entry. Lets the

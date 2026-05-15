@@ -203,14 +203,14 @@ impl PrefillBuffers {
     }
 }
 
-/// 5ax K-trace + MROPE in-kernel dump diagnostic gate.
-/// Set `BRAIDINFER_K_TRACE_5AX=1` to enable; off by default.
-/// When off, the diagnostic adds no instructions to the megakernel program
-/// and no kernel-side dump writes. The trace/dump buffers are still allocated
-/// (~12KB) but unused.
+/// 5ax K-trace + MROPE in-kernel dump diagnostic gate. The
+/// `BRAIDINFER_K_TRACE_5AX` env var was retired by braidinfer-wuf.3
+/// (the qwen35_35b_a3b MROPE investigation it served is closed; see kb
+/// `5ax-k-trace-2026-05-06-result-commit`). Helper kept so the existing
+/// call sites in megakernel_compile.rs and braid_bench compile; always
+/// returns false now. Remove call sites + this helper as a follow-up.
 pub fn k_trace_5ax_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("BRAIDINFER_K_TRACE_5AX").is_ok())
+    false
 }
 
 impl PrefillBuffers {

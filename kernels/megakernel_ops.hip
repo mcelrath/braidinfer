@@ -7,16 +7,10 @@
 #include "rdna3_reduce.h"
 
 // 77r.2.14 quality probe: -DBRAIDINFER_BF16_INPUT_PROBE makes
-// op_linear_proj round-trip its f32 input through bf16 before the
-// dot product, simulating the precision loss that would result
-// from adopting __builtin_amdgcn_fdot2_f32_bf16 (kb 77r-2-13). The
-// macro is a no-op when the define is absent.
-#ifdef BRAIDINFER_BF16_INPUT_PROBE
-#define BF16_ROUND_F32(x) \
-    __builtin_bit_cast(float, ((unsigned)((unsigned short)(__builtin_bit_cast(unsigned, (x)) >> 16))) << 16)
-#else
+// BF16_ROUND_F32: identity in production. Historically gated on
+// BRAIDINFER_BF16_INPUT_PROBE (precision-loss simulator for 77r.2.14);
+// probe retired by braidinfer-wuf.3.
 #define BF16_ROUND_F32(x) (x)
-#endif
 
 // 77r.2.4 (reframed): -DBRAIDINFER_KV_LOAD_AUX=N replaces plain `k_base[i]`
 // and `v_base[i]` reads in op_attn_paged with an explicit raw_buffer_load
