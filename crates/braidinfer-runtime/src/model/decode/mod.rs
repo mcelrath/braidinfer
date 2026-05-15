@@ -268,7 +268,7 @@ impl Model {
                 if let Some(b) = w.attn_k.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_k")); }
                 if let Some(b) = w.attn_v.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_v")); }
                 if let Some(b) = w.attn_gate.as_ref()   { dev(b, &format!("workers[{gpu_i}].attn_gate")); }
-                if let Some(b) = w.attn_out.as_ref()    { dev(b, &format!("workers[{gpu_i}].attn_out")); }
+                if let Some(b) = w.attn_out.as_ref()    { host(b, &format!("workers[{gpu_i}].attn_out")); }
                 for (i, kv) in w.attn_kv_caches.iter().enumerate() {
                     if i < 2 {
                         dev(&kv.k, &format!("workers[{gpu_i}].attn_kv_caches[{i}].k"));
@@ -635,11 +635,8 @@ impl Model {
                 let out = if gpu_i == 0 {
                     attn_out_base
                 } else {
-                    mgpu.workers[gpu_i]
-                        .attn_out
-                        .as_ref()
-                        .unwrap()
-                        .as_write_ptr() as u64
+                    // Worker writes via its own dev_ptr to the host-mapped buffer.
+                    mgpu.workers[gpu_i].attn_out_dev_self.unwrap() as u64
                 };
                 (
                     kc.k.as_write_ptr() as u64,
@@ -678,9 +675,7 @@ impl Model {
                         let q_gate = w.attn_q_gate.as_ref().unwrap().as_write_ptr() as u64;
                         let k = w.attn_k.as_ref().unwrap().as_write_ptr() as u64;
                         let v = w.attn_v.as_ref().unwrap().as_write_ptr() as u64;
-                        let gate = w.attn_gate.as_ref()
-                            .map(|b| b.as_write_ptr() as u64)
-                            .unwrap_or(0);
+                        let gate = w.attn_gate.as_ref().map(|b| b.as_write_ptr() as u64).unwrap_or(0);
                         (normed, q_gate, k, v, gate)
                     }
                 };
@@ -886,12 +881,11 @@ impl Model {
         let grid_x = ((n_elems as u32) + 255) / 256;
 
         // attn_out gather: GPU i → act.attn_out[i*n_elems..]
+        // Reads worker's host-mapped UC via GPU 0's dev_ptr (no peer-VRAM read).
         for gpu_i in 1..num_gpus {
             let src = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                .attn_out
-                .as_ref()
-                .unwrap()
-                .as_ptr() as *const f32;
+                .attn_out_dev_gpu0
+                .unwrap() as *const f32;
             let dst =
                 unsafe { (self.activations.attn_out.as_write_ptr()).add(gpu_i * n_elems) };
             gather_batch.push(D2dCopyInst::new(grid_x, dst, src, n_elems as i32).into_inst());

@@ -64,13 +64,26 @@ pub struct GpuWorker {
     // Head-parallel attention buffers (allocated by init_attn_buffers after construction)
     pub attn_kv_caches: Vec<crate::weights::KvCache>, // [num_attn_layers], each [local_nkh, max_seq_len, hd]
     pub attn_q: Option<DeviceBuffer<f32>>,            // [local_nqh * head_dim]
-    pub attn_out: Option<DeviceBuffer<f32>>,          // [local_nqh * head_dim]
+    // attn_out/attn_gate: host-mapped UC (snl 2026-05-15 follow-up to
+    // output_slots/moe_act_uc_handoff). Same §11.4-class fix: workers wrote
+    // these into local VRAM UC and GPU 0 peer-read via D2D_COPY, which on
+    // gfx1100 under PCIe pressure at 4+ GPU wedges MES. Routing through
+    // host-mapped portable+coherent eliminates the cross-GPU peer-read.
+    pub attn_out: Option<braidinfer_hip::memory::MappedHostBuffer<f32>>, // [local_nqh * head_dim]
+    pub attn_out_dev_self: Option<*mut f32>,
+    pub attn_out_dev_gpu0: Option<*mut f32>,
     // Distributed QKV projection buffers (allocated by init_split_attn_weights)
     pub attn_normed: Option<DeviceBuffer<f32>>, // [hidden_size] — P2P copy of GPU 0's normed
     pub attn_q_gate: Option<DeviceBuffer<f32>>, // [local_nqh*hd*q_mult] — Q+gate interleaved
     pub attn_k: Option<DeviceBuffer<f32>>,      // [local_nkh*hd]
     pub attn_v: Option<DeviceBuffer<f32>>,      // [local_nkh*hd]
-    pub attn_gate: Option<DeviceBuffer<f32>>,   // [local_nqh*hd] — gate (split from q_gate)
+    // attn_gate stays as worker-VRAM UC: the DeinterleaveInst that writes it
+    // emits cached vector stores, and on host-mapped pages the L2 dirty lines
+    // are not flushed by the agent-scope ack fence before GPU 0's gather reads.
+    // Worker-VRAM UC physical pages still serve correct values via peer-read.
+    // Bisection (2026-05-15): out-host+gate-VRAM passes 3/3 with real content;
+    // out-host+gate-host produced gibberish "write" tokens at 2-GPU.
+    pub attn_gate: Option<DeviceBuffer<f32>>,
     // Split attention projection weights (per attention layer), stored on this GPU
     pub attn_w_q_gate: Vec<crate::quant::LinearWeight>, // [local_nqh*hd*q_mult, hs] per attn layer
     pub attn_w_k: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
@@ -145,6 +158,8 @@ impl MultiGpuContext {
                 attn_kv_caches: Vec::new(),
                 attn_q: None,
                 attn_out: None,
+                attn_out_dev_self: None,
+                attn_out_dev_gpu0: None,
                 attn_normed: None,
                 attn_q_gate: None,
                 attn_k: None,
@@ -183,14 +198,38 @@ impl MultiGpuContext {
                 worker.device,
                 local_nqh * head_dim,
             )?);
-            // attn_out is peer-read by GPU 0's persistent worker via D2D_COPY
-            // gather. Without UC, GPU 0's L2 may serve stale entries from prior
-            // decode steps (no KMD L2 invalidation between CPU-spin and the
-            // gather kernel — see GFX1100_ARCH.md §5.1).
-            worker.attn_out = Some(DeviceBuffer::<f32>::alloc_uncached(
-                worker.device,
-                local_nqh * head_dim,
-            )?);
+            // attn_out: host-mapped portable+coherent. Worker writes via its
+            // own dev_ptr; GPU 0 gather reads via GPU 0's dev_ptr. Replaces
+            // the prior worker-VRAM UC peer-read which triggered the §11.4
+            // class wedge under PCIe pressure at 4+ GPU.
+            {
+                let buf = braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable_coherent(
+                    local_nqh * head_dim,
+                )?;
+                // Worker-side dev pointer (current context is worker.device).
+                let mut self_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                        &mut self_ptr,
+                        buf.host_ptr() as *mut std::ffi::c_void,
+                        0,
+                    ))?;
+                }
+                // GPU 0-side dev pointer.
+                Device::set_current(DeviceId(0))?;
+                let mut gpu0_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                        &mut gpu0_ptr,
+                        buf.host_ptr() as *mut std::ffi::c_void,
+                        0,
+                    ))?;
+                }
+                Device::set_current(worker.device)?;
+                worker.attn_out = Some(buf);
+                worker.attn_out_dev_self = Some(self_ptr as *mut f32);
+                worker.attn_out_dev_gpu0 = Some(gpu0_ptr as *mut f32);
+            }
             // Distributed QKV projection activation buffers
             worker.attn_normed = Some(DeviceBuffer::<f32>::alloc(worker.device, hidden_size)?);
             worker.attn_q_gate = Some(DeviceBuffer::<f32>::alloc(
@@ -206,7 +245,11 @@ impl MultiGpuContext {
                 local_nkh * head_dim,
             )?);
             if q_mult > 1 {
-                // attn_gate is also peer-read by GPU 0's gather (alongside attn_out).
+                // attn_gate: worker-VRAM UC. DeinterleaveInst writes via cached
+                // vector stores; on host-mapped pages those L2 dirty lines are
+                // not flushed by the ack fence and GPU 0's gather reads stale
+                // values. Worker-VRAM UC physical pages still serve correct
+                // values via P2P peer-read.
                 worker.attn_gate = Some(DeviceBuffer::<f32>::alloc_uncached(
                     worker.device,
                     local_nqh * head_dim,
