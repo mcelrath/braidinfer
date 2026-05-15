@@ -26,11 +26,25 @@ pub fn resolve_hf_dir(bqnt_path: &str) -> Option<String> {
         if p.is_dir() {
             return Some(model_name);
         }
+        // Absolute path miss: the snapshot the bqnt was quantized from has
+        // moved or been GC'd. Recover by extracting the `models--<repo>`
+        // segment and picking any snapshot present under that repo.
+        if let Some(repo_seg) = model_name
+            .split('/')
+            .find(|seg| seg.starts_with("models--"))
+        {
+            return pick_snapshot_from_repo_seg(repo_seg);
+        }
+        return None;
     }
     let hf_name = model_name.replace('/', "--");
+    pick_snapshot_from_repo_seg(&format!("models--{hf_name}"))
+}
+
+fn pick_snapshot_from_repo_seg(repo_seg: &str) -> Option<String> {
     let cache_dir = dirs::home_dir()?
         .join(".cache/huggingface/hub")
-        .join(format!("models--{hf_name}"))
+        .join(repo_seg)
         .join("snapshots");
     let mut snapshots: Vec<_> = std::fs::read_dir(&cache_dir)
         .ok()?
