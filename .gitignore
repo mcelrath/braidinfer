@@ -71,3 +71,27 @@ benchmark_results/*
 .claude
 .worktrees
 kernels/diagnostic/persistent_skeleton_repro/host_runner
+
+# Build outputs from kernels/diagnostic/build_repro.sh and
+# benchmarks/build*.sh that hipcc leaves in the source tree (already
+# covered by extension globs above; these are explicit names).
+/benchmarks/cache_hint_bench
+/benchmarks/gemv_wmma_bench
+/scripts/bench_flat_gemm
+
+# Stray hipcc intermediates in any subdirectory (catches
+# kernels/diagnostic/foo/, benchmarks/, repo root, etc.). Was previously
+# only covered for file extensions at repo root via no-slash patterns;
+# leading **/ here makes it apply at any depth.
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.bc
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.bc.tmp
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.hipi
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.o
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.out
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.out.resolution.txt
+**/*-hip-amdgcn-amd-amdhsa-gfx1100.s
+**/*-host-x86_64-pc-linux-gnu.bc
+**/*-host-x86_64-pc-linux-gnu.hipi
+**/*-host-x86_64-pc-linux-gnu.s
+**/*-host-x86_64-pc-linux-gnu.o
+**/*.hipfb
