@@ -248,7 +248,6 @@ pub(crate) trait BatchDispatcher {
     /// per-stream synchronize (PerBatchDispatch).
     fn try_wait_acks_many(&self, targets: &[(usize, u32)]) -> Result<(), DispatchError>;
     fn has_worker(&self, gpu_idx: usize) -> bool;
-    fn num_gpus(&self) -> usize;
 }
 
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
@@ -878,10 +877,6 @@ impl PersistentDispatch {
         }
     }
 
-    /// Number of GPUs with launched workers.
-    pub fn num_gpus(&self) -> usize {
-        self.workers.iter().filter(|s| s.is_some()).count()
-    }
 }
 
 impl BatchDispatcher for PersistentDispatch {
@@ -902,9 +897,6 @@ impl BatchDispatcher for PersistentDispatch {
     }
     fn has_worker(&self, gpu_idx: usize) -> bool {
         PersistentDispatch::has_worker(self, gpu_idx)
-    }
-    fn num_gpus(&self) -> usize {
-        PersistentDispatch::num_gpus(self)
     }
 }
 

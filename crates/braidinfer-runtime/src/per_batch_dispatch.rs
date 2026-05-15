@@ -337,8 +337,4 @@ impl BatchDispatcher for PerBatchDispatch {
     fn has_worker(&self, gpu_idx: usize) -> bool {
         gpu_idx < self.workers.len() && self.workers[gpu_idx].is_some()
     }
-
-    fn num_gpus(&self) -> usize {
-        self.workers.iter().filter(|s| s.is_some()).count()
-    }
 }

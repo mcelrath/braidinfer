@@ -365,14 +365,11 @@ mod tests {
             seed: None,
             ..Default::default()
         };
-        // Token 3 has highest logit but is in history; after penalty it should lose
-        let mut logits = vec![0.1f32, 0.2, 0.3, 10.0, 0.4];
         let history = vec![3u32];
         let mut rng = small_rng();
-        // logits[3] = 10.0 / 2.0 = 5.0, still highest — use a case where penalty flips winner
-        let mut logits2 = vec![0.1f32, 0.2, 0.3, 1.1, 1.0];
         // logits[3] = 1.1/2.0 = 0.55, logits[4] = 1.0 -> winner = 4
-        let tok = sample(&mut logits2, &params, &history, &mut rng);
+        let mut logits = vec![0.1f32, 0.2, 0.3, 1.1, 1.0];
+        let tok = sample(&mut logits, &params, &history, &mut rng);
         assert_eq!(
             tok, 4,
             "repetition penalty should reduce logit[3] below logit[4]"

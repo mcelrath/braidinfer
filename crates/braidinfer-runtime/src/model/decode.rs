@@ -244,8 +244,6 @@ impl Model {
         let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
         let moe_worker_shared_mem = 1024u32 * 4 + 256;
         let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
-        let hs = self.config.hidden_size;
-        let gate_up_in_dim = self.config.moe_latent_size.unwrap_or(hs);
 
         // Lazy-init MoE P2P + per-batch dispatcher via the shared helper.
         // `ensure_moe_workers_started` reads `self.per_batch_coop` and
