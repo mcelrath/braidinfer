@@ -23,7 +23,7 @@ verification), the row is marked HASH-ONLY in the evidence column.
 | qwen35_2b.q4.bqnt | Qwen3.5-2B | 33-37 | sweep 3/3 + trace baseline | "clean sensible English" (bd braidinfer-bto NOTES table) |
 | qwen35_27b.q4.bqnt | Qwen3.5-27B dense | 4.1-4.2 | sweep 3/3, thinking-mode output ("<think>Thinking Process...") | coherent thinking-mode prelude observed |
 | qwen35_35b_a3b.q4.bqnt | Qwen3.5-35B-A3B MoE | 11-13 | bd braidinfer-bto NOTES 2026-05-14: "12.2 tok/s, sensible English 'Convolution is a mathematical operation that slides a filter over an input to extract...'" | reference good-MoE model |
-| qwen36_27b.q4.bqnt | Qwen3.6-27B dense | 4.1 | sweep 3/3 ("Paris.The capital of France is Paris.") | dense Qwen3.6 path (no MoE, no layer_types) — works |
+| qwen36_27b.q4.bqnt | Qwen3.6-27B dense | 4.1 | sweep 3/3 ("Paris.The capital of France is Paris.") | dense Qwen3.6 path (no MoE, no layer_types) — works on `paris` only; see Suspect-Working below |
 | mistral-7b-q4.bqnt | Mistral-7B-Instruct-v0.3 | 12.0-12.3 | sweep 3/3 | output is run-on but textually English |
 | mistral-nemo-q4.bqnt | Mistral-Nemo | 8.0-8.2 | sweep 3/3, "a city that is located in the north of France..." | coherent |
 | nemotron_cascade_30b.q4.bqnt | Nemotron-Cascade-2-30B-A3B (hybrid Mamba2/Attn MoE) | 19.9-20.4 | sweep 3/3, "Paris. The capital of France is Paris." | hybrid path supported |
@@ -37,6 +37,29 @@ verification), the row is marked HASH-ONLY in the evidence column.
 | qwen36_27b.q8.bqnt | Qwen3.6-27B q8 | OOM_FAIL | sweep 3/3 Hip(HipError(2)) | — | Q8 size exceeds single-GPU VRAM (24GB) |
 | qwen35_122b_a10b.q4.bqnt | Qwen3.5-122B-A10B MoE | OOM_FAIL on single GPU | sweep 3/3 Hip(HipError(2)) | — | 122B does not fit in 24GB; needs multi-GPU. (Earlier transcript referenced a `test_parse_qwen35_122b` parse panic — re-verified 2026-05-14 PM, test PASSES; no separate parse issue.) |
 | nemotron_super_120b.q4.bqnt | Nemotron-Super-120B (hybrid) | OOM_FAIL on single GPU; NaN logits on multi-GPU | sweep 3/3 Hip(HipError(2)); bd braidinfer-vo0 "4 GPUs: outputs '<unk><unk>...'" | braidinfer-vo0 | 79.4GB model needs multi-GPU. Multi-GPU NaN is a distinct active bug. |
+
+## Suspect-Working — single GPU (passes paris, stop_early on other prompts)
+
+Models classified `pass` on the short paris prompt but `stop_early` (0
+generated tokens) on the longer prompts. Two interpretations:
+- The model needs chat-template wrapping which the sweep harness's
+  `RAW=1` greedy mode does not provide; on raw prompts the first token
+  sampled is EOS so generation stops. Not a model bug per se.
+- The model has the same forward-pass bug as the bto family and the
+  short paris path masks it.
+
+| model file | post-cleanup sweep | likely cause |
+|---|---|---|
+| nemotron_cascade_30b.q4.bqnt | paris=pass, write=stop_early, attention=stop_early | RAW-mode artifact: model only emits beyond-EOS with the proper chat template. Chat binary produces full poems (verified 2026-05-14 PM); the model itself works. |
+| qwen36_27b.q4.bqnt | paris=pass, write=stop_early, attention=stop_early | Same arch family as qwen36_35b_a3b (DEGENERATE on long prompts). Strongly suspect same bto forward-pass bug. NOT confirmed working on longer prompts. Demote to "broken" once a chat-template-wrapped run is attempted. |
+
+## Post-cleanup sweep (2026-05-14 PM)
+
+`benchmark_results/regression/2026-05-14_post_cleanup/single_gpu_content_sweep.tsv`
+captures the full content-verified single-GPU sweep for every `.bqnt`
+in `models/`. Run with `python3 scripts/content_sweep.py --gpus 1`.
+This replaces the earlier hash-only sweep as the canonical evidence
+table going forward.
 
 ## Verified Working — multi-GPU
 

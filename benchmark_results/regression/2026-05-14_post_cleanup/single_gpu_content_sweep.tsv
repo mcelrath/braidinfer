@@ -1,0 +1,109 @@
+model	n_gpu	prompt	status	evidence
+deepseek-v2-lite-mixed.bqnt	1	paris	load_fail	MissingWeight("none of [\"model.layers.0.self_attn.k_proj.weight\", \"model.layers.0.mixer.k_proj.weight\"] found")
+devstral-small-q4.bqnt	1	paris	load_fail	HF cache miss
+leanstral-mixed.bqnt	1	paris	load_fail	tokenizer load failed
+mistral-7b-q4.bqnt	1	paris	pass	acityoflights,thecityoflove,thecityoffashion,thecityofart,
+persistent_worker: st
+mistral-7b-q4.bqnt	1	write	pass	1.
+
+2.
+3.
+4.
+5.
+6.
+7.
+8.
+9.
+10.
+11.
+2
+persistent_worker: started, queue=0x147c8b
+mistral-7b-q4.bqnt	1	attention	pass	persistent_worker: started, queue=0x14d79c868000
+mistral-nemo-q4.bqnt	1	paris	pass	a city that is located in the north of France. The city is the most populous cit
+mistral-nemo-q4.bqnt	1	write	pass	1. 1. 1. 12. 13. 14. 15. 1. 12. 1. 1. 1
+persistent_worker: started, queue=0x14e5
+mistral-nemo-q4.bqnt	1	attention	pass	(1 point) 1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.1.
+nemotron_cascade_30b.q4.bqnt	1	paris	pass	Paris. The capital of France is Paris. The capital of France is Paris. The capit
+nemotron_cascade_30b.q4.bqnt	1	write	stop_early	0 tokens generated (immediate EOS)
+nemotron_cascade_30b.q4.bqnt	1	attention	stop_early	0 tokens generated (immediate EOS)
+nemotron_super_120b.q4.bqnt	1	paris	oom	HipError(2) at load
+qwen35-0.8b-mixed.bqnt	1	paris	pass	Paris, and the capital of the United States is Washington, D.C.
+The capital of t
+qwen35-0.8b-mixed.bqnt	1	write	pass	<think>
+
+</think>
+
+The ocean is a vast, endless, and dynamic force that shapes t
+qwen35-0.8b-mixed.bqnt	1	attention	pass	<think>
+
+</think>
+
+Attention allows a model to focus on specific parts of the in
+qwen35_08b.q4.bqnt	1	paris	pass	Paris, and the capital of the United States is Washington, D.C.
+The capital of t
+qwen35_08b.q4.bqnt	1	write	pass	<think>
+
+</think>
+
+The ocean is a vast, endless, and dynamic sea of water that d
+qwen35_08b.q4.bqnt	1	attention	pass	<think>
+
+</think>
+
+Attention allows a model to focus on specific parts of the in
+qwen35_122b_a10b.q4.bqnt	1	paris	oom	HipError(2) at load
+qwen35_27b.q4.bqnt	1	paris	pass	Paris.
+
+<think>
+Thinking Process:
+
+1.  **Analyze the Request:**
+   
+persistent_w
+qwen35_27b.q4.bqnt	1	write	pass	<think>
+
+</think>
+
+The vast, mysterious ocean stretches endlessly beneath the ho
+qwen35_27b.q4.bqnt	1	attention	pass	<think>
+Thinking Process:
+
+1.  **Analyze the Request:**
+    *   Topic: Differenc
+qwen35_2b.q4.bqnt	1	paris	pass	Paris. The capital of the United States is Washington, D.C. The capital of the U
+qwen35_2b.q4.bqnt	1	write	pass	<think>
+
+</think>
+
+The ocean is a vast, dynamic, and life-supporting system that
+qwen35_2b.q4.bqnt	1	attention	pass	<think>
+
+</think>
+
+Attention is a mechanism that allows a model to weigh the imp
+qwen35_35b_a3b.q4.bqnt	1	paris	pass	Paris.
+The capital of France is Paris.
+The capital of France is Paris.
+The
+qwen35_35b_a3b.q4.bqnt	1	write	pass	<think>
+
+</think>
+
+The ocean is a vast, mysterious expanse that covers most of o
+qwen35_35b_a3b.q4.bqnt	1	attention	pass	<think>
+
+</think>
+
+Convolution is a mathematical operation that slides a filter 
+qwen36_27b.q4.bqnt	1	paris	pass	Paris.
+The capital of France is Paris.
+The capital of France is Paris.
+The
+persi
+qwen36_27b.q4.bqnt	1	write	stop_early	0 tokens generated (immediate EOS)
+qwen36_27b.q4.bqnt	1	attention	stop_early	0 tokens generated (immediate EOS)
+qwen36_27b.q8.bqnt	1	paris	oom	HipError(2) at load
+qwen36_35b_a3b.q4.bqnt	1	paris	pass	Paris.
+qwen36_35b_a3b.q4.bqnt	1	write	degenerate	40 tokens but stdout strips to ''
+qwen36_35b_a3b.q4.bqnt	1	attention	degenerate	repetition collapse: '<think>\n<|im_start|>\n<|im_start|>\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n<\n'
+qwen36_35b_a3b.q8.bqnt	1	paris	oom	HipError(2) at load
