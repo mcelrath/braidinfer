@@ -115,175 +115,6 @@ impl Model {
         Ok(logits)
     }
 
-    /// Phase 0a of braidinfer-pky: one-shot cooperative `megakernel_f32`
-    /// launch per decode step instead of dispatching through the persistent
-    /// worker mailbox.
-    ///
-    /// Identical state lifecycle to `decode_step_persistent`, but:
-    ///   - No `PersistentDispatch::init` (skips persistent worker launch).
-    ///   - `update_step_paged` (with `hipMemcpyAsync` upload) replaces
-    ///     `update_step_paged_no_upload`. Safe because no cooperative kernel
-    ///     is holding CUs.
-    ///   - `mk.execute(&self.stream)` + `stream.synchronize()` replaces the
-    ///     mailbox round-trip. `megakernel_f32` breaks on the trailing
-    ///     `OP_HALT` and returns normally.
-    ///   - Logits read from host-mapped `logits_mapped` (lm_head was patched
-    ///     to write there at first-compile time).
-    ///
-    /// Phase 0a is a smoke test for the dispatch wiring; single-GPU paged
-    /// decode is already deterministic. The 5ax determinism validation
-    /// happens on multi-GPU MoE (Phase 0b).
-    pub(super) fn decode_step_per_batch_coop(
-        &mut self,
-        token_id: u32,
-        position: u32,
-    ) -> Result<Vec<f32>, ModelError> {
-        if self.megakernel_paged.is_none() {
-            let max_chunks = self.max_paged_chunks();
-            let mut mk = MegakernelProgram::compile_paged(self)?;
-            mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
-            self.megakernel_paged = Some(mk);
-        }
-
-        // Patch lm_head to write host-mapped logits_mapped so the CPU reads
-        // logits directly without a hipMemcpy after each launch. MUST run
-        // every step (idempotent) because prefill_paged also compiles
-        // megakernel_paged without patching this — the persistent path
-        // hit the same trap (see decode_step_persistent comment).
-        // Layout: [..., OP_LM_HEAD, OP_HALT] — second-to-last is lm_head.
-        {
-            let mk = self.megakernel_paged.as_mut().unwrap();
-            let n_inst = mk.instructions.len();
-            let lm_head_idx = n_inst - 2;
-            mk.instructions[lm_head_idx].words[1] =
-                self.activations.logits_mapped.as_write_ptr() as u64;
-        }
-
-        self.ensure_paged_decode_state(false)?;
-        self.set_position(position).map_err(ModelError::Hip)?;
-
-        {
-            let seq_mut = self.paged_seq.as_mut().unwrap();
-            let alloc_mut = self.page_allocator.as_mut().unwrap();
-            seq_mut
-                .append_token(position as i32, alloc_mut)
-                .map_err(ModelError::Hip)?;
-        }
-
-        // Per-step instruction patching + hipMemcpyAsync upload to device_program.
-        {
-            let mk = self.megakernel_paged.as_mut().unwrap();
-            let seq = self.paged_seq.as_ref().unwrap();
-            let allocator = self.page_allocator.as_ref().unwrap();
-            mk.update_step_paged(token_id, position, seq, allocator, &self.stream)
-                .map_err(ModelError::Hip)?;
-        }
-
-        // One-shot cooperative launch + sync. megakernel_f32 exits on the
-        // trailing OP_HALT — control returns to host with logits_mapped
-        // fully written.
-        {
-            let mk = self.megakernel_paged.as_ref().unwrap();
-            mk.execute(&self.stream).map_err(ModelError::Hip)?;
-        }
-        self.stream.synchronize().map_err(ModelError::Hip)?;
-
-        let logits = unsafe {
-            std::slice::from_raw_parts(
-                self.activations.logits_mapped.host_ptr(),
-                self.config.vocab_size,
-            )
-        }
-        .to_vec();
-
-        // Chunk-seal lifecycle (stream.synchronize internal — safe here, no
-        // cooperative kernel is running).
-        {
-            let mk = self.megakernel_paged.as_mut().unwrap();
-            let seq_mut = self.paged_seq.as_mut().unwrap();
-            let alloc_mut = self.page_allocator.as_mut().unwrap();
-            mk.post_step_paged(
-                position,
-                seq_mut,
-                alloc_mut,
-                None,
-                &self.config,
-                &self.stream,
-            )
-            .map_err(ModelError::Hip)?;
-        }
-
-        self.seq_len = position + 1;
-        Ok(logits)
-    }
-
-    /// Phase 0b of braidinfer-pky: multi-GPU per-batch coop decode. Mirrors
-    /// `decode_step_persistent_multi_gpu` but routes through
-    /// [`PerBatchDispatch`](crate::per_batch_dispatch::PerBatchDispatch)
-    /// instead of [`PersistentDispatch`](crate::persistent_dispatch::PersistentDispatch).
-    ///
-    /// Lazy-init initializes:
-    ///   - `moe_p2p` and `megakernel_multi_gpu_p2p` (shared with persistent
-    ///     path; the megakernel program is identical between the two
-    ///     dispatch backends — only the dispatch mechanism changes).
-    ///   - `per_batch_dispatch` with ALL N GPUs as one-shot coop workers.
-    ///     Unlike persistent which incrementally adds GPU 0 on first decode,
-    ///     per-batch coop has no kernel-lifetime conflict, so we can register
-    ///     all GPUs at once on first decode.
-    ///
-    /// `decode_step_p2p` (shared with persistent path) reads
-    /// `self.per_batch_coop` at each dispatch site to choose the active
-    /// backend via [`BatchDispatcher`](crate::persistent_dispatch::BatchDispatcher).
-    pub(super) fn decode_step_per_batch_coop_multi_gpu(
-        &mut self,
-        token_id: u32,
-        position: u32,
-    ) -> Result<Vec<f32>, ModelError> {
-        use crate::per_batch_dispatch::PerBatchDispatch;
-
-        let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-        let moe_worker_shared_mem = 1024u32 * 4 + 256;
-        let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
-
-        // Lazy-init MoE P2P + per-batch dispatcher via the shared helper.
-        // `ensure_moe_workers_started` reads `self.per_batch_coop` and
-        // initializes PerBatchDispatch (not PersistentDispatch) when set —
-        // so prefill MoE goes through per-batch coop too.
-        self.ensure_moe_workers_started()?;
-
-        // GPU 0 wasn't included in the prefill init (kbk launches conflict
-        // with cooperative kernels mid-prefill). Add it now — per-batch coop
-        // has no lifetime hazard since each launch exits.
-        if let Some(dispatch) = self.per_batch_dispatch.as_mut() {
-            if !dispatch.has_worker(0) {
-                dispatch
-                    .add_device(self.device, shared_mem)
-                    .map_err(ModelError::Hip)?;
-            }
-        } else {
-            // Non-MoE multi-GPU: ensure_moe_workers_started no-ops (no MoE).
-            // Allocate per_batch_dispatch with all GPUs from scratch here.
-            let all_devices: Vec<_> = (0..num_gpus)
-                .map(|i| braidinfer_core::types::DeviceId(i as u32))
-                .collect();
-            let dispatch = PerBatchDispatch::init_with_total(num_gpus, &all_devices, shared_mem)
-                .map_err(ModelError::Hip)?;
-            self.per_batch_dispatch = Some(dispatch);
-            eprintln!(
-                "  Per-batch coop dispatch armed: {} GPUs (Phase 0b, non-MoE)",
-                num_gpus
-            );
-        }
-
-        if self.megakernel_multi_gpu_p2p.is_some() {
-            return self.decode_step_p2p(token_id, position);
-        }
-        // Non-MoE multi-GPU not yet supported through per-batch path.
-        Err(ModelError::InvalidConfig(
-            "KV_DISPATCH_MODE=per_batch_coop currently requires has_moe + multi_gpu".into(),
-        ))
-    }
-
     /// Multi-GPU persistent worker decode for MoE models.
     /// Initializes P2P workers on first call, then delegates to decode_step_p2p.
     pub(super) fn decode_step_persistent_multi_gpu(
@@ -316,14 +147,7 @@ impl Model {
     /// Lazily start MoE expert workers (GPUs 1-3) without launching the GPU 0 decode
     /// persistent cooperative kernel. Safe to call during prefill (no cooperative kernel
     /// running on GPU 0 yet, so hipMalloc is allowed).
-    ///
-    /// Under `per_batch_coop` mode, workers are armed via
-    /// [`PerBatchDispatch`](crate::per_batch_dispatch::PerBatchDispatch)
-    /// instead — no persistent cooperative kernel runs on worker GPUs, so
-    /// the Phase 0b decode path can `launch_cooperative` `megakernel_f32`
-    /// per sub-batch without contending with a CU-holding worker.
     pub(super) fn ensure_moe_workers_started(&mut self) -> Result<(), ModelError> {
-        use crate::per_batch_dispatch::PerBatchDispatch;
         use crate::persistent_dispatch::PersistentDispatch;
         if self.moe_p2p.is_some() {
             return Ok(());
@@ -379,21 +203,8 @@ impl Model {
         // Arm worker dispatchers on each WORKER GPU (1..N-1) — but NOT GPU 0.
         // GPU 0 still runs kbk launches during prefill (kernels.linear_proj.forward
         // in moe_ffn_forward / compile_prefill_segment paths). Its dispatcher
-        // worker is added on first decode call (init_multi_gpu_persistent for the
-        // persistent path; decode_step_per_batch_coop_multi_gpu for per-batch).
-        if self.per_batch_coop {
-            let dispatch = PerBatchDispatch::init_with_total(
-                num_gpus,
-                &worker_devices,
-                shared_mem_persistent,
-            )
-            .map_err(ModelError::Hip)?;
-            self.per_batch_dispatch = Some(dispatch);
-            eprintln!(
-                "  MoE P2P per-batch dispatch armed: {} worker GPUs (prefill path)",
-                num_gpus - 1
-            );
-        } else {
+        // worker is added on first decode call (init_multi_gpu_persistent).
+        {
             let dispatch = PersistentDispatch::init_with_total(
                 num_gpus,
                 &worker_devices,
@@ -519,12 +330,6 @@ impl Model {
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
     /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        // Phase 0b diagnostic — pinpoint which dispatch wedges in the
-        // per-batch coop path. Remove once Phase 0b passes.
-        let p0b_diag = self.per_batch_coop && std::env::var("BRAIDINFER_P0B_DIAG").is_ok();
-        if p0b_diag {
-            eprintln!("[p0b] decode_step_p2p: token_id={token_id} position={position}");
-        }
         // 5ax-decode probe: BRAIDINFER_MTYPE_AUDIT=1 dumps the MTYPE table
         // for all cross-agent and reused buffers in the decode path. Runs
         // once on the first decode step. Surfaces buffers that should be
@@ -613,9 +418,6 @@ impl Model {
             //      have written output_slots).
             if moe_i < moe_boundaries.len() && i == moe_boundaries[moe_i].0 {
                 let layer_idx = moe_boundaries[moe_i].1;
-                if p0b_diag {
-                    eprintln!("[p0b] MoE boundary moe_i={moe_i} i={i} layer={layer_idx} seg=[{seg_start}..{}]", i + 1);
-                }
                 // Build combined GPU 0 segment [seg_start..=i] (including PRE).
                 let seg_end_inclusive = i + 1;
                 let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end_inclusive];
@@ -629,39 +431,22 @@ impl Model {
                 // Fire GPU 0 batch async (PRE included). All chunks except the LAST
                 // use synchronous dispatch_batch (waits per-chunk); the last chunk
                 // uses dispatch_batch_fire so PRE runs concurrently with workers.
-                let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
-                    self.per_batch_dispatch.as_mut().unwrap()
-                } else {
-                    self.persistent_workers.as_mut().unwrap()
-                };
+                let dispatch: &mut dyn BatchDispatcher =
+                    self.persistent_workers.as_mut().unwrap();
                 let mut chunks = combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS).peekable();
                 let mut gpu0_seq: Option<u32> = None;
-                let mut chunk_idx = 0usize;
                 while let Some(chunk) = chunks.next() {
-                    if p0b_diag {
-                        eprintln!("[p0b]   GPU0 PRE chunk {chunk_idx} ({} insts)", chunk.len());
-                    }
                     if chunks.peek().is_none() {
                         // Last chunk — fire async, hold seq for wait_ack below.
                         gpu0_seq = Some(dispatch.dispatch_batch_fire(0, chunk));
                     } else {
                         dispatch.dispatch_batch(0, chunk);
                     }
-                    if p0b_diag {
-                        eprintln!("[p0b]   GPU0 PRE chunk {chunk_idx} fired");
-                    }
-                    chunk_idx += 1;
-                }
-                if p0b_diag {
-                    eprintln!("[p0b]   dispatch_moe_workers_decode_async layer={layer_idx} gpu0_seq={gpu0_seq:?}");
                 }
                 // Concurrently dispatch OP_MOE_FFN_REMOTE on each worker (async).
                 // dispatch_moe_workers_decode_async returns the per-worker seqs;
                 // we then wait_ack for all (workers + GPU 0 PRE).
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
-                if p0b_diag {
-                    eprintln!("[p0b]   MoE workers acked");
-                }
                 // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
                 seg_start = i + 1;
                 moe_i += 1;
@@ -673,19 +458,13 @@ impl Model {
             if has_head_parallel && attn_i < attn_boundaries.len() {
                 let (flush_idx, resume_idx) = attn_boundaries[attn_i];
                 if i == flush_idx {
-                    if p0b_diag {
-                        eprintln!("[p0b] attn boundary attn_i={attn_i} flush={flush_idx} resume={resume_idx}");
-                    }
                     // Include this instruction in the segment, then flush.
                     // Prepend any pending gather from previous attention layer.
                     let seg_end = i + 1;
                     {
                         let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..seg_end];
-                        let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
-                            self.per_batch_dispatch.as_mut().unwrap()
-                        } else {
-                            self.persistent_workers.as_mut().unwrap()
-                        };
+                        let dispatch: &mut dyn BatchDispatcher =
+                            self.persistent_workers.as_mut().unwrap();
                         if pending_gather.is_empty() {
                             dispatch.dispatch_batch_slice(0, mk_insts);
                         } else {
@@ -706,9 +485,6 @@ impl Model {
             i += 1;
         }
 
-        if p0b_diag {
-            eprintln!("[p0b] main loop done; tail seg=[{seg_start}..{i}] pending_gather.len={}", pending_gather.len());
-        }
         // Dispatch remaining segment, prepending any pending gather
         if seg_start < i || !pending_gather.is_empty() {
             let debug_hidden = self.debug_p2p_hidden;
@@ -723,11 +499,8 @@ impl Model {
                 c.extend_from_slice(mk_insts);
                 c
             };
-            let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
-                self.per_batch_dispatch.as_mut().unwrap()
-            } else {
-                self.persistent_workers.as_mut().unwrap()
-            };
+            let dispatch: &mut dyn BatchDispatcher =
+                self.persistent_workers.as_mut().unwrap();
             for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
                 dispatch.dispatch_batch(0, chunk);
                 if debug_hidden {
@@ -1084,29 +857,22 @@ impl Model {
                 }
             }
 
-            // All GPUs (including workers 1..N-1) dispatch via the active
-            // BatchDispatcher (persistent_worker mailbox or per-batch coop
-            // launch per `self.per_batch_coop`).
+            // All GPUs (including workers 1..N-1) dispatch via the
+            // persistent_worker mailbox (PersistentDispatch).
             assert!(
                 batch.len() <= MAX_BATCH_INSTRUCTIONS,
                 "attn batch overflow gpu={} len={}",
                 gpu_i, batch.len()
             );
-            let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
-                self.per_batch_dispatch.as_mut().unwrap()
-            } else {
-                self.persistent_workers.as_mut().unwrap()
-            };
+            let dispatch: &mut dyn BatchDispatcher =
+                self.persistent_workers.as_mut().unwrap();
             let seq = dispatch.dispatch_batch_fire(gpu_i, &batch);
             seq_nums.push((gpu_i, seq));
         }
 
         // Wait for all GPUs' dispatchers to complete attention.
-        let dispatch: &dyn BatchDispatcher = if self.per_batch_coop {
-            self.per_batch_dispatch.as_ref().unwrap()
-        } else {
-            self.persistent_workers.as_ref().unwrap()
-        };
+        let dispatch: &dyn BatchDispatcher =
+            self.persistent_workers.as_ref().unwrap();
         for &(gpu_i, seq) in &seq_nums {
             dispatch.wait_ack(gpu_i, seq);
         }
@@ -1220,11 +986,8 @@ impl Model {
         // [GPU0, GPU1, ..., GPU(num_gpus-1)] in PersistentDispatch::workers).
         let _ = num_gpus;
 
-        let dispatch: &mut dyn BatchDispatcher = if self.per_batch_coop {
-            self.per_batch_dispatch.as_mut().unwrap()
-        } else {
-            self.persistent_workers.as_mut().unwrap()
-        };
+        let dispatch: &mut dyn BatchDispatcher =
+            self.persistent_workers.as_mut().unwrap();
         let mut seq_per_gpu: Vec<(usize, u32)> = Vec::with_capacity(num_workers + 1);
         for (gpu_idx, inst) in &insts {
             // dispatch_batch_fire takes a slice; one OP_MOE_FFN_REMOTE per worker.

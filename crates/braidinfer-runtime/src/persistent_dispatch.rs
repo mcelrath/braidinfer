@@ -220,14 +220,12 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
-/// Surface common to both [`PersistentDispatch`] and
-/// [`crate::per_batch_dispatch::PerBatchDispatch`]. Lets `decode_step_p2p`
-/// route through either backend selected by `Model::per_batch_coop`
-/// (braidinfer-pky Phase 0b).
-///
-/// All methods are intentionally object-safe: the Phase 0b plumbing uses
-/// `&mut dyn BatchDispatcher` to avoid duplicating call sites in the
-/// multi-GPU decode path.
+/// Dispatch surface for [`PersistentDispatch`]. Kept as a trait (rather
+/// than inherent methods on PersistentDispatch) so call sites can hold
+/// `&mut dyn BatchDispatcher` — historically there was a second impl
+/// (`PerBatchDispatch`, deleted by braidinfer-wuf.2) and the indirection
+/// kept dispatch sites uniform. The single-impl form is retained for
+/// testability and future alternate dispatch strategies.
 pub(crate) trait BatchDispatcher {
     /// Fire a single batch asynchronously and return a per-GPU seq token.
     /// Caller must `wait_ack(gpu, seq)` before reading any buffer the
@@ -245,9 +243,8 @@ pub(crate) trait BatchDispatcher {
     fn wait_ack(&self, gpu_idx: usize, seq: u32);
     /// Wait for multiple (gpu, seq) targets in a single pass. Implementers
     /// may parallel-poll (PersistentDispatch) or deduplicate by GPU then
-    /// per-stream synchronize (PerBatchDispatch).
+    /// Multi-target wait used by hybrid layer dispatch.
     fn try_wait_acks_many(&self, targets: &[(usize, u32)]) -> Result<(), DispatchError>;
-    fn has_worker(&self, gpu_idx: usize) -> bool;
 }
 
 /// Rust mirror of WorkerQueue from persistent_worker.hip.
@@ -894,9 +891,6 @@ impl BatchDispatcher for PersistentDispatch {
     }
     fn try_wait_acks_many(&self, targets: &[(usize, u32)]) -> Result<(), DispatchError> {
         PersistentDispatch::try_wait_acks_many(self, targets)
-    }
-    fn has_worker(&self, gpu_idx: usize) -> bool {
-        PersistentDispatch::has_worker(self, gpu_idx)
     }
 }
 

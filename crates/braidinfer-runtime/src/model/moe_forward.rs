@@ -614,15 +614,10 @@ impl Model {
                     std::ptr::write_volatile(wts_dst.add(j), all_expert_weights[t * k + j]);
                 }
             }
-            // Build instruction per worker. Route through the active
-            // BatchDispatcher: per-batch coop or persistent worker mailbox.
+            // Build instruction per worker. Dispatch through persistent_worker mailbox.
             let p2p = self.moe_p2p.as_ref().unwrap();
             let dispatch: &mut dyn crate::persistent_dispatch::BatchDispatcher =
-                if self.per_batch_coop {
-                    self.per_batch_dispatch.as_mut().unwrap()
-                } else {
-                    self.persistent_workers.as_mut().unwrap()
-                };
+                self.persistent_workers.as_mut().unwrap();
             for w in 0..num_workers {
                 let gpu_id = w + 1;
                 let out_slot = unsafe { output_slots_raw.add((t * num_gpus + gpu_id) * hs) };

@@ -1111,7 +1111,6 @@ impl Model {
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
             has_moe,
             persistent: std::env::var("PERSISTENT").as_deref() == Ok("1"),
-            per_batch_coop: std::env::var("KV_DISPATCH_MODE").as_deref() == Ok("per_batch_coop"),
             kv_quant: std::env::var("KV_QUANT").as_deref() == Ok("1"),
             sync_debug: std::env::var("SYNC_DEBUG").is_ok(),
             debug_p2p_hidden: std::env::var("DEBUG_P2P_HIDDEN").is_ok(),
@@ -1121,7 +1120,6 @@ impl Model {
             moe_p2p: None,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
-            per_batch_dispatch: None,
         })
     }
 
