@@ -99,6 +99,13 @@ impl TokenConfig {
     pub fn is_stop_token(&self, token: u32) -> bool {
         self.eos_token_ids.contains(&token)
     }
+
+    /// Whether a chat template is available for this model. Base (non-
+    /// instruction-tuned) models return `None`; the `chat` binary surfaces
+    /// this at startup rather than failing on first turn.
+    pub fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
 }
 
 pub fn load_tokenizer(model_dir: &Path) -> Result<Tokenizer, Box<dyn std::error::Error>> {

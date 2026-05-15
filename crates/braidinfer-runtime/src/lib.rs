@@ -1,4 +1,5 @@
 pub mod bqnt;
+pub mod cli;
 pub mod gpu_utils;
 pub mod config;
 pub mod generate;

@@ -1,31 +1,14 @@
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::Instant;
 
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::config::FfnType;
+use braidinfer_runtime::cli::{apply_auto_modes, resolve_model_arg};
 use braidinfer_runtime::generate::{
     ChatMessage, TokenConfig, apply_chat_template_thinking, load_tokenizer,
 };
 use braidinfer_runtime::model::Model;
-
-fn vram_free_per_gpu() -> Vec<usize> {
-    let mut count: i32 = 0;
-    unsafe { braidinfer_hip::ffi::hipGetDeviceCount(&mut count) };
-    (0..count)
-        .map(|i| {
-            unsafe { braidinfer_hip::ffi::hipSetDevice(i) };
-            let mut free: usize = 0;
-            let mut total: usize = 0;
-            unsafe { braidinfer_hip::ffi::hipMemGetInfo(&mut free, &mut total) };
-            free
-        })
-        .collect()
-}
-
-const DEFAULT_MODEL_DIR: &str = "/home/mcelrath/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17";
 
 #[tokio::main]
 async fn main() {
@@ -36,120 +19,40 @@ async fn main() {
 
     let system_prompt = std::env::var("SYSTEM").ok();
 
-    fn resolve_hf_dir(bqnt_path: &str) -> Option<String> {
-        let bqnt = braidinfer_runtime::bqnt::MmapBqnt::open(Path::new(bqnt_path)).ok()?;
-        let model_name = bqnt.model_name()?;
-        let hf_name = model_name.replace('/', "--");
-        let cache_dir = dirs::home_dir()?
-            .join(".cache/huggingface/hub")
-            .join(format!("models--{hf_name}"))
-            .join("snapshots");
-        std::fs::read_dir(&cache_dir)
-            .ok()?
-            .filter_map(|e| e.ok())
-            .find(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.path().to_string_lossy().to_string())
-    }
-
     let model_arg = std::env::var("MODEL")
         .ok()
         .or_else(|| std::env::args().nth(1));
+    let resolved = resolve_model_arg(model_arg);
+    let model_dir = resolved.model_dir.as_path();
 
-    let (model_path, bqnt_override) = match model_arg {
-        Some(ref p) if p.ends_with(".bqnt") => {
-            let hf_dir = resolve_hf_dir(p).unwrap_or_else(|| {
-                eprintln!("Could not resolve HF cache dir for {p}");
-                std::process::exit(1);
-            });
-            (hf_dir, Some(p.clone()))
-        }
-        Some(p) => (p, None),
-        None => {
-            let from_bqnt = std::env::var("BQNT_PATH")
-                .ok()
-                .and_then(|p| resolve_hf_dir(&p));
-            (
-                from_bqnt.unwrap_or_else(|| DEFAULT_MODEL_DIR.to_string()),
-                None,
-            )
-        }
-    };
-    if let Some(ref bqnt_path) = bqnt_override {
-        unsafe {
-            std::env::set_var("BQNT_PATH", bqnt_path);
-        }
-    }
-
-    let model_dir = Path::new(&model_path);
-    if !model_dir.exists() {
-        eprintln!("Model not found at {}", model_path);
-        std::process::exit(1);
-    }
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
     let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
+    if token_config.chat_template().is_none() {
+        eprintln!(
+            "Error: {} has no chat_template — base model, not instruction-tuned.",
+            model_dir.display()
+        );
+        eprintln!("  Use `cargo run --release --bin generate -- <prompt>` for raw prompting,");
+        eprintln!("  or load an instruction-tuned variant (e.g. *-Instruct).");
+        std::process::exit(1);
+    }
     let device = DeviceId(0);
     let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN")
         .ok()
         .and_then(|v| v.parse().ok());
 
-    // Parse model config to detect MoE (needed for PERSISTENT auto-detection).
-    let config_path = model_dir.join("config.json");
-    let has_moe = config_path
-        .exists()
-        .then(|| braidinfer_runtime::config::ModelConfig::from_config_json(&config_path).ok())
-        .flatten()
-        .map_or(false, |c| c.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. })));
-
-    let bqnt_size_bytes: u64 = std::env::var("BQNT_PATH")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            model_dir.file_name().map(|n| {
-                model_dir
-                    .parent()
-                    .unwrap_or(model_dir)
-                    .join(format!("{}.q4.bqnt", n.to_string_lossy()))
-            })
-        })
-        .and_then(|p| std::fs::metadata(&p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    let free_per_gpu = vram_free_per_gpu();
-    let single_gpu_vram = free_per_gpu.first().copied().unwrap_or(0);
-    let multi_gpu = std::env::var("MULTI_GPU").is_ok()
-        || (bqnt_size_bytes > 0
-            && bqnt_size_bytes as usize > single_gpu_vram * 85 / 100
-            && free_per_gpu.len() > 1);
-    if multi_gpu && std::env::var("MULTI_GPU").is_err() {
-        eprintln!(
-            "Auto: MULTI_GPU enabled (model {:.1}GB > single-GPU {:.1}GB free)",
-            bqnt_size_bytes as f64 / 1e9,
-            single_gpu_vram as f64 / 1e9,
-        );
-        unsafe { std::env::set_var("MULTI_GPU", "1") };
-    }
+    let (multi_gpu, _persistent) = apply_auto_modes(model_dir);
 
     let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
     if kv_quant {
         eprintln!("KV_QUANT enabled (residual_pc int4)");
     }
-
-    // KV quantization is not yet supported in multi-GPU mode.
-    // Both require the paged KV path, but multi-GPU paged dispatch is not implemented.
+    // KV quantization requires the paged KV path; multi-GPU paged dispatch
+    // is not implemented.
     if kv_quant && multi_gpu {
         eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");
         eprintln!("  KV quantization only works in single-GPU mode.");
         std::process::exit(1);
-    }
-
-    let persistent = std::env::var("PERSISTENT").as_deref() == Ok("1")
-        || multi_gpu
-        || !has_moe;
-    if persistent && std::env::var("PERSISTENT").is_err() {
-        let reason = if multi_gpu { "required for multi-GPU" } else { "non-MoE model" };
-        eprintln!("Auto: PERSISTENT enabled ({reason})");
-        unsafe { std::env::set_var("PERSISTENT", "1") };
     }
 
     let mut model =
