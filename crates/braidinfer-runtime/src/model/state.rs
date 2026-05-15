@@ -156,10 +156,15 @@ impl Model {
             let wd = crate::watchdog::WatchdogThread::spawn();
             let wd_state_dev = wd.register(self.device).map_err(ModelError::Hip)?;
             let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 3] = [
+            // megakernel_f32 signature: (program, num_inst, watchdog, op_profile).
+            // op_profile may be null when profiling is disabled.
+            let mut op_profile_ptr: *mut std::ffi::c_void =
+                crate::op_profile::get_global() as *mut std::ffi::c_void;
+            let mut args: [*mut std::ffi::c_void; 4] = [
                 std::ptr::addr_of_mut!(prog_ptr).cast(),
                 std::ptr::addr_of_mut!(num_inst).cast(),
                 std::ptr::addr_of_mut!(wd_ptr).cast(),
+                std::ptr::addr_of_mut!(op_profile_ptr).cast(),
             ];
             func.launch_cooperative(
                 (num_blocks, 1, 1),
