@@ -31,6 +31,11 @@ pub struct DecodeMirror {
     /// normed_stage directly). For locating where bad data first enters
     /// the per-worker pipeline.
     worker_normed: Vec<PinnedBuffer<f32>>,
+    /// Per-worker attn_q_gate (Q+gate interleaved) mirror — sized
+    /// local_nqh * head_dim * q_mult.
+    worker_q_gate: Vec<PinnedBuffer<f32>>,
+    /// Per-worker attn_k mirror — sized local_nkh * head_dim.
+    worker_k: Vec<PinnedBuffer<f32>>,
     /// GPU 0 act.hidden mirror.
     act_hidden: PinnedBuffer<f32>,
     /// GPU 0 act.attn_out mirror (full [num_gpus × local_nqh × hd]).
@@ -93,14 +98,22 @@ impl DecodeMirror {
         let attn_out_floats = nqh_total * head_dim;
         let act_attn_out = PinnedBuffer::<f32>::alloc(attn_out_floats)?;
         let mut worker_normed: Vec<PinnedBuffer<f32>> = Vec::with_capacity(worker_devices.len());
+        let mut worker_q_gate: Vec<PinnedBuffer<f32>> = Vec::with_capacity(worker_devices.len());
+        let mut worker_k: Vec<PinnedBuffer<f32>> = Vec::with_capacity(worker_devices.len());
+        let local_nqh = nqh_total / (1 + worker_devices.len());
         for _ in worker_devices {
             worker_normed.push(PinnedBuffer::<f32>::alloc(hidden_size)?);
+            // q_mult is unknown here; allocate for max (q_mult=2 = output-gate)
+            worker_q_gate.push(PinnedBuffer::<f32>::alloc(local_nqh * head_dim * 2)?);
+            worker_k.push(PinnedBuffer::<f32>::alloc(local_nkh * head_dim)?);
         }
         Device::set_current(gpu0)?;
         Ok(DecodeMirror {
             streams,
             attn_kv,
             worker_normed,
+            worker_q_gate,
+            worker_k,
             act_hidden,
             act_attn_out,
             hidden_size,
@@ -121,6 +134,8 @@ impl DecodeMirror {
         activations: &ActivationBuffers,
         workers_attn_kv: &[&[crate::weights::KvCache]],
         workers_attn_normed: &[Option<*const f32>],
+        workers_attn_q_gate: &[Option<(*const f32, usize)>],
+        workers_attn_k: &[Option<*const f32>],
     ) -> HipResult<()> {
         // GPU 0 activations.
         Device::set_current(gpu0)?;
@@ -171,23 +186,44 @@ impl DecodeMirror {
                 }
             }
         }
-        // Per-worker attn_normed (workers 1..N).
+        // Per-worker attn_normed / attn_q_gate / attn_k (workers 1..N).
         let hs_bytes = self.hidden_size * std::mem::size_of::<f32>();
         for (w_idx, &dev) in worker_devices.iter().enumerate() {
-            // Slot in workers_attn_normed is gpu_i (== w_idx+1 for workers).
-            let src_ptr = match workers_attn_normed.get(w_idx + 1).and_then(|o| *o) {
-                Some(p) => p,
-                None => continue,
-            };
             Device::set_current(dev)?;
-            unsafe {
-                braidinfer_hip::error::check(ffi::hipMemcpyAsync(
-                    self.worker_normed[w_idx].as_mut_ptr() as *mut std::ffi::c_void,
-                    src_ptr as *const std::ffi::c_void,
-                    hs_bytes,
-                    ffi::hipMemcpyDeviceToHost,
-                    self.streams[w_idx + 1],
-                ))?;
+            if let Some(Some(p)) = workers_attn_normed.get(w_idx + 1).copied() {
+                unsafe {
+                    braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                        self.worker_normed[w_idx].as_mut_ptr() as *mut std::ffi::c_void,
+                        p as *const std::ffi::c_void,
+                        hs_bytes,
+                        ffi::hipMemcpyDeviceToHost,
+                        self.streams[w_idx + 1],
+                    ))?;
+                }
+            }
+            if let Some(Some((p, n))) = workers_attn_q_gate.get(w_idx + 1).copied() {
+                let copy_bytes = n.min(self.worker_q_gate[w_idx].len()) * 4;
+                unsafe {
+                    braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                        self.worker_q_gate[w_idx].as_mut_ptr() as *mut std::ffi::c_void,
+                        p as *const std::ffi::c_void,
+                        copy_bytes,
+                        ffi::hipMemcpyDeviceToHost,
+                        self.streams[w_idx + 1],
+                    ))?;
+                }
+            }
+            if let Some(Some(p)) = workers_attn_k.get(w_idx + 1).copied() {
+                let copy_bytes = self.worker_k[w_idx].len() * 4;
+                unsafe {
+                    braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                        self.worker_k[w_idx].as_mut_ptr() as *mut std::ffi::c_void,
+                        p as *const std::ffi::c_void,
+                        copy_bytes,
+                        ffi::hipMemcpyDeviceToHost,
+                        self.streams[w_idx + 1],
+                    ))?;
+                }
             }
         }
         // Sync all streams.
@@ -257,10 +293,13 @@ impl DecodeMirror {
         stat("act.hidden", self.act_hidden.as_slice());
         stat("act.attn_out", self.act_attn_out.as_slice());
         for (w_idx, normed) in self.worker_normed.iter().enumerate() {
-            stat(
-                &format!("g{}.attn_normed", w_idx + 1),
-                normed.as_slice(),
-            );
+            stat(&format!("g{}.attn_normed", w_idx + 1), normed.as_slice());
+        }
+        for (w_idx, qg) in self.worker_q_gate.iter().enumerate() {
+            stat(&format!("g{}.attn_q_gate", w_idx + 1), qg.as_slice());
+        }
+        for (w_idx, k) in self.worker_k.iter().enumerate() {
+            stat(&format!("g{}.attn_k", w_idx + 1), k.as_slice());
         }
         // Per-(gpu, layer) KV stats — restrict to position+1 elements per head
         // to keep output focused on the live range.

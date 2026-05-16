@@ -368,8 +368,18 @@ impl Model {
             .iter()
             .map(|w| w.attn_normed.as_ref().map(|b| b.as_ptr() as *const f32))
             .collect();
+        let workers_q_gate: Vec<Option<(*const f32, usize)>> = mgpu
+            .workers
+            .iter()
+            .map(|w| w.attn_q_gate.as_ref().map(|b| (b.as_ptr() as *const f32, b.len())))
+            .collect();
+        let workers_k: Vec<Option<*const f32>> = mgpu
+            .workers
+            .iter()
+            .map(|w| w.attn_k.as_ref().map(|b| b.as_ptr() as *const f32))
+            .collect();
         let mirror = self.decode_mirror.as_mut().unwrap();
-        if let Err(e) = mirror.snapshot(self.device, &worker_devices, &self.activations, &workers_kv_refs, &workers_normed) {
+        if let Err(e) = mirror.snapshot(self.device, &worker_devices, &self.activations, &workers_kv_refs, &workers_normed, &workers_q_gate, &workers_k) {
             eprintln!("[snap {label}] FAILED: {e:?}");
             return;
         }
