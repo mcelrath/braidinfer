@@ -199,6 +199,38 @@ impl DecodeMirror {
     }
 
     /// Print per-buffer stats (count, NaN, Inf, max abs) to stderr.
+    /// Also receives a direct host-readable slice for normed_stage (no GPU
+    /// memcpy needed since it's host-mapped) — comparing CPU-view of
+    /// normed_stage against workers' attn_normed isolates whether the
+    /// broadcast read garbage.
+    pub fn print_stats_with_normed_stage(
+        &self,
+        label: &str,
+        position: u32,
+        normed_stage_host: &[f32],
+    ) {
+        self.print_stats(label, position);
+        let stat = |name: &str, slice: &[f32]| {
+            let mut n_nan = 0usize;
+            let mut max_abs = 0.0f32;
+            for &x in slice {
+                if x.is_nan() {
+                    n_nan += 1;
+                } else if x.abs() > max_abs {
+                    max_abs = x.abs();
+                }
+            }
+            eprintln!(
+                "[snap {label}] {name}: n={} nan={} max_abs={:.4} first4={:?}",
+                slice.len(),
+                n_nan,
+                max_abs,
+                &slice[..slice.len().min(4)],
+            );
+        };
+        stat("normed_stage(CPU-view)", normed_stage_host);
+    }
+
     pub fn print_stats(&self, label: &str, position: u32) {
         let stat = |name: &str, slice: &[f32]| {
             let mut n_nan = 0usize;

@@ -935,6 +935,22 @@ impl Model {
             dispatch.wait_ack(gpu_i, seq);
         }
 
+        // Per-layer snapshot (BRAIDINFER_DECODE_MIRROR + first decode step
+        // + first attn layer). Surfaces whether worker.attn_normed differs
+        // from CPU-view of normed_stage — diagnosing L2-staleness on read.
+        if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_some() && attn_i == 0 {
+            let normed_stage_host: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(
+                    self.activations.normed_stage.host_ptr() as *const f32,
+                    hs,
+                )
+            }.to_vec();
+            self.decode_mirror_snapshot(&format!("attn0-post-ack pos={position}"), position);
+            if let Some(mirror) = self.decode_mirror.as_ref() {
+                mirror.print_stats_with_normed_stage(&format!("attn0-post-ack pos={position}"), position, &normed_stage_host);
+            }
+        }
+
         // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.
         // MUST NOT use peer_copy_async (kernel launch on GPU 0) while persistent cooperative
         // worker holds all CUs. Route all GPU-0 copies through persistent worker protocol.
