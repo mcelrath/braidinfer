@@ -73,6 +73,9 @@ pub struct Model {
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     // Multi-GPU megakernel programs
     pub(crate) megakernel_multi_gpu_p2p: Option<MegakernelProgram>,
+    /// SDMA-based VRAM→host mirror for decode-step debugging (snl wt1 minimal).
+    /// Lazy-init in init_multi_gpu_persistent BEFORE persistent_workers launch.
+    pub(crate) decode_mirror: Option<crate::mirror::DecodeMirror>,
 }
 
 // ---- Model impl ----

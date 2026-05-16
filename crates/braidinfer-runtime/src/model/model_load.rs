@@ -918,7 +918,13 @@ impl Model {
                     .max()
                     .unwrap_or(1),
             )?,
-            normed_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable(hs)?,
+            // alloc_portable_coherent (not _portable): _portable may use MTYPE_NC
+            // (L2-cached) — GPU 0's op_rmsnorm_wx write to normed_stage can sit
+            // in GPU 0's L2 past ack; workers' peer-reads get partial/stale data,
+            // producing non-deterministic NaN injection at layer 0 K projection
+            // (snl decode-step2 NaN bisect 2026-05-17, mirror snapshot).
+            // Coherent forces fine-grained UC on all sides → ack-time visibility.
+            normed_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable_coherent(hs)?,
             ffn_down_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(hs)?,
             moe_expert_ids: braidinfer_hip::memory::MappedHostBuffer::<i32>::alloc(
                 config
@@ -1120,6 +1126,7 @@ impl Model {
             moe_p2p: None,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
+            decode_mirror: None,
         })
     }
 

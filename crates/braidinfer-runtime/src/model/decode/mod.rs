@@ -198,6 +198,31 @@ impl Model {
         self.moe_p2p = Some(p2p);
         self.megakernel_multi_gpu_p2p = Some(mk_p2p);
 
+        // wt1-minimal: allocate SDMA decode-mirror BEFORE launching worker
+        // cooperative kernels (hipStreamCreate on a GPU with active coop
+        // kernel can wedge — see sdma_under_coop_fork probe). Lazy-init
+        // controlled by env var to keep prod path cost-free.
+        if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_none() {
+            let num_attn_layers = self
+                .config
+                .layers
+                .iter()
+                .filter(|l| l.layer_type == crate::config::LayerType::Attention)
+                .count();
+            let mirror = crate::mirror::DecodeMirror::alloc(
+                self.device,
+                &worker_devices,
+                self.config.num_kv_heads,
+                self.config.max_seq_len,
+                self.config.head_dim,
+                num_attn_layers,
+                hs,
+                self.config.num_q_heads,
+            )
+            .map_err(ModelError::Hip)?;
+            self.decode_mirror = Some(mirror);
+            eprintln!("  decode_mirror: SDMA H2D mirror allocated ({num_attn_layers} attn layers × {} gpus)", num_gpus);
+        }
         // Arm worker dispatchers on each WORKER GPU (1..N-1) — but NOT GPU 0.
         // GPU 0 still runs kbk launches during prefill (kernels.linear_proj.forward
         // in moe_ffn_forward / compile_prefill_segment paths). Its dispatcher
@@ -327,7 +352,46 @@ impl Model {
 
     /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
     /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
+    /// SDMA-based snapshot of cross-GPU debug-relevant tensors (KV caches +
+    /// GPU 0 activations) into pinned host buffers, with per-buffer stats
+    /// printed to stderr. No-op if BRAIDINFER_DECODE_MIRROR is unset.
+    pub(super) fn decode_mirror_snapshot(&mut self, label: &str, position: u32) {
+        if self.decode_mirror.is_none() || self.multi_gpu.is_none() {
+            return;
+        }
+        let mgpu = self.multi_gpu.as_ref().unwrap();
+        let worker_devices: Vec<_> = mgpu.workers.iter().skip(1).map(|w| w.device).collect();
+        let workers_kv_refs: Vec<&[crate::weights::KvCache]> =
+            mgpu.workers.iter().map(|w| w.attn_kv_caches.as_slice()).collect();
+        let workers_normed: Vec<Option<*const f32>> = mgpu
+            .workers
+            .iter()
+            .map(|w| w.attn_normed.as_ref().map(|b| b.as_ptr() as *const f32))
+            .collect();
+        let mirror = self.decode_mirror.as_mut().unwrap();
+        if let Err(e) = mirror.snapshot(self.device, &worker_devices, &self.activations, &workers_kv_refs, &workers_normed) {
+            eprintln!("[snap {label}] FAILED: {e:?}");
+            return;
+        }
+        mirror.print_stats(label, position);
+    }
+
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
+        let mirror_on = std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok();
+        let max_steps: u32 = std::env::var("BRAIDINFER_DECODE_MIRROR_STEPS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+        let do_snap = mirror_on && (position < (self.seq_len + max_steps));
+        if do_snap {
+            self.decode_mirror_snapshot(&format!("step-begin pos={position}"), position);
+        }
+        let r = self.decode_step_p2p_inner(token_id, position);
+        if do_snap {
+            self.decode_mirror_snapshot(&format!("step-end pos={position}"), position);
+        }
+        r
+    }
+
+    pub(super) fn decode_step_p2p_inner(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         // 5ax-decode probe: BRAIDINFER_MTYPE_AUDIT=1 dumps the MTYPE table
         // for all cross-agent and reused buffers in the decode path. Runs
         // once on the first decode step. Surfaces buffers that should be
