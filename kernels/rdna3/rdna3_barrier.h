@@ -236,7 +236,12 @@ __device__ __forceinline__ void atomic_block_barrier(GridBarrierState* state) {
                     __hip_atomic_load(&state->generation, __ATOMIC_ACQUIRE,
                                       __HIP_MEMORY_SCOPE_AGENT);
                 if (g == target_gen) break;
-                __builtin_amdgcn_s_sleep(0);
+                // s_sleep(1) not (0): per ea KB root-cause-zuk-phase-2-2ab,
+                // s_sleep(0) starves MES of cycles to schedule REMOVE_QUEUE
+                // messages under 4-GPU concurrent cooperative kernels →
+                // MES deadlock → MODE1 reset cascade (observed 2026-05-16
+                // at t≈55000s, all 4 MCIO cards wedged simultaneously).
+                __builtin_amdgcn_s_sleep(1);
             }
         }
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
@@ -304,7 +309,12 @@ __device__ __forceinline__ void atomic_block_barrier_v2(GridBarrierState* state)
                     __hip_atomic_load(&state->generation, __ATOMIC_ACQUIRE,
                                       __HIP_MEMORY_SCOPE_AGENT);
                 if (g == target_gen) break;
-                __builtin_amdgcn_s_sleep(0);
+                // s_sleep(1) not (0): per ea KB root-cause-zuk-phase-2-2ab,
+                // s_sleep(0) starves MES of cycles to schedule REMOVE_QUEUE
+                // messages under 4-GPU concurrent cooperative kernels →
+                // MES deadlock → MODE1 reset cascade (observed 2026-05-16
+                // at t≈55000s, all 4 MCIO cards wedged simultaneously).
+                __builtin_amdgcn_s_sleep(1);
             }
         }
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");

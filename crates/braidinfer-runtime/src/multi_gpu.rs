@@ -384,12 +384,15 @@ impl MultiGpuContext {
         let head_elems = max_seq_len * head_dim;
         let copy_bytes = prefill_len * head_dim * std::mem::size_of::<f32>();
 
-        // DIAGNOSTIC: skip GPU 0 — the previous "first 4 tokens coherent"
-        // result came from this configuration, suggesting GPU 0's
-        // attn_kv_caches might already be valid from another path.
+        // Broadcast to ALL workers including GPU 0. The 2bab0d7 "skip GPU 0"
+        // diagnostic comment was incorrect — GPU 0's worker[0].attn_kv_caches
+        // is read by dispatch_head_parallel_attention for the gpu_i==0 head
+        // shard (decode/mod.rs:629), so if it's not populated, GPU 0 reads
+        // uninit garbage and decode produces all-NaN logits (4-GPU NaN bug
+        // bisect 2026-05-17).
         for (attn_i, &kv_i) in attn_to_kv_idx.iter().enumerate() {
             let src_kv = &legacy_kv_caches[kv_i];
-            for gpu_i in 1..self.num_devices {
+            for gpu_i in 0..self.num_devices {
                 let worker = &self.workers[gpu_i];
                 let dst_kv = &worker.attn_kv_caches[attn_i];
                 for h in 0..num_kv_heads {
