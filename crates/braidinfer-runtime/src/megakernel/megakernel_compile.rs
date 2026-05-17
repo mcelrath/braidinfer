@@ -24,10 +24,6 @@ use crate::model::{LayerWeights, Model};
 use crate::watchdog::WatchdogThread;
 
 impl MegakernelProgram {
-    pub fn compile(model: &Model) -> HipResult<Self> {
-        Self::compile_inner(model, false, false)
-    }
-
     pub fn compile_paged(model: &Model) -> HipResult<Self> {
         Self::compile_inner(model, true, false)
     }
