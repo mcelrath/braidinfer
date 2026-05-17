@@ -507,6 +507,21 @@ fn bench_coherence(model: &mut Model, prompt_len: usize) {
     // Batched prefill comparison.
     model.reset_state().expect("reset");
     let prefill_logits = model.prefill(&prompt).expect("batched prefill");
+
+    // BZ0 discriminator (issue braidinfer-bz0): mirror the 4 D2H reads the seq path
+    // executes at i==0 (collect_step_logits above) to test the hipMemcpyAsync /
+    // stream-history hypothesis. Opt-in via env var; default behavior unchanged.
+    // If enabling these post-prefill D2H syncs flips the inter-path top-10 delta
+    // toward 0/10, the cause is async-copy hazard on device_program being masked
+    // by stream serialization induced by the D2H reads.
+    if std::env::var("BRAIDINFER_BZ0_DISCRIMINATOR").is_ok() {
+        let _ = model.read_gdn_state().expect("bz0 discriminator: read gdn state");
+        let _ = model.read_gdn_conv_state().expect("bz0 discriminator: read gdn conv state");
+        let _ = model.read_kv_chunk_slot0().expect("bz0 discriminator: read kv chunk slot 0");
+        let _ = model.read_legacy_kv_caches().expect("bz0 discriminator: read legacy kv caches");
+        println!("  BZ0 discriminator: applied 4 post-batched-prefill D2H reads");
+    }
+
     let prefill_top = top10(&prefill_logits);
 
     let matches = seq_top.iter().zip(prefill_top.iter()).filter(|(a, b)| a == b).count();
