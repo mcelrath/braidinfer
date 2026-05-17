@@ -403,17 +403,7 @@ impl PersistentDispatch {
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         Device::set_current(device)?;
-        // pky.2 IOMMU/GART probe: BRAIDINFER_QUEUE_HOSTREGISTER_HUGETLB=1
-        // routes the WorkerQueue alloc through mmap(MAP_HUGETLB)+hipHostRegister
-        // instead of hipHostMalloc. Different kernel-driver pin path. If the
-        // §11.4 wedge mechanism is IOMMU/GART state specific to hipHostMalloc's
-        // path, this should sidestep it; otherwise wedge persists with same
-        // fingerprint and we narrow further.
-        let queue = if std::env::var("BRAIDINFER_QUEUE_HOSTREGISTER_HUGETLB").is_ok() {
-            MappedHostBuffer::<u8>::alloc_hostregister_hugetlb(queue_size)?
-        } else {
-            MappedHostBuffer::<u8>::alloc(queue_size)?
-        };
+        let queue = MappedHostBuffer::<u8>::alloc(queue_size)?;
         // Write the op_profile counter pointer into the queue BEFORE launch.
         // Per-instance pointer (set_op_profile_ptr) takes priority; falls
         // back to the process-global (op_profile::install_global) if unset.
@@ -447,18 +437,9 @@ impl PersistentDispatch {
         ];
         let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let bpsm_max = bpsm_raw.min(2);
-        let bpsm = std::env::var("BRAIDINFER_BPSM")
-            .ok().and_then(|v| v.parse::<u32>().ok())
-            .map(|v| v.clamp(1, bpsm_max as u32) as usize)
-            .unwrap_or(bpsm_max as usize);
+        let bpsm = bpsm_max;
         let num_cus = multiprocessor_count(device)?;
-        // pky.2 probe 2026-05-13: BRAIDINFER_PERSISTENT_BLOCKS=N override
-        // for testing "wedge requires all-CUs cooperative-kernel residency"
-        // hypothesis. Default (no env var) preserves bpsm * num_cus = 96.
-        let num_blocks = std::env::var("BRAIDINFER_PERSISTENT_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or((bpsm as u32 * num_cus).max(num_cus));
+        let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
         func.launch_cooperative(
             (num_blocks, 1, 1),
             (256, 1, 1),
