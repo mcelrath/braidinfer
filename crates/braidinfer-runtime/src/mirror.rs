@@ -23,7 +23,12 @@ use braidinfer_hip::ffi;
 use braidinfer_hip::memory::PinnedBuffer;
 
 pub struct DecodeMirror {
-    /// One SDMA stream per GPU, owned by that GPU's context.
+    /// One SDMA stream per GPU, BORROWED from PersistentDispatch::sdma_streams
+    /// (wt1 P2-a). DecodeMirror does NOT own these — destruction is the
+    /// responsibility of PersistentDispatch::Drop. Storing raw hipStream_t
+    /// here (no lifetime) is acceptable because PersistentDispatch outlives
+    /// DecodeMirror within Model: persistent_workers is dropped AFTER
+    /// decode_mirror in struct-field declaration order.
     streams: Vec<ffi::hipStream_t>,
     /// attn_kv[gpu_i][attn_layer] = (k_mirror, v_mirror).
     attn_kv: Vec<Vec<(PinnedBuffer<f32>, PinnedBuffer<f32>)>>,
@@ -54,11 +59,15 @@ unsafe impl Send for DecodeMirror {}
 unsafe impl Sync for DecodeMirror {}
 
 impl DecodeMirror {
-    /// Allocate streams + pinned-host mirrors. MUST be called before any
-    /// persistent_workers (cooperative kernels) launch on any GPU.
+    /// Allocate pinned-host mirrors. The caller supplies a borrowed SDMA stream
+    /// per GPU (`streams[0]` = gpu0, `streams[1..]` = worker_devices, in order).
+    /// Streams are owned by `PersistentDispatch::sdma_streams` (wt1 P2-a) and
+    /// MUST already exist before the persistent_worker cooperative kernels
+    /// launch on their GPUs. DecodeMirror does NOT destroy these streams.
     pub fn alloc(
         gpu0: DeviceId,
         worker_devices: &[DeviceId],
+        streams: Vec<ffi::hipStream_t>,
         local_nkh: usize,
         max_seq_len: usize,
         head_dim: usize,
@@ -67,17 +76,9 @@ impl DecodeMirror {
         nqh_total: usize,
     ) -> HipResult<Self> {
         let num_gpus = 1 + worker_devices.len();
-        // Per-GPU SDMA streams. The hipStreamCreate must run on each GPU's context.
-        let mut streams: Vec<ffi::hipStream_t> = Vec::with_capacity(num_gpus);
-        Device::set_current(gpu0)?;
-        let mut s: ffi::hipStream_t = std::ptr::null_mut();
-        braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
-        streams.push(s);
-        for &dev in worker_devices {
-            Device::set_current(dev)?;
-            let mut s: ffi::hipStream_t = std::ptr::null_mut();
-            braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
-            streams.push(s);
+        assert_eq!(streams.len(), num_gpus, "DecodeMirror::alloc: streams.len() must equal 1 + worker_devices.len()");
+        for (i, &s) in streams.iter().enumerate() {
+            assert!(!s.is_null(), "DecodeMirror::alloc: streams[{i}] is null — PersistentDispatch::ensure_sdma_stream not called for this device");
         }
         // Per-GPU attn_kv mirrors. All pinned-host allocations are device-context
         // independent (hipHostMalloc).
@@ -323,15 +324,7 @@ impl DecodeMirror {
     }
 }
 
-impl Drop for DecodeMirror {
-    fn drop(&mut self) {
-        // Streams: best-effort destroy. The cooperative kernels may already
-        // be torn down by the time we get here (Drop order). hipStreamDestroy
-        // on already-destroyed context is a soft error.
-        for &s in &self.streams {
-            unsafe {
-                let _ = ffi::hipStreamDestroy(s);
-            }
-        }
-    }
-}
+// wt1 P2-a: no Drop impl — streams are borrowed from
+// PersistentDispatch::sdma_streams (destroyed in that type's Drop) and the
+// PinnedBuffers handle their own hipHostFree on drop. DecodeMirror has no
+// owned HIP resources to release.

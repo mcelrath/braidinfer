@@ -198,10 +198,41 @@ impl Model {
         self.moe_p2p = Some(p2p);
         self.megakernel_multi_gpu_p2p = Some(mk_p2p);
 
-        // wt1-minimal: allocate SDMA decode-mirror BEFORE launching worker
-        // cooperative kernels (hipStreamCreate on a GPU with active coop
-        // kernel can wedge — see sdma_under_coop_fork probe). Lazy-init
-        // controlled by env var to keep prod path cost-free.
+        // wt1 P2-a: PersistentDispatch now owns SDMA streams (one per GPU,
+        // indexed by DeviceId.0). Stream allocation for worker GPUs (1..N-1)
+        // happens inside `add_device` immediately BEFORE the cooperative
+        // launch (hipStreamCreate on a GPU with an active coop kernel can
+        // wedge — see sdma_under_coop_fork probe). GPU 0's stream is
+        // allocated here explicitly because GPU 0's persistent worker is
+        // added later in `init_multi_gpu_persistent` on first decode call.
+        //
+        // Order matters: init_with_total → worker GPU streams + workers
+        // launched; then ensure_sdma_stream(gpu0) while GPU 0 still has no
+        // persistent worker; then DecodeMirror::alloc borrowing all streams.
+        {
+            let mut dispatch = PersistentDispatch::init_with_total(
+                num_gpus,
+                &worker_devices,
+                shared_mem_persistent,
+                hs,
+                self.watchdog.clone(),
+            )
+            .map_err(ModelError::Hip)?;
+            // GPU 0 stream — safe to allocate now (GPU 0 has no persistent
+            // worker yet; still in kbk-launch phase).
+            dispatch
+                .ensure_sdma_stream(self.device)
+                .map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
+            eprintln!(
+                "  MoE P2P dispatch initialized: {} worker GPUs (prefill path)",
+                num_gpus - 1
+            );
+        }
+
+        // Decode-mirror: lazy-init from env var. Borrows SDMA streams from
+        // PersistentDispatch (owned there; destroyed in that Drop after
+        // workers have exited).
         if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_none() {
             let num_attn_layers = self
                 .config
@@ -209,9 +240,20 @@ impl Model {
                 .iter()
                 .filter(|l| l.layer_type == crate::config::LayerType::Attention)
                 .count();
+            let dispatch = self
+                .persistent_workers
+                .as_ref()
+                .expect("PersistentDispatch must be initialized before DecodeMirror");
+            let mut streams: Vec<braidinfer_hip::ffi::hipStream_t> =
+                Vec::with_capacity(1 + worker_devices.len());
+            streams.push(dispatch.sdma_stream(self.device.0 as usize));
+            for &dev in &worker_devices {
+                streams.push(dispatch.sdma_stream(dev.0 as usize));
+            }
             let mirror = crate::mirror::DecodeMirror::alloc(
                 self.device,
                 &worker_devices,
+                streams,
                 self.config.num_kv_heads,
                 self.config.max_seq_len,
                 self.config.head_dim,
@@ -222,25 +264,6 @@ impl Model {
             .map_err(ModelError::Hip)?;
             self.decode_mirror = Some(mirror);
             eprintln!("  decode_mirror: SDMA H2D mirror allocated ({num_attn_layers} attn layers × {} gpus)", num_gpus);
-        }
-        // Arm worker dispatchers on each WORKER GPU (1..N-1) — but NOT GPU 0.
-        // GPU 0 still runs kbk launches during prefill (kernels.linear_proj.forward
-        // in moe_ffn_forward / compile_prefill_segment paths). Its dispatcher
-        // worker is added on first decode call (init_multi_gpu_persistent).
-        {
-            let dispatch = PersistentDispatch::init_with_total(
-                num_gpus,
-                &worker_devices,
-                shared_mem_persistent,
-                hs,
-                self.watchdog.clone(),
-            )
-            .map_err(ModelError::Hip)?;
-            self.persistent_workers = Some(dispatch);
-            eprintln!(
-                "  MoE P2P dispatch initialized: {} worker GPUs (prefill path)",
-                num_gpus - 1
-            );
         }
         Ok(())
     }

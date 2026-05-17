@@ -322,6 +322,14 @@ pub struct PersistentDispatch {
     /// passed in). Written into each WorkerQueue::op_profile field at
     /// worker launch in `add_device`. See crates/.../op_profile.rs.
     pub op_profile_dev_ptr: *mut u64,
+    /// Per-device SDMA streams for out-of-band VRAM→host copies (decode-mirror,
+    /// trace dump, etc.). Indexed by `DeviceId.0`. A null entry means no SDMA
+    /// stream has been allocated for that GPU. MUST be allocated BEFORE the
+    /// corresponding persistent_worker launches on that device — hipStreamCreate
+    /// on a GPU running a cooperative kernel can deadlock (sdma_under_coop_fork
+    /// probe). Streams are destroyed in `Drop` AFTER the persistent workers
+    /// have exited (see drop ordering comments below).
+    pub sdma_streams: Vec<ffi::hipStream_t>,
 }
 
 // Raw pointer in PersistentDispatch — caller must keep the underlying
@@ -370,6 +378,7 @@ impl PersistentDispatch {
             moe_output_slot: MappedHostBuffer::<f32>::alloc(1)?,
             watchdog,
             op_profile_dev_ptr: std::ptr::null_mut(),
+            sdma_streams: vec![std::ptr::null_mut(); total_gpus],
         };
         for &device in devices {
             dispatch.add_device(device, shared_mem)?;
@@ -383,6 +392,43 @@ impl PersistentDispatch {
     /// kernel reads it via `queue->op_profile`.
     pub fn set_op_profile_ptr(&mut self, ptr: *mut u64) {
         self.op_profile_dev_ptr = ptr;
+    }
+
+    /// Lazily allocate a per-device SDMA stream for out-of-band copies
+    /// (decode-mirror, trace dump). MUST be called BEFORE the persistent_worker
+    /// launches on `device` — afterwards hipStreamCreate on the same GPU can
+    /// deadlock against the running cooperative kernel.
+    ///
+    /// For worker GPUs (1..N-1) this is called internally by `add_device`
+    /// immediately before `launch_cooperative`. For GPU 0 (whose persistent
+    /// worker is added lazily on first decode call) callers must invoke this
+    /// during model init while GPU 0 is still in the kbk-launch phase.
+    ///
+    /// Idempotent: returns Ok(()) if the stream slot is already populated.
+    pub fn ensure_sdma_stream(&mut self, device: DeviceId) -> HipResult<()> {
+        let slot = device.0 as usize;
+        if slot >= self.sdma_streams.len() {
+            self.sdma_streams.resize(slot + 1, std::ptr::null_mut());
+        }
+        if !self.sdma_streams[slot].is_null() {
+            return Ok(());
+        }
+        Device::set_current(device)?;
+        let mut s: ffi::hipStream_t = std::ptr::null_mut();
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
+        self.sdma_streams[slot] = s;
+        Ok(())
+    }
+
+    /// Accessor for the SDMA stream of a given GPU. Returns a raw hipStream_t
+    /// (or null if `ensure_sdma_stream` was not called for that device).
+    /// Caller must NOT call hipStreamDestroy — ownership remains with this
+    /// PersistentDispatch and is released in Drop after worker teardown.
+    pub fn sdma_stream(&self, gpu_idx: usize) -> ffi::hipStream_t {
+        self.sdma_streams
+            .get(gpu_idx)
+            .copied()
+            .unwrap_or(std::ptr::null_mut())
     }
 
     /// Single-GPU init helper (unchanged signature for non-MoE callers).
@@ -399,6 +445,10 @@ impl PersistentDispatch {
     /// design so workers (GPUs 1..N-1) can launch during prefill (when GPU 0
     /// is still running kbk kernels) and GPU 0 is added on first decode call.
     pub fn add_device(&mut self, device: DeviceId, shared_mem: u32) -> HipResult<()> {
+        // wt1 P2-a: allocate SDMA stream BEFORE the persistent_worker
+        // cooperative kernel launches on this device. hipStreamCreate after
+        // launch can deadlock against the running coop kernel.
+        self.ensure_sdma_stream(device)?;
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         Device::set_current(device)?;
@@ -988,6 +1038,17 @@ impl Drop for PersistentDispatch {
                         std::mem::ManuallyDrop::drop(&mut worker);
                     }
                 }
+            }
+        }
+
+        // wt1 P2-a: destroy SDMA streams AFTER the persistent workers have
+        // exited (single-GPU clean path). On the multi-GPU `_exit(134)` path
+        // above we skip this — the OS reclaims the streams as part of process
+        // teardown, matching the existing Stream/Module skip rationale.
+        for s in self.sdma_streams.iter_mut() {
+            if !s.is_null() {
+                unsafe { let _ = ffi::hipStreamDestroy(*s); }
+                *s = std::ptr::null_mut();
             }
         }
 
