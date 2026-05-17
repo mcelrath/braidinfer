@@ -359,49 +359,22 @@ impl Model {
         eprintln!("=== end MTYPE audit ===");
     }
 
-    /// DEBUG_P2P_HIDDEN probe: dispatch a one-shot OP_D2D_COPY batch that
-    /// copies the first 16 floats of `activations.hidden` into the
-    /// host-mapped UC probe buffer, then read + report from CPU. Safe under
-    /// the persistent cooperative kernel — the copy runs *inside* the
-    /// megakernel (same CUs already held by the worker), and the readback is
-    /// a CPU MMIO load from host-mapped memory (no hipMemcpy, no kernel
-    /// launch). No-op when `debug_hidden_probe` is None.
+    /// DEBUG_P2P_HIDDEN probe: copy first 16 floats of `activations.hidden` via
+    /// `DecodeMirror::snapshot_hidden_head16` (SDMA engine, GPU 0 stream) and
+    /// print a one-line diagnostic. Safe under the persistent cooperative kernel —
+    /// SDMA operates independently of the CUs held by `persistent_worker`.
+    /// No-op when `decode_mirror` is None or `debug_p2p_hidden` is false.
     fn probe_hidden_after_segment(&mut self, label: &str) {
         if !self.debug_p2p_hidden {
             return;
         }
-        let probe = match self.activations.debug_hidden_probe.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-        let dst = probe.as_write_ptr();
-        let src = self.activations.hidden.as_ptr() as *const f32;
-        let inst = crate::megakernel::instructions::D2dCopyInst::new(
-            1, // grid_x: 1 block is enough for 16 elements
-            dst,
-            src,
-            16,
-        )
-        .into_inst();
-        let batch = [inst];
-        let dispatch: &mut dyn BatchDispatcher =
-            self.persistent_workers.as_mut().unwrap();
-        dispatch.dispatch_batch(0, &batch);
-        // After ack, host-mapped UC memory is visible. Read 16 floats, scan.
-        let buf: &[f32] = unsafe { std::slice::from_raw_parts(probe.host_ptr() as *const f32, 16) };
-        let mut nan = false;
-        let mut inf = false;
-        let mut max_abs = 0.0f32;
-        for &v in buf.iter() {
-            if v.is_nan() { nan = true; }
-            if v.is_infinite() { inf = true; }
-            let a = v.abs();
-            if a > max_abs { max_abs = a; }
+        let hidden_ptr = self.activations.hidden.as_ptr() as *const f32;
+        let device = self.device;
+        if let Some(mirror) = self.decode_mirror.as_mut() {
+            if let Err(e) = mirror.snapshot_hidden_head16(device, hidden_ptr, label) {
+                eprintln!("DBG hidden[{label}] snapshot_hidden_head16 error: {e:?}");
+            }
         }
-        eprintln!(
-            "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
-            buf[0], buf[1], buf[2], buf[3]
-        );
     }
 
     fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {

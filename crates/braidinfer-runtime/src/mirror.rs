@@ -389,6 +389,49 @@ impl DecodeMirror {
         stat("normed_stage(CPU-view)", normed_stage_host);
     }
 
+    /// Copy first 16 floats of `hidden_ptr` (VRAM, GPU 0) into the `act_hidden` pinned
+    /// mirror via the GPU 0 SDMA stream, then synchronize. Prints a one-line diagnostic
+    /// to stderr. Safe under the persistent cooperative kernel: uses the SDMA engine,
+    /// not the CUs held by `persistent_worker`.
+    ///
+    /// Returns HipResult<()> so callers can propagate errors; diagnostic is always printed
+    /// on success.
+    pub fn snapshot_hidden_head16(
+        &mut self,
+        gpu0: DeviceId,
+        hidden_ptr: *const f32,
+        label: &str,
+    ) -> HipResult<()> {
+        Device::set_current(gpu0)?;
+        let n = 16usize.min(self.hidden_size);
+        let copy_bytes = n * std::mem::size_of::<f32>();
+        unsafe {
+            braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                self.act_hidden.as_mut_ptr() as *mut std::ffi::c_void,
+                hidden_ptr as *const std::ffi::c_void,
+                copy_bytes,
+                ffi::hipMemcpyDeviceToHost,
+                self.streams[0],
+            ))?;
+            braidinfer_hip::error::check(ffi::hipStreamSynchronize(self.streams[0]))?;
+        }
+        let buf = &self.act_hidden.as_slice()[..n];
+        let mut nan = false;
+        let mut inf = false;
+        let mut max_abs = 0.0f32;
+        for &v in buf {
+            if v.is_nan() { nan = true; }
+            if v.is_infinite() { inf = true; }
+            let a = v.abs();
+            if a > max_abs { max_abs = a; }
+        }
+        eprintln!(
+            "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
+            buf[0], buf[1], buf[2], buf[3]
+        );
+        Ok(())
+    }
+
     pub fn print_stats(&self, label: &str, position: u32) {
         let stat = |name: &str, slice: &[f32]| {
             let mut n_nan = 0usize;

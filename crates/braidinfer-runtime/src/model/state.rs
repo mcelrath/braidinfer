@@ -439,6 +439,8 @@ impl Model {
     }
 
     /// Read all GDN recurrent state to host (for testing).
+    /// PRE-WORKER-ONLY: calls `copy_to_host` (hipMemcpy) — must NOT be called
+    /// while the persistent cooperative worker is running (CUs held → deadlock).
     pub fn read_gdn_state(&self) -> Result<Vec<Vec<f32>>, ModelError> {
         self.stream.synchronize()?;
         let mut result = Vec::with_capacity(self.gdn_states.len());
@@ -572,6 +574,8 @@ impl Model {
 
     /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.
     /// Returns empty Vec if page_allocator is not initialized (e.g., multi-GPU non-paged path).
+    /// PRE-WORKER-ONLY: calls `memcpy_d2h` — must NOT be called while the persistent
+    /// cooperative worker is running (CUs held → deadlock).
     pub fn read_kv_chunk_slot0(&self) -> Result<Vec<u8>, ModelError> {
         self.stream.synchronize()?;
         let Some(alloc) = self.page_allocator.as_ref() else {
