@@ -17,6 +17,7 @@
 //! cooperative-launch occupancy (our production). H2D via the same SDMA
 //! engine has even less surface than peer-pulls.
 
+use crate::persistent_dispatch::PersistentDispatch;
 use crate::weights::ActivationBuffers;
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
@@ -267,6 +268,7 @@ impl DecodeMirror {
         workers_attn_normed: &[Option<*const f32>],
         workers_attn_q_gate: &[Option<(*const f32, usize)>],
         workers_attn_k: &[Option<*const f32>],
+        dispatch: &PersistentDispatch,
     ) -> HipResult<()> {
         // DeviceGuard saves the caller's current device and restores it on drop
         // (same fix class as ensure_sdma_stream: snapshot iterates GPUs via

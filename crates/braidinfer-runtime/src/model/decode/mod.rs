@@ -443,7 +443,8 @@ impl Model {
             .map(|w| w.attn_k.as_ref().map(|b| b.as_ptr() as *const f32))
             .collect();
         let mirror = self.decode_mirror.as_mut().unwrap();
-        if let Err(e) = mirror.snapshot(self.device, &worker_devices, &self.activations, &workers_kv_refs, &workers_normed, &workers_q_gate, &workers_k) {
+        let dispatch = self.persistent_workers.as_ref().unwrap();
+        if let Err(e) = mirror.snapshot(self.device, &worker_devices, &self.activations, &workers_kv_refs, &workers_normed, &workers_q_gate, &workers_k, dispatch) {
             eprintln!("[snap {label}] FAILED: {e:?}");
             return;
         }

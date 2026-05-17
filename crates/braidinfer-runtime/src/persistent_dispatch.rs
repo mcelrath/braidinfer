@@ -288,6 +288,18 @@ const _: () = assert!(
     "WorkerQueueLayout size mismatch — verify C struct in kernels/worker_queue.h matches"
 );
 
+/// Descriptor for a single VRAM→host async copy issued via `mirror_dump`.
+pub struct MirrorRegion {
+    /// Source VRAM address on the target GPU.
+    pub device_ptr: *const u8,
+    /// Number of bytes to copy.
+    pub byte_len: usize,
+    /// Pinned-host destination (at least `byte_len` bytes).
+    pub host_dst: *mut u8,
+}
+unsafe impl Send for MirrorRegion {}
+unsafe impl Sync for MirrorRegion {}
+
 /// Per-GPU worker state.
 pub struct GpuWorker {
     pub device: DeviceId,
@@ -907,19 +919,28 @@ impl PersistentDispatch {
         braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })
     }
 
-    /// Record `event_kv_written` on the compute stream of worker `gpu_idx`.
+    /// Record `event_kv_written` on the NULL stream for worker `gpu_idx`.
     ///
-    /// Call this AFTER ack is received from the worker to capture the L2
-    /// completion point. The SDMA stream must then call
-    /// `wait_kv_event_on_sdma` before reading any KV from that worker's
-    /// VRAM — this flushes the worker's L2 caches before SDMA bypasses L2
-    /// and reads VRAM directly (udi #567 / forensic option 2).
+    /// IMPORTANT: Must NOT record on `worker.stream` (the cooperative kernel's
+    /// launch stream) — that stream is permanently busy (persistent_worker runs
+    /// forever), so hipEventRecord on it would never fire, deadlocking any
+    /// hipStreamWaitEvent caller.
+    ///
+    /// Recording on NULL stream provides an ordering fence relative to all GPU
+    /// memory operations that precede it (NULL stream synchronizes with all
+    /// non-blocking streams on ROCm). Call this AFTER ack is received from the
+    /// worker to create a happens-before edge between the worker's L2 writes
+    /// and the SDMA copy (udi #567 / forensic option 2).
     ///
     /// No-op if `gpu_idx` has no worker slot.
     pub fn record_kv_event(&self, gpu_idx: usize) -> HipResult<()> {
         let Some(Some(worker)) = self.workers.get(gpu_idx) else { return Ok(()); };
+        // Record on NULL stream (not worker.stream): the cooperative kernel's
+        // launch stream is permanently busy, so recording there would stall the
+        // event forever. NULL stream on ROCm synchronizes with the default
+        // per-device context and fires promptly.
         braidinfer_hip::error::check(unsafe {
-            ffi::hipEventRecord(worker.event_kv_written, worker.stream.raw())
+            ffi::hipEventRecord(worker.event_kv_written, std::ptr::null_mut())
         })
     }
 
