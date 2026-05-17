@@ -1,6 +1,6 @@
 mod trace;
 
-use crate::megakernel::{MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
+use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
 use crate::persistent_dispatch::BatchDispatcher;
 use crate::weights::LayerWeights;
 
@@ -107,6 +107,21 @@ impl Model {
             let alloc_mut = self.page_allocator.as_mut().unwrap();
             mk.post_step_paged(position, seq_mut, alloc_mut, None, &self.config, &self.stream)
                 .map_err(ModelError::Hip)?;
+        }
+
+        // Chunk-seal mirror hook (wt1 P2-c): enqueue SDMA copy of the just-sealed
+        // chunk to pinned host memory. The persistent_workers SDMA stream is used so
+        // the copy runs out-of-band without blocking the CPU decode loop.
+        if (position as usize + 1) % CHUNK_TOKENS == 0 {
+            if let Some(dispatch) = self.persistent_workers.as_mut() {
+                let alloc = self.page_allocator.as_ref().unwrap();
+                let seq = self.paged_seq.as_ref().unwrap();
+                if let Some(sealed) = seq.chunks.last() {
+                    let vram_ptr = alloc.slot_ptr(sealed.slot_index());
+                    dispatch.kv_mirror_chunk(0, vram_ptr).map_err(ModelError::Hip)?;
+                    dispatch.drain_kv_chunk_mirror(0, position).map_err(ModelError::Hip)?;
+                }
+            }
         }
 
         self.seq_len = position + 1;
@@ -1289,6 +1304,20 @@ impl Model {
                 &self.config,
                 &self.stream,
             )?;
+        }
+
+        // Chunk-seal mirror hook (wt1 P2-c): same as persistent path but for
+        // the non-persistent paged decode route.
+        if (position as usize + 1) % CHUNK_TOKENS == 0 {
+            if let Some(dispatch) = self.persistent_workers.as_mut() {
+                let alloc = self.page_allocator.as_ref().unwrap();
+                let seq = self.paged_seq.as_ref().unwrap();
+                if let Some(sealed) = seq.chunks.last() {
+                    let vram_ptr = alloc.slot_ptr(sealed.slot_index());
+                    dispatch.kv_mirror_chunk(0, vram_ptr).map_err(ModelError::Hip)?;
+                    dispatch.drain_kv_chunk_mirror(0, position).map_err(ModelError::Hip)?;
+                }
+            }
         }
 
         let mut logits = vec![0.0f32; self.config.vocab_size];

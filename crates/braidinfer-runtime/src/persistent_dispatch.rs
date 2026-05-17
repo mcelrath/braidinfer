@@ -330,6 +330,11 @@ pub struct PersistentDispatch {
     /// probe). Streams are destroyed in `Drop` AFTER the persistent workers
     /// have exited (see drop ordering comments below).
     pub sdma_streams: Vec<ffi::hipStream_t>,
+    /// Write-through KV chunk mirror (wt1 P2-c). `None` until
+    /// `init_kv_chunk_mirror` is called. One mirror covers all GPUs in the
+    /// model — chunks from each GPU are written through in seal order.
+    /// `None` in non-debug / production paths to avoid pinned-memory overhead.
+    pub kv_chunk_mirror: Option<crate::mirror::KvChunkMirror>,
 }
 
 // Raw pointer in PersistentDispatch — caller must keep the underlying
@@ -379,6 +384,7 @@ impl PersistentDispatch {
             watchdog,
             op_profile_dev_ptr: std::ptr::null_mut(),
             sdma_streams: vec![std::ptr::null_mut(); total_gpus],
+            kv_chunk_mirror: None,
         };
         for &device in devices {
             dispatch.add_device(device, shared_mem)?;
@@ -435,6 +441,58 @@ impl PersistentDispatch {
             .get(gpu_idx)
             .copied()
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Enable write-through KV chunk mirroring (wt1 P2-c). Must be called
+    /// before the first decode step. `chunk_bytes` is the byte size of one
+    /// full chunk (all attention layers K+V, same layout as PageAllocator slots).
+    /// Allocates `KvChunkMirror` into `self.kv_chunk_mirror`.
+    pub fn init_kv_chunk_mirror(&mut self, chunk_bytes: usize) {
+        self.kv_chunk_mirror = Some(crate::mirror::KvChunkMirror::new(chunk_bytes));
+    }
+
+    /// Enqueue an SDMA copy of a just-sealed VRAM chunk to pinned host memory.
+    /// Call immediately after chunk seal is detected (at `post_step_paged`
+    /// boundaries). The copy is async — it completes on `sdma_stream(gpu_idx)`.
+    /// A subsequent `drain_kv_chunk_mirror` call synchronizes the stream.
+    ///
+    /// No-op if `kv_chunk_mirror` is None (mirror not enabled) or if the SDMA
+    /// stream for `gpu_idx` is null (stream not yet allocated).
+    ///
+    /// # Safety
+    /// `vram_ptr` must remain valid (chunk slot not freed/reused) until
+    /// `drain_kv_chunk_mirror` has been called for this chunk.
+    pub fn kv_mirror_chunk(
+        &mut self,
+        gpu_idx: usize,
+        vram_ptr: *const u8,
+    ) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Ok(());
+        }
+        if let Some(mirror) = self.kv_chunk_mirror.as_mut() {
+            mirror.enqueue_chunk(vram_ptr, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize the SDMA stream for `gpu_idx` and record `sealed_chunk_last_pos`
+    /// as the sequence position of the last drained chunk in the mirror.
+    /// No-op if mirror is disabled or stream is null.
+    pub fn drain_kv_chunk_mirror(
+        &mut self,
+        gpu_idx: usize,
+        sealed_chunk_last_pos: u32,
+    ) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Ok(());
+        }
+        if let Some(mirror) = self.kv_chunk_mirror.as_mut() {
+            mirror.drain(sealed_chunk_last_pos, stream)?;
+        }
+        Ok(())
     }
 
     /// Single-GPU init helper (unchanged signature for non-MoE callers).
