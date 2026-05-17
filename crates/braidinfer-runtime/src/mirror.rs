@@ -172,6 +172,7 @@ impl DecodeMirror {
         num_gpus: usize,
         hidden_size: usize,
     ) -> HipResult<()> {
+        let saved = Device::current()?;
         // Copy MoE output_slots token-0 slots to a local snapshot (host-mapped UC,
         // directly readable — no DMA needed).
         // Layout: slot for (token=0, gpu_id) = output_slots_host + gpu_id * hidden_size.
@@ -204,6 +205,7 @@ impl DecodeMirror {
         for w_idx in 0..worker_devices.len().min(self.streams.len().saturating_sub(1)) {
             braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(self.streams[w_idx + 1]) })?;
         }
+        Device::set_current(saved)?;
         Ok(())
     }
 
@@ -406,6 +408,7 @@ impl DecodeMirror {
         hidden_ptr: *const f32,
         label: &str,
     ) -> HipResult<()> {
+        let saved = Device::current()?;
         Device::set_current(gpu0)?;
         let n = 16usize.min(self.hidden_size);
         let copy_bytes = n * std::mem::size_of::<f32>();
@@ -433,6 +436,7 @@ impl DecodeMirror {
             "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
             buf[0], buf[1], buf[2], buf[3]
         );
+        Device::set_current(saved)?;
         Ok(())
     }
 
