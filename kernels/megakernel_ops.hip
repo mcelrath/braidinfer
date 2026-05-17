@@ -1633,7 +1633,10 @@ __device__ __attribute__((noinline)) void op_qk_norm(const u64* inst, u32 vblock
 
     float sum_sq = 0.0f;
     for (int i = tid; i < head_dim; i += stride) { float v = head_ptr[i]; sum_sq += v * v; }
-    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)head_dim + eps);
+    // bz0 fix #1: match op_attn_paged / op_attn_paged_quant K-rms which use
+    // tree_reduce_sum_256 (block_reduce_sum is shfl-based, produces different
+    // float-rounded sums due to non-associativity; broke paged-vs-flat coherence).
+    float rms = rsqrtf(tree_reduce_sum_256(sum_sq, shared) / (float)head_dim + eps);
 
     for (int i = tid; i < head_dim; i += stride) {
         head_ptr[i] = head_ptr[i] * rms * (1.0f + bf16_to_f32(weight_ptr[i]));
@@ -1754,7 +1757,7 @@ __device__ __attribute__((noinline)) void op_gqa_attn(const u64* inst, u32 vbloc
         const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
-        float score = block_reduce_sum(dot, partial) * scale;
+        float score = tree_reduce_sum_256(dot, partial) * scale;
         float m_new = fmaxf(m, score);
         float correction = expf(m - m_new);
         float w = expf(score - m_new);
@@ -1960,7 +1963,7 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
             }
             // Q·K dot reduction. A/B test confirmed shfl is fine here (only
             // K-rms's reduction shows bz0); use the fast block_reduce_sum.
-            float score = block_reduce_sum(dot, partial) * scale;
+            float score = tree_reduce_sum_256(dot, partial) * scale;
 
             // Online softmax update
             float m_new = fmaxf(m, score);
@@ -2142,7 +2145,7 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
             // Q·K dot product
             float dot = 0.0f;
             if (tid < head_dim) dot = q_ptr[tid] * sh_k[tid];
-            float score = block_reduce_sum(dot, partial) * attn_scale;
+            float score = tree_reduce_sum_256(dot, partial) * attn_scale;
 
             // Online softmax
             float m_new = fmaxf(m, score);
@@ -2231,7 +2234,7 @@ __device__ __attribute__((noinline)) void op_attn_prefill(const u64* inst, u32 v
         const float* k_ptr = k_cache + ((long)kv_head * max_seq_len + t) * head_dim;
         float dot = 0.0f;
         for (int i = tid; i < head_dim; i += block_size) dot += q_ptr[i] * k_ptr[i];
-        float score = block_reduce_sum(dot, partial) * scale;
+        float score = tree_reduce_sum_256(dot, partial) * scale;
         float m_new = fmaxf(m, score);
         float correction = expf(m - m_new);
         float w = expf(score - m_new);
