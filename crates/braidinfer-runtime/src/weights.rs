@@ -1504,6 +1504,24 @@ pub fn distribute_moe_weights_from_bqnt(
         counts[gpu] += 1;
     }
 
+    // Diagnostic: log per-layer per-expert sizes on layer 0 only to give the
+    // user a sense of allocation scale without spamming the output.
+    if layer_idx == 0 {
+        eprintln!(
+            "  distribute layer 0: ne={} gu_bytes/expert={} down_bytes/expert={} gate_up_in_dim={} format={:?}",
+            ne, gu_bytes_per_expert, down_bytes_per_expert, gate_up_in_dim, weight_format
+        );
+        let per_gpu_alloc_mb = (counts[0] as f64
+            * (gu_bytes_per_expert + down_bytes_per_expert) as f64)
+            / (1024.0 * 1024.0);
+        eprintln!(
+            "  per-GPU MoE alloc/layer ≈ {:.1} MB ({} experts × {:.1} MB/expert)",
+            per_gpu_alloc_mb,
+            counts[0],
+            (gu_bytes_per_expert + down_bytes_per_expert) as f64 / (1024.0 * 1024.0)
+        );
+    }
+
     // Allocate per-GPU buffers
     let mut expert_buffers = Vec::with_capacity(num_devices);
     for gpu in 0..num_devices {
@@ -1518,10 +1536,26 @@ pub fn distribute_moe_weights_from_bqnt(
                 slot += 1;
             }
         }
+        let gu_size = n * gu_bytes_per_expert;
+        let down_size = n * down_bytes_per_expert;
+        let gate_up_buf = DeviceBuffer::<u8>::alloc(device, gu_size).map_err(|e| {
+            eprintln!(
+                "  FAIL distribute layer {} GPU {}: gate_up alloc {} bytes ({:.1}MB) — {:?}",
+                layer_idx, gpu, gu_size, gu_size as f64 / 1e6, e
+            );
+            e
+        })?;
+        let down_buf = DeviceBuffer::<u8>::alloc(device, down_size).map_err(|e| {
+            eprintln!(
+                "  FAIL distribute layer {} GPU {}: down alloc {} bytes ({:.1}MB) — {:?}",
+                layer_idx, gpu, down_size, down_size as f64 / 1e6, e
+            );
+            e
+        })?;
         expert_buffers.push(GpuExpertBuffer {
             device,
-            gate_up: DeviceBuffer::<u8>::alloc(device, n * gu_bytes_per_expert)?,
-            down: DeviceBuffer::<u8>::alloc(device, n * down_bytes_per_expert)?,
+            gate_up: gate_up_buf,
+            down: down_buf,
             local_expert_count: n,
             slot_map,
         });

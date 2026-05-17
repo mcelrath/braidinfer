@@ -415,6 +415,22 @@ impl Model {
                         total,
                     )
                     .map_err(ModelError::Hip)?;
+                    // kv-unify Phase 1 (pc3h.1): legacy_kv_caches is dead memory
+                    // on GPU 0 after broadcast in multi-GPU MoE — decode reads
+                    // exclusively from worker.attn_kv_caches via head-parallel.
+                    // Free to reclaim ~num_attn_layers × num_kv_heads × max_seq_len
+                    // × head_dim × 8 bytes (K+V) on GPU 0 (~320MB for 35B-A3B at
+                    // max_seq_len=8192).
+                    self.legacy_kv_caches = None;
+                    // kv-unify Phase 2 (pc3h.2): prefill_bufs scratch is dead
+                    // after prefill on the multi-GPU MoE decode path — decode
+                    // never invokes compile_prefill*. Free to reclaim per-chunk
+                    // scratch (hidden, normed, qkv, ffn_act, etc).
+                    self.prefill_bufs = None;
+                    // Also drop cached prefill megakernel programs.
+                    self.megakernel_prefill = None;
+                    self.megakernel_prefill_partial = None;
+                    self.megakernel_prefill_segments.clear();
                 }
             }
         }
