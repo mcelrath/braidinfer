@@ -259,6 +259,10 @@ impl DecodeMirror {
         workers_attn_q_gate: &[Option<(*const f32, usize)>],
         workers_attn_k: &[Option<*const f32>],
     ) -> HipResult<()> {
+        // Save caller's current device; restore on exit (same fix as P2-a
+        // ensure_sdma_stream: snapshot iterates GPUs via set_current, must
+        // not leave a stale Device::current for the decode hot path).
+        let saved = Device::current()?;
         // GPU 0 activations.
         Device::set_current(gpu0)?;
         let hs_bytes = self.hidden_size * std::mem::size_of::<f32>();
@@ -352,7 +356,7 @@ impl DecodeMirror {
         for &s in &self.streams {
             braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(s) })?;
         }
-        Device::set_current(gpu0)?;
+        Device::set_current(saved)?;
         Ok(())
     }
 
