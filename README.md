@@ -121,52 +121,64 @@ Key entry points for code-reading:
 
 ## Planned features
 
-In progress:
+Live status lives in `.beads/`. Use `bd list --status=open --type=epic`
+for the current epic list and `bd show <id>` for design docs and
+acceptance criteria. Snapshot of open epics organized by theme:
 
-- **§11.4 mitigation suite** (cross-GPU UC writer slabs, deferred peer
-  writes, host-mapped staging) — most surfaces landed; remaining
-  asymmetric cases tracked via `r7dv` family bds.
-- **wt1** — Write-through VRAM cache via SDMA stream. All GPU state
-  mirrored to host RAM continuously. Becomes the canonical "read GPU
-  state under persistent kernel" infrastructure. Strategic spine of
-  the cleanup arc; unblocks every subsequent debug cycle.
+### Strategic / architectural arc
 
-Near-term (next sessions):
+| ID | Title | Pri | Notes |
+|---|---|---|---|
+| `945` | wt1: Write-through KV mirror via SDMA stream | P1 | Big Plan spine — mirrors all GPU state to host RAM continuously; unblocks every subsequent debug surface and structural delete |
+| `4n5` | wt2: Host-RAM canonical KV tier (ChunkTier, promote/evict) | P1 | Phase 2 of write-through; KV chunks promotable across VRAM/host tiers |
+| `pc3h` | kv-unify: Collapse legacy/paged/worker KV variants | P2 | ~400 LOC delete + ~320 MiB GPU 0 VRAM savings; paged becomes primary |
+| `pns` | Unify cooperative-grid launches into single persistent_worker | P3 | Exactly ONE cooperative megakernel per process; deletes `megakernel_f32` entry, eliminates second-coop-launch wedge class |
+| `77r.2` | Consolidate `rdna3_*.h` into single library + migration plan | P1 | Headers in `kernels/rdna3/`; this epic finishes the migration and produces the canonical version |
+| `lr6t` | arch: in-megakernel signal-then-fire handoff | P2 | Replaces the current sync-then-launch ordering with in-kernel signal-then-fire; closes the Nemotron-Super multi-GPU NaN class |
 
-- **pns** — Unify all cooperative-grid launches into a single
-  `persistent_worker`. Delete `megakernel_f32` entry; eliminate the
-  "second-coop-launch wedge" hazard architecturally. Exactly one
-  cooperative megakernel per process.
-- **pc3h** — kv-unify: collapse legacy / paged / per-worker KV cache
-  variants to a single abstraction. Paged becomes primary. ~400 LOC
-  reduction + ~320 MiB GPU 0 VRAM savings on multi-GPU MoE decode.
-- **t8fl** — `CrossGpuStaging<T>` type-encoded UC-buffer contract.
-  Makes the "every cross-GPU dst needs UC writer" class impossible
-  to write incorrectly (currently maintained by code-review).
-- **lr6t** — In-megakernel signal-then-fire dispatch ordering,
-  replacing the current sync-then-launch handoff. Closes the
-  multi-GPU NaN class for Nemotron-H and qwen3.6 architectural
-  completeness.
+### MoE
 
-Mid-term:
+| ID | Title | Pri | Notes |
+|---|---|---|---|
+| `vfgj` | moe1: Dynamic MoE expert placement control plane | P2 | CPU-side tracker reallocates experts to idle/underloaded GPUs or offloads to system RAM |
+| `x7fo` | moe2: Host-resident cold experts + VRAM LRU cache | P1 | All experts in host RAM; VRAM holds working set with LRU eviction; enables 397B-class models on 8×24GB |
+| `fm7o` | moe-aff: Routing-locality expert affinity + batched dispatch | P1 | Affinity-sticky expert routing to reduce cross-GPU dispatch count per decode; batch dispatches across same target GPU |
+| `bl2x` | dp1: Data-parallel chunk prefill | P1 | Replaces `tp1`/`tp2` (closed as infeasible at PCIe Gen3 bandwidth); splits prefill across GPUs by independent chunks |
+| `gs1` | perf: megakernel fused-instructions Phase 3 | P1 | Attack remaining `grid.sync` boundaries via fused-instruction merging |
+| `58p` | 77r-style audit: MoE megakernel ops | P2 | Following the `rdna3_*` library audit pattern, scrub `megakernel_moe.hip` for §11.4 hazards |
 
-- **mla1** — Multi-head Latent Attention for DeepSeek-V4-Flash.
-- **ssm1 / ssm2 / ssm3** — Chunked SSD-form SSM prefill,
-  head-parallel SSM across GPUs, region-edit staleness measurement.
-- **moe1 / moe2 / moe-aff** — Dynamic expert placement control
-  plane, host-resident cold experts + VRAM LRU cache, routing-locality
-  expert affinity.
-- **dp1** — Data-parallel chunk prefill (replaces `tp1` / `tp2`
-  which were infeasible at PCIe Gen3 bandwidth).
-- **wt2** — Host-RAM canonical KV tier (`ChunkTier`, promote / evict).
-- **reg1 / reg2** — Region-based KV API (codebase-as-KV core,
-  save / restore via host RAM + disk).
-- **hw-cal** — Empirical bandwidth calibration documentation
-  (consolidates `exterior_algebra/results/*.json` into a canonical
-  `docs/hw-bandwidth-envelope.md`).
+### SSM / hybrid
 
-See `.beads/` for live status (`bd ready` shows current actionable
-work; `bd show <id>` for design docs and acceptance criteria).
+| ID | Title | Pri | Notes |
+|---|---|---|---|
+| `993` | ssm1: Chunked SSD-form SSM prefill (`OP_SSM_PREFILL_SSD`) | P1 | Mamba2-style semi-separable matrix decomposition for parallel SSM prefill; WMMA-amenable |
+| `8tzg` | ssm2: Head-parallel SSM across GPUs | P1 | Zero-comm head-axis sharding for SSM/Mamba/GDN, matching the attention multi-GPU pattern |
+| `cjxe` | ssm3: SSM region-edit staleness measurement and policy | P3 | Quantifies SSM state divergence on region-based KV edits; informs staleness-tolerant cache policies |
+
+### Attention / model architectures
+
+| ID | Title | Pri | Notes |
+|---|---|---|---|
+| `7ytz` | mla1: Multi-head Latent Attention (MLA) | P1 | For DeepSeek-V4-Flash; latent-projection attention variant |
+
+### Storage / session / KV API
+
+| ID | Title | Pri | Notes |
+|---|---|---|---|
+| `cnh` | reg1: Region-based KV API (codebase-as-KV core) | P2 | Named regions in KV with mask/replace/append; codebase-as-cache foundation |
+| `47i` | reg2: Session save/restore via host RAM + disk | P2 | Phase 2 of regions; on-disk persistence for slot state |
+
+### Calibration / cleanup
+
+| ID | Title | Pri | Notes |
+|---|---|---|---|
+| `8x5s` | hw-cal: Empirical bandwidth calibration | P1 | Consolidate microbench results into canonical `docs/hw-bandwidth-envelope.md` |
+| `wuf` | Cleanup + model coverage recovery | P1 | Phase A landed (delete `bin/braid_bench`, retire env knobs, singleton watchdog, `mtype_audit` module extract); Phase B+ continues |
+
+Active recent work also landed today as part of the §11.4 cross-GPU
+coherence mitigation suite (UC writer slabs, deferred peer writes,
+host-mapped staging) — see `composable_kernel/GFX1100_ARCH.md`
+§11.4 / §11.16 / §11.17 for the canonical mitigation set.
 
 ## Documentation
 
