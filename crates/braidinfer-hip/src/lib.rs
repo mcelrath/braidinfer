@@ -7,7 +7,7 @@ pub mod module;
 pub mod stream;
 
 pub use dev_ptr::{DevPtr, tags};
-pub use device::Device;
+pub use device::{Device, DeviceGuard};
 pub use error::{HipError, HipResult};
 pub use memory::{
     DeviceBuffer, MappedHostBuffer, PinnedBuffer, memcpy_d2d, memcpy_d2h, memcpy_h2d,
