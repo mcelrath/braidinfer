@@ -413,10 +413,16 @@ impl PersistentDispatch {
         if !self.sdma_streams[slot].is_null() {
             return Ok(());
         }
+        // Save and restore the current device so callers (e.g. add_device
+        // iterating over worker GPUs) do not observe a stale current-device
+        // after this call. Without restore, the last worker GPU becomes
+        // current for all subsequent HIP calls, causing NaN on GPU 0 ops.
+        let saved = Device::current()?;
         Device::set_current(device)?;
         let mut s: ffi::hipStream_t = std::ptr::null_mut();
         braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
         self.sdma_streams[slot] = s;
+        Device::set_current(saved)?;
         Ok(())
     }
 
