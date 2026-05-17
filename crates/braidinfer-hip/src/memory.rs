@@ -340,6 +340,22 @@ impl<T> PinnedBuffer<T> {
 /// Uses hipHostMallocMapped which maps the allocation into the GPU address space.
 /// Reads/writes are coherent: GPU accesses go through GART (MTYPE_UC, no L2 caching).
 /// Use for barrier flags and small shared state between CPU and a running GPU kernel.
+///
+/// # Choosing an allocator (snl audit 2026-05-17)
+///
+/// | Writer | Reader(s)           | Use                     |
+/// |--------|---------------------|-------------------------|
+/// | CPU    | single GPU          | `alloc`                 |
+/// | CPU    | multiple GPUs       | `alloc_portable`        |
+/// | GPU    | single GPU (self)   | `alloc` or `alloc_coherent` |
+/// | GPU    | peer GPU(s)         | `alloc_portable_coherent` (MANDATORY) |
+///
+/// When a GPU writes and another GPU reads, `alloc_portable` is insufficient
+/// because it may use MTYPE_NC (L2-cached) on the writer GPU — peer reads
+/// can observe stale data past the ack/fence boundary. Only
+/// `alloc_portable_coherent` forces MTYPE_UC. Empirical: this caused the
+/// snl 4-GPU decode NaN bug fixed 2026-05-17 (normed_stage was
+/// alloc_portable; switched to alloc_portable_coherent restored correctness).
 pub struct MappedHostBuffer<T> {
     host_ptr: *mut T,
     device_ptr: *mut T,
