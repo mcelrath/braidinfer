@@ -20,7 +20,7 @@
 use crate::weights::ActivationBuffers;
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::device::Device;
+use braidinfer_hip::device::{Device, DeviceGuard};
 use braidinfer_hip::ffi;
 use braidinfer_hip::memory::PinnedBuffer;
 
@@ -172,7 +172,14 @@ impl DecodeMirror {
         num_gpus: usize,
         hidden_size: usize,
     ) -> HipResult<()> {
-        let saved = Device::current()?;
+        // DeviceGuard saves the caller's current device and restores it on drop.
+        // The inner loop uses Device::set_current for per-worker switching; the
+        // guard ensures restoration to the caller's device regardless of exit path.
+        let _guard = if let Some(&first_dev) = worker_devices.first() {
+            Some(DeviceGuard::switch_to(first_dev)?)
+        } else {
+            None
+        };
         // Copy MoE output_slots token-0 slots to a local snapshot (host-mapped UC,
         // directly readable — no DMA needed).
         // Layout: slot for (token=0, gpu_id) = output_slots_host + gpu_id * hidden_size.
@@ -205,7 +212,7 @@ impl DecodeMirror {
         for w_idx in 0..worker_devices.len().min(self.streams.len().saturating_sub(1)) {
             braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(self.streams[w_idx + 1]) })?;
         }
-        Device::set_current(saved)?;
+        // _guard drops here, restoring the caller's device.
         Ok(())
     }
 
@@ -261,12 +268,11 @@ impl DecodeMirror {
         workers_attn_q_gate: &[Option<(*const f32, usize)>],
         workers_attn_k: &[Option<*const f32>],
     ) -> HipResult<()> {
-        // Save caller's current device; restore on exit (same fix as P2-a
-        // ensure_sdma_stream: snapshot iterates GPUs via set_current, must
-        // not leave a stale Device::current for the decode hot path).
-        let saved = Device::current()?;
-        // GPU 0 activations.
-        Device::set_current(gpu0)?;
+        // DeviceGuard saves the caller's current device and restores it on drop
+        // (same fix class as ensure_sdma_stream: snapshot iterates GPUs via
+        // set_current and must not leave a stale Device::current for the decode
+        // hot path).
+        let _guard = DeviceGuard::switch_to(gpu0)?;
         let hs_bytes = self.hidden_size * std::mem::size_of::<f32>();
         let attn_out_bytes = self.attn_out_floats * std::mem::size_of::<f32>();
         unsafe {
@@ -358,7 +364,7 @@ impl DecodeMirror {
         for &s in &self.streams {
             braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(s) })?;
         }
-        Device::set_current(saved)?;
+        // _guard drops here, restoring the caller's device.
         Ok(())
     }
 
@@ -408,8 +414,7 @@ impl DecodeMirror {
         hidden_ptr: *const f32,
         label: &str,
     ) -> HipResult<()> {
-        let saved = Device::current()?;
-        Device::set_current(gpu0)?;
+        let _guard = DeviceGuard::switch_to(gpu0)?;
         let n = 16usize.min(self.hidden_size);
         let copy_bytes = n * std::mem::size_of::<f32>();
         unsafe {
@@ -436,7 +441,7 @@ impl DecodeMirror {
             "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
             buf[0], buf[1], buf[2], buf[3]
         );
-        Device::set_current(saved)?;
+        // _guard drops here, restoring the caller's device.
         Ok(())
     }
 
