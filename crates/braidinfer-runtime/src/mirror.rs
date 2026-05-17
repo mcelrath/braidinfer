@@ -3,6 +3,8 @@
 //! Allocates pinned-host shadows of cross-GPU debug-relevant tensors:
 //!   - worker.attn_kv_caches[layer].k/v per (gpu, attn_layer)
 //!   - GPU 0 activations.hidden, activations.attn_out
+//!   - MoE output_slots (host-mapped, directly CPU-readable — no DMA)
+//!   - Per-worker OP_MOE_FFN_REMOTE local_output (VRAM → SDMA shadow)
 //!
 //! Per-GPU SDMA streams (raw hipStream_t, created BEFORE persistent_workers
 //! launch — afterwards hipStreamCreate may deadlock against the cooperative
@@ -53,6 +55,12 @@ pub struct DecodeMirror {
     local_nkh: usize,
     max_seq_len: usize,
     head_dim: usize,
+    /// Per-worker pinned-host shadow of OP_MOE_FFN_REMOTE local_output (VRAM).
+    /// Indexed by worker_idx (0 = GPU 1). Allocated by `alloc_moe_workers`.
+    /// Empty if `alloc_moe_workers` was never called.
+    worker_ffn_output: Vec<PinnedBuffer<f32>>,
+    /// Number of worker GPUs (GPUs 1..N). Set by `alloc_moe_workers`.
+    num_workers: usize,
 }
 
 unsafe impl Send for DecodeMirror {}
@@ -122,7 +130,120 @@ impl DecodeMirror {
             local_nkh,
             max_seq_len,
             head_dim,
+            worker_ffn_output: Vec::new(),
+            num_workers: worker_devices.len(),
         })
+    }
+
+    /// Allocate per-worker pinned-host shadows for OP_MOE_FFN_REMOTE local_output.
+    /// `worker_devices`: GPUs 1..N in order. `hidden_size`: floats per worker output.
+    /// Must be called BEFORE the first MoE decode step. Safe to call multiple times
+    /// (re-alloc is idempotent if dimensions match).
+    pub fn alloc_moe_workers(
+        &mut self,
+        worker_devices: &[DeviceId],
+        hidden_size: usize,
+    ) -> HipResult<()> {
+        if self.worker_ffn_output.len() == worker_devices.len() {
+            // Already allocated.
+            return Ok(());
+        }
+        self.worker_ffn_output.clear();
+        for _ in worker_devices {
+            self.worker_ffn_output.push(PinnedBuffer::<f32>::alloc(hidden_size)?);
+        }
+        Ok(())
+    }
+
+    /// Snapshot MoE output_slots (host-mapped, no DMA) and per-worker FFN_REMOTE
+    /// local_output (SDMA copy) into their respective shadow buffers.
+    ///
+    /// `output_slots_host`: CPU-readable host pointer to MoeP2pContext::output_slots.
+    ///   Layout: [MAX_PREFILL_BATCH × num_gpus × hidden_size]; decode uses
+    ///   token 0 slots: offsets [gpu_id * hidden_size] for gpu_id in 0..num_gpus.
+    /// `worker_local_outputs`: per-worker (worker_idx) VRAM pointer to local_output.
+    /// `worker_devices`: GPU device IDs for workers 1..N.
+    /// `num_gpus`: total GPU count (1 + num_workers).
+    pub fn snapshot_moe(
+        &mut self,
+        output_slots_host: *const f32,
+        worker_local_outputs: &[*const f32],
+        worker_devices: &[DeviceId],
+        num_gpus: usize,
+        hidden_size: usize,
+    ) -> HipResult<()> {
+        // Copy MoE output_slots token-0 slots to a local snapshot (host-mapped UC,
+        // directly readable — no DMA needed).
+        // Layout: slot for (token=0, gpu_id) = output_slots_host + gpu_id * hidden_size.
+        // We'll store them in worker_ffn_output[w] for w_idx=gpu_id-1 below, along with
+        // SDMA copies — but output_slots is printed inline in print_moe_stats via the
+        // host pointer, so no extra allocation is needed here.
+        let _ = output_slots_host;
+        let _ = num_gpus;
+
+        // SDMA copy of each worker's local_output VRAM → pinned shadow.
+        let copy_bytes = hidden_size * std::mem::size_of::<f32>();
+        for (w_idx, &dev) in worker_devices.iter().enumerate() {
+            if w_idx >= self.worker_ffn_output.len() || w_idx >= worker_local_outputs.len() {
+                break;
+            }
+            Device::set_current(dev)?;
+            let src = worker_local_outputs[w_idx];
+            let dst = self.worker_ffn_output[w_idx].as_mut_ptr() as *mut std::ffi::c_void;
+            unsafe {
+                braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                    dst,
+                    src as *const std::ffi::c_void,
+                    copy_bytes,
+                    ffi::hipMemcpyDeviceToHost,
+                    self.streams[w_idx + 1],
+                ))?;
+            }
+        }
+        // Sync worker SDMA streams only (streams[1..]).
+        for w_idx in 0..worker_devices.len().min(self.streams.len().saturating_sub(1)) {
+            braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(self.streams[w_idx + 1]) })?;
+        }
+        Ok(())
+    }
+
+    /// Print MoE output_slots and per-worker FFN_REMOTE local_output stats.
+    /// `output_slots_host`: host pointer (portable coherent) to MoeP2pContext::output_slots.
+    /// `num_gpus`: total GPU count.
+    /// `hidden_size`: floats per slot.
+    pub fn print_moe_stats(
+        &self,
+        label: &str,
+        output_slots_host: *const f32,
+        num_gpus: usize,
+        hidden_size: usize,
+    ) {
+        let stat = |name: &str, slice: &[f32]| {
+            let mut n_nan = 0usize;
+            let mut n_inf = 0usize;
+            let mut max_abs = 0.0f32;
+            for &x in slice {
+                if x.is_nan() { n_nan += 1; }
+                else if x.is_infinite() { n_inf += 1; }
+                else if x.abs() > max_abs { max_abs = x.abs(); }
+            }
+            eprintln!(
+                "[moe {label}] {name}: n={} nan={} inf={} max_abs={:.4} first4={:?}",
+                slice.len(), n_nan, n_inf, max_abs,
+                &slice[..slice.len().min(4)]
+            );
+        };
+        // output_slots: print slot for each gpu_id (token=0).
+        for gpu_id in 0..num_gpus {
+            let slice = unsafe {
+                std::slice::from_raw_parts(output_slots_host.add(gpu_id * hidden_size), hidden_size)
+            };
+            stat(&format!("output_slots[gpu{}]", gpu_id), slice);
+        }
+        // Per-worker FFN_REMOTE local_output (post-SDMA snapshot).
+        for (w_idx, buf) in self.worker_ffn_output.iter().enumerate() {
+            stat(&format!("worker{}_ffn_out(gpu{})", w_idx, w_idx + 1), buf.as_slice());
+        }
     }
 
     /// Issue DMA copies VRAM→host for all mirrored buffers, then sync all

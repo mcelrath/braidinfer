@@ -265,6 +265,12 @@ impl Model {
             self.decode_mirror = Some(mirror);
             eprintln!("  decode_mirror: SDMA H2D mirror allocated ({num_attn_layers} attn layers × {} gpus)", num_gpus);
         }
+        // Allocate per-worker FFN_REMOTE output shadows if MoE is present.
+        if let (Some(mirror), Some(p2p)) = (self.decode_mirror.as_mut(), self.moe_p2p.as_ref()) {
+            let worker_devs: Vec<_> = p2p.workers.iter().map(|w| w.device).collect();
+            mirror.alloc_moe_workers(&worker_devs, p2p.hidden_size)
+                .map_err(ModelError::Hip)?;
+        }
         Ok(())
     }
 
@@ -456,6 +462,33 @@ impl Model {
         mirror.print_stats(label, position);
     }
 
+    /// Snapshot MoE output_slots (host-mapped, direct read) and per-worker FFN_REMOTE
+    /// local_output (SDMA copy) into pinned shadows, then print stats. No-op if
+    /// decode_mirror or moe_p2p is None.
+    fn decode_mirror_moe_snapshot(&mut self, layer_idx: usize) {
+        let (Some(p2p), Some(mirror)) = (self.moe_p2p.as_ref(), self.decode_mirror.as_mut()) else {
+            return;
+        };
+        let output_slots_host = p2p.output_slots.host_ptr() as *const f32;
+        let worker_local_outputs: Vec<*const f32> = p2p.workers.iter()
+            .map(|w| w.local_output.as_ptr() as *const f32)
+            .collect();
+        let worker_devs: Vec<_> = p2p.workers.iter().map(|w| w.device).collect();
+        let num_gpus = p2p.num_gpus;
+        let hidden_size = p2p.hidden_size;
+        if let Err(e) = mirror.snapshot_moe(
+            output_slots_host,
+            &worker_local_outputs,
+            &worker_devs,
+            num_gpus,
+            hidden_size,
+        ) {
+            eprintln!("[moe mirror L{layer_idx}] snapshot failed: {e:?}");
+            return;
+        }
+        mirror.print_moe_stats(&format!("L{layer_idx}"), output_slots_host, num_gpus, hidden_size);
+    }
+
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let mirror_on = std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok();
         let max_steps: u32 = std::env::var("BRAIDINFER_DECODE_MIRROR_STEPS")
@@ -591,6 +624,10 @@ impl Model {
                 // parallel with each other (their dispatches are still async)
                 // but only after GPU 0's PRE has completed.
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
+                // MoE mirror: snapshot output_slots + worker FFN outputs after ack.
+                if self.decode_mirror.is_some() {
+                    self.decode_mirror_moe_snapshot(layer_idx);
+                }
                 // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
                 seg_start = i + 1;
                 moe_i += 1;
