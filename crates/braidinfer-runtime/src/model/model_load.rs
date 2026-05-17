@@ -1194,6 +1194,17 @@ impl Model {
             .ok()
             .and_then(|p| crate::bqnt::MmapBqnt::open(std::path::Path::new(&p)).ok());
 
+        // VRAM diagnostic helper: prints per-GPU free MB.
+        let print_vram = |label: &str| {
+            let free_per_gpu: Vec<String> = crate::cli::vram_free_per_gpu()
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| format!("GPU{}={:.0}MB", i, b as f64 / (1024.0 * 1024.0)))
+                .collect();
+            eprintln!("  VRAM after {}: [{}]", label, free_per_gpu.join(", "));
+        };
+        print_vram("init");
+
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
@@ -1232,6 +1243,7 @@ impl Model {
 
         self.distributed_moe = distributed;
         eprintln!("Multi-GPU: experts distributed across all {num_devices} GPUs");
+        print_vram("MoE distribute");
 
         // Allocate head-parallel attention buffers for all GPUs
         let num_attn_layers = self
@@ -1266,8 +1278,10 @@ impl Model {
                 self.config.hidden_size,
                 q_mult,
             )?;
+            print_vram("init_attn_buffers");
             // Split Q/K/V projection weights onto each GPU
             self.init_split_attn_weights(&mut ctx, local_nqh, local_nkh, q_mult)?;
+            print_vram("init_split_attn_weights");
         }
 
         self.multi_gpu = Some(ctx);

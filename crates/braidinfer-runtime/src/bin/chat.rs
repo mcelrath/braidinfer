@@ -51,7 +51,21 @@ async fn main() {
         Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
     if multi_gpu {
-        model.enable_multi_gpu().expect("enable multi-GPU");
+        if let Err(e) = model.enable_multi_gpu() {
+            let per_gpu_free_mb: Vec<f64> =
+                braidinfer_runtime::cli::vram_free_per_gpu()
+                    .iter()
+                    .map(|&b| b as f64 / (1024.0 * 1024.0))
+                    .collect();
+            eprintln!("ERROR: enable_multi_gpu failed: {e:?}");
+            eprintln!("  Per-GPU free VRAM (MB): {:?}", per_gpu_free_mb);
+            eprintln!("  Hints:");
+            eprintln!("    - increase GPU count (try -g 4 or -g 8)");
+            eprintln!("    - reduce MAX_SEQ_LEN (e.g. MAX_SEQ_LEN=4096)");
+            eprintln!("    - use a smaller quant (e.g. .q4.bqnt instead of .q8.bqnt)");
+            eprintln!("    - HipError(2) = hipErrorOutOfMemory: not enough VRAM for distributed weights + KV caches + scratch");
+            std::process::exit(1);
+        }
     }
 
     eprintln!("braidinfer chat (max_tokens={max_tokens}, ^D to quit)");
