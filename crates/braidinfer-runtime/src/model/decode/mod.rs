@@ -1,6 +1,6 @@
 mod trace;
 
-use crate::megakernel::{MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
+use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
 use crate::persistent_dispatch::BatchDispatcher;
 use crate::weights::LayerWeights;
 
@@ -109,6 +109,21 @@ impl Model {
                 .map_err(ModelError::Hip)?;
         }
 
+        // Chunk-seal mirror hook (wt1 P2-c): enqueue SDMA copy of the just-sealed
+        // chunk to pinned host memory. The persistent_workers SDMA stream is used so
+        // the copy runs out-of-band without blocking the CPU decode loop.
+        if (position as usize + 1) % CHUNK_TOKENS == 0 {
+            if let Some(dispatch) = self.persistent_workers.as_mut() {
+                let alloc = self.page_allocator.as_ref().unwrap();
+                let seq = self.paged_seq.as_ref().unwrap();
+                if let Some(sealed) = seq.chunks.last() {
+                    let vram_ptr = alloc.slot_ptr(sealed.slot_index());
+                    dispatch.kv_mirror_chunk(0, vram_ptr).map_err(ModelError::Hip)?;
+                    dispatch.drain_kv_chunk_mirror(0, position).map_err(ModelError::Hip)?;
+                }
+            }
+        }
+
         self.seq_len = position + 1;
         Ok(logits)
     }
@@ -198,10 +213,41 @@ impl Model {
         self.moe_p2p = Some(p2p);
         self.megakernel_multi_gpu_p2p = Some(mk_p2p);
 
-        // wt1-minimal: allocate SDMA decode-mirror BEFORE launching worker
-        // cooperative kernels (hipStreamCreate on a GPU with active coop
-        // kernel can wedge — see sdma_under_coop_fork probe). Lazy-init
-        // controlled by env var to keep prod path cost-free.
+        // wt1 P2-a: PersistentDispatch now owns SDMA streams (one per GPU,
+        // indexed by DeviceId.0). Stream allocation for worker GPUs (1..N-1)
+        // happens inside `add_device` immediately BEFORE the cooperative
+        // launch (hipStreamCreate on a GPU with an active coop kernel can
+        // wedge — see sdma_under_coop_fork probe). GPU 0's stream is
+        // allocated here explicitly because GPU 0's persistent worker is
+        // added later in `init_multi_gpu_persistent` on first decode call.
+        //
+        // Order matters: init_with_total → worker GPU streams + workers
+        // launched; then ensure_sdma_stream(gpu0) while GPU 0 still has no
+        // persistent worker; then DecodeMirror::alloc borrowing all streams.
+        {
+            let mut dispatch = PersistentDispatch::init_with_total(
+                num_gpus,
+                &worker_devices,
+                shared_mem_persistent,
+                hs,
+                self.watchdog.clone(),
+            )
+            .map_err(ModelError::Hip)?;
+            // GPU 0 stream — safe to allocate now (GPU 0 has no persistent
+            // worker yet; still in kbk-launch phase).
+            dispatch
+                .ensure_sdma_stream(self.device)
+                .map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
+            eprintln!(
+                "  MoE P2P dispatch initialized: {} worker GPUs (prefill path)",
+                num_gpus - 1
+            );
+        }
+
+        // Decode-mirror: lazy-init from env var. Borrows SDMA streams from
+        // PersistentDispatch (owned there; destroyed in that Drop after
+        // workers have exited).
         if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_none() {
             let num_attn_layers = self
                 .config
@@ -209,9 +255,20 @@ impl Model {
                 .iter()
                 .filter(|l| l.layer_type == crate::config::LayerType::Attention)
                 .count();
+            let dispatch = self
+                .persistent_workers
+                .as_ref()
+                .expect("PersistentDispatch must be initialized before DecodeMirror");
+            let mut streams: Vec<braidinfer_hip::ffi::hipStream_t> =
+                Vec::with_capacity(1 + worker_devices.len());
+            streams.push(dispatch.sdma_stream(self.device.0 as usize));
+            for &dev in &worker_devices {
+                streams.push(dispatch.sdma_stream(dev.0 as usize));
+            }
             let mirror = crate::mirror::DecodeMirror::alloc(
                 self.device,
                 &worker_devices,
+                streams,
                 self.config.num_kv_heads,
                 self.config.max_seq_len,
                 self.config.head_dim,
@@ -223,24 +280,11 @@ impl Model {
             self.decode_mirror = Some(mirror);
             eprintln!("  decode_mirror: SDMA H2D mirror allocated ({num_attn_layers} attn layers × {} gpus)", num_gpus);
         }
-        // Arm worker dispatchers on each WORKER GPU (1..N-1) — but NOT GPU 0.
-        // GPU 0 still runs kbk launches during prefill (kernels.linear_proj.forward
-        // in moe_ffn_forward / compile_prefill_segment paths). Its dispatcher
-        // worker is added on first decode call (init_multi_gpu_persistent).
-        {
-            let dispatch = PersistentDispatch::init_with_total(
-                num_gpus,
-                &worker_devices,
-                shared_mem_persistent,
-                hs,
-                self.watchdog.clone(),
-            )
-            .map_err(ModelError::Hip)?;
-            self.persistent_workers = Some(dispatch);
-            eprintln!(
-                "  MoE P2P dispatch initialized: {} worker GPUs (prefill path)",
-                num_gpus - 1
-            );
+        // Allocate per-worker FFN_REMOTE output shadows if MoE is present.
+        if let (Some(mirror), Some(p2p)) = (self.decode_mirror.as_mut(), self.moe_p2p.as_ref()) {
+            let worker_devs: Vec<_> = p2p.workers.iter().map(|w| w.device).collect();
+            mirror.alloc_moe_workers(&worker_devs, p2p.hidden_size)
+                .map_err(ModelError::Hip)?;
         }
         Ok(())
     }
@@ -315,49 +359,22 @@ impl Model {
         eprintln!("=== end MTYPE audit ===");
     }
 
-    /// DEBUG_P2P_HIDDEN probe: dispatch a one-shot OP_D2D_COPY batch that
-    /// copies the first 16 floats of `activations.hidden` into the
-    /// host-mapped UC probe buffer, then read + report from CPU. Safe under
-    /// the persistent cooperative kernel — the copy runs *inside* the
-    /// megakernel (same CUs already held by the worker), and the readback is
-    /// a CPU MMIO load from host-mapped memory (no hipMemcpy, no kernel
-    /// launch). No-op when `debug_hidden_probe` is None.
+    /// DEBUG_P2P_HIDDEN probe: copy first 16 floats of `activations.hidden` via
+    /// `DecodeMirror::snapshot_hidden_head16` (SDMA engine, GPU 0 stream) and
+    /// print a one-line diagnostic. Safe under the persistent cooperative kernel —
+    /// SDMA operates independently of the CUs held by `persistent_worker`.
+    /// No-op when `decode_mirror` is None or `debug_p2p_hidden` is false.
     fn probe_hidden_after_segment(&mut self, label: &str) {
         if !self.debug_p2p_hidden {
             return;
         }
-        let probe = match self.activations.debug_hidden_probe.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-        let dst = probe.as_write_ptr();
-        let src = self.activations.hidden.as_ptr() as *const f32;
-        let inst = crate::megakernel::instructions::D2dCopyInst::new(
-            1, // grid_x: 1 block is enough for 16 elements
-            dst,
-            src,
-            16,
-        )
-        .into_inst();
-        let batch = [inst];
-        let dispatch: &mut dyn BatchDispatcher =
-            self.persistent_workers.as_mut().unwrap();
-        dispatch.dispatch_batch(0, &batch);
-        // After ack, host-mapped UC memory is visible. Read 16 floats, scan.
-        let buf: &[f32] = unsafe { std::slice::from_raw_parts(probe.host_ptr() as *const f32, 16) };
-        let mut nan = false;
-        let mut inf = false;
-        let mut max_abs = 0.0f32;
-        for &v in buf.iter() {
-            if v.is_nan() { nan = true; }
-            if v.is_infinite() { inf = true; }
-            let a = v.abs();
-            if a > max_abs { max_abs = a; }
+        let hidden_ptr = self.activations.hidden.as_ptr() as *const f32;
+        let device = self.device;
+        if let Some(mirror) = self.decode_mirror.as_mut() {
+            if let Err(e) = mirror.snapshot_hidden_head16(device, hidden_ptr, label) {
+                eprintln!("DBG hidden[{label}] snapshot_hidden_head16 error: {e:?}");
+            }
         }
-        eprintln!(
-            "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
-            buf[0], buf[1], buf[2], buf[3]
-        );
     }
 
     fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
@@ -431,6 +448,33 @@ impl Model {
             return;
         }
         mirror.print_stats(label, position);
+    }
+
+    /// Snapshot MoE output_slots (host-mapped, direct read) and per-worker FFN_REMOTE
+    /// local_output (SDMA copy) into pinned shadows, then print stats. No-op if
+    /// decode_mirror or moe_p2p is None.
+    fn decode_mirror_moe_snapshot(&mut self, layer_idx: usize) {
+        let (Some(p2p), Some(mirror)) = (self.moe_p2p.as_ref(), self.decode_mirror.as_mut()) else {
+            return;
+        };
+        let output_slots_host = p2p.output_slots.host_ptr() as *const f32;
+        let worker_local_outputs: Vec<*const f32> = p2p.workers.iter()
+            .map(|w| w.local_output.as_ptr() as *const f32)
+            .collect();
+        let worker_devs: Vec<_> = p2p.workers.iter().map(|w| w.device).collect();
+        let num_gpus = p2p.num_gpus;
+        let hidden_size = p2p.hidden_size;
+        if let Err(e) = mirror.snapshot_moe(
+            output_slots_host,
+            &worker_local_outputs,
+            &worker_devs,
+            num_gpus,
+            hidden_size,
+        ) {
+            eprintln!("[moe mirror L{layer_idx}] snapshot failed: {e:?}");
+            return;
+        }
+        mirror.print_moe_stats(&format!("L{layer_idx}"), output_slots_host, num_gpus, hidden_size);
     }
 
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
@@ -568,6 +612,10 @@ impl Model {
                 // parallel with each other (their dispatches are still async)
                 // but only after GPU 0's PRE has completed.
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
+                // MoE mirror: snapshot output_slots + worker FFN outputs after ack.
+                if self.decode_mirror.is_some() {
+                    self.decode_mirror_moe_snapshot(layer_idx);
+                }
                 // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
                 seg_start = i + 1;
                 moe_i += 1;
@@ -1229,6 +1277,20 @@ impl Model {
                 &self.config,
                 &self.stream,
             )?;
+        }
+
+        // Chunk-seal mirror hook (wt1 P2-c): same as persistent path but for
+        // the non-persistent paged decode route.
+        if (position as usize + 1) % CHUNK_TOKENS == 0 {
+            if let Some(dispatch) = self.persistent_workers.as_mut() {
+                let alloc = self.page_allocator.as_ref().unwrap();
+                let seq = self.paged_seq.as_ref().unwrap();
+                if let Some(sealed) = seq.chunks.last() {
+                    let vram_ptr = alloc.slot_ptr(sealed.slot_index());
+                    dispatch.kv_mirror_chunk(0, vram_ptr).map_err(ModelError::Hip)?;
+                    dispatch.drain_kv_chunk_mirror(0, position).map_err(ModelError::Hip)?;
+                }
+            }
         }
 
         let mut logits = vec![0.0f32; self.config.vocab_size];

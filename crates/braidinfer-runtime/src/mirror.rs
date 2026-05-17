@@ -3,6 +3,8 @@
 //! Allocates pinned-host shadows of cross-GPU debug-relevant tensors:
 //!   - worker.attn_kv_caches[layer].k/v per (gpu, attn_layer)
 //!   - GPU 0 activations.hidden, activations.attn_out
+//!   - MoE output_slots (host-mapped, directly CPU-readable — no DMA)
+//!   - Per-worker OP_MOE_FFN_REMOTE local_output (VRAM → SDMA shadow)
 //!
 //! Per-GPU SDMA streams (raw hipStream_t, created BEFORE persistent_workers
 //! launch — afterwards hipStreamCreate may deadlock against the cooperative
@@ -23,7 +25,12 @@ use braidinfer_hip::ffi;
 use braidinfer_hip::memory::PinnedBuffer;
 
 pub struct DecodeMirror {
-    /// One SDMA stream per GPU, owned by that GPU's context.
+    /// One SDMA stream per GPU, BORROWED from PersistentDispatch::sdma_streams
+    /// (wt1 P2-a). DecodeMirror does NOT own these — destruction is the
+    /// responsibility of PersistentDispatch::Drop. Storing raw hipStream_t
+    /// here (no lifetime) is acceptable because PersistentDispatch outlives
+    /// DecodeMirror within Model: persistent_workers is dropped AFTER
+    /// decode_mirror in struct-field declaration order.
     streams: Vec<ffi::hipStream_t>,
     /// attn_kv[gpu_i][attn_layer] = (k_mirror, v_mirror).
     attn_kv: Vec<Vec<(PinnedBuffer<f32>, PinnedBuffer<f32>)>>,
@@ -48,17 +55,27 @@ pub struct DecodeMirror {
     local_nkh: usize,
     max_seq_len: usize,
     head_dim: usize,
+    /// Per-worker pinned-host shadow of OP_MOE_FFN_REMOTE local_output (VRAM).
+    /// Indexed by worker_idx (0 = GPU 1). Allocated by `alloc_moe_workers`.
+    /// Empty if `alloc_moe_workers` was never called.
+    worker_ffn_output: Vec<PinnedBuffer<f32>>,
+    /// Number of worker GPUs (GPUs 1..N). Set by `alloc_moe_workers`.
+    num_workers: usize,
 }
 
 unsafe impl Send for DecodeMirror {}
 unsafe impl Sync for DecodeMirror {}
 
 impl DecodeMirror {
-    /// Allocate streams + pinned-host mirrors. MUST be called before any
-    /// persistent_workers (cooperative kernels) launch on any GPU.
+    /// Allocate pinned-host mirrors. The caller supplies a borrowed SDMA stream
+    /// per GPU (`streams[0]` = gpu0, `streams[1..]` = worker_devices, in order).
+    /// Streams are owned by `PersistentDispatch::sdma_streams` (wt1 P2-a) and
+    /// MUST already exist before the persistent_worker cooperative kernels
+    /// launch on their GPUs. DecodeMirror does NOT destroy these streams.
     pub fn alloc(
         gpu0: DeviceId,
         worker_devices: &[DeviceId],
+        streams: Vec<ffi::hipStream_t>,
         local_nkh: usize,
         max_seq_len: usize,
         head_dim: usize,
@@ -67,17 +84,9 @@ impl DecodeMirror {
         nqh_total: usize,
     ) -> HipResult<Self> {
         let num_gpus = 1 + worker_devices.len();
-        // Per-GPU SDMA streams. The hipStreamCreate must run on each GPU's context.
-        let mut streams: Vec<ffi::hipStream_t> = Vec::with_capacity(num_gpus);
-        Device::set_current(gpu0)?;
-        let mut s: ffi::hipStream_t = std::ptr::null_mut();
-        braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
-        streams.push(s);
-        for &dev in worker_devices {
-            Device::set_current(dev)?;
-            let mut s: ffi::hipStream_t = std::ptr::null_mut();
-            braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
-            streams.push(s);
+        assert_eq!(streams.len(), num_gpus, "DecodeMirror::alloc: streams.len() must equal 1 + worker_devices.len()");
+        for (i, &s) in streams.iter().enumerate() {
+            assert!(!s.is_null(), "DecodeMirror::alloc: streams[{i}] is null — PersistentDispatch::ensure_sdma_stream not called for this device");
         }
         // Per-GPU attn_kv mirrors. All pinned-host allocations are device-context
         // independent (hipHostMalloc).
@@ -121,7 +130,122 @@ impl DecodeMirror {
             local_nkh,
             max_seq_len,
             head_dim,
+            worker_ffn_output: Vec::new(),
+            num_workers: worker_devices.len(),
         })
+    }
+
+    /// Allocate per-worker pinned-host shadows for OP_MOE_FFN_REMOTE local_output.
+    /// `worker_devices`: GPUs 1..N in order. `hidden_size`: floats per worker output.
+    /// Must be called BEFORE the first MoE decode step. Safe to call multiple times
+    /// (re-alloc is idempotent if dimensions match).
+    pub fn alloc_moe_workers(
+        &mut self,
+        worker_devices: &[DeviceId],
+        hidden_size: usize,
+    ) -> HipResult<()> {
+        if self.worker_ffn_output.len() == worker_devices.len() {
+            // Already allocated.
+            return Ok(());
+        }
+        self.worker_ffn_output.clear();
+        for _ in worker_devices {
+            self.worker_ffn_output.push(PinnedBuffer::<f32>::alloc(hidden_size)?);
+        }
+        Ok(())
+    }
+
+    /// Snapshot MoE output_slots (host-mapped, no DMA) and per-worker FFN_REMOTE
+    /// local_output (SDMA copy) into their respective shadow buffers.
+    ///
+    /// `output_slots_host`: CPU-readable host pointer to MoeP2pContext::output_slots.
+    ///   Layout: [MAX_PREFILL_BATCH × num_gpus × hidden_size]; decode uses
+    ///   token 0 slots: offsets [gpu_id * hidden_size] for gpu_id in 0..num_gpus.
+    /// `worker_local_outputs`: per-worker (worker_idx) VRAM pointer to local_output.
+    /// `worker_devices`: GPU device IDs for workers 1..N.
+    /// `num_gpus`: total GPU count (1 + num_workers).
+    pub fn snapshot_moe(
+        &mut self,
+        output_slots_host: *const f32,
+        worker_local_outputs: &[*const f32],
+        worker_devices: &[DeviceId],
+        num_gpus: usize,
+        hidden_size: usize,
+    ) -> HipResult<()> {
+        let saved = Device::current()?;
+        // Copy MoE output_slots token-0 slots to a local snapshot (host-mapped UC,
+        // directly readable — no DMA needed).
+        // Layout: slot for (token=0, gpu_id) = output_slots_host + gpu_id * hidden_size.
+        // We'll store them in worker_ffn_output[w] for w_idx=gpu_id-1 below, along with
+        // SDMA copies — but output_slots is printed inline in print_moe_stats via the
+        // host pointer, so no extra allocation is needed here.
+        let _ = output_slots_host;
+        let _ = num_gpus;
+
+        // SDMA copy of each worker's local_output VRAM → pinned shadow.
+        let copy_bytes = hidden_size * std::mem::size_of::<f32>();
+        for (w_idx, &dev) in worker_devices.iter().enumerate() {
+            if w_idx >= self.worker_ffn_output.len() || w_idx >= worker_local_outputs.len() {
+                break;
+            }
+            Device::set_current(dev)?;
+            let src = worker_local_outputs[w_idx];
+            let dst = self.worker_ffn_output[w_idx].as_mut_ptr() as *mut std::ffi::c_void;
+            unsafe {
+                braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                    dst,
+                    src as *const std::ffi::c_void,
+                    copy_bytes,
+                    ffi::hipMemcpyDeviceToHost,
+                    self.streams[w_idx + 1],
+                ))?;
+            }
+        }
+        // Sync worker SDMA streams only (streams[1..]).
+        for w_idx in 0..worker_devices.len().min(self.streams.len().saturating_sub(1)) {
+            braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(self.streams[w_idx + 1]) })?;
+        }
+        Device::set_current(saved)?;
+        Ok(())
+    }
+
+    /// Print MoE output_slots and per-worker FFN_REMOTE local_output stats.
+    /// `output_slots_host`: host pointer (portable coherent) to MoeP2pContext::output_slots.
+    /// `num_gpus`: total GPU count.
+    /// `hidden_size`: floats per slot.
+    pub fn print_moe_stats(
+        &self,
+        label: &str,
+        output_slots_host: *const f32,
+        num_gpus: usize,
+        hidden_size: usize,
+    ) {
+        let stat = |name: &str, slice: &[f32]| {
+            let mut n_nan = 0usize;
+            let mut n_inf = 0usize;
+            let mut max_abs = 0.0f32;
+            for &x in slice {
+                if x.is_nan() { n_nan += 1; }
+                else if x.is_infinite() { n_inf += 1; }
+                else if x.abs() > max_abs { max_abs = x.abs(); }
+            }
+            eprintln!(
+                "[moe {label}] {name}: n={} nan={} inf={} max_abs={:.4} first4={:?}",
+                slice.len(), n_nan, n_inf, max_abs,
+                &slice[..slice.len().min(4)]
+            );
+        };
+        // output_slots: print slot for each gpu_id (token=0).
+        for gpu_id in 0..num_gpus {
+            let slice = unsafe {
+                std::slice::from_raw_parts(output_slots_host.add(gpu_id * hidden_size), hidden_size)
+            };
+            stat(&format!("output_slots[gpu{}]", gpu_id), slice);
+        }
+        // Per-worker FFN_REMOTE local_output (post-SDMA snapshot).
+        for (w_idx, buf) in self.worker_ffn_output.iter().enumerate() {
+            stat(&format!("worker{}_ffn_out(gpu{})", w_idx, w_idx + 1), buf.as_slice());
+        }
     }
 
     /// Issue DMA copies VRAM→host for all mirrored buffers, then sync all
@@ -137,6 +261,10 @@ impl DecodeMirror {
         workers_attn_q_gate: &[Option<(*const f32, usize)>],
         workers_attn_k: &[Option<*const f32>],
     ) -> HipResult<()> {
+        // Save caller's current device; restore on exit (same fix as P2-a
+        // ensure_sdma_stream: snapshot iterates GPUs via set_current, must
+        // not leave a stale Device::current for the decode hot path).
+        let saved = Device::current()?;
         // GPU 0 activations.
         Device::set_current(gpu0)?;
         let hs_bytes = self.hidden_size * std::mem::size_of::<f32>();
@@ -230,7 +358,7 @@ impl DecodeMirror {
         for &s in &self.streams {
             braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(s) })?;
         }
-        Device::set_current(gpu0)?;
+        Device::set_current(saved)?;
         Ok(())
     }
 
@@ -265,6 +393,51 @@ impl DecodeMirror {
             );
         };
         stat("normed_stage(CPU-view)", normed_stage_host);
+    }
+
+    /// Copy first 16 floats of `hidden_ptr` (VRAM, GPU 0) into the `act_hidden` pinned
+    /// mirror via the GPU 0 SDMA stream, then synchronize. Prints a one-line diagnostic
+    /// to stderr. Safe under the persistent cooperative kernel: uses the SDMA engine,
+    /// not the CUs held by `persistent_worker`.
+    ///
+    /// Returns HipResult<()> so callers can propagate errors; diagnostic is always printed
+    /// on success.
+    pub fn snapshot_hidden_head16(
+        &mut self,
+        gpu0: DeviceId,
+        hidden_ptr: *const f32,
+        label: &str,
+    ) -> HipResult<()> {
+        let saved = Device::current()?;
+        Device::set_current(gpu0)?;
+        let n = 16usize.min(self.hidden_size);
+        let copy_bytes = n * std::mem::size_of::<f32>();
+        unsafe {
+            braidinfer_hip::error::check(ffi::hipMemcpyAsync(
+                self.act_hidden.as_mut_ptr() as *mut std::ffi::c_void,
+                hidden_ptr as *const std::ffi::c_void,
+                copy_bytes,
+                ffi::hipMemcpyDeviceToHost,
+                self.streams[0],
+            ))?;
+            braidinfer_hip::error::check(ffi::hipStreamSynchronize(self.streams[0]))?;
+        }
+        let buf = &self.act_hidden.as_slice()[..n];
+        let mut nan = false;
+        let mut inf = false;
+        let mut max_abs = 0.0f32;
+        for &v in buf {
+            if v.is_nan() { nan = true; }
+            if v.is_infinite() { inf = true; }
+            let a = v.abs();
+            if a > max_abs { max_abs = a; }
+        }
+        eprintln!(
+            "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
+            buf[0], buf[1], buf[2], buf[3]
+        );
+        Device::set_current(saved)?;
+        Ok(())
     }
 
     pub fn print_stats(&self, label: &str, position: u32) {
@@ -323,15 +496,81 @@ impl DecodeMirror {
     }
 }
 
-impl Drop for DecodeMirror {
-    fn drop(&mut self) {
-        // Streams: best-effort destroy. The cooperative kernels may already
-        // be torn down by the time we get here (Drop order). hipStreamDestroy
-        // on already-destroyed context is a soft error.
-        for &s in &self.streams {
-            unsafe {
-                let _ = ffi::hipStreamDestroy(s);
-            }
+// wt1 P2-a: no Drop impl — streams are borrowed from
+// PersistentDispatch::sdma_streams (destroyed in that type's Drop) and the
+// PinnedBuffers handle their own hipHostFree on drop. DecodeMirror has no
+// owned HIP resources to release.
+
+// ---- KvChunkMirror (wt1 P2-c) ----
+
+/// Write-through KV mirror: one pinned-host copy per sealed chunk, flushed via
+/// SDMA at chunk-seal boundaries. Provides a host-visible snapshot for
+/// debugging/testing with a bounded mirror lag of at most 1 chunk (≤ CHUNK_TOKENS
+/// tokens after the seal fires).
+///
+/// `snapshot()` returns (data_ptr, seq_pos_of_last_drain) so callers cannot
+/// treat the mirror as the live VRAM truth — the seq_pos stamp shows exactly
+/// how many tokens were visible when the last flush completed.
+pub struct KvChunkMirror {
+    /// One pinned buffer per sealed chunk, in seal order.
+    /// Each buffer holds chunk_bytes bytes copied from VRAM via SDMA async.
+    pub chunks: Vec<PinnedBuffer<u8>>,
+    /// Sequence position of the last token in the most recently drained
+    /// (hipStreamSynchronize-completed) chunk. u32::MAX = no drain yet.
+    pub seq_pos_of_last_drain: u32,
+    /// Byte size of one chunk (all layers K+V interleaved, same layout as VRAM).
+    pub chunk_bytes: usize,
+}
+
+impl KvChunkMirror {
+    pub fn new(chunk_bytes: usize) -> Self {
+        KvChunkMirror {
+            chunks: Vec::new(),
+            seq_pos_of_last_drain: u32::MAX,
+            chunk_bytes,
         }
+    }
+
+    /// Enqueue an async VRAM→host copy of the just-sealed chunk.
+    /// `vram_ptr` is the base of the sealed chunk slot (GPU VRAM, device pointer).
+    /// `stream` is the SDMA stream for the owning GPU.
+    /// The copy is in-flight after this call; call `drain()` to synchronize.
+    ///
+    /// # Safety
+    /// `vram_ptr` must remain valid until `drain()` completes for this chunk.
+    pub fn enqueue_chunk(
+        &mut self,
+        vram_ptr: *const u8,
+        stream: ffi::hipStream_t,
+    ) -> HipResult<()> {
+        let mut host_buf = PinnedBuffer::<u8>::alloc(self.chunk_bytes)?;
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                vram_ptr as *const std::ffi::c_void,
+                self.chunk_bytes,
+                ffi::hipMemcpyDeviceToHost,
+                stream,
+            )
+        })?;
+        self.chunks.push(host_buf);
+        Ok(())
+    }
+
+    /// Synchronize the SDMA stream and record the sequence position of the last
+    /// drained chunk. After this call, `chunks.last()` contains coherent data.
+    /// `sealed_chunk_last_pos` is the sequence position of the last token in
+    /// the chunk just enqueued (= chunk_end_position = (chunk_idx+1)*CHUNK_TOKENS - 1).
+    pub fn drain(&mut self, sealed_chunk_last_pos: u32, stream: ffi::hipStream_t) -> HipResult<()> {
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })?;
+        self.seq_pos_of_last_drain = sealed_chunk_last_pos;
+        Ok(())
+    }
+
+    /// Return a reference to the most recently drained chunk data and the
+    /// sequence position stamp. Callers must not treat this as live VRAM state —
+    /// up to 1 chunk of lag is possible between drain and next token.
+    pub fn snapshot(&self) -> Option<(&[u8], u32)> {
+        self.chunks.last().map(|b| (b.as_slice(), self.seq_pos_of_last_drain))
     }
 }

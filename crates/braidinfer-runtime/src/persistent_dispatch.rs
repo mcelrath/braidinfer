@@ -322,6 +322,19 @@ pub struct PersistentDispatch {
     /// passed in). Written into each WorkerQueue::op_profile field at
     /// worker launch in `add_device`. See crates/.../op_profile.rs.
     pub op_profile_dev_ptr: *mut u64,
+    /// Per-device SDMA streams for out-of-band VRAM→host copies (decode-mirror,
+    /// trace dump, etc.). Indexed by `DeviceId.0`. A null entry means no SDMA
+    /// stream has been allocated for that GPU. MUST be allocated BEFORE the
+    /// corresponding persistent_worker launches on that device — hipStreamCreate
+    /// on a GPU running a cooperative kernel can deadlock (sdma_under_coop_fork
+    /// probe). Streams are destroyed in `Drop` AFTER the persistent workers
+    /// have exited (see drop ordering comments below).
+    pub sdma_streams: Vec<ffi::hipStream_t>,
+    /// Write-through KV chunk mirror (wt1 P2-c). `None` until
+    /// `init_kv_chunk_mirror` is called. One mirror covers all GPUs in the
+    /// model — chunks from each GPU are written through in seal order.
+    /// `None` in non-debug / production paths to avoid pinned-memory overhead.
+    pub kv_chunk_mirror: Option<crate::mirror::KvChunkMirror>,
 }
 
 // Raw pointer in PersistentDispatch — caller must keep the underlying
@@ -370,6 +383,8 @@ impl PersistentDispatch {
             moe_output_slot: MappedHostBuffer::<f32>::alloc(1)?,
             watchdog,
             op_profile_dev_ptr: std::ptr::null_mut(),
+            sdma_streams: vec![std::ptr::null_mut(); total_gpus],
+            kv_chunk_mirror: None,
         };
         for &device in devices {
             dispatch.add_device(device, shared_mem)?;
@@ -383,6 +398,101 @@ impl PersistentDispatch {
     /// kernel reads it via `queue->op_profile`.
     pub fn set_op_profile_ptr(&mut self, ptr: *mut u64) {
         self.op_profile_dev_ptr = ptr;
+    }
+
+    /// Lazily allocate a per-device SDMA stream for out-of-band copies
+    /// (decode-mirror, trace dump). MUST be called BEFORE the persistent_worker
+    /// launches on `device` — afterwards hipStreamCreate on the same GPU can
+    /// deadlock against the running cooperative kernel.
+    ///
+    /// For worker GPUs (1..N-1) this is called internally by `add_device`
+    /// immediately before `launch_cooperative`. For GPU 0 (whose persistent
+    /// worker is added lazily on first decode call) callers must invoke this
+    /// during model init while GPU 0 is still in the kbk-launch phase.
+    ///
+    /// Idempotent: returns Ok(()) if the stream slot is already populated.
+    pub fn ensure_sdma_stream(&mut self, device: DeviceId) -> HipResult<()> {
+        let slot = device.0 as usize;
+        if slot >= self.sdma_streams.len() {
+            self.sdma_streams.resize(slot + 1, std::ptr::null_mut());
+        }
+        if !self.sdma_streams[slot].is_null() {
+            return Ok(());
+        }
+        // Save and restore the current device so callers (e.g. add_device
+        // iterating over worker GPUs) do not observe a stale current-device
+        // after this call. Without restore, the last worker GPU becomes
+        // current for all subsequent HIP calls, causing NaN on GPU 0 ops.
+        let saved = Device::current()?;
+        Device::set_current(device)?;
+        let mut s: ffi::hipStream_t = std::ptr::null_mut();
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamCreate(&mut s) })?;
+        self.sdma_streams[slot] = s;
+        Device::set_current(saved)?;
+        Ok(())
+    }
+
+    /// Accessor for the SDMA stream of a given GPU. Returns a raw hipStream_t
+    /// (or null if `ensure_sdma_stream` was not called for that device).
+    /// Caller must NOT call hipStreamDestroy — ownership remains with this
+    /// PersistentDispatch and is released in Drop after worker teardown.
+    pub fn sdma_stream(&self, gpu_idx: usize) -> ffi::hipStream_t {
+        self.sdma_streams
+            .get(gpu_idx)
+            .copied()
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Enable write-through KV chunk mirroring (wt1 P2-c). Must be called
+    /// before the first decode step. `chunk_bytes` is the byte size of one
+    /// full chunk (all attention layers K+V, same layout as PageAllocator slots).
+    /// Allocates `KvChunkMirror` into `self.kv_chunk_mirror`.
+    pub fn init_kv_chunk_mirror(&mut self, chunk_bytes: usize) {
+        self.kv_chunk_mirror = Some(crate::mirror::KvChunkMirror::new(chunk_bytes));
+    }
+
+    /// Enqueue an SDMA copy of a just-sealed VRAM chunk to pinned host memory.
+    /// Call immediately after chunk seal is detected (at `post_step_paged`
+    /// boundaries). The copy is async — it completes on `sdma_stream(gpu_idx)`.
+    /// A subsequent `drain_kv_chunk_mirror` call synchronizes the stream.
+    ///
+    /// No-op if `kv_chunk_mirror` is None (mirror not enabled) or if the SDMA
+    /// stream for `gpu_idx` is null (stream not yet allocated).
+    ///
+    /// # Safety
+    /// `vram_ptr` must remain valid (chunk slot not freed/reused) until
+    /// `drain_kv_chunk_mirror` has been called for this chunk.
+    pub fn kv_mirror_chunk(
+        &mut self,
+        gpu_idx: usize,
+        vram_ptr: *const u8,
+    ) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Ok(());
+        }
+        if let Some(mirror) = self.kv_chunk_mirror.as_mut() {
+            mirror.enqueue_chunk(vram_ptr, stream)?;
+        }
+        Ok(())
+    }
+
+    /// Synchronize the SDMA stream for `gpu_idx` and record `sealed_chunk_last_pos`
+    /// as the sequence position of the last drained chunk in the mirror.
+    /// No-op if mirror is disabled or stream is null.
+    pub fn drain_kv_chunk_mirror(
+        &mut self,
+        gpu_idx: usize,
+        sealed_chunk_last_pos: u32,
+    ) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Ok(());
+        }
+        if let Some(mirror) = self.kv_chunk_mirror.as_mut() {
+            mirror.drain(sealed_chunk_last_pos, stream)?;
+        }
+        Ok(())
     }
 
     /// Single-GPU init helper (unchanged signature for non-MoE callers).
@@ -399,6 +509,10 @@ impl PersistentDispatch {
     /// design so workers (GPUs 1..N-1) can launch during prefill (when GPU 0
     /// is still running kbk kernels) and GPU 0 is added on first decode call.
     pub fn add_device(&mut self, device: DeviceId, shared_mem: u32) -> HipResult<()> {
+        // wt1 P2-a: allocate SDMA stream BEFORE the persistent_worker
+        // cooperative kernel launches on this device. hipStreamCreate after
+        // launch can deadlock against the running coop kernel.
+        self.ensure_sdma_stream(device)?;
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
         Device::set_current(device)?;
@@ -988,6 +1102,17 @@ impl Drop for PersistentDispatch {
                         std::mem::ManuallyDrop::drop(&mut worker);
                     }
                 }
+            }
+        }
+
+        // wt1 P2-a: destroy SDMA streams AFTER the persistent workers have
+        // exited (single-GPU clean path). On the multi-GPU `_exit(134)` path
+        // above we skip this — the OS reclaims the streams as part of process
+        // teardown, matching the existing Stream/Module skip rationale.
+        for s in self.sdma_streams.iter_mut() {
+            if !s.is_null() {
+                unsafe { let _ = ffi::hipStreamDestroy(*s); }
+                *s = std::ptr::null_mut();
             }
         }
 
