@@ -9,6 +9,26 @@ use std::time::Instant;
 fn main() {
     let mut args: Vec<String> = std::env::args().collect();
     let _flags = extract_cli_flags(&mut args);
+
+    // Match chat.rs convention: model argument can come from MODEL env OR
+    // argv[1] when it points to an existing model path (.bqnt file or a
+    // directory). Otherwise argv[1..] is the prompt. This makes
+    //   MODEL=... generate "prompt"            (content_sweep style)
+    //   generate models/foo.bqnt "prompt"      (chat.rs-style positional)
+    //   generate "prompt"                       (default model fallback)
+    // all work consistently.
+    let env_model = std::env::var("MODEL").ok();
+    let positional_model = if env_model.is_none() && args.len() > 1 {
+        let candidate = std::path::Path::new(&args[1]);
+        if candidate.exists() && (args[1].ends_with(".bqnt") || candidate.is_dir()) {
+            Some(args.remove(1))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let prompt = if args.len() > 1 {
         args[1..].join(" ")
     } else {
@@ -22,7 +42,7 @@ fn main() {
 
     let raw_mode = std::env::var("RAW").is_ok();
 
-    let resolved = resolve_model_arg(std::env::var("MODEL").ok());
+    let resolved = resolve_model_arg(env_model.or(positional_model));
     let model_dir = resolved.model_dir.as_path();
 
     let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
