@@ -235,3 +235,43 @@ fn test_prefill_benchmark() {
         elapsed.as_secs_f64()
     );
 }
+
+// braidinfer-bz0 regression: looping prefill(&[tok]) per-token must produce
+// the same final logits as a single batched prefill(&tokens). Prior bug:
+// decode_step_paged_inner failed to update self.seq_len, so each per-token
+// prefill call captured start_pos=0 and rotated every token at MROPE pos=0.
+#[test]
+fn test_prefill_per_token_loop_matches_batched_bz0() {
+    let device = DeviceId(0);
+    let model_dir = Path::new(MODEL_DIR);
+    if !model_dir.exists() {
+        eprintln!("Model not found, skipping");
+        return;
+    }
+    let tokens: Vec<u32> = vec![9707, 13, 220, 5120];
+
+    let mut model_loop = Model::load(model_dir, device).expect("load");
+    let mut loop_logits = vec![];
+    for &tok in &tokens {
+        loop_logits = model_loop.prefill(&[tok]).expect("per-token prefill");
+    }
+
+    let mut model_batch = Model::load(model_dir, device).expect("load");
+    let batch_logits = model_batch.prefill(&tokens).expect("batched prefill");
+
+    let diff = max_diff(&loop_logits, &batch_logits);
+    println!("bz0 regression: max_abs_diff={diff:.6e}");
+    assert_eq!(
+        argmax(&loop_logits),
+        argmax(&batch_logits),
+        "per-token-loop and batched prefill must agree on top-1 (bz0)"
+    );
+    // Pre-fix bz0 produced max_abs ~5e-1 because every post-first-token MROPE
+    // rotated at position=0. Post-fix the residual is model-dependent FP order;
+    // for Qwen3.5-0.8B ~1.5e-1. The argmax assertion above is the load-bearing
+    // check; this bound only guards against a regression-class blow-up.
+    assert!(
+        diff < 3e-1,
+        "per-token-loop vs batched diff blew up: {diff:.6e}"
+    );
+}

@@ -1194,6 +1194,7 @@ impl Model {
 
         let mut logits = vec![0.0f32; self.config.vocab_size];
         self.activations.logits.copy_to_host(&mut logits)?;
+        self.seq_len = position + 1;
         Ok(logits)
     }
 }
