@@ -26,6 +26,12 @@ pub struct Model {
     pub(crate) persistent_workers: Option<crate::persistent_dispatch::PersistentDispatch>,
     // GPU-native P2P MoE dispatch: cooperative kernels on GPUs 1-3. Drop before other GPU 1-3 resources.
     pub(crate) moe_p2p: Option<crate::moe_p2p::MoeP2pContext>,
+    // Singleton watchdog thread shared by all MegakernelProgram + PersistentDispatch instances.
+    // Declared after persistent_workers/moe_p2p: drops AFTER them, so cooperative kernels signal
+    // exit before the watchdog thread stops polling.
+    // Underscore-prefixed to suppress dead_code warning — field is never read, only its Drop matters.
+    #[allow(dead_code)]
+    pub(crate) watchdog: std::sync::Arc<crate::watchdog::WatchdogThread>,
     pub config: ModelConfig,
     pub(crate) device: DeviceId,
     pub(crate) stream: Stream,

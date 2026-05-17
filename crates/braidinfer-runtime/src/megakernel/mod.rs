@@ -130,11 +130,9 @@ pub struct MegakernelProgram {
     /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.
     /// Avoids a Vec allocation per decode step.
     pub(crate) flat_program: Vec<u64>,
-    /// Host-side watchdog thread polling this program's WatchdogState page.
-    /// Held as RAII guard — `WatchdogThread::drop` signals stop and joins the
-    /// polling thread. Underscore-prefixed because the field is never read,
-    /// only its `Drop` matters (compiler can't see Drop as a "use").
-    pub(crate) _watchdog: WatchdogThread,
+    /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
+    /// stopped while this program is in use.
+    pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,
     /// Device pointer to WatchdogState (host-mapped, owned by watchdog). Passed to kernel.
     pub(crate) wd_dev_ptr: *mut c_void,
 }

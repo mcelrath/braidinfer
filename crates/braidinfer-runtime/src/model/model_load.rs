@@ -1089,6 +1089,7 @@ impl Model {
         };
 
         let has_moe = config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+        let watchdog = std::sync::Arc::new(crate::watchdog::WatchdogThread::spawn());
         Ok(Model {
             config,
             device,
@@ -1131,6 +1132,7 @@ impl Model {
             multi_gpu: None,
             distributed_moe: Vec::new(),
             moe_p2p: None,
+            watchdog,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
             decode_mirror: None,

@@ -47,7 +47,7 @@ impl Model {
             // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
             let shared_mem = SHARED_LPROJ_TOTAL as u32;
             let dispatch =
-                PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size).map_err(ModelError::Hip)?;
+                PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
         }
 
@@ -233,6 +233,7 @@ impl Model {
                 &worker_devices,
                 shared_mem_persistent,
                 hs,
+                self.watchdog.clone(),
             )
             .map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
@@ -382,6 +383,7 @@ impl Model {
                 &[self.device],
                 shared_mem,
                 hs,
+                self.watchdog.clone(),
             ).map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
         } else {

@@ -153,7 +153,7 @@ impl Model {
 
             let mut prog_ptr: *const std::ffi::c_void = dev_prog.as_ptr().cast();
             let mut num_inst = insts.len() as i32;
-            let wd = crate::watchdog::WatchdogThread::spawn();
+            let wd = self.watchdog.clone();
             let wd_state_dev = wd.register(self.device).map_err(ModelError::Hip)?;
             let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
             // megakernel_f32 signature: (program, num_inst, watchdog, op_profile).

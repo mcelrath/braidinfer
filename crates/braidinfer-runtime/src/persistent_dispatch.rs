@@ -316,7 +316,7 @@ pub struct PersistentDispatch {
     pub moe_output_slot: MappedHostBuffer<f32>,
     /// Host-side watchdog thread polling all persistent kernel WatchdogState pages.
     /// Dropped after workers to ensure the thread stops before the state pages are freed.
-    pub watchdog: WatchdogThread,
+    pub watchdog: std::sync::Arc<WatchdogThread>,
     /// Optional per-op profile counter device pointer. Null when
     /// BRAIDINFER_OP_PROFILE build flag is unset (or set but no OpProfile
     /// passed in). Written into each WorkerQueue::op_profile field at
@@ -362,9 +362,8 @@ impl PersistentDispatch {
     /// and `devices=[GPU1, GPU2, GPU3]` yields workers populated at slots 1-3
     /// and slot 0 empty (GPU 0 added later via `add_device`).
     /// `hidden_size`: for MoE output slot allocation (0 if no MoE).
-    pub fn init_with_total(total_gpus: usize, devices: &[DeviceId], shared_mem: u32, _hidden_size: usize) -> HipResult<Self> {
+    pub fn init_with_total(total_gpus: usize, devices: &[DeviceId], shared_mem: u32, _hidden_size: usize, watchdog: std::sync::Arc<WatchdogThread>) -> HipResult<Self> {
         install_signal_handlers_once();
-        let watchdog = WatchdogThread::spawn();
         let mut workers: Vec<Option<std::mem::ManuallyDrop<GpuWorker>>> = (0..total_gpus).map(|_| None).collect();
         let mut dispatch = PersistentDispatch {
             workers: std::mem::take(&mut workers),
@@ -388,12 +387,12 @@ impl PersistentDispatch {
 
     /// Single-GPU init helper (unchanged signature for non-MoE callers).
     /// Allocates a single-slot dispatcher launched on `devices[0]`.
-    pub fn init(devices: &[DeviceId], shared_mem: u32, hidden_size: usize) -> HipResult<Self> {
+    pub fn init(devices: &[DeviceId], shared_mem: u32, hidden_size: usize, watchdog: std::sync::Arc<WatchdogThread>) -> HipResult<Self> {
         // Old signature: assume `devices` is a single-GPU list and allocate
         // exactly that many slots. Callers that need slot-by-DeviceId.0 layout
         // should call `init_with_total` directly.
         let total = devices.iter().map(|d| d.0 as usize + 1).max().unwrap_or(1);
-        Self::init_with_total(total, devices, shared_mem, hidden_size)
+        Self::init_with_total(total, devices, shared_mem, hidden_size, watchdog)
     }
 
     /// Append a GPU to the persistent worker pool. Used by the unified-worker
