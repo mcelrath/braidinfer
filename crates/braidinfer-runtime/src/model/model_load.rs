@@ -1079,6 +1079,13 @@ impl Model {
             },
             prefill_moe_token_indices: DeviceBuffer::<i32>::alloc(device, crate::megakernel::CHUNK_TOKENS)?,
             prefill_moe_token_weights: DeviceBuffer::<f32>::alloc(device, crate::megakernel::CHUNK_TOKENS)?,
+            debug_hidden_probe: if std::env::var("DEBUG_P2P_HIDDEN").is_ok() {
+                // Portable+coherent so GPU 0's appended OP_D2D_COPY writes
+                // land visibly before ack (no L2 caching of writer side).
+                Some(braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable_coherent(16)?)
+            } else {
+                None
+            },
         };
 
         let has_moe = config.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));

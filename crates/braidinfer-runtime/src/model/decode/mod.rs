@@ -314,6 +314,51 @@ impl Model {
         eprintln!("=== end MTYPE audit ===");
     }
 
+    /// DEBUG_P2P_HIDDEN probe: dispatch a one-shot OP_D2D_COPY batch that
+    /// copies the first 16 floats of `activations.hidden` into the
+    /// host-mapped UC probe buffer, then read + report from CPU. Safe under
+    /// the persistent cooperative kernel — the copy runs *inside* the
+    /// megakernel (same CUs already held by the worker), and the readback is
+    /// a CPU MMIO load from host-mapped memory (no hipMemcpy, no kernel
+    /// launch). No-op when `debug_hidden_probe` is None.
+    fn probe_hidden_after_segment(&mut self, label: &str) {
+        if !self.debug_p2p_hidden {
+            return;
+        }
+        let probe = match self.activations.debug_hidden_probe.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        let dst = probe.as_write_ptr();
+        let src = self.activations.hidden.as_ptr() as *const f32;
+        let inst = crate::megakernel::instructions::D2dCopyInst::new(
+            1, // grid_x: 1 block is enough for 16 elements
+            dst,
+            src,
+            16,
+        )
+        .into_inst();
+        let batch = [inst];
+        let dispatch: &mut dyn BatchDispatcher =
+            self.persistent_workers.as_mut().unwrap();
+        dispatch.dispatch_batch(0, &batch);
+        // After ack, host-mapped UC memory is visible. Read 16 floats, scan.
+        let buf: &[f32] = unsafe { std::slice::from_raw_parts(probe.host_ptr() as *const f32, 16) };
+        let mut nan = false;
+        let mut inf = false;
+        let mut max_abs = 0.0f32;
+        for &v in buf.iter() {
+            if v.is_nan() { nan = true; }
+            if v.is_infinite() { inf = true; }
+            let a = v.abs();
+            if a > max_abs { max_abs = a; }
+        }
+        eprintln!(
+            "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
+            buf[0], buf[1], buf[2], buf[3]
+        );
+    }
+
     fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
 
@@ -515,6 +560,7 @@ impl Model {
                 for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
                     dispatch.dispatch_batch(0, chunk);
                 }
+                self.probe_hidden_after_segment(&format!("moe-pre L{}", layer_idx));
                 let gpu0_seq: Option<u32> = None;
                 // Dispatch OP_MOE_FFN_REMOTE on each worker. Workers run in
                 // parallel with each other (their dispatches are still async)
@@ -547,6 +593,7 @@ impl Model {
                             dispatch.dispatch_batch_slice(0, &combined);
                         }
                     }
+                    self.probe_hidden_after_segment(&format!("attn-pre #{}", attn_i));
                     pending_gather = self.dispatch_head_parallel_attention(attn_i, position)?;
                     attn_i += 1;
                     i = if use_distributed_qkv { resume_idx } else { resume_idx + 1 };
@@ -560,9 +607,7 @@ impl Model {
 
         // Dispatch remaining segment, prepending any pending gather
         if seg_start < i || !pending_gather.is_empty() {
-            let debug_hidden = self.debug_p2p_hidden;
             let mk_insts = &self.megakernel_multi_gpu_p2p.as_ref().unwrap().instructions[seg_start..i];
-            let mut batch_idx = 0usize;
             // Combine pending gather + remaining segment into one owned Vec
             // so the dispatcher borrow doesn't conflict with mk_insts.
             let combined: Vec<crate::megakernel::Instruction> = if pending_gather.is_empty() {
@@ -576,16 +621,8 @@ impl Model {
                 self.persistent_workers.as_mut().unwrap();
             for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
                 dispatch.dispatch_batch(0, chunk);
-                if debug_hidden {
-                    let src = self.activations.hidden.as_ptr() as *const u8;
-                    let mut buf = [0u8; 8];
-                    braidinfer_hip::memory::memcpy_d2h(&mut buf, src, 8)?;
-                    let v0 = f32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]);
-                    let v1 = f32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]);
-                    eprintln!("DBG p2p batch {batch_idx}: h[0]={v0:.6} h[1]={v1:.6}");
-                    batch_idx += 1;
-                }
             }
+            self.probe_hidden_after_segment("tail");
         }
 
         let logits = unsafe {

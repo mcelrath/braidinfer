@@ -220,6 +220,11 @@ pub struct ActivationBuffers {
     pub mamba2_ssm_out: DeviceBuffer<f32>, // [intermediate] (SSM output y)
     // GPU-resident argmax
     pub argmax_result: DeviceBuffer<i32>, // [1] — single token ID
+    /// DEBUG_P2P_HIDDEN probe: GPU 0 writes first 16 floats of
+    /// `hidden` here via OP_D2D_COPY appended to each persistent-worker batch.
+    /// Host-mapped UC so CPU can read after the batch acks — no memcpy_d2h
+    /// (which would deadlock the cooperative kernel). None unless env var set.
+    pub debug_hidden_probe: Option<MappedHostBuffer<f32>>, // [16]
 }
 
 // ---- Error type ----
