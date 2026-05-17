@@ -1637,6 +1637,33 @@ impl MegakernelProgram {
             // inserted_before[i] = number of instructions inserted before old index i
             let mut inserted_before: Vec<usize> = vec![0usize; prog.instructions.len() + 1];
             for (i, inst) in prog.instructions.iter().enumerate() {
+                // Nemotron-H (fc1_latent_proj present): fc1 writes its output to
+                // `act.moe_latent` (cached GPU 0 VRAM) at barrier_idx-2 in Pass 1.
+                // Workers read activation from `p2p.moe_act_uc_handoff_dev_ptrs[gpu_id]`
+                // (host-mapped UC, see decode/mod.rs:1065 and the snl input-side fix
+                // for the non-latent branch at megakernel_compile.rs:1573-1579).
+                // Without this stage copy, the latent path leaves the handoff buffer
+                // unwritten → workers read zeros/garbage → NaN logits downstream
+                // (braidinfer-vo0). Stage moe_latent → handoff (gupd elements) just
+                // before OP_MOE_DISPATCH fires; GPU 0's local-expert path keeps
+                // reading activation_ptr=act.moe_latent (cached VRAM) unchanged.
+                if let Some(&layer_idx) = barrier_map.get(&i) {
+                    let moe_layer = model.moe_weights[layer_idx].as_ref().unwrap();
+                    if moe_layer.fc1_latent_proj.is_some() {
+                        let dist = model.distributed_moe[layer_idx].as_ref();
+                        let gupd_stage = dist.map(|d| d.gate_up_in_dim)
+                            .unwrap_or(hs);
+                        new_instructions.push(
+                            D2dCopyInst::new(
+                                div_ceil(gupd_stage as u32, 256),
+                                p2p.moe_act_uc_handoff_dev_ptrs[0],
+                                act.moe_latent.as_ptr(),
+                                gupd_stage as i32,
+                            )
+                            .into_inst(),
+                        );
+                    }
+                }
                 inserted_before[i] = new_instructions.len() - i;
                 new_instructions.push(inst.clone());
                 // After OP_MOE_DISPATCH: insert OP_MOE_DISPATCH_POST (sum), then for
