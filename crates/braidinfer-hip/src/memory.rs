@@ -497,10 +497,8 @@ impl<T> Drop for MappedHostBuffer<T> {
         // deadlocks because the worker still holds the device pointer to this
         // page. Skip the free and let the OS reclaim on process exit.
         if crate::any_persistent_worker_active() {
-            eprintln!(
-                "braidinfer: skipping hipHostFree (persistent worker leaked; \
-                 buffer will be reclaimed by OS at process exit)"
-            );
+            // Persistent worker still holds the device pointer to this page.
+            // hipHostFree would deadlock; skip and let OS reclaim on process exit.
             return;
         }
         let err = unsafe { ffi::hipHostFree(self.host_ptr.cast()) };
@@ -520,10 +518,7 @@ impl<T> Drop for PinnedBuffer<T> {
         }
         // braidinfer-4fg: same hipHostFree deadlock as MappedHostBuffer.
         if crate::any_persistent_worker_active() {
-            eprintln!(
-                "braidinfer: leaking {}B pinned buffer (persistent worker active)",
-                self.len * std::mem::size_of::<T>()
-            );
+            // Persistent worker holds reference; skip hipHostFree, OS reclaims on exit.
             return;
         }
         {
