@@ -295,6 +295,11 @@ pub struct GpuWorker {
     pub stream: Stream,
     pub module: Module,
     pub seq_counter: u32,
+    /// Event recorded on the compute stream after each ack to mark that
+    /// all GPU L2 KV writes have been issued. SDMA stream waits on this
+    /// event before reading KV from VRAM to prevent stale-L2 coherency bugs
+    /// (udi #567 / forensic option 2).
+    pub event_kv_written: ffi::hipEvent_t,
 }
 
 /// Persistent dispatch context: manages persistent cooperative workers on every
@@ -534,6 +539,13 @@ impl PersistentDispatch {
             std::ptr::addr_of_mut!((*q).dump_capacity).write(0);
         }
         let stream = Stream::new(device)?;
+        // Allocate per-worker event for L2-coherency fence (udi #567).
+        // Created here (before cooperative launch) — hipEventCreate after a
+        // cooperative kernel is running can deadlock on some ROCm versions.
+        let mut event_kv_written: ffi::hipEvent_t = std::ptr::null_mut();
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipEventCreate(&mut event_kv_written)
+        })?;
         // zqw merge: persistent_worker entry now lives in megakernel.hsaco
         // alongside megakernel_f32. One module load, get the right function.
         let module = Module::load(device, &kernel_dir.join("megakernel.hsaco"))?;
@@ -573,6 +585,7 @@ impl PersistentDispatch {
             stream,
             module,
             seq_counter: 0,
+            event_kv_written,
         }));
         Ok(())
     }
@@ -857,6 +870,74 @@ impl PersistentDispatch {
     pub fn shutdown(&mut self) {
         self.request_shutdown();
     }
+
+    /// Queue a single VRAM→host async copy on the SDMA stream for `gpu_idx`.
+    ///
+    /// Caller MUST call `Device::set_current(device)` for `gpu_idx` before
+    /// this call. The copy is issued asynchronously; call `mirror_sync` to
+    /// wait for completion before reading `region.host_dst`.
+    ///
+    /// Returns `Err` if `sdma_stream` for `gpu_idx` is null (caller forgot
+    /// `ensure_sdma_stream`) or if `hipMemcpyAsync` fails.
+    pub fn mirror_dump(&self, gpu_idx: usize, region: &MirrorRegion) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Err(braidinfer_hip::error::HipError(ffi::hipErrorInvalidValue));
+        }
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                region.host_dst as *mut std::ffi::c_void,
+                region.device_ptr as *const std::ffi::c_void,
+                region.byte_len,
+                ffi::hipMemcpyDeviceToHost,
+                stream,
+            )
+        })
+    }
+
+    /// Wait for all in-flight copies on the SDMA stream for `gpu_idx` to land.
+    ///
+    /// Equivalent to `hipStreamSynchronize(sdma_streams[gpu_idx])`. Returns
+    /// `Err` if the stream is null or synchronize fails.
+    pub fn mirror_sync(&self, gpu_idx: usize) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Err(braidinfer_hip::error::HipError(ffi::hipErrorInvalidValue));
+        }
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })
+    }
+
+    /// Record `event_kv_written` on the compute stream of worker `gpu_idx`.
+    ///
+    /// Call this AFTER ack is received from the worker to capture the L2
+    /// completion point. The SDMA stream must then call
+    /// `wait_kv_event_on_sdma` before reading any KV from that worker's
+    /// VRAM — this flushes the worker's L2 caches before SDMA bypasses L2
+    /// and reads VRAM directly (udi #567 / forensic option 2).
+    ///
+    /// No-op if `gpu_idx` has no worker slot.
+    pub fn record_kv_event(&self, gpu_idx: usize) -> HipResult<()> {
+        let Some(Some(worker)) = self.workers.get(gpu_idx) else { return Ok(()); };
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipEventRecord(worker.event_kv_written, worker.stream.raw())
+        })
+    }
+
+    /// Make the SDMA stream of `gpu_idx` wait for `event_kv_written` on that
+    /// worker's compute stream before proceeding. This creates the
+    /// cross-stream ordering point that ensures L2 stores land in VRAM before
+    /// SDMA reads (udi #567 / forensic option 2).
+    ///
+    /// No-op if the SDMA stream for `gpu_idx` is null.
+    pub fn wait_kv_event_on_sdma(&self, gpu_idx: usize) -> HipResult<()> {
+        let sdma = self.sdma_stream(gpu_idx);
+        if sdma.is_null() { return Ok(()); }
+        let Some(Some(worker)) = self.workers.get(gpu_idx) else { return Ok(()); };
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipStreamWaitEvent(sdma, worker.event_kv_written, 0)
+        })
+    }
+
 
     /// braidinfer-4fg.4: in-band shutdown via OP_HALT instruction batches.
     /// Dispatches a single-instruction OP_HALT batch to each worker queue.

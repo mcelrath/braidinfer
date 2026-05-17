@@ -292,6 +292,10 @@ impl DecodeMirror {
             ))?;
         }
         // Per-GPU attn_kv (GPU 0 first, then workers).
+        // For worker GPUs (gpu_i > 0) insert L2-coherency fence per udi #567:
+        //   hipEventRecord on compute stream → hipStreamWaitEvent on SDMA stream.
+        // This ensures GPU N's L2 KV writes are flushed to VRAM before SDMA
+        // reads (SDMA bypasses L2 on RDNA3).
         let kv_bytes = self.local_nkh * self.max_seq_len * self.head_dim * 4;
         for (gpu_i, kv_layers) in workers_attn_kv.iter().enumerate() {
             let dev = if gpu_i == 0 {
@@ -300,6 +304,12 @@ impl DecodeMirror {
                 worker_devices[gpu_i - 1]
             };
             Device::set_current(dev)?;
+            if gpu_i > 0 {
+                // Record event on the compute stream (after ack) then make
+                // the SDMA stream wait — cross-stream L2 flush fence.
+                dispatch.record_kv_event(dev.0 as usize)?;
+                dispatch.wait_kv_event_on_sdma(dev.0 as usize)?;
+            }
             for (layer_i, kv) in kv_layers.iter().enumerate() {
                 let (k_mirror, v_mirror) = &mut self.attn_kv[gpu_i][layer_i];
                 unsafe {
