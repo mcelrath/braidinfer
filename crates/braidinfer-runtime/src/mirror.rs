@@ -392,20 +392,35 @@ impl DecodeMirror {
         normed_stage_host: &[f32],
     ) {
         self.print_stats(label, position);
+        // β probe (bd braidinfer-sm16): count denormals + NaN + Inf bit-patterns
+        // on GPU0's host-mapped normed_stage. If denormals appear AT GPU0 before
+        // any cross-GPU transfer, the bug is producer-side (op_rmsnorm_wx), not
+        // coherence. Single observation falsifies γ/δ/α per scope agent #ab6e129.
         let stat = |name: &str, slice: &[f32]| {
             let mut n_nan = 0usize;
+            let mut n_inf = 0usize;
+            let mut n_denorm = 0usize;
             let mut max_abs = 0.0f32;
             for &x in slice {
+                let bits = x.to_bits();
+                let exp = (bits >> 23) & 0xFF;
+                let mant = bits & 0x7F_FFFF;
                 if x.is_nan() {
                     n_nan += 1;
+                } else if x.is_infinite() {
+                    n_inf += 1;
+                } else if exp == 0 && mant != 0 {
+                    n_denorm += 1;
                 } else if x.abs() > max_abs {
                     max_abs = x.abs();
                 }
             }
             eprintln!(
-                "[snap {label}] {name}: n={} nan={} max_abs={:.4} first4={:?}",
+                "[snap {label}] {name}: n={} nan={} inf={} denorm={} max_abs={:.4} first4={:?}",
                 slice.len(),
                 n_nan,
+                n_inf,
+                n_denorm,
                 max_abs,
                 &slice[..slice.len().min(4)],
             );
