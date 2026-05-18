@@ -74,7 +74,13 @@ pub(crate) struct RmsNormInst {
     pub weight: *const u16, // bf16 weight
     pub dim: u64,           // i32 zero-extended
     pub eps_bits: u64,      // f32::to_bits() as u64
-    pub _pad: [u64; 12],
+    // bd braidinfer-sm16 sentinel: when sentinel_ptr != 0, kernel writes
+    // sentinel_seq to *(u32*)sentinel_ptr after the agent-scope fence at
+    // op_rmsnorm_wx exit. Consumer (op_d2d_copy with matching sentinel
+    // fields) spin-waits on this value.
+    pub sentinel_ptr: u64,
+    pub sentinel_seq: u64,
+    pub _pad: [u64; 10],
 }
 assert_inst_size!(RmsNormInst);
 impl_inst!(RmsNormInst);
@@ -88,8 +94,16 @@ impl RmsNormInst {
             weight,
             dim: dim as u64,
             eps_bits: eps.to_bits() as u64,
-            _pad: [0; 12],
+            sentinel_ptr: 0,
+            sentinel_seq: 0,
+            _pad: [0; 10],
         }
+    }
+
+    pub(crate) fn with_sentinel(mut self, sentinel_ptr: *mut u32, seq: u32) -> Self {
+        self.sentinel_ptr = sentinel_ptr as u64;
+        self.sentinel_seq = seq as u64;
+        self
     }
 }
 
@@ -572,7 +586,15 @@ pub(crate) struct D2dCopyInst {
     pub dst: *mut f32,
     pub src: *const f32,
     pub n_elems: u64,
-    pub _pad: [u64; 14],
+    // bd braidinfer-sm16 sentinel wait (consumer role): when wait_ptr != 0,
+    // spin-wait at entry until *(u32*)wait_ptr == wait_seq before reading src.
+    pub wait_ptr: u64,
+    pub wait_seq: u64,
+    // bd braidinfer-sm16 sentinel signal (producer role): when signal_ptr != 0,
+    // write signal_seq to *(u32*)signal_ptr after the copy completes (release).
+    pub signal_ptr: u64,
+    pub signal_seq: u64,
+    pub _pad: [u64; 10],
 }
 assert_inst_size!(D2dCopyInst);
 impl_inst!(D2dCopyInst);
@@ -583,8 +605,24 @@ impl D2dCopyInst {
             opcode_gridx: make_opcode_gridx(OP_D2D_COPY, grid_x),
             dst, src,
             n_elems: n_elems as u64,
-            _pad: [0; 14],
+            wait_ptr: 0,
+            wait_seq: 0,
+            signal_ptr: 0,
+            signal_seq: 0,
+            _pad: [0; 10],
         }
+    }
+
+    pub(crate) fn with_wait(mut self, sentinel_ptr: *const u32, seq: u32) -> Self {
+        self.wait_ptr = sentinel_ptr as u64;
+        self.wait_seq = seq as u64;
+        self
+    }
+
+    pub(crate) fn with_signal(mut self, sentinel_ptr: *mut u32, seq: u32) -> Self {
+        self.signal_ptr = sentinel_ptr as u64;
+        self.signal_seq = seq as u64;
+        self
     }
 }
 

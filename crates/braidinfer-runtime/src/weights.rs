@@ -191,6 +191,12 @@ pub struct ActivationBuffers {
     // Multi-GPU barrier staging: written by megakernel before OP_BARRIER, read by CPU dispatch.
     // MappedHostBuffer = GPU-writable (GART/uncached) + CPU-readable without hipMemcpy.
     pub normed_stage: MappedHostBuffer<f32>, // [hidden_size] — copy of normed for CPU broadcast
+    // bd braidinfer-sm16 / udi #2740: producer/consumer sequence number for
+    // normed_stage. op_rmsnorm_wx writes (position+1) on completion; workers'
+    // op_d2d_copy spin-waits on this value before peer-reading normed_stage.
+    // Forces PCIe-posted writes to drain through host-mapped UC GART page
+    // before consumer reads. Initial value = 0 (position+1 starts at 1).
+    pub normed_seq: MappedHostBuffer<u32>, // [1] — sequence number
     pub ffn_down_stage: MappedHostBuffer<f32>, // [hidden_size] — CPU writes gathered expert output
     // MoE scratch buffers (pre-allocated to avoid hipMalloc in hot path)
     pub moe_scores: DeviceBuffer<f32>,         // [max_num_experts]

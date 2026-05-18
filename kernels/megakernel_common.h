@@ -38,7 +38,12 @@ typedef struct {
     const uint16_t* weight;
     int64_t dim;
     uint64_t eps_bits;
-    uint64_t _pad[12];
+    // bd braidinfer-sm16 sentinel (see RmsNormInst in instructions.rs).
+    // 0 = inactive. When set, op_rmsnorm_wx writes sentinel_seq to *sentinel_ptr
+    // after the agent-scope fence at exit (release semantics).
+    uint64_t sentinel_ptr;
+    uint64_t sentinel_seq;
+    uint64_t _pad[10];
 } RmsNormInst;
 static_assert(sizeof(RmsNormInst) == INST_SIZE_WORDS * 8, "RmsNormInst size mismatch");
 static_assert(offsetof(RmsNormInst, output) == 8, "RmsNormInst.output offset");
@@ -269,7 +274,14 @@ typedef struct {
     float* dst;
     const float* src;
     int64_t n_elems;
-    uint64_t _pad[14];
+    // bd braidinfer-sm16 sentinel (see D2dCopyInst in instructions.rs).
+    // wait: spin at entry until *(u32*)wait_ptr == wait_seq (acquire).
+    // signal: write signal_seq to *(u32*)signal_ptr on exit (release).
+    uint64_t wait_ptr;
+    uint64_t wait_seq;
+    uint64_t signal_ptr;
+    uint64_t signal_seq;
+    uint64_t _pad[10];
 } D2dCopyInst;
 static_assert(sizeof(D2dCopyInst) == INST_SIZE_WORDS * 8, "D2dCopyInst size mismatch");
 static_assert(offsetof(D2dCopyInst, dst) == 8, "D2dCopyInst.dst offset");

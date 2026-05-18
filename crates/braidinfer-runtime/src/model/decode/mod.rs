@@ -509,6 +509,18 @@ impl Model {
         }
         self.set_position(position).map_err(ModelError::Hip)?;
 
+        // β'''' sentinel reset (bd braidinfer-sm16): zero the per-attn-layer
+        // sequence buffer so producers write `1` and consumers wait-for `1`
+        // on each layer of this decode step. Writes are CPU-side to a
+        // host-mapped UC buffer — no GPU touch.
+        unsafe {
+            std::ptr::write_bytes(
+                self.activations.normed_seq.host_ptr() as *mut u8,
+                0u8,
+                self.activations.normed_seq.len() * std::mem::size_of::<u32>(),
+            );
+        }
+
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
         let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
         mk.update_step_host_only(token_id, position)?;
@@ -844,7 +856,19 @@ impl Model {
 
                 // 0. Broadcast normed to GPUs 1..n
                 if gpu_i > 0 {
-                    batch.push(D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32).into_inst());
+                    // β'''' sentinel wait (bd braidinfer-sm16): acquire-load
+                    // on act.normed_seq[attn_i] == 1 forces this D2dCopy's
+                    // peer-read of normed_stage to be ordered after the
+                    // producer's GPU 0 D2dCopy at compile_attention.rs that
+                    // writes act.normed → act.normed_stage and signals.
+                    let normed_seq_slot = unsafe {
+                        (self.activations.normed_seq.device_ptr() as *const u32).add(attn_i)
+                    };
+                    batch.push(
+                        D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32)
+                            .with_wait(normed_seq_slot, 1)
+                            .into_inst()
+                    );
                 }
 
                 // 1-3. QKV projections.

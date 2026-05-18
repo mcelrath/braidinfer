@@ -135,6 +135,7 @@ impl MegakernelProgram {
                             cfg,
                             &model.layers[layer_i],
                             act,
+                            attn_layer_count,
                             &mut instructions,
                             &mut multi_gpu_attn_boundaries,
                         );

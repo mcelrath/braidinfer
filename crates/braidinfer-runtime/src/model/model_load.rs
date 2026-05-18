@@ -925,6 +925,16 @@ impl Model {
             // (snl decode-step2 NaN bisect 2026-05-17, mirror snapshot).
             // Coherent forces fine-grained UC on all sides → ack-time visibility.
             normed_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable_coherent(hs)?,
+            // bd braidinfer-sm16 sentinel for producer/consumer ordering — see
+            // weights.rs:193 comment. One slot per attention layer (indexed by
+            // attn_layer_count from compile_attention).
+            normed_seq: {
+                let n_attn = config.layers.iter()
+                    .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+                    .count()
+                    .max(1);
+                braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc_portable_coherent(n_attn)?
+            },
             ffn_down_stage: braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc(hs)?,
             moe_expert_ids: braidinfer_hip::memory::MappedHostBuffer::<i32>::alloc(
                 config
@@ -1343,6 +1353,73 @@ impl Model {
                 ctx.workers[gpu_i].attn_w_q_gate.push(w_q);
                 ctx.workers[gpu_i].attn_w_k.push(w_k);
                 ctx.workers[gpu_i].attn_w_v.push(w_v);
+
+                // β' probe (bd braidinfer-sm16, udi #2652): byte-compare 16
+                // bytes at offset 0 from src slice vs worker copy of the first
+                // attn layer's w_q_gate + w_k. Layer 0 is where workers'
+                // attn_k = 512/512 NaN on clean attn_normed input. If bytes
+                // mismatch, copy_weight_slice has a slice-arithmetic bug; if
+                // they match, β' is falsified and bug is in dequant or kernel.
+                if std::env::var("BRAIDINFER_BETA_PRIME").is_ok() && layer_idx == attn_layer_indices[0] {
+                    use braidinfer_hip::ffi;
+                    let probe_byte_offset = w.w_q_gate.row_byte_offset_dim(q_row_start, hs);
+                    let mut src_bytes = [0u8; 16];
+                    let mut dst_bytes = [0u8; 16];
+                    let src_ptr = unsafe { w.w_q_gate.raw_data_ptr().add(probe_byte_offset) };
+                    unsafe {
+                        let _ = ffi::hipMemcpy(
+                            src_bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                            src_ptr as *const std::ffi::c_void,
+                            16,
+                            ffi::hipMemcpyDeviceToHost,
+                        );
+                    }
+                    let dst_q = ctx.workers[gpu_i].attn_w_q_gate.last().unwrap();
+                    let dst_ptr = dst_q.raw_data_ptr();
+                    unsafe {
+                        let _ = ffi::hipMemcpy(
+                            dst_bytes.as_mut_ptr() as *mut std::ffi::c_void,
+                            dst_ptr as *const std::ffi::c_void,
+                            16,
+                            ffi::hipMemcpyDeviceToHost,
+                        );
+                    }
+                    eprintln!(
+                        "[β' L{layer_idx} g{gpu_i} w_q_gate@row{q_row_start}] src16={:02x?} dst16={:02x?} match={}",
+                        src_bytes,
+                        dst_bytes,
+                        src_bytes == dst_bytes,
+                    );
+
+                    let k_byte_offset = w.w_k.row_byte_offset_dim(0, hs);
+                    let mut src_k = [0u8; 16];
+                    let mut dst_k = [0u8; 16];
+                    let src_kptr = unsafe { w.w_k.raw_data_ptr().add(k_byte_offset) };
+                    unsafe {
+                        let _ = ffi::hipMemcpy(
+                            src_k.as_mut_ptr() as *mut std::ffi::c_void,
+                            src_kptr as *const std::ffi::c_void,
+                            16,
+                            ffi::hipMemcpyDeviceToHost,
+                        );
+                    }
+                    let dst_kw = ctx.workers[gpu_i].attn_w_k.last().unwrap();
+                    let dst_kptr = dst_kw.raw_data_ptr();
+                    unsafe {
+                        let _ = ffi::hipMemcpy(
+                            dst_k.as_mut_ptr() as *mut std::ffi::c_void,
+                            dst_kptr as *const std::ffi::c_void,
+                            16,
+                            ffi::hipMemcpyDeviceToHost,
+                        );
+                    }
+                    eprintln!(
+                        "[β' L{layer_idx} g{gpu_i} w_k@row0]            src16={:02x?} dst16={:02x?} match={}",
+                        src_k,
+                        dst_k,
+                        src_k == dst_k,
+                    );
+                }
             }
         }
         // copy_weight_slice does not mutate current-device context, so no

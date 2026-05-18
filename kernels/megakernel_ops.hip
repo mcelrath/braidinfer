@@ -844,6 +844,20 @@ __device__ __attribute__((noinline)) void op_rmsnorm_wx(const u64* inst, u32 vbl
     // __threadfence_system — gfx1100 has no L2 sys-invalidate ISA and that
     // variant hangs (rdna3_barrier.h:102-113 fence_system_uc).
     __threadfence();
+
+    // β'''' sentinel (bd braidinfer-sm16, udi #2740): producer-side release.
+    // After the agent-scope fence drains this kernel's stores to L2, write
+    // sentinel_seq to the host-mapped UC u32 word that workers' op_d2d_copy
+    // spin-waits on. Single thread (block 0, lane 0) so only ONE PCIe-posted
+    // write hits the sentinel. The release-store __atomic_store_n with
+    // __ATOMIC_RELEASE ordering ensures workers' acquire-load synchronizes
+    // with all prior writes from this kernel.
+    if (i->sentinel_ptr != 0 && vblock == 0 && threadIdx.x == 0) {
+        __atomic_store_n(
+            (volatile unsigned int*)i->sentinel_ptr,
+            (unsigned int)i->sentinel_seq,
+            __ATOMIC_RELEASE);
+    }
 }
 
 // OP_CONV1D: causal conv1d update with SiLU activation (one virtual block per channel)
@@ -1676,6 +1690,24 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
     const float* src = i->src;
     int count = (int)i->n_elems;
 
+    // β'''' sentinel wait (bd braidinfer-sm16, udi #2740): consumer-side
+    // acquire. When wait_ptr is set, spin-wait one thread per block on the
+    // sequence number written by the producer (another op_d2d_copy with
+    // signal_ptr set, or RmsNormInst.sentinel_ptr). The acquire load
+    // synchronizes with the producer's release store, guaranteeing that src
+    // reads below see all of the producer's prior writes — including the
+    // PCIe-posted drain through host-mapped UC GART pages.
+    if (i->wait_ptr != 0) {
+        if (threadIdx.x == 0) {
+            while (__atomic_load_n(
+                       (volatile unsigned int*)i->wait_ptr,
+                       __ATOMIC_ACQUIRE) != (unsigned int)i->wait_seq) {
+                /* spin */
+            }
+        }
+        __syncthreads();
+    }
+
     // §11.18 (b): consumer-side cache invalidation. If `src` is a peer GART
     // page (worker reading GPU 0's normed_stage), this WGP's L0 + WGP-cluster
     // L1 may hold stale lines from a prior decode step. gfx1100 has gl0_inv
@@ -1692,6 +1724,29 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < count) dst[idx] = src[idx];
+
+    // β'''' sentinel signal (bd braidinfer-sm16, udi #2810):
+    // 1. __threadfence (agent-scope) orders the prior dst-writes ahead.
+    // 2. Single thread does non-posted PCIe readback of its own dst write
+    //    to force this requester's posted writes to drain through PCIe
+    //    (megakernel_moe.hip:435-439 pattern). Empirically reaches
+    //    ~60% worker-K PASS plateau at N=5; per-thread readback variant
+    //    (every idx reads back its own write) achieved coherent decode
+    //    on 2/5 trials including "The quick brown" full output but
+    //    triggered intermittent host-mapped page-fault under contention.
+    //    Reverted to single-thread for stability.
+    // 3. Release-store of signal_seq.
+    if (i->signal_ptr != 0) {
+        __threadfence();
+        if (vblock == 0 && threadIdx.x == 0) {
+            volatile float drain_probe = dst[0];
+            (void)drain_probe;
+            __atomic_store_n(
+                (volatile unsigned int*)i->signal_ptr,
+                (unsigned int)i->signal_seq,
+                __ATOMIC_RELEASE);
+        }
+    }
 }
 
 // OP_MROPE: multimodal rotary position embedding (one block per head)

@@ -480,6 +480,7 @@ impl MegakernelProgram {
         cfg: &ModelConfig,
         layer: &LayerWeights,
         act: &ActivationBuffers,
+        attn_layer_count: usize,
         instructions: &mut Vec<Instruction>,
         multi_gpu_boundaries: &mut Vec<(usize, usize)>,
     ) {
@@ -510,12 +511,26 @@ impl MegakernelProgram {
         // normed_stage is coherently visible to GPUs 1-3 without L2 cache coherence issues.
         // (Regular device VRAM is NOT coherent for PCIe P2P on RDNA3; GART is.)
         let normed_stage_copy_idx = instructions.len();
-        instructions.push(D2dCopyInst::new(
-            div_ceil(hs as u32, 256),
-            act.normed_stage.as_write_ptr(),
-            normed_ptr,
-            hs as i32,
-        ).into_inst());
+        // β'''' sentinel signal (bd braidinfer-sm16, udi #2810): after this
+        // D2dCopy completes (act.normed → act.normed_stage), single-thread
+        // release-store of `1` to act.normed_seq[attn_layer_count]. Workers'
+        // D2dCopy in dispatch_head_parallel_attention acquire-loads same slot
+        // before peer-reading normed_stage. Host resets the array to 0 at
+        // start of each decode iteration so each layer's signal/wait is
+        // fresh.
+        let normed_seq_slot = unsafe {
+            (act.normed_seq.device_ptr() as *mut u32).add(attn_layer_count)
+        };
+        instructions.push(
+            D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                act.normed_stage.as_write_ptr(),
+                normed_ptr,
+                hs as i32,
+            )
+            .with_signal(normed_seq_slot, 1)
+            .into_inst()
+        );
         // Steps 2–9 (QKV proj, deinterleave, QK-norm, KV write, mRoPE, GQA) handled by dispatcher.
         // output_gate_idx points to the first instruction AFTER the dispatched block.
         let output_gate_idx = instructions.len(); // == normed_stage_copy_idx + 1
