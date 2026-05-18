@@ -1241,7 +1241,7 @@ pub fn distribute_moe_weights_from_ref(
     hs: usize,
     start_gpu: usize,
 ) -> Result<DistributedMoeWeights, ModelError> {
-    use braidinfer_hip::device::Device;
+    use braidinfer_hip::device::DeviceGuard;
 
     if start_gpu >= num_devices {
         return Err(ModelError::InvalidConfig(format!(
@@ -1275,7 +1275,8 @@ pub fn distribute_moe_weights_from_ref(
     let mut expert_buffers = Vec::with_capacity(num_devices);
     for gpu in 0..num_devices {
         let device = DeviceId(gpu as u32);
-        Device::set_current(device)?;
+        // DeviceGuard restores the caller's device at end of each iteration.
+        let _guard = DeviceGuard::switch_to(device)?;
 
         let n = counts[gpu];
         let mut slot_map = vec![None; ne];
@@ -1331,41 +1332,49 @@ pub fn distribute_moe_weights_from_ref(
 
         let local_slot = expert_buffers[gpu].slot_map[e].unwrap();
 
-        // gate_up: GPU 0 → host → target GPU
+        // gate_up: GPU 0 → host → target GPU. Scoped DeviceGuards switch the
+        // current device for the duration of each memcpy and restore the
+        // caller's device when they drop.
         let src_offset = e * gate_up_expert_stride;
         let dst_offset = local_slot * gate_up_expert_stride;
-        Device::set_current(DeviceId(0))?;
-        braidinfer_hip::memory::memcpy_d2h(
-            &mut host_buf,
-            unsafe { src_gate_up.add(src_offset) },
-            gate_up_expert_stride,
-        )?;
-        Device::set_current(DeviceId(gpu as u32))?;
-        braidinfer_hip::memory::memcpy_h2d(
-            unsafe { expert_buffers[gpu].gate_up.as_write_ptr().add(dst_offset) },
-            &host_buf,
-            gate_up_expert_stride,
-        )?;
+        {
+            let _g0 = DeviceGuard::switch_to(DeviceId(0))?;
+            braidinfer_hip::memory::memcpy_d2h(
+                &mut host_buf,
+                unsafe { src_gate_up.add(src_offset) },
+                gate_up_expert_stride,
+            )?;
+        }
+        {
+            let _gd = DeviceGuard::switch_to(DeviceId(gpu as u32))?;
+            braidinfer_hip::memory::memcpy_h2d(
+                unsafe { expert_buffers[gpu].gate_up.as_write_ptr().add(dst_offset) },
+                &host_buf,
+                gate_up_expert_stride,
+            )?;
+        }
 
         // down: GPU 0 → host → target GPU
         let src_offset = e * down_expert_stride;
         let dst_offset = local_slot * down_expert_stride;
-        Device::set_current(DeviceId(0))?;
-        braidinfer_hip::memory::memcpy_d2h(
-            &mut host_buf,
-            unsafe { src_down.add(src_offset) },
-            down_expert_stride,
-        )?;
-        Device::set_current(DeviceId(gpu as u32))?;
-        braidinfer_hip::memory::memcpy_h2d(
-            unsafe { expert_buffers[gpu].down.as_write_ptr().add(dst_offset) },
-            &host_buf,
-            down_expert_stride,
-        )?;
+        {
+            let _g0 = DeviceGuard::switch_to(DeviceId(0))?;
+            braidinfer_hip::memory::memcpy_d2h(
+                &mut host_buf,
+                unsafe { src_down.add(src_offset) },
+                down_expert_stride,
+            )?;
+        }
+        {
+            let _gd = DeviceGuard::switch_to(DeviceId(gpu as u32))?;
+            braidinfer_hip::memory::memcpy_h2d(
+                unsafe { expert_buffers[gpu].down.as_write_ptr().add(dst_offset) },
+                &host_buf,
+                down_expert_stride,
+            )?;
+        }
     }
 
-    // Restore GPU 0 context
-    Device::set_current(DeviceId(0))?;
 
     Ok(DistributedMoeWeights {
         expert_buffers,
@@ -1395,7 +1404,7 @@ pub fn distribute_moe_weights_from_bqnt(
     _hs: usize,
     start_gpu: usize,
 ) -> Result<DistributedMoeWeights, ModelError> {
-    use braidinfer_hip::device::Device;
+    use braidinfer_hip::device::DeviceGuard;
 
     if start_gpu >= num_devices {
         return Err(ModelError::InvalidConfig(format!(
@@ -1526,7 +1535,7 @@ pub fn distribute_moe_weights_from_bqnt(
     let mut expert_buffers = Vec::with_capacity(num_devices);
     for gpu in 0..num_devices {
         let device = DeviceId(gpu as u32);
-        Device::set_current(device)?;
+        let _guard = DeviceGuard::switch_to(device)?;
         let n = counts[gpu];
         let mut slot_map = vec![None; ne];
         let mut slot = 0;
@@ -1574,7 +1583,7 @@ pub fn distribute_moe_weights_from_bqnt(
         for e in 0..ne {
             let gpu = expert_device[e];
             let slot = expert_buffers[gpu].slot_map[e].unwrap();
-            Device::set_current(DeviceId(gpu as u32))?;
+            let _guard = DeviceGuard::switch_to(DeviceId(gpu as u32))?;
 
             let gu_src = &gu_data[e * gu_bytes_per_expert..(e + 1) * gu_bytes_per_expert];
             checked_hip_memcpy_h2d(
@@ -1603,7 +1612,7 @@ pub fn distribute_moe_weights_from_bqnt(
         for e in 0..ne {
             let gpu = expert_device[e];
             let slot = expert_buffers[gpu].slot_map[e].unwrap();
-            Device::set_current(DeviceId(gpu as u32))?;
+            let _guard = DeviceGuard::switch_to(DeviceId(gpu as u32))?;
 
             // gate_up
             if has_gate_proj {
@@ -1666,7 +1675,6 @@ pub fn distribute_moe_weights_from_bqnt(
         }
     }
 
-    Device::set_current(DeviceId(0))?;
     eprintln!(
         "  Layer {layer_idx}: {ne} experts distributed ({} per GPU, {} GPUs)",
         ne / num_devices,

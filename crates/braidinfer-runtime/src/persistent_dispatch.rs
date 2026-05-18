@@ -27,7 +27,7 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::device::{Device, DeviceGuard};
+use braidinfer_hip::device::DeviceGuard;
 use braidinfer_hip::ffi;
 use braidinfer_hip::memory::MappedHostBuffer;
 use braidinfer_hip::module::Module;
@@ -524,7 +524,10 @@ impl PersistentDispatch {
         self.ensure_sdma_stream(device)?;
         let kernel_dir = crate::kernel::kernel_dir();
         let queue_size = std::mem::size_of::<WorkerQueueLayout>();
-        Device::set_current(device)?;
+        // DeviceGuard saves the caller's current device and restores it on
+        // drop at function return, so add_device does not leak the worker's
+        // device context to the caller.
+        let _guard = DeviceGuard::switch_to(device)?;
         let queue = MappedHostBuffer::<u8>::alloc(queue_size)?;
         // Write the op_profile counter pointer into the queue BEFORE launch.
         // Per-instance pointer (set_op_profile_ptr) takes priority; falls

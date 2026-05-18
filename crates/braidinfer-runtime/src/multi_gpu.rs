@@ -1,7 +1,7 @@
 //! Multi-GPU context: P2P setup, per-device streams and events for expert parallel dispatch.
 
 use braidinfer_core::types::DeviceId;
-use braidinfer_hip::device::Device;
+use braidinfer_hip::device::{Device, DeviceGuard};
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use braidinfer_hip::stream::Stream;
@@ -105,13 +105,15 @@ impl MultiGpuContext {
             return Ok(None);
         }
 
-        // Enable P2P access between all device pairs
+        // Enable P2P access between all device pairs.
+        // DeviceGuard saves the caller's current device and restores it on
+        // drop, so the loop never leaves a stale current-device behind.
         for i in 0..num_devices {
             for j in 0..num_devices {
                 if i == j {
                     continue;
                 }
-                Device::set_current(DeviceId(i as u32))?;
+                let _guard = DeviceGuard::switch_to(DeviceId(i as u32))?;
                 let mut can_access = 0i32;
                 unsafe {
                     ffi::hipDeviceCanAccessPeer(&mut can_access, i as i32, j as i32);
@@ -137,7 +139,7 @@ impl MultiGpuContext {
         let mut workers = Vec::with_capacity(num_devices);
         for i in 0..num_devices {
             let device = DeviceId(i as u32);
-            Device::set_current(device)?;
+            let _guard = DeviceGuard::switch_to(device)?;
             eprintln!(
                 "Multi-GPU: allocating buffers on GPU {i} (hs={hidden_size}, eis={max_expert_is})"
             );
@@ -171,7 +173,6 @@ impl MultiGpuContext {
             });
         }
 
-        Device::set_current(DeviceId(0))?;
         eprintln!("Multi-GPU: {num_devices} devices, P2P enabled");
 
         Ok(Some(MultiGpuContext {
@@ -193,7 +194,9 @@ impl MultiGpuContext {
         q_mult: usize,
     ) -> HipResult<()> {
         for worker in self.workers.iter_mut() {
-            Device::set_current(worker.device)?;
+            // DeviceGuard saves the caller's current device once per iteration
+            // and restores it when the guard drops at end of iteration.
+            let _worker_guard = DeviceGuard::switch_to(worker.device)?;
             worker.attn_q = Some(DeviceBuffer::<f32>::alloc(
                 worker.device,
                 local_nqh * head_dim,
@@ -215,17 +218,20 @@ impl MultiGpuContext {
                         0,
                     ))?;
                 }
-                // GPU 0-side dev pointer.
-                Device::set_current(DeviceId(0))?;
+                // GPU 0-side dev pointer. Inner DeviceGuard switches to GPU 0
+                // and restores back to worker.device when it drops at end of
+                // this block.
                 let mut gpu0_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-                unsafe {
-                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                        &mut gpu0_ptr,
-                        buf.host_ptr() as *mut std::ffi::c_void,
-                        0,
-                    ))?;
+                {
+                    let _g0 = DeviceGuard::switch_to(DeviceId(0))?;
+                    unsafe {
+                        braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
+                            &mut gpu0_ptr,
+                            buf.host_ptr() as *mut std::ffi::c_void,
+                            0,
+                        ))?;
+                    }
                 }
-                Device::set_current(worker.device)?;
                 worker.attn_out = Some(buf);
                 worker.attn_out_dev_self = Some(self_ptr as *mut f32);
                 worker.attn_out_dev_gpu0 = Some(gpu0_ptr as *mut f32);
@@ -268,7 +274,6 @@ impl MultiGpuContext {
                 });
             }
         }
-        Device::set_current(DeviceId(0))?;
         eprintln!(
             "Multi-GPU attn: {} layers × {} workers, local_nqh={local_nqh} local_nkh={local_nkh} q_mult={q_mult}",
             num_attn_layers, self.num_devices
@@ -429,7 +434,7 @@ impl MultiGpuContext {
         // the cooperative moe_worker_kernel running on the worker GPU.
         use std::sync::atomic::Ordering;
         for gpu_i in 1..self.num_devices {
-            Device::set_current(DeviceId(gpu_i as u32))?;
+            let _guard = DeviceGuard::switch_to(DeviceId(gpu_i as u32))?;
             let worker = &self.workers[gpu_i];
             let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
             Self::launch_set_flag(
@@ -452,7 +457,6 @@ impl MultiGpuContext {
                 std::hint::spin_loop();
             }
         }
-        Device::set_current(DeviceId(0))?;
         Ok(())
     }
 }

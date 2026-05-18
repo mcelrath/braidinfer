@@ -21,7 +21,7 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::device::Device;
+use braidinfer_hip::device::DeviceGuard;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 
 use crate::quant::WeightFormat;
@@ -194,7 +194,11 @@ impl MoeP2pContext {
         // (called below in the worker launch loop), which works even without portable flag
         // because P2P is enabled between all GPUs at init time.
         // Work queue includes flexible activation_cache[] at the end, sized to gate_up_in_dim.
-        Device::set_current(gpu0)?;
+        // DeviceGuard pins the function body to gpu0 and restores the caller's
+        // device when this guard drops at function return. The per-worker
+        // inner DeviceGuard below temporarily switches to each worker device
+        // and restores gpu0 at end of each iteration.
+        let _gpu0_guard = DeviceGuard::switch_to(gpu0)?;
         // Allocate GART work queue sized for max batch (MAX_PREFILL_BATCH tokens).
         // The flexible activation_cache tail holds batch_size * gate_up_in_dim floats.
         let wq_size = MOE_WORK_QUEUE_FIXED + MAX_PREFILL_BATCH * gate_up_in_dim * std::mem::size_of::<f32>();
@@ -296,7 +300,7 @@ impl MoeP2pContext {
         let mut activation_staging_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_workers);
         for (w_idx, &device) in worker_devices.iter().enumerate() {
             let gpu_id = (w_idx + 1) as u32;
-            Device::set_current(device)?;
+            let _worker_guard = DeviceGuard::switch_to(device)?;
             // Get a worker-specific device pointer to the portable host-mapped
             // activation_staging. Even with `hipHostMallocPortable`, AMD ROCm
             // requires this call from each GPU's context to obtain a valid
@@ -377,7 +381,6 @@ impl MoeP2pContext {
             });
             eprintln!("  MoE worker state allocated on GPU {} (no separate kernel — runs via persistent_worker)", gpu_id);
         }
-        Device::set_current(gpu0)?;
 
         Ok(MoeP2pContext {
             output_slots_dev_ptrs,

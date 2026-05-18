@@ -1179,7 +1179,9 @@ impl Model {
             }
         };
 
-        braidinfer_hip::device::Device::set_current(DeviceId(0))?;
+        // DeviceGuard pins the rest of this function to GPU 0 and restores
+        // the caller's device when this guard drops at function return.
+        let _gpu0_guard = braidinfer_hip::device::DeviceGuard::switch_to(DeviceId(0))?;
 
         // Distribute MoE weights across GPUs
         let num_devices = ctx.num_devices;
@@ -1343,8 +1345,10 @@ impl Model {
                 ctx.workers[gpu_i].attn_w_v.push(w_v);
             }
         }
-        braidinfer_hip::device::Device::set_current(braidinfer_core::types::DeviceId(0))
-            .map_err(ModelError::Hip)?;
+        // copy_weight_slice does not mutate current-device context, so no
+        // explicit restore is needed here. (Prior code defensively set
+        // DeviceId(0); the calling site, distribute_multi_gpu, holds a
+        // DeviceGuard for GPU 0 that restores on its own return.)
         eprintln!(
             "Multi-GPU: split QKV weights for {} attn layers across {} GPUs",
             attn_layer_indices.len(),
