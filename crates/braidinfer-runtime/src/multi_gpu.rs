@@ -135,6 +135,20 @@ impl MultiGpuContext {
             }
         }
 
+        // Warm HWQ on each device. hipStreamCreate is the KFD HWQ first-touch
+        // primitive that triggers kfd_wait_on_events on cold devices (bd
+        // braidinfer-4e2m). Surfacing the first-touch here, in the bounded
+        // P2P-enable phase, keeps any wedge contained to a single early step
+        // instead of striking inside the per-worker push loop below where
+        // partial state is harder to clean up.
+        for i in 0..num_devices {
+            let _guard = DeviceGuard::switch_to(DeviceId(i as u32))?;
+            let warm = Stream::new(DeviceId(i as u32))?;
+            warm.synchronize()?;
+            // warm drops here -> hipStreamDestroy
+        }
+        eprintln!("Multi-GPU: HWQ warm-up complete on {num_devices} devices");
+
         // Create workers for each device
         let mut workers = Vec::with_capacity(num_devices);
         for i in 0..num_devices {

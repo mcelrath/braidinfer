@@ -819,6 +819,13 @@ __device__ __attribute__((noinline)) void op_rmsnorm_wx(const u64* inst, u32 vbl
     for (int i = tid; i < hidden_size; i += stride) {
         output[i] = input[i] * rms * bf16_to_f32(weight[i]);
     }
+    // §11.18 (a): producer-side agent-scope fence before persistent_iter_ack
+    // so worker-GPU peer reads of `output` (alloc_portable_coherent
+    // normed_stage) see committed values. __threadfence() == agent-scope
+    // acq_rel per rdna3_barrier.h:96-100 fence_device. Do NOT use
+    // __threadfence_system — gfx1100 has no L2 sys-invalidate ISA and that
+    // variant hangs (rdna3_barrier.h:102-113 fence_system_uc).
+    __threadfence();
 }
 
 // OP_CONV1D: causal conv1d update with SiLU activation (one virtual block per channel)
@@ -1650,6 +1657,14 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
     float* dst = i->dst;
     const float* src = i->src;
     int count = (int)i->n_elems;
+
+    // §11.18 (b): consumer-side cache invalidation. If `src` is a peer GART
+    // page (worker reading GPU 0's normed_stage), this WGP's L0 + WGP-cluster
+    // L1 may hold stale lines from a prior decode step. gfx1100 has gl0_inv
+    // and gl1_inv but NO gl2_inv (matches fence_system_uc HANG comment at
+    // rdna3_barrier.h:102-113). Pair with producer fence_device() in
+    // op_rmsnorm_wx.
+    asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < count) dst[idx] = src[idx];

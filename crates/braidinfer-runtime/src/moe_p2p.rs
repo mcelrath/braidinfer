@@ -337,6 +337,28 @@ impl MoeP2pContext {
             }
             moe_act_uc_handoff_dev_ptrs.push(handoff_dev as *mut f32);
 
+            // §11.18 (d-buffers) per udi #2619: peer-side UTCL2 TLB warm-up.
+            // hipHostGetDevicePointer above only resolves the peer's virtual
+            // address for the GART page; per §11.18 L1900-1904 the GPU VA TLB
+            // entry is committed in this peer's UTCL2 ONLY on first touch. A
+            // 4-byte D2H read via hipMemcpy from each peer-view dev_ptr forces
+            // that TLB commit during init, before the first decode-time read
+            // would otherwise PERMISSION_FAULT or read stale.
+            {
+                let mut scratch: u32 = 0;
+                let scratch_ptr = &mut scratch as *mut u32 as *mut std::ffi::c_void;
+                for &peer_view in &[act_dev_ptr, out_dev_ptr, handoff_dev] {
+                    unsafe {
+                        braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpy(
+                            scratch_ptr,
+                            peer_view,
+                            4,
+                            braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                        ))?;
+                    }
+                }
+            }
+
             let (layer_config_ptrs, config_storage) = build_layer_configs(
                 device,
                 gpu_id,
