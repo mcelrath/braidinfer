@@ -719,6 +719,19 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32_full(const u64* i
 // args: [1]=output, [2]=weight (packed pcg32), [3]=input, [4]=out_dim, [5]=in_dim
 // Weight layout per row: groups of 32 elements, each 20 bytes.
 __device__ __attribute__((noinline)) void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
+    // β'' (bd braidinfer-sm16, udi #2661) — §11.18 extension: consumer-side
+    // L0/L1 cache invalidation at opcode entry. On worker GPUs the prior
+    // opcode (e.g. op_d2d_copy writing worker.attn_normed from peer GART)
+    // commits to L2 via grid.sync()'s agent-scope fence, but THIS opcode's
+    // reading threads may have stale L0/L1 lines for the same VRAM addresses.
+    // megakernel.hip:183 invalidates gl1_inv only at BATCH boundary, leaving
+    // intra-batch consumer ops uncovered. One thread per block issues the
+    // invalidate (per-WGP scope), gated by __syncthreads() so all lanes start
+    // reads after the invalidate is observed.
+    if (threadIdx.x == 0) {
+        asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
+    }
+    __syncthreads();
     const LinearProjInst* i = (const LinearProjInst*)inst;
     float* output_base = i->output;
     const unsigned char* weight = i->weight;
