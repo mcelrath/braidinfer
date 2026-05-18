@@ -719,17 +719,22 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32_full(const u64* i
 // args: [1]=output, [2]=weight (packed pcg32), [3]=input, [4]=out_dim, [5]=in_dim
 // Weight layout per row: groups of 32 elements, each 20 bytes.
 __device__ __attribute__((noinline)) void op_linear_proj_pcg32(const u64* inst, u32 vblock) {
-    // β'' (bd braidinfer-sm16, udi #2661) — §11.18 extension: consumer-side
-    // L0/L1 cache invalidation at opcode entry. On worker GPUs the prior
-    // opcode (e.g. op_d2d_copy writing worker.attn_normed from peer GART)
-    // commits to L2 via grid.sync()'s agent-scope fence, but THIS opcode's
-    // reading threads may have stale L0/L1 lines for the same VRAM addresses.
-    // megakernel.hip:183 invalidates gl1_inv only at BATCH boundary, leaving
-    // intra-batch consumer ops uncovered. One thread per block issues the
-    // invalidate (per-WGP scope), gated by __syncthreads() so all lanes start
-    // reads after the invalidate is observed.
+    // β''-refine-v3 (bd braidinfer-sm16, udi #2670+empirical): consumer-side
+    // L0/L1 invalidation at opcode entry. RDNA3 gfx1100 WGP has 4 SIMDs each
+    // with its own L0 and one shared L1. buffer_gl0_inv is per-SIMD;
+    // issuing from one thread per WAVE (4 waves at wave64) hits all 4 SIMDs
+    // when blockDim.x >= 256. buffer_gl1_inv is per-WGP and once-per-block.
+    // s_waitcnt vmcnt(0) drains in-flight memory before reads.
+    //
+    // Empirical (N=3 each variant on qwen35_35b_a3b.q4 -g 4):
+    //   one-per-block      → 7/9 worker-K NaN failures (initial β'')
+    //   per-wave (4 waves) → 1/9 (overflow, not NaN)   [this commit]
+    //   all-threads        → 4/9 NaN failures (regression — likely contention)
+    if ((threadIdx.x & 63) == 0) {
+        asm volatile("buffer_gl0_inv" ::: "memory");
+    }
     if (threadIdx.x == 0) {
-        asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
+        asm volatile("buffer_gl1_inv\n\ts_waitcnt vmcnt(0)" ::: "memory");
     }
     __syncthreads();
     const LinearProjInst* i = (const LinearProjInst*)inst;
@@ -1677,7 +1682,13 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
     // and gl1_inv but NO gl2_inv (matches fence_system_uc HANG comment at
     // rdna3_barrier.h:102-113). Pair with producer fence_device() in
     // op_rmsnorm_wx.
-    asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
+    if ((threadIdx.x & 63) == 0) {
+        asm volatile("buffer_gl0_inv" ::: "memory");
+    }
+    if (threadIdx.x == 0) {
+        asm volatile("buffer_gl1_inv" ::: "memory");
+    }
+    __syncthreads();
 
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < count) dst[idx] = src[idx];
