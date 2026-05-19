@@ -14,7 +14,7 @@
 // plain L2-cached global_load_b64 for the descriptor read — no glc, no dlc.
 // On a cold-start first-mailbox-transaction, the consumer worker GPU may
 // hold stale data for that line and read garbage instruction words → NaN
-// logits, "Sig A" cold-start race (see COHERENCE.md "Cold-start mailbox
+// logits, "Sig A" cold-start race (see GFX1100_ARCH.md §11.19 "Cold-start mailbox
 // visibility race" section, bd 4e2m).
 //
 // Adding glc+dlc via volatile-preserving casts is correct on first
@@ -51,9 +51,9 @@
 // bd braidinfer-tm5t   (mailbox warmup A2 experiment; 30/30 with prefill+warmup)
 // bd braidinfer-upxd   (rc=134 shutdown abort, separate)
 // linux-p2p 0012/0013  (kernel HDP flush patches, complementary)
-// COHERENCE.md         (full mechanism analysis + falsified interventions)
+// GFX1100_ARCH.md §11.19         (full mechanism analysis + falsified interventions)
 //
-// HW QUIRKS (recap, full detail in COHERENCE.md):
+// HW QUIRKS (recap, full detail in GFX1100_ARCH.md §11.19):
 //   - gfx1100 has NO buffer_gl2_inv / buffer_invl2 in ISA (composable_kernel §5.3).
 //     The only L2-control bit available is `dlc` on per-op loads.
 //   - __hip_atomic_load(SYSTEM scope) HANGS on gfx1100 multi-GPU.

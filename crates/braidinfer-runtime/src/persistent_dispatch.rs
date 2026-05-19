@@ -1165,7 +1165,18 @@ impl Drop for PersistentDispatch {
         if self.workers.len() > 1 {
             self.watchdog.force_exit_all();
             std::thread::sleep(std::time::Duration::from_millis(200));
-            unsafe { libc::_exit(134); }
+            // bd 4e2m / udi #3230: rc=134 was deliberate sentinel from 4fg.2
+            // but visually indistinguishable from SIGABRT (128+6). All output
+            // has flushed by this point; the process is exiting cleanly modulo
+            // cleanup ordering. Emit a stderr marker so parents don't mistake
+            // this for a crash, then _exit(0).
+            eprintln!(
+                "[braidinfer] multi-GPU fast-exit (rc=0): bypasses Stream/Module/Buffer drops \
+                 that may wedge for 600s+ on the cooperative-kernel atomic_block_barrier \
+                 (4fg.2). Functional output has already been printed. Not an abort."
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            unsafe { libc::_exit(0); }
         }
 
         // Single-GPU clean path: drop workers normally. No multi-GPU wedge
