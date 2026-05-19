@@ -2016,3 +2016,130 @@ kb entry `gpu-hang-cascade` (if present).
 - old §11.18 SAFE vs UNSAFE patterns -> §11.19 (z)
 - old §11.18 library integration, call sites, Rule 10, RDNA4 context -> §11.19 (aa)
 - old §11.19 (a)-(q) -> §11.19 (a)-(q) [unchanged]
+
+---
+
+## Appendix A — Falsified hypotheses (do not retry)
+
+Single-place index of every empirically-refuted hypothesis tested during
+the bd 4e2m investigation arc (and adjacent investigations). Preserved
+so future investigators don't re-run dead-ends. Each entry: hypothesis,
+verdict, where to read the falsification record.
+
+**Userspace shader interventions (consumer-side cache control)**
+
+- `buffer_gl0_inv` + `buffer_gl1_inv` before mailbox descriptor load. NO
+  EFFECT on §11.13 wedge. See §11.13 stub → `mes/MES_PROBE_ARCHIVE.md`.
+- `global_load_b32 ... glc dlc` on consumer descriptor (Exp 1a, bd 4e2m).
+  16/30 PASS = baseline noise floor. Volatile-cast → L0/L1/L2
+  invalidate-on-load is necessary correctness hygiene but NOT sufficient
+  for cold-start cure. See §11.19 (c).
+- `global_atomic_or_b32` with mask 0 on poll address. NO EFFECT on
+  §11.13 wedge. See `mes/MES_PROBE_ARCHIVE.md`.
+- Wide 16-byte loads, inject 128 v_mad cycles between polls, cache-line
+  isolation (60-byte pad). NO EFFECT. See `mes/MES_PROBE_ARCHIVE.md`.
+- Inline-asm `slc` bypass on consumer load was not run end-to-end (per
+  udi #3237 directive: not worth experimenting given Exp 1a result).
+  Recorded as DEFERRED rather than falsified.
+
+**Userspace producer-side interventions (CPU)**
+
+- CPU `_mm_mfence`, `_mm_clflush + mfence` after host-mapped write.
+  NO EFFECT on §11.13 wedge. See `mes/MES_PROBE_ARCHIVE.md`.
+- CPU `read_volatile` of last descriptor word between
+  `num_instructions` and `seq_num` writes (Exp 3, bd 4e2m). 10/30 PASS =
+  baseline noise floor. Refutes §11.18 Rule 10 producer-fence hypothesis
+  at the CPU analog. See §11.19 (d).
+- `hipHostMallocCoherent`, `hipHostRegister` mapping mode variants. NO
+  EFFECT on §11.13 wedge. See `mes/MES_PROBE_ARCHIVE.md`.
+- `mmap(MAP_HUGETLB)`, fresh-page mmap. NO EFFECT. See
+  `mes/MES_PROBE_ARCHIVE.md`.
+- Stream rotation (hipStreamDestroy + hipStreamCreate between trials).
+  NO EFFECT. See `mes/MES_PROBE_ARCHIVE.md`.
+- Non-cooperative-kernel interleave between trials. NO EFFECT. See
+  `mes/MES_PROBE_ARCHIVE.md`.
+
+**Kernel-mode interventions (linux-p2p tree)**
+
+- `MESAPI_MISC__INV_GART` opcode wired from `add_queue_mes` on
+  first-queue-per-PASID-per-device (bd 4e2m, 2026-05-19). 10/30 PASS
+  PLUS 351 `MES failed to respond` + `MES might be in unrecoverable
+  state` advisories + 3 process crashes on N=30 cold-starts. REGRESSION.
+  Opcode declared in upstream `mes_v11_api_def.h:574` but firmware-side
+  broken on gfx11/MES1 in this call context. AMD shipped it but did NOT
+  wire it for a real reason. See §11.19 (q); reverted in linux-p2p
+  tree; also documented in `kernels/rdna3/rdna3_compat.h` as FORBIDDEN.
+- linux-p2p patches 0014 / 0014v2 (MQD HDP flush during init_mqd_hiq).
+  REGRESSED to 0-3/10. Broke HIQ MQD privilege bits. See §11.19 (e),
+  `~/builds/linux-p2p/0014*.patch.reverted`.
+- linux-p2p patches 0015 / 0015v2 (KIQ ACQUIRE_MEM with GC L2 invalidate).
+  REGRESSED to 0/10 (and 5/5 only with warmup-discard already active,
+  indicating near-zero kernel-side contribution). Disrupted MES on
+  concurrent compute. See §11.19 (e), `~/builds/linux-p2p/0015*.patch.reverted`.
+- MES MISC `NOTIFY_TO_UNMAP_PROCESSES` (Design D). WEDGE persists. See
+  `mes/MES_PROBE_ARCHIVE.md`.
+- MES MISC `SET_SHADER_DEBUGGER` (Design F). WEDGE persists; HIP
+  already uses the first SHADER_DEBUGGER call at `hipInit`. See
+  `mes/MES_PROBE_ARCHIVE.md`.
+- Raw MES `REMOVE_QUEUE` + `ADD_QUEUE` with `skip_process_ctx_clear=0`
+  override (Design G). WEDGE persists. See `mes/MES_PROBE_ARCHIVE.md`.
+- Raw REMOVE-all + ADD-all reaching "last gang in process" condition
+  (Design H). WEDGE persists. See `mes/MES_PROBE_ARCHIVE.md`.
+- Per-PASID heavy `amdgpu_gmc_flush_gpu_tlb_pasid` + Design H. WEDGE
+  persists. See `mes/MES_PROBE_ARCHIVE.md`.
+- `amdgpu.cwsr_enable=0` (helps SOME framework users for adjacent wedge
+  classes). REJECTED for our case via empirical reboot test. See
+  `mes/MES_PROBE_ARCHIVE.md`.
+
+**Architectural / framing hypotheses**
+
+- "Rule 9 violation fully explains the §11.13 wedge" (2026-05-14
+  morning take). WRONG. Standalone reproducer with ZERO prior
+  cooperative launches wedged identically. Actual root cause was the
+  Phase 2' deferred-ack protocol deadlock (§11.15). Rule 9 is still
+  valid as a separate guideline; it just isn't the §11.13 mechanism.
+  See §11.15 + §11.13 stub.
+- "Prefill is the cold-start cure-step" (bd tm5t framing, 2026-05-19
+  morning take). REFINED: Lane C Exp 1 (commit 38b05b1) showed
+  worker-spawn + 1 mailbox round-trip (NO prefill) = 30/30 at ~320ms.
+  Prefill was decoration; the actual cure-step is ANY mailbox dispatch
+  through a fresh worker. See §11.19 (o).
+- "§11.18 Rule 10 producer-fence (fence_device after store) is the
+  systematic fix for cross-cache GART staleness". FALSIFIED by Exp 3 at
+  the CPU producer analog. The cure layer is below userspace; MES μC
+  private cache or memory-hub state. See §11.19 (d), (f), (y).
+- "MTYPE_UC on the destination buffer alone is sufficient for cross-
+  cache reads" (early §11.16 framing). SUPERSEDED — UC on the dst is
+  necessary but the FIRST cross-cache read from a fresh worker still
+  reads stale state on cold-start. See §11.19 (r)-(v) (merged §11.16).
+- `hsa-rocr-coop-force-destroy-gfx11.patch` (obsolete approach).
+  REJECTED due to double-free risk. See bridge thread / linux-p2p
+  history.
+
+**Common reasoning pitfalls (do not re-derive)**
+
+- "Partial improvement at one intervention class is additive evidence
+  that combining classes will cure" — NO. If glc+dlc gives 16/30 and
+  CPU read-back gives 10/30 and baseline is ~16/30, the 16/30 is the
+  noise floor, not a stack of partial cures. See §11.19 (n) and §1.2
+  methodology recipe.
+- "AMD-declared opcode in `mes_v11_api_def.h` implies firmware support"
+  — NO. INV_GART is exhibit A. Treat declared-but-unwired opcodes as
+  N/A unless empirically validated on hardware. See §11.19 (q) +
+  `kernels/rdna3/rdna3_compat.h` FORBIDDEN section.
+- "First-coop-launch wedge on a fresh process can be explained by Rule
+  9" — NO. See §11.13 historical postscript.
+
+**What is NOT in this appendix**
+
+Falsified hypotheses INTERNAL to a development sprint that did not
+result in a published mitigation or test artifact are documented within
+the §11.x subsections themselves rather than promoted here. This
+appendix covers the cross-investigation thread that produced testable
+patches or published probe results.
+
+**Cross-references.** bd braidinfer-4e2m (top investigation issue);
+bd 20fp / 1uak / 1i1c / iwn0 / ew00 / upxd (follow-ups);
+linux-p2p tree (kernel patch history);
+`kernels/rdna3/rdna3_compat.h` (FORBIDDEN block);
+`mes/MES_PROBE_ARCHIVE.md` (extracted §11.13 probe data).
