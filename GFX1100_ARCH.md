@@ -239,140 +239,17 @@ When debugging register mappings (which lane holds which fragment element) or va
 
 - **Bank-conflict avoidance** – LDS is 64 banks × 4 B in WGP mode (RDNA3 ISA §2.3.1). On this system, `lds_bank_conflict_bench` shows large slowdowns for certain regular per-thread strides (notably 128–512 B in the tested pattern). Use CK swizzles (`S<1,32,1,8>` etc.) and padding so `(thread_id % 64)` spreads accesses across banks, and validate your exact pattern with a microbench. (CU mode splits into two 32-bank halves; see §5.2.)
 
-### 5.0 Cache Controls (GLC/SLC/DLC) — What They Mean and What We Measured
-RDNA3 exposes three relevant cache-control bits on vector memory ops (RDNA3 ISA §4.1.1):
+### 5.0 Cache Controls (GLC/SLC/DLC) — extracted to sibling
 
-- **`GLC`** – affects the graphics client first-level cache behavior and is also a scope bit (CU vs device scope for loads).
-- **`SLC`** – a **temporal hint for graphics client caches** (`0` regular, `1` stream/non-temporal).
-- **`DLC`** – a **temporal hint for Infinity Cache** (`0` regular, `1` non-temporal).
+The measured microbench content for GLC/SLC/DLC behavior on gfx1100 —
+raw buffer loads/stores/copies bandwidth, pointer-chase latency vs
+working-set size, hot-vs-streaming pollution, paged-KV gather
+(block-table indirection), stride/page sensitivity, attention-shaped
+microbenches — has been extracted to **GFX1100_CACHE_HINTS.md** for
+focus. The load-bearing operational rules remain in §5.5.
 
-On this system (RX 7900 XTX / gfx1100), the microbench suite shows these can be meaningful levers, but **their effect depends strongly on access pattern and working-set size**.
+See: [GFX1100_CACHE_HINTS.md](./GFX1100_CACHE_HINTS.md)
 
-#### 5.0.1 Measured Bandwidth: Raw Buffer Loads/Stores/Copies
-All results below are from `test/gfx1100_microbench/` and are intended as A/B guidance (not “architecture constants”):
-
-- **Streaming read bandwidth can improve with `glc=1` and/or `slc=1`** (64 MiB repeated reads, 16B loads):
-  - `raw_load_hint_bench` aux=0: ~1237 GB/s
-  - `raw_load_hint_bench` aux=1 (`glc=1`): ~1365 GB/s
-  - `raw_load_hint_bench` aux=2 (`slc=1`): ~1369 GB/s
-- **`dlc=1` (Infinity Cache non-temporal) strongly reduced bandwidth for reuse-friendly reads** in the same test:
-  - `raw_load_hint_bench` aux=4 (`dlc=1`): ~697 GB/s
-- **Aligned stores are far more sensitive to *alignment* than to `glc/slc/dlc`**:
-  - `raw_store_hint_bench` (16B stores, offset=0): ~836 GB/s across aux settings (differences were small)
-  - `raw_store_hint_bench` (16B stores, offset=1): ~423 GB/s (a ~2× regression from alignment alone)
-- **Non-temporal store hint can partially mitigate misaligned stores/copies**:
-  - `raw_store_hint_bench` (16B stores, offset=1): `dlc=0` ~425 GB/s vs `dlc=1` ~560 GB/s
-  - `raw_copy_hint_bench` (16B load+store, src_off=1 dst_off=1): `dlc-store=0` ~555 GB/s vs `dlc-store=1` ~648 GB/s (read+write)
-- **Copy (read+write aggregate) is modestly sensitive to `dlc`** (256 MiB copy, 16B loads/stores):
-  - `raw_copy_hint_bench` `dlc-load=0 dlc-store=0`: ~751 GB/s (read+write)
-  - `raw_copy_hint_bench` `dlc-load=1 dlc-store=1`: ~695 GB/s (read+write)
-
-#### 5.0.2 Measured Latency: Pointer-Chase vs Working-Set Size
-`cache_chase_bench` (dependent raw-buffer loads; random permutation) shows the expected “more bytes ⇒ more latency” behavior, and it makes the `dlc` effect easy to see once the working set exceeds L2:
-
-- 32 KiB: ~29 ns/load (`dlc` had no visible effect)
-- 2 MiB: ~74 ns/load (`dlc` had no visible effect)
-- 8 MiB: ~107 ns/load with `dlc=0`, ~254 ns/load with `dlc=1`
-- 32 MiB: ~170 ns/load with `dlc=0`, ~289 ns/load with `dlc=1`
-- 256 MiB: ~240 ns/load with `dlc=0`, ~256 ns/load with `dlc=1`
-
-Interpretation (practical, not microarchitectural): **when the working set is larger than L2 but still cacheable by Infinity Cache, `dlc=1` can force more traffic past Infinity Cache and increase latency substantially**.
-
-#### 5.0.3 Measured “Hot vs Streaming” Pollution
-`dlc_pollution_bench` (32 MiB hot set + 256 MiB stream) shows:
-
-- `dlc=0`: streaming phase slowed a subsequent hot-set pass (pollution)
-- `dlc=1`: hot-set performance stayed close to “hot_before” (less pollution), but the streaming phase itself ran slower
-
-#### 5.0.4 Paged KV Gather (Block-Table Indirection) — Focus-Model Guidance
-Attention decode/prefill with `use_cache=true` often reads KV in a “paged” pattern. `paged_kv_gather_bench` simulates KV reads through a page table and measures aggregate K+V read bandwidth.
-
-Two important regimes show up clearly on RX 7900 XTX:
-
-- **Focus A-like (head_dim=128, tokens≈40k, kv_heads=4)**: `dlc=0` was consistently best (~1100–1230 GB/s). `dlc=1` was consistently much worse (~420–525 GB/s).
-- **Focus B-like (head_dim=64, tokens≈131k, kv_heads=8)**: in this *pure gather* microbench, `dlc=1` was often slightly better than `dlc=0` (~916 GB/s vs ~860 GB/s).
-
-Important: this “pure gather” result does **not** necessarily carry over to a fused attention tile. In `attention_tile_bench` (paged K+V load + softmax-like compute + PV-like accumulate), `dlc=0` was consistently better than `dlc=1` for **both** Focus A-like and Focus B-like settings on this system.
-
-**Other long-context LLM regimes we tested on real hardware**
-These are the additional “focus models” we pulled shapes from `config.json` and measured directly on RX 7900 XTX (gfx1100) using the microbench suite in `test/gfx1100_microbench/`:
-
-- **Kimi-K2-Thinking-like (head_dim=112, tokens=262144, kv_heads=64, gqa_group=1)**:
-  - `paged_kv_batch_gather_bench` (K+V reads through a page table): `dlc=1` was modestly better than `dlc=0` when within-page order was contiguous (~901 GB/s vs ~858 GB/s), and slightly better even with within-page scrambling (~804 GB/s vs ~782 GB/s).
-  - `paged_kv_scatter_gather_bench` (prefill→decode staged, moving tail): `aux_load=4` (`dlc=1`) improved the paired measurement (~887 GB/s vs ~844 GB/s).
-  - `attention_tile_bench` (fused-ish): `dlc` was essentially a tie (~433–435 GB/s).
-- **MiniMax-M2.1-like (head_dim=128, tokens=196608, kv_heads=8, gqa_group=6)**:
-  - `paged_kv_batch_gather_bench`: `dlc=1` improved read bandwidth in this test (~699 GB/s vs ~625 GB/s).
-  - `paged_kv_scatter_gather_bench` (moving tail): best paired measurement used `aux_load=0` (`dlc=0`) (~613 GB/s); `aux_load=4` was worse (~553 GB/s).
-  - `attention_tile_bench`: `dlc=0` was better (~182 GB/s best-case) than `dlc=1` (down to ~113 GB/s in the same sweep).
-- **GLM-4.7-like (head_dim=128, tokens=202752, kv_heads=8, gqa_group=12)**:
-  - `paged_kv_batch_gather_bench`: `dlc=0` and `dlc=1` were both viable; best observed read bandwidth was with `dlc=0` (~935 GB/s).
-  - `paged_kv_scatter_gather_bench` (moving tail): best paired measurement used `aux_load=0` (`dlc=0`) (~914 GB/s).
-  - `attention_tile_bench`: `dlc=0` was better (~95 GB/s) than `dlc=1` (~82–89 GB/s).
-
-**Paged QK dot (K-only) is a different `dlc` regime than KV gathers**
-`paged_qk_dot_bench` uses raw buffer loads for K (paged indirection) and computes a QK dot-like inner loop. Across all three “new” regimes above, it strongly preferred `dlc=0` on loads:
-
-- Kimi-like (gqa_group=1): `dlc=0` best (~760 GB/s K-read), `dlc=1` slightly worse (~730 GB/s).
-- MiniMax-like (gqa_group=6): `dlc=1` was much worse (~131 GB/s) than `dlc=0` (~201 GB/s).
-- GLM-like (gqa_group=12): `dlc=1` was catastrophic (~55 GB/s) vs `dlc=0` (~166 GB/s).
-
-Practical takeaway: **treat `dlc` as per-kernel (and sometimes per-stage) tuning**. “Pure KV gather” and “QK dot” can want opposite `dlc` settings on gfx1100.
-
-**Measured: “rotate page order per block” can matter**
-- `paged_kv_gather_bench` has a `--rotate-step` option that applies a per-CTA rotation of the logical page index to change the concurrency pattern.
-- For Focus B-like settings with `dlc=0`, `rotate_step=1` consistently improved bandwidth (~845–850 GB/s → ~920 GB/s in repeated runs). For `dlc=1`, `rotate_step` was typically closer to neutral in this microbench.
-
-Interpretation: for very long-context KV reads, having “all CTAs walk the same page order” can be suboptimal; distributing page indices across CTAs can improve effective throughput (likely by reducing cache/TLB/memory-partition contention).
-
-**Measured: batch + within-page order also matter (and can change which `dlc` wins)**
-- `paged_kv_batch_gather_bench` adds a batch dimension (per-sequence page tables and per-batch KV regions) and an adversarial “scramble within page” option that breaks within-page contiguity.
-- **Within-page contiguity matters**: scrambling token order within each page reduced aggregate read bandwidth:
-  - Focus B-like (`head_dim=64`, batch=1): ~828 GB/s → ~715 GB/s (`dlc=0`) in one sweep. (For Focus A-like in this microbench, the effect was much smaller/noisier.)
-- **Very large effective working sets can flip `dlc` behavior for pure gathers**:
-  - Focus A-like: batch=1 strongly prefers `dlc=0` (~1375 GB/s vs ~410 GB/s), but batch=32 can prefer `dlc=1` (~899 GB/s vs ~852 GB/s) because the access becomes “more purely streaming”.
-  - Focus B-like: `dlc=1` is often slightly better than `dlc=0` even at batch=1 (~912 GB/s vs ~848 GB/s), and at batch=32 we saw ~928 GB/s vs ~875 GB/s.
-
-**Measured: KV writes are a different regime than KV reads**
-- `paged_kv_scatter_bench` measures paged K+V writes (prefill-like). KV writes were lower bandwidth than KV reads, and the `dlc` behavior can be batch-dependent:
-  - Focus A-like, batch=1: `dlc=0` was better (~750 GB/s) than `dlc=1` (~270 GB/s).
-  - Focus A-like, batch=32: `dlc=1` can slightly beat `dlc=0` (~596 GB/s vs ~563 GB/s).
-  - Focus B-like, batch=1: `dlc=0` and `dlc=1` were close (~508 GB/s vs ~503 GB/s).
-  - Focus B-like, batch=32: `dlc=1` can be better (~598 GB/s vs ~554 GB/s).
-- `paged_kv_scatter_gather_bench` measures a prefill→decode transition (write then read) and reports both baselines and a paired timing. It supports **windowed** ranges (e.g., write the last 1–32 tokens then read the full context) via `--scatter-start-token/--scatter-tokens` and `--gather-start-token/--gather-tokens`, and also supports a decode-like **moving tail** via `--scatter-advance-step` (advances the write window between iterations).
-  - **Focus A-like windowed decode (tokens=40960, scatter last 32, gather full)**:
-    - Fixed tail: `dlc=0` remained best for the read stage at batch=1 (paired ~865–976 GB/s for `dlc=0` vs ~697–700 GB/s for `dlc=1` in one sweep), but at batch=32 the paired measurement preferred `dlc=1` (~826 GB/s) over `dlc=0` (~786 GB/s).
-    - Moving tail (`--scatter-advance-step 32`, `scramble_within_page=1`): same conclusion in a longer run (batch=1 paired ~1215 GB/s for `dlc=0` vs ~767 GB/s for `dlc=1`; batch=32 paired ~826 GB/s for `dlc=1` vs ~787 GB/s for `dlc=0`).
-  - **Focus B-like windowed decode (tokens=131072, scatter last 32, gather full)**:
-    - Fixed tail: `dlc=1` consistently improved the paired measurement in the more adversarial “scramble within page” setting (batch=1: ~760 GB/s vs ~700 GB/s; batch=32: ~815 GB/s vs ~743 GB/s).
-    - Moving tail (`--scatter-advance-step 32`, `scramble_within_page=1`): same pattern (batch=1 paired ~795 GB/s for `dlc=1` vs ~713 GB/s for `dlc=0`; batch=32 paired ~802 GB/s for `dlc=1` vs ~737 GB/s for `dlc=0`).
-  - Interpretation: **even a small “write tail” can change the best choice for subsequent reads**. If your decode step is staged (scatter then gather), A/B `dlc` on the *load* path with a paired benchmark; do not assume the fused attention tile will follow pure-gather behavior.
-
-**Practical guidance (general across models):**
-- Default to **`dlc=0`** when you expect reuse (weights, K/V reused across multiple query heads, activations reused across tiles).
-- Consider **`dlc=1`** only for **true streaming** where the working set is well beyond Infinity Cache and the goal is to reduce cache pollution — and only if an on-hardware A/B shows it helps the *full* kernel (isolated gathers can be misleading).
-- For streaming reads, consider **`slc=1`** (stream hint) and/or **`glc=1`** (scope/cache behavior) as knobs; validate per kernel because these can change caching and consistency behavior.
-
-#### 5.0.5 Stride/Page Sensitivity (Proxy for TLB/Page-Walk Cost)
-`stride_load_bench` performs strided 16B loads across a large buffer. It’s not a pure “TLB benchmark”, but it does show the practical effect of page-scale striding:
-
-- With 512 MiB working set and 4 KiB stride: ~8.7 GB/s (`dlc=0`) to ~9.2 GB/s (`dlc=1`)
-
-This is orders of magnitude below contiguous streaming loads and is a good reminder that **making accesses contiguous within a page (and avoiding page-stride patterns) matters** for long-context attention kernels.
-
-#### 5.0.6 Attention-Shaped Microbenches (Focus A vs Focus B)
-These benches are useful because they look more like attention than pure bandwidth tests:
-
-- `softmax_like_bench` (BF16 logits, FP32 max/sum + exp): for both Focus A-like (`cols=40960`) and Focus B-like (`cols=131072`) settings, the warp-based reduction and LDS-tree reduction were **close** on this system (typically within a few percent); treat this as a kernel-level tuning choice (register pressure/occupancy can flip the winner).
-- `qk_dot_gqa_bench` (load K once per token, reuse across GQA query-head warps):
-  - Focus A-like (`head_dim=128`, `kv_heads=4`, `gqa_group=16`): `dlc=0` beat `dlc=1` (~49 GB/s vs ~42 GB/s K-read; ~0.79 vs ~0.67 TFLOP/s in this microbench).
-  - Focus B-like (`head_dim=64`, `kv_heads=8`, `gqa_group=8`): `dlc=1` slightly beat `dlc=0` for the “same page order everywhere” setup, but changing the concurrency pattern changed which setting won (e.g., in one run, `rotate_step=1` improved `dlc=0` from ~60 GB/s to ~71 GB/s while making `dlc=1` worse).
-- `attention_tile_bench` (paged K+V load + softmax + PV-like scalar accumulate):
-  - Focus A-like: `dlc=0` beat `dlc=1` (~62–64 GB/s vs ~56–57 GB/s K+V read). `glc=1` sometimes provided a small additional win on top of `dlc=0` (~+1–2% in one sweep).
-  - Focus B-like: `dlc=0` beat `dlc=1` (~90–92 GB/s vs ~81–82 GB/s K+V read); `glc=1`/`slc=1` were small wins in some runs, and `rotate_step=1` was roughly neutral in this microbench.
-  - Batch stress: with `batch=32` and per-batch page tables, `dlc=0` still did not lose (Focus A-like: `dlc=0` remained slightly better; Focus B-like: `dlc=0` and `dlc=1` were essentially tied). This is another example where *pure gather* behavior does not reliably predict fused attention-tile behavior.
-
-This supports a practical policy: **default to `dlc=0` for real attention tiles on this system**, and for Focus B-like long-context cases prioritize **concurrency/layout tuning** (page-table order, CTA staggering/rotation) before reaching for `dlc=1`.
 
 ### 5.1 Scalar Cache & Global Data Share (GDS)
 - **Scalar cache / descriptors** – Buffer resource descriptors (V#) are 128-bit values resident in 4 SGPRs (4-SGPR aligned) and are sent to the texture/cache path with buffer instructions (RDNA3 ISA §9.6). If you store SRDs in memory (e.g., descriptor tables), keep them naturally aligned (16 B) and load with scalar buffer loads (`S_BUFFER_LOAD_B128`) before hot loops. On this system, `srd_table_load_bench` (uniform scalar 16B loads; verified to compile to `s_load_b128`) showed little sensitivity to base misalignment in the 0–15B range or to table stride (16B–1024B) — suggesting alignment is more about **correctness and keeping a single 16B scalar load** than about a large steady-state bandwidth gain.
@@ -1449,149 +1326,15 @@ reset mid-spin). For persistent-kernel delay loops, prefer
 
 ### 11.13 Cooperative-grid relaunch wedge — empirical archive (confirmed; mechanism unknown)
 
-**History (2026-05-14, settled).** The "Re-confirmation" text that
-previously occupied this slot — claiming the production wedge was a
-Rule 9 violation via per-token cooperative `mk.execute()` in
-`prefill_paged` — was wrong. A standalone reproducer
-(`braidinfer kernels/diagnostic/persistent_skeleton_repro/prod_kernel_test`)
-loading `megakernel.hsaco`'s `persistent_worker` symbol with a fresh
-`WorkerQueue` and ZERO prior cooperative launches also wedged with the
-identical fingerprint. The actual root cause was a Phase 2'
-deferred-ack protocol deadlock inside the worker (§11.15). The
-6-hour 2026-05-14 chase through bulk-write, VCC/readfirstlane
-hazards, gl0/gl1_inv (silently no-op on gfx11+, §11.14),
-`__threadfence_system`, and 10 GB prior-DMA pressure was all real
-evidence ruling things out, but the conclusion that "Rule 9 fully
-explains it" was incorrect.
+**Status: HISTORICAL-RECORD.** The empirical probe table for the
+cooperative-grid relaunch wedge — including the six MES-side patches
+that failed to clear it, the V0/skeleton reproducer history, and the
+"process exit is only known recovery" finding — has been extracted to
+**mes/MES_PROBE_ARCHIVE.md** for focus. Mechanism remains unidentified;
+§11.15 confirms this is a real separate phenomenon from the immediate-ack
+protocol deadlock.
 
-**Status post-investigation: Rule 9 stands as a separate, real
-phenomenon independent of §11.15.** Verified 2026-05-14 by inspection
-of the V0 skeleton's ack-write code
-(`persistent_worker_skeleton.hip:205-213`): V0 uses **immediate-ack**
-(writes `ack=seq` in the same iteration that processed `seq`). V0's
-trial-2-wedge in cross-launch baseline therefore cannot be the
-deferred-ack deadlock and represents a true relaunch-state
-phenomenon. The negative-probe archive below is the canonical record
-of attempts to clear the relaunch state mid-process; all failed.
-Process exit remains the only known recovery path.
-
-**Wedge fingerprint.** Persistent cooperative kernel polls a host-mapped
-MTYPE_UC `seq_num` field. Host writes `seq=1`; CPU readback confirms
-the write landed in host RAM. Worker's volatile read of the same
-address returns 0 forever. `dmesg` SILENT during wedge. debugfs
-`amdgpu_fence_info` shows fences ADVANCING (gfx + compute) over the
-30s wedge interval — MES scheduling continues normally. The wedge is
-specific to the SECOND-or-later `hipLaunchCooperativeKernel` call's
-FIRST dispatch within a process.
-
-**Verified pattern (rock-solid, 2 complementary tests).**
-
-| Test | Mode | Result |
-|---|---|---|
-| `skeleton_V0` PERSISTENT_KERNEL=1 n=100 | One cooperative kernel, 100 seq increments without exit/relaunch | 100/100 PASS, monotonic `completed_dispatches`=1..100, each dispatch <1ms |
-| `skeleton_V0` default mode n=3 | 3 separate cooperative-kernel launches (launch / dispatch / shutdown / repeat) | trial 1 PASS, trials 2-3 WEDGE with 31s host timeout |
-
-The pattern matches every prior multi-trial wedge run (Designs D-I
-test logs). Wedge is per-process, per-cooperative-kernel-LAUNCH;
-within-kernel dispatch is fine.
-
-**Rule-outs (do not retry).**
-
-User-space probes (15+ from the broader investigation, summary):
-
-| Probe | Result |
-|---|---|
-| `buffer_gl0_inv`, `buffer_gl1_inv` before load | WEDGED |
-| `global_load_b32 ... glc dlc` | WEDGED |
-| `global_atomic_or_b32` with mask 0 | WEDGED |
-| Wide 16-byte load | WEDGED |
-| Inject 128 v_mad cycles between polls | WEDGED |
-| Cache-line isolation (60-byte pad) | WEDGED |
-| CPU `_mm_mfence`, `_mm_clflush + mfence` after write | WEDGED |
-| `hipHostMallocCoherent`, `hipHostRegister` | WEDGED |
-| `mmap(MAP_HUGETLB)` | WEDGED |
-| Fresh mmap (different physical page) | WEDGED |
-| `BENCH_WARMUP=0`, prefill-priming variations | WEDGED |
-| Stream rotation (hipStreamDestroy+hipStreamCreate) | WEDGED |
-| Non-cooperative kernel interleave between trials | WEDGED |
-| 10-100ms zero-queue-delay between trials | WEDGED |
-
-Kernel-side patches (6 attempts; all built and tested against running
-`amdgpu.ko` for gfx1100):
-
-| Design | Mechanism | Result |
-|---|---|---|
-| D | MES MISC NOTIFY_TO_UNMAP_PROCESSES (spec p46) | WEDGE persists; MES processed packets cleanly per dev_info trace |
-| F | MES MISC SET_SHADER_DEBUGGER (per kfd_chardev.c comment "first call clears stale process context") | WEDGE persists; HIP already used the first SHADER_DEBUGGER call at hipInit |
-| G | Raw MES REMOVE_QUEUE + ADD_QUEUE for one HIP queue with `skip_process_ctx_clear=0` override (spec p25) | WEDGE persists; override applied per trace, MES accepted both packets |
-| H | Raw REMOVE-all queues then ADD-all reaching "last gang in process" condition (spec p26) | WEDGE persists; 3 of 3 HIP queues cycled, no MES errors |
-| (TLB flush + H) | Per-PASID heavy `amdgpu_gmc_flush_gpu_tlb_pasid(adev, pasid, 2, true, 0)` matching what fires at process-exit teardown, then Design H | WEDGE persists |
-| (GPU reset via debugfs) | `cat /sys/kernel/debug/dri/0000:XX:00.0/amdgpu_gpu_recover` | NOT tested empirically — would clear wedge but destroys all in-flight work, not viable for production multi-tenant |
-
-**What actually clears at process exit** (per WEDGE_TRACE
-instrumentation, retained as `~/builds/linux-p2p/0011-*.patch` for
-future revival): HIP atexit destructor sends `REMOVE_QUEUE` for each
-of its queues (typically 3 doorbells: 0x1000 / 0x1002 / 0x1004) in
-host_runner process context. Then amdkfd's
-`kfd_process_destroy_pdds` fires in a kworker async context, per-pdd:
-`destroy_cwsr_dgpu` → `destroy_ib_mem` → `fput(drm_file)` (queues
-`amdgpu_vm_fini`) → `kfd_free_process_doorbells` → 2 MES MISC
-`WAIT_REG_MEM` packets (per-PASID TLB flush via
-`gmc_v11_0_flush_gpu_tlb_pasid`) → `proc_ctx_bo` free. Finally
-`amdgpu_vm_fini` runs ×8 in kworker context, batched at the end.
-Replicating each of these mid-process individually does NOT clear the
-wedge. The wedge-clear is likely an emergent property of the full
-teardown sequence, possibly including an amdgpu hung-queue-detection
-path that triggers GPU reset late in teardown.
-
-**Cross-chip-family corroboration.** Framework community thread
-`community.frame.work/t/71364` has 96+ posts of similar MES wedges on
-gfx1103, gfx1150, gfx1152. Mario_Limonciello (AMD) participates;
-`amdgpu.mes=0` is a no-op on gfx11+ (hardcoded
-`adev->enable_mes=true` at `amdgpu_discovery.c:2588`);
-`amdgpu.cwsr_enable=0` helps SOME framework users for ADJACENT wedge
-classes (rejected for our case via empirical reboot test).
-`buffer_wbl2` and `buffer_gl2_inv` are documented absent from gfx11+
-ISA (AMD's own `hsa-rocr-p2p-mtype-uc-gfx11.patch` works around the
-writer-side gap; reader-side has no workaround). Our wedge likely
-shares the same underlying ISA gap class but the per-process latching
-mechanism is firmware-internal.
-
-**Reference artifacts** at
-`~/Projects/ai/exterior_algebra/mes/`:
-- `AMD_MES_specification_April2024.pdf` (54 pages, authoritative)
-- `mes_sch_decompiled.c` / `mes_sch_disasm.s` (942 functions, RV32IMCV)
-- `mes_sch_coop_sites.txt` (7 sites with `andi rd,rs,0x200`
-  cooperative-dispatch-bit check; container function f000aa2c et al)
-- `mes_sch_prime_clear.txt` (43 accesses to offset -0x3dc in MES SRAM
-  per-PASID slot; bit-0 set on cooperative dispatch; clear path at
-  f000ad50 — verified not our wedge mechanism via Design G/H)
-
-**Production pattern that works** (per Rule 9 §5.5): single
-cooperative `persistent_worker` kernel launched at model-init time
-BEFORE any other cooperative-grid activity; route all subsequent
-dispatch types (prefill, decode, etc.) through doorbell + opcode-mux
-in the persistent kernel.
-
-> **2026-05-14 POSTSCRIPT — the "Rule 9 fully explains" conclusion
-> above was wrong.** A standalone reproducer (`kernels/diagnostic/
-> persistent_skeleton_repro/prod_kernel_test`) that loads
-> `megakernel.hsaco`'s `persistent_worker` symbol and dispatches with
-> ZERO prior cooperative launches and ZERO process state also wedged
-> with the identical fingerprint. Rule 9 cannot be the mechanism if a
-> first-coop-launch in a fresh process wedges. The actual root cause
-> was a Phase 2' deferred-ack protocol deadlock in the worker's
-> outer-body code — `ack=last_seq` was written in iter N+1 AFTER iter
-> N+1's inner-poll completion, but the inner-poll required `seq=N+1`
-> which the host wouldn't send before observing `ack=N`. Documented
-> in §11.15 with the canonical fix and the standing regression test.
-> Rule 9 itself (avoid re-launching cooperative kernels) is still
-> valid as a separate architectural guideline; the 100/100 within-
-> lifetime PASS and the 1+N relaunch WEDGE observations support it.
-> But the production wedge braidinfer hit on 2026-05-14 was NOT a
-> Rule 9 violation — it was protocol mis-design that the standalone
-> reproducer also triggers.
-
+See: [mes/MES_PROBE_ARCHIVE.md](./mes/MES_PROBE_ARCHIVE.md)
 ### 11.14 `s_buffer_gl0_inv` / `s_buffer_gl1_inv` silently no-op on gfx11+ (2026-05-14)
 
 **Empirical finding.** During the 2026-05-14 wedge chase, a
