@@ -1722,6 +1722,14 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
     }
     __syncthreads();
 
+    // bd 20fp audit (2026-05-19): src is a non-volatile pointer; ROCm clang
+    // emits a plain global_load (no glc). This is DELIBERATELY-CACHEABLE: the
+    // buffer_gl0_inv + buffer_gl1_inv above explicitly invalidate L0 + L1
+    // before the load, so any stale cached lines from a prior decode step are
+    // discarded. L2 invalidate is not available on gfx1100 (§5.4), and the
+    // worker-consumer pattern relies on the producer's release-store sentinel
+    // (rmsnorm signal_ptr) + this consumer's buffer_gl1_inv pair to bound
+    // staleness. See GFX1100_ARCH.md §11.18 (b)/(d) and §11.19.
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < count) dst[idx] = src[idx];
 

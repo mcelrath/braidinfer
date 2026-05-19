@@ -2059,3 +2059,26 @@ CORRECTION to (g)/(j) above. Prior analysis attributed the cold-start cure to "p
 **No change to (a)-(n)** other than this correction; the falsification cascade and methodology are unchanged. The §11.18 Rule 10 producer-fence hypothesis remains FALSIFIED (Exp 3, 10/30). The unreachable-layer identification (MES μC / memory hub) is unchanged. The shader-side cast-strip fix (b) is unchanged.
 
 **Cross-refs.** bd 4e2m, bd tm5t (corrects framing — "prefill is the cure-step" → "mailbox dispatch is the cure-step; prefill incidentally exercises it"), Commit 1 of Lane C ladder.
+
+**(p) Audit completeness (bd 20fp, 2026-05-19).**
+
+Source-level audit of the ~150 non-flagged `global_load_b64` instructions observed in persistent_worker disasm (per (b) above). Classified by access pattern at the C++ source level rather than per-instruction (the loads are predominantly duplicates of the same source patterns inlined across virtual block iterations and the ~30 op_* helpers).
+
+Categories:
+  1. **LDS reads via `(const FooInst*)inst` casts (~30 sites, dominant).** Every op_* function (op_rmsnorm, op_linear_proj, op_silu, op_moe_gate, op_moe_dispatch, op_moe_ffn_remote, ...) starts with `const FooInst* i = (const FooInst*)inst;`. The `inst` pointer here is the per-pc LDS buffer populated by `mailbox_load_descriptor` (megakernel.hip:203, post-6bd6635). LDS reads are per-CU local; not cross-cache. **PURELY-LOCAL — safe.**
+  2. **Same-GPU VRAM reads (~80 sites).** Weights (`DeviceBuffer<u16>`, `DeviceBuffer<u8>`), scratch buffers, GDN/Mamba2 recurrent state, KV-cache pages — all sit in the worker GPU's own VRAM. **PURELY-LOCAL — safe; cacheable by intent.**
+  3. **Cross-GPU peer-VRAM reads with explicit invalidate (~5 sites).** `op_d2d_copy` at megakernel_ops.hip:1725 reads `src[idx]` from a peer GART/VRAM page; the `buffer_gl0_inv` + `buffer_gl1_inv` pair at lines 1717-1722 explicitly invalidates L0+L1 before the load. **DELIBERATELY-CACHEABLE WITH EXPLICIT INVALIDATE — safe; comment added at the load site in this audit to document why.**
+  4. **Cross-GPU host-mapped UC reads (~10 sites).** `op_moe_dispatch` at megakernel_moe_dispatch.hip:96 (`src_expert_ids[j]`) and `op_moe_ffn_remote` at megakernel_moe.hip:360 (`eids[j]`) read from the gate-output buffer, which is allocated via `MappedHostBuffer::alloc_portable_coherent` and mapped with **MTYPE_UC** per the hsa-rocr-p2p-mtype-uc-gfx11 patch. Hardware bypasses L2 unconditionally for UC pages regardless of the glc bit — the non-volatile load is functionally equivalent to a glc load on these pages. **DELIBERATELY-CACHEABLE-AT-COMPILER-LEVEL-BUT-UNCACHED-AT-HARDWARE — safe.**
+  5. **One flagged-not-migrated cross-cache touch (1 site).** `op_moe_ffn_remote` line 353: `coop_copy(la, act_p2p, gupd, ...)` reads worker activations from GPU 0 peer VRAM. Unlike (3), `coop_copy` does NOT issue an explicit L1 invalidate before the load. Flagged for future investigation. **DO NOT migrate to inline-asm slc without separate experiment** — Exp 1a (§11.19 (c)) established that glc+dlc on the descriptor load did not move the cold-start needle, so the in-stream P2P read may behave similarly. Filed as bd `<followup>` (see cross-refs).
+
+**Counts.** ~30 LDS-cast sites + ~80 own-VRAM + ~5 peer-VRAM-with-invalidate + ~10 UC-hardware-bypass + 1 flagged = ~125 source-level distinct sites; the ~150 disasm instructions reflect that several of these are duplicated across virtual-block iterations and inlined op functions.
+
+**Migrations done in this audit.** Zero new `mailbox_load_descriptor` migrations. The descriptor copy at megakernel.hip:203 was the only host-mapped-UC payload read with stripped volatile, and was migrated in commit 6bd6635 (§11.19 (b)). The remaining sites are either purely-local, explicit-invalidate, or hardware-UC-bypass.
+
+**Comment additions.** One comment added at megakernel_ops.hip:1725 documenting why the non-volatile read in `op_d2d_copy` is safe (relies on explicit buffer_gl0_inv+gl1_inv preceding).
+
+**Audit completeness assertion.** All persistent_worker access patterns from C++ source enumerated. No further cast-strip-class bugs identified. The audit is complete for the purpose of bd 20fp; the one flagged item (coop_copy in op_moe_ffn_remote) is a separate research question (not a known bug) tracked as a follow-up.
+
+**New API category that did NOT emerge.** I expected the audit might reveal a need for a dedicated `peer_vram_load_with_inv<T>` primitive distinct from `mailbox_load_descriptor`. It did not — the explicit-invalidate-before-load pattern is sufficiently localized (only `op_d2d_copy`) that a one-line C++ comment was the right intervention. If more sites adopt the pattern, a typed helper becomes worthwhile; not yet.
+
+**Cross-refs.** bd 20fp (this audit), bd 4e2m, bd 1uak (coop_copy P2P L1-invalidate follow-up), GFX1100_ARCH.md §5.4 / §11.18 / §11.19 (b), commit 6bd6635 (cast-strip fix), this commit (audit + op_d2d_copy comment).
