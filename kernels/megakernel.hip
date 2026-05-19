@@ -5,6 +5,7 @@
 #include "rdna3/rdna3_persistent.h"
 #include "rdna3/rdna3_barrier.h"          // braidinfer::rdna3::atomic_block_barrier
 #include "rdna3/rdna3_persistent_protocol.h"  // canonical poll/ack helper
+#include "rdna3/rdna3_mailbox.h"              // mailbox_load_descriptor (volatile-safe payload read)
 #include "op_profile.h"          // OP_PROFILE_BEGIN/END (no-op when -DBRAIDINFER_OP_PROFILE unset)
 #include "dump.h"                // dump_instruction_output (used by megakernel_dispatch)
 
@@ -199,10 +200,17 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         // post-op barrier, and trace dump.
         for (uint32_t pc = 0; pc < num_inst; pc++) {
             // Copy instruction to shared memory (avoids PCIe reads in virtual block loop)
+            // bd 4e2m / udi #3221: use mailbox_load_descriptor (rdna3_mailbox.h)
+            // to preserve volatile through pointer arithmetic. The prior
+            // `(const u64*)` cast stripped volatile, causing ROCm clang to emit
+            // plain L2-cached global_load_b64 — empirically necessary-but-not-
+            // sufficient correctness fix (closes the cast-strip bug at the
+            // shader level; cold-start race lives below L1/L2, see COHERENCE.md).
             __shared__ u64 sinst[INST_SIZE_WORDS];
-            const u64* src = (const u64*)(queue->inst + pc * INST_SIZE_WORDS);
             if (threadIdx.x < INST_SIZE_WORDS) {
-                sinst[threadIdx.x] = src[threadIdx.x];
+                sinst[threadIdx.x] = braidinfer::rdna3::mailbox_load_descriptor(
+                    &queue->inst[pc * INST_SIZE_WORDS + threadIdx.x]
+                );
             }
             __syncthreads();
             const u64* inst = sinst;

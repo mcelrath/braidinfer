@@ -1132,6 +1132,101 @@ at runtime). Without this, first cross-GPU access on a sleeping GPU has 2-7× hi
 latency as the device wakes up — explains apparent "first-pair anomalies" in cold-start
 sweeps. Tradeoff: ~30 W extra idle power per GPU.
 
+## Cold-start mailbox visibility race (persistent_worker pattern, bd 4e2m)
+
+**Symptom.** With multi-GPU (`-g 4`) MoE models (qwen35_35b_a3b.q4) on gfx1100,
+the first inference after process start has ~40% probability of NaN logits
+(Sig A: argmax-of-NaN collapses to repeated low-id token, typically `!`).
+Once a worker queue triggers the race it stays broken until process reload.
+Sticky per PASID/process. Documented from 2026-04 through 2026-05 across
+the sm16-section-11-18-mitigations branch series.
+
+**Localization.** The race is in the FIRST mailbox transaction per worker
+GPU. Producer is CPU (Rust `write_volatile` to host-mapped UC mailbox in
+`crates/braidinfer-runtime/src/persistent_dispatch.rs::dispatch_batch_fire`);
+consumer is the GPU `persistent_worker` cooperative kernel that copies the
+descriptor from `queue->inst[]` into LDS via global_load_b64.
+
+**Cast-strip bug found and fixed (cleanest source-level finding).** The
+descriptor read at `kernels/megakernel.hip:203` was:
+
+```
+const u64* src = (const u64*)(queue->inst + pc * INST_SIZE_WORDS);
+sinst[threadIdx.x] = src[threadIdx.x];
+```
+
+The `(const u64*)` cast SILENTLY STRIPS the `volatile` qualifier inherited
+from `volatile WorkerQueue* queue`. Disassembly of the resulting persistent_worker
+shows ROCm clang emits a plain L2-cached `global_load_b64` (no glc, no slc,
+no dlc) — there are ~150 such cacheable loads in persistent_worker, all
+descendents of similar casts. Fix: use `braidinfer::rdna3::mailbox_load_descriptor`
+from `kernels/rdna3/rdna3_mailbox.h` (or cast through `const volatile u64*`).
+ROCm clang then emits `flat_load_b64 ... glc dlc` (L0/L1 + L2 invalidate-
+on-load).
+
+**Mechanism: layer below L1/L2 (falsification cascade).** Adding glc+dlc on
+the consumer descriptor load (Exp 1a) gave **16/30 first-attempt clean** —
+within statistical noise of the ~16/30 baseline. CPU-side producer read-back
+between descriptor-write and seq_num-write (Exp 3) gave **10/30** — also
+within noise. Both shader-level (consumer L1/L2 invalidate) and Rust-side
+(producer-side propagation) interventions are falsified. The stale layer
+sits below L1/L2 — most likely the MES μC private cache or memory-hub-level
+state, neither of which exposes an invalidate primitive to userspace shader
+or kernel-mode driver.
+
+**Previously falsified kernel-side interventions (linux-p2p tree).**
+Patches 0014/0014v2 (MQD HDP flush) and 0015/0015v2 (KIQ ACQUIRE_MEM) all
+REGRESSED PASS rate. 0014 series broke HIQ MQD privilege bits; 0015 series
+disrupted MES on concurrent compute via GC L2 invalidate touching in-flight
+worker queues. Reverted upstream. The minimal kernel patch set that earned
+its place is 0012+0013 (proc_ctx_bo + gang_ctx_bo HDP flush) — closes a
+real CPU→DRAM ordering gap; baseline ~60% PASS standalone.
+
+**Cure: warmup-discard (production fix, bd 4e2m commit `a048318`).**
+Run a sacrificial 4-token decode of `"Hello"` immediately after `Model::load`.
+If output is NaN-tail (3+ consecutive `!`), drop+reload the model and retry
+(up to `BRAIDINFER_WARMUP_RETRIES`, default 5). Empirically: 10/10 PASS at
+~680ms cost. The cure-step is **prefill MoE FFN dispatch** (bd tm5t: 30/30
+with just prefill + per-worker mailbox round-trip in 490ms; the 4-step
+decode tail is redundant). Whatever the MES μC or memory-hub layer is, the
+first cross-GPU MoE FFN dispatch through the mailbox per worker GPU drains
+the staleness. Subsequent dispatches are clean for the lifetime of the
+process.
+
+**Temporal autocorrelation curiosity.** N=30 cold-start trials with no
+warmup show clusters (e.g. T16-T24 9-consecutive-clean burst) surrounded
+by failure clusters. Each trial is a fresh process (`launch-gpu.py` wraps
+each invocation), so PASID is recycled. Implies GPU-side state survives
+PASID teardown for some interval — kernel-side queue pool, KFD first-queue
+init cache, or amdgpu scheduler internal state. Not load-bearing for the
+cure but a data point about mechanism geometry.
+
+**Forward defense: rdna3_mailbox.h primitives.** `mailbox_load_descriptor<T>`
+forces volatile-preserving load via a `const volatile T*` parameter. Use
+this primitive (not raw pointer arithmetic + cast) for all CPU→GPU mailbox
+payload reads in this codebase. Prevents future recurrence of the
+cast-strip bug. Zero runtime cost.
+
+**Audit work (deferred, see follow-up bd issue).** Sweep persistent_worker
+for the other ~150 non-flagged global_loads found in disasm; any that crosses
+a producer-consumer cache boundary is a similar latent bug.
+
+**Cross-references.**
+- bd braidinfer-4e2m (top issue, this race)
+- bd braidinfer-tm5t (mailbox warmup experiment, 30/30)
+- bd braidinfer-upxd (rc=134 SIGABRT shutdown bug, separate)
+- linux-p2p patches 0012/0013 (kernel HDP flush; baseline ~60% PASS)
+- linux-p2p patches 0014/0015 series (all FALSIFIED; reverted)
+- This file's "no L2 invalidation on gfx1100" section above (the structural
+  reason buffer_gl2_inv isn't available as a shader-side intervention)
+- `kernels/rdna3/rdna3_persistent.h:40-41` (SYSTEM-scope atomic_load hangs)
+- `kernels/rdna3/rdna3_peer.h:80` (host_uc_store_agent — canonical signal-write)
+- bridge thread (2026-05-19): #3203-#3225 between braidinfer + udi
+
+**Upstream filing TODO.** The mechanism analysis is publishable; even if
+AMD doesn't act, the public record helps anyone else hitting the same wall.
+File on amd-gfx mailing list when bandwidth allows.
+
 ## References
 
 - braidinfer prior P2P commits: `4f56691`, `574b729`, `663731c`
