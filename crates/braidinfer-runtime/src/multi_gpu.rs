@@ -154,13 +154,24 @@ impl MultiGpuContext {
         // P2P-enable phase, keeps any wedge contained to a single early step
         // instead of striking inside the per-worker push loop below where
         // partial state is harder to clean up.
-        for i in 0..num_devices {
+        //
+        // ud #3174: env BRAIDINFER_REVERSE_INIT swaps the warm-up iteration
+        // order to discriminate KFD per-PASID first-queue init vs HIP queue
+        // index as the source of the first-worker NaN latch. Workers vec
+        // indexing remains 0..N (HIP-id-aligned); only the KFD touch order
+        // is swapped.
+        let warm_iter: Vec<usize> = if std::env::var("BRAIDINFER_REVERSE_INIT").is_ok() {
+            (0..num_devices).rev().collect()
+        } else {
+            (0..num_devices).collect()
+        };
+        for &i in &warm_iter {
             let _guard = DeviceGuard::switch_to(DeviceId(i as u32))?;
             let warm = Stream::new(DeviceId(i as u32))?;
             warm.synchronize()?;
             // warm drops here -> hipStreamDestroy
         }
-        eprintln!("Multi-GPU: HWQ warm-up complete on {num_devices} devices");
+        eprintln!("Multi-GPU: HWQ warm-up complete on {num_devices} devices (order={warm_iter:?})");
 
         // Create workers for each device
         let mut workers = Vec::with_capacity(num_devices);

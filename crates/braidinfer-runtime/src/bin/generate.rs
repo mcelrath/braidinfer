@@ -80,6 +80,69 @@ fn main() {
     eprintln!("max_seq_len: {}", model.config().max_seq_len);
     eprintln!("stop tokens: {:?}", token_config.eos_token_ids);
 
+    // bd 4e2m / udi #3203: warmup-discard. Run a 4-token sacrificial decode to
+    // detect Sig A queue-init NaN (cold-start KFD per-PASID first-queue init
+    // produces ~40% NaN-corrupted first-decode). If detected, drop+reload model
+    // and retry; max BRAIDINFER_WARMUP_RETRIES retries before exiting with error.
+    // Skip via BRAIDINFER_WARMUP_SKIP=1.
+    let max_warmup_retries: usize = std::env::var("BRAIDINFER_WARMUP_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let warmup_skip = std::env::var("BRAIDINFER_WARMUP_SKIP").is_ok();
+    let warmup_start = Instant::now();
+    let mut warmup_attempts: usize = 0;
+    if !warmup_skip {
+        loop {
+            warmup_attempts += 1;
+            let test = greedy_generate(&mut model, &tokenizer, &token_config, "Hello", 4);
+            let dirty = match &test {
+                Ok(r) => {
+                    let concat: String = r.text_pieces.iter().cloned().collect();
+                    // Sig A signature: NaN logits collapse to argmax of NaN array,
+                    // producing repeated low-id token (often "!" in tokenizer).
+                    let bang_run = concat
+                        .chars()
+                        .rev()
+                        .take_while(|c| *c == '!')
+                        .count();
+                    bang_run >= 3
+                }
+                Err(_) => true,
+            };
+            if !dirty {
+                eprintln!(
+                    "warmup-discard: clean after {warmup_attempts} attempt(s) in {:.2}s",
+                    warmup_start.elapsed().as_secs_f64()
+                );
+                break;
+            }
+            if warmup_attempts >= max_warmup_retries {
+                eprintln!(
+                    "ERROR: warmup-discard failed {} attempts ({:.2}s); exiting with NaN-detected code 100",
+                    max_warmup_retries,
+                    warmup_start.elapsed().as_secs_f64()
+                );
+                std::process::exit(100);
+            }
+            eprintln!(
+                "warmup-discard NaN-detected, retry {}/{} ({:.2}s elapsed)",
+                warmup_attempts, max_warmup_retries,
+                warmup_start.elapsed().as_secs_f64()
+            );
+            // Drop + reload to recreate KFD queues with fresh PASID init.
+            drop(model);
+            model = Model::load_with_max_seq_len(model_dir, device, max_seq_len)
+                .expect("reload model after warmup-discard");
+            if multi_gpu {
+                if let Err(e) = model.enable_multi_gpu() {
+                    eprintln!("ERROR: enable_multi_gpu failed on warmup-discard reload: {e:?}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
     let start = Instant::now();
     let result = if raw_mode {
         greedy_generate(&mut model, &tokenizer, &token_config, &prompt, max_tokens)

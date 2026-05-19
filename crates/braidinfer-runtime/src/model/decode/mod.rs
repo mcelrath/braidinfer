@@ -509,20 +509,26 @@ impl Model {
         }
         self.set_position(position).map_err(ModelError::Hip)?;
 
-        // β'''' sentinel reset (bd braidinfer-sm16): zero the per-attn-layer
-        // sequence buffer so producers write `1` and consumers wait-for `1`
-        // on each layer of this decode step. Writes are CPU-side to a
-        // host-mapped UC buffer — no GPU touch.
-        unsafe {
-            std::ptr::write_bytes(
-                self.activations.normed_seq.host_ptr() as *mut u8,
-                0u8,
-                self.activations.normed_seq.len() * std::mem::size_of::<u32>(),
-            );
+        // β'''' sentinel monotonic-seq (bd braidinfer-sm16, udi #3189): use
+        // per-step monotonic value (position+1) so no CPU reset is needed.
+        // Avoids the race where CPU 0-write to normed_seq doesn't drain to
+        // peer-GPU UTCL2 before workers spin-wait → workers saw stale 1
+        // from prior step → exited spin too early → read stale normed_stage
+        // → all-workers simultaneous NaN at later pos (Sig B canonical T6).
+        // Patch producer D2dCopy signal_seq at each attn flush boundary.
+        let seq_value = (position as u64) + 1;
+        let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
+        let boundaries: Vec<usize> = mk
+            .multi_gpu_attn_boundaries
+            .iter()
+            .map(|(flush_idx, _)| *flush_idx)
+            .collect();
+        for flush_idx in &boundaries {
+            // D2dCopyInst layout: words[7] = signal_seq (see instructions.rs).
+            mk.instructions[*flush_idx].words[7] = seq_value;
         }
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
-        let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
         mk.update_step_host_only(token_id, position)?;
         let n_inst = mk.instructions.len();
         mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
@@ -864,9 +870,11 @@ impl Model {
                     let normed_seq_slot = unsafe {
                         (self.activations.normed_seq.device_ptr() as *const u32).add(attn_i)
                     };
+                    // β'''' monotonic seq: wait for (position+1) per #3189
+                    let wait_value = (position as u32) + 1;
                     batch.push(
                         D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32)
-                            .with_wait(normed_seq_slot, 1)
+                            .with_wait(normed_seq_slot, wait_value)
                             .into_inst()
                     );
                 }
@@ -1048,6 +1056,29 @@ impl Model {
                 self.persistent_workers.as_mut().unwrap();
             let seq = dispatch.dispatch_batch_fire(gpu_i, &batch);
             seq_nums.push((gpu_i, seq));
+            // β'''' diagnostic probes (ea #3147, post-reboot timing test):
+            // BRAIDINFER_RACE_PROBE=1 blocks host on GPU 0 batch ack before
+            // workers dispatch — adds synchronization (not just delay).
+            // BRAIDINFER_USLEEP_PROBE=N adds an N-microsecond sleep after GPU 0
+            // dispatch — pure timing delay without ack semantics.
+            // Both env-gated, off by default. Diagnostic only; not shippable.
+            if gpu_i == 0 {
+                if std::env::var("BRAIDINFER_RACE_PROBE").is_ok() {
+                    let dispatch_ro: &dyn BatchDispatcher =
+                        self.persistent_workers.as_ref().unwrap();
+                    dispatch_ro.wait_ack(0, seq);
+                }
+                if let Ok(us) = std::env::var("BRAIDINFER_USLEEP_PROBE")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|us| Result::<u64, ()>::Ok(us))
+                    .unwrap_or(Ok(0))
+                {
+                    if us > 0 {
+                        std::thread::sleep(std::time::Duration::from_micros(us));
+                    }
+                }
+            }
         }
 
         // Wait for all GPUs' dispatchers to complete attention.
@@ -1060,16 +1091,22 @@ impl Model {
         // Per-layer snapshot (BRAIDINFER_DECODE_MIRROR + first decode step
         // + first attn layer). Surfaces whether worker.attn_normed differs
         // from CPU-view of normed_stage — diagnosing L2-staleness on read.
-        if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_some() && attn_i == 0 {
+        // bd 4e2m sig-B-upstream probe (udi #3197): instrument ALL attn layers
+        // (not just attn_i==0) to find FIRST layer where normed_stage(CPU-view)
+        // first turns NaN. attn_i==0 alone catches downstream propagation but
+        // misses which attn layer originated the NaN.
+        let all_attn = std::env::var("BRAIDINFER_DECODE_MIRROR_ALL_ATTN").is_ok();
+        if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_some() && (attn_i == 0 || all_attn) {
             let normed_stage_host: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(
                     self.activations.normed_stage.host_ptr() as *const f32,
                     hs,
                 )
             }.to_vec();
-            self.decode_mirror_snapshot(&format!("attn0-post-ack pos={position}"), position);
+            let label = format!("attn{attn_i}-post-ack pos={position}");
+            self.decode_mirror_snapshot(&label, position);
             if let Some(mirror) = self.decode_mirror.as_ref() {
-                mirror.print_stats_with_normed_stage(&format!("attn0-post-ack pos={position}"), position, &normed_stage_host);
+                mirror.print_stats_with_normed_stage(&label, position, &normed_stage_host);
             }
         }
 
