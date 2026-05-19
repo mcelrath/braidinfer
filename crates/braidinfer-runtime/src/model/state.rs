@@ -1119,12 +1119,17 @@ impl Model {
         use crate::megakernel::instructions::D2dCopyInst;
         use braidinfer_hip::memory::MappedHostBuffer;
 
+        // bd 4e2m Lane 1 D1 (revised): mailbox-only warmup only applies to
+        // multi-GPU mode. Single-GPU mode has no cross-GPU mailbox race
+        // (no peer reads), and spawning the persistent_worker BEFORE prefill
+        // breaks prefill's lazy paged-KV init (prefill_paged uses hipMemcpy
+        // which deadlocks once a cooperative kernel is holding all CUs).
+        // For single-GPU, the caller should fall back to full-decode warmup.
+        if self.multi_gpu.is_none() {
+            return Err("single-gpu-fallback".into());
+        }
+
         let t_spawn = std::time::Instant::now();
-        // Bring up all persistent workers without running prefill:
-        //   - ensure_moe_workers_started (idempotent): spawns GPUs 1..N-1
-        //     for MoE models; no-op for non-MoE or single-GPU.
-        //   - init_multi_gpu_persistent: spawns GPU 0 (and creates a fresh
-        //     PersistentDispatch in the non-MoE case).
         self.ensure_moe_workers_started()
             .map_err(|e| format!("ensure_moe_workers_started: {e:?}"))?;
         self.init_multi_gpu_persistent()

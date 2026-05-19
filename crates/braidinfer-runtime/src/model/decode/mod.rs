@@ -379,6 +379,7 @@ impl Model {
 
     pub(crate) fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
+        let _ = PersistentDispatch::init; // silence unused import in single-gpu-skip path
 
         let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
         let moe_worker_shared_mem = 1024u32 * 4 + 256;

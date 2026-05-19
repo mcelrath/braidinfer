@@ -2082,3 +2082,38 @@ Categories:
 **New API category that did NOT emerge.** I expected the audit might reveal a need for a dedicated `peer_vram_load_with_inv<T>` primitive distinct from `mailbox_load_descriptor`. It did not — the explicit-invalidate-before-load pattern is sufficiently localized (only `op_d2d_copy`) that a one-line C++ comment was the right intervention. If more sites adopt the pattern, a typed helper becomes worthwhile; not yet.
 
 **Cross-refs.** bd 20fp (this audit), bd 4e2m, bd 1uak (coop_copy P2P L1-invalidate follow-up), GFX1100_ARCH.md §5.4 / §11.18 / §11.19 (b), commit 6bd6635 (cast-strip fix), this commit (audit + op_d2d_copy comment).
+
+**(q) Production state as of 2026-05-19 — mailbox-only default with single-GPU fallback. Plus D1 v1 deadlock lesson and INV_GART kernel-patch falsification.**
+
+**Default warmup behavior.** `BRAIDINFER_WARMUP_MODE` defaults to `mailbox-only`:
+  - True multi-GPU MoE: spawn persistent workers (via `ensure_moe_workers_started` + `init_multi_gpu_persistent`, both `pub(crate)`), dispatch one `OP_D2D_COPY` of 4 floats per worker mailbox + verify via host-mapped UC round-trip. ~320ms cold-start cost (mostly worker spawn ~318ms; dispatch ~1.5ms). 30/30 first-attempt-clean on qwen35_35b_a3b.q4 -g 4 + qwen36_35b_a3b.q4 -g 4.
+  - Single-GPU (incl. apply_auto_modes-selected single-GPU even with `-g N>1` requested): `minimal_mailbox_warmup_no_prefill` returns `Err("single-gpu-fallback")` early; `generate.rs` falls back inline to `greedy_generate("Hello", 4)` (the prior full-decode warmup). Behavior identical to pre-flip default for these configs. 10/10 first-attempt-clean across qwen35_27b -g 2 dense, qwen36_27b -g 4 dense, nemotron_cascade_30b -g 4 (all auto-selected single-GPU). The race itself does not manifest in single-GPU mode (no cross-GPU mailbox reads), so the fallback is a safety net for the single-process invariant.
+
+Env opt-outs (preserved):
+  - `BRAIDINFER_WARMUP_MODE=full-decode` — force full-decode warmup on all configs (prior default).
+  - `BRAIDINFER_WARMUP_SKIP=1` — skip warmup entirely (diagnostic / testing only; cold-start race remains unprotected).
+  - `BRAIDINFER_WARMUP_RETRIES=N` — max retries per cold-start before exit-100 (default 5).
+
+**D1 v1 deadlock lesson (preserved for future contributors).** First attempt at single-GPU mailbox-only warmup (Lane 1 D1 v1) extended `init_multi_gpu_persistent` to handle the `multi_gpu == None` case by allocating a single-slot `PersistentDispatch` for GPU 0 and spawning its persistent_worker. This APPEARED clean: 10/10 trials decode-coherent, mailbox round-trip ~600µs, no NaN. BUT every trial exited rc=1 with `panic at decode/mod.rs:59: 'Option::unwrap() on a None value'`. Root cause: the persistent worker holds all CUs on GPU 0 once launched. The subsequent user prompt's `prefill` saw `persistent_workers.is_some() && !has_moe` and routed AROUND `prefill_paged` — which is the ONLY init path that lazily populates `paged_seq` / `page_allocator` / `megakernel_paged`. `decode_step_persistent` then panicked unwrapping `paged_seq`. The fundamental conflict: `prefill_paged` uses `hipMemcpy` to populate paged chunks, and `hipMemcpy` deadlocks once a cooperative kernel is holding all CUs. So spawning the worker before prefill is mutually exclusive with the existing init flow.
+
+**D1 v2 resolution (current commit).** Sentinel-based fallback: `minimal_mailbox_warmup_no_prefill` returns `Err("single-gpu-fallback")` when `multi_gpu.is_none()`. `generate.rs` detects the sentinel and runs `greedy_generate("Hello", 4)` inline. No worker spawn before prefill; no `hipMemcpy` deadlock; behavior identical to pre-flip for single-GPU configs.
+
+**Forward lesson:** spawning the persistent worker BEFORE prefill is architecturally incompatible with the current paged-KV lazy-init pattern on this codebase. If a future contributor wants to unify warmup further, the path is to refactor `prefill_paged` to use cooperative-kernel dispatch instead of `hipMemcpy` (significant work), not to spawn the worker earlier.
+
+**INV_GART kernel-patch experiment — FALSIFIED at MES firmware level (2026-05-19, linux-p2p tree).** Sub-agent investigation surfaced `MESAPI_MISC__INV_GART` opcode declared in `mes_v11_api_def.h:574` with no caller anywhere in amdgpu. `kfd_chardev.c:2814-2820` has AMD's own comment naming "stale process context data saved in MES" as a known phenomenon with `SET_SHADER_DEBUGGER` as workaround — matches our cold-start race 1:1.
+
+Kernel patch (in linux-p2p tree): new `amdgpu_mes_inv_gart()` wrapper + `MES_MISC_OP_INV_GART` enum + `mes_v11_0_misc_op` case + call from `add_queue_mes` gated on `qpd->queue_count == 0` (first queue per PASID per device). Built clean. Symbol `amdgpu_mes_inv_gart` confirmed in `/proc/kallsyms` after install.
+
+N=30 cold-start qwen35_35b_a3b.q4 -g 4 BRAIDINFER_WARMUP_SKIP=1:
+  - decode-clean:   **10/30** (WORSE than baseline ~16/30)
+  - dmesg lines matching "MES failed to respond" or "MES might be in unrecoverable state": **351**
+  - Process crashes (rc=250): **3/30**
+  - Zero `amdgpu_mes_inv_gart failed` advisories (the call ITSELF didn't return error; the failure cascades downstream in MES firmware)
+
+Pattern matches the previously falsified linux-p2p 0014/0015 series: invalidate-MES-state interventions disrupt the firmware when called concurrently with in-flight queue management. The fact that the call is gated on first-queue-per-PASID doesn't help — PASIDs are recycled across processes and MES is concurrently servicing other compute queues across all 4 GPUs.
+
+**Falsification verdict:** the `MESAPI_MISC__INV_GART` opcode as currently exposed on gfx11/MES1 firmware causes an MES unrecoverable-state cascade. AMD's reason for shipping-the-opcode-but-not-wiring-it is now empirical fact. Kernel patch reverted; production kernel runs 0012+0013 only.
+
+**Upstream amd-gfx filing TODO (highest-value forward action).** Subject: "MESAPI_MISC__INV_GART opcode causes MES unrecoverable-state cascade on gfx11/MES1 when called from add_queue_mes". Include: motivation from `kfd_chardev.c:2814` + observable cold-start NaN race; approach (wire INV_GART); result (351 MES failures + 3 crashes on 30-trial run); reproducer (braidinfer cold-start with `BRAIDINFER_WARMUP_SKIP=1` + the patch); question to AMD (is INV_GART intended safe-to-call from `add_queue_mes`, or firmware-side broken; if latter, what IS the correct path to clear MES per-PASID cached state on first-queue setup).
+
+**Cross-refs.** bd 4e2m (top), bd 20fp / 1uak / 1i1c / iwn0 (follow-ups), this commit, linux-p2p tree (INV_GART patch reverted but preserved in branch history for upstream filing reference), bridge thread #3239-#3257.

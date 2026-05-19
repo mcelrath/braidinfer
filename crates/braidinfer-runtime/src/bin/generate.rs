@@ -96,17 +96,35 @@ fn main() {
     if !warmup_skip {
         loop {
             warmup_attempts += 1;
-            let dirty = if warmup_mode == "mailbox-only" {
-                // bd 4e2m Lane C Exp 1: skip-prefill minimal-mailbox warmup.
-                // Spawn workers without running prefill, dispatch one
-                // OP_D2D_COPY per live worker mailbox, verify round-trip.
-                // Tests whether prefill is load-bearing for the cold-start
-                // cure or whether a single mailbox transaction per worker
-                // suffices.
+            let mailbox_fallback_to_decode = std::cell::Cell::new(false);
+            // bd 4e2m / udi #3257: mailbox-only is DEFAULT as of this commit
+            // (~320ms cold-start vs ~680ms full-decode). Opt out via
+            // BRAIDINFER_WARMUP_MODE=full-decode. Single-GPU mode auto-
+            // falls back to full-decode warmup via "single-gpu-fallback"
+            // sentinel (no race in single-GPU; spawning a worker before
+            // prefill would also break the lazy paged-KV init).
+            let use_mailbox = warmup_mode != "full-decode";
+            let dirty = if use_mailbox {
                 match model.minimal_mailbox_warmup_no_prefill() {
                     Ok(diag) => {
                         eprintln!("warmup-mailbox-only attempt {warmup_attempts}: OK — {diag}");
                         false
+                    }
+                    Err(diag) if diag == "single-gpu-fallback" => {
+                        eprintln!("warmup-mailbox-only attempt {warmup_attempts}: single-GPU mode — falling back to full-decode warmup");
+                        mailbox_fallback_to_decode.set(true);
+                        // Fall through to full-decode below via re-entry on next iteration
+                        // — but we don't want to count this as a "dirty" attempt.
+                        // Instead, run greedy_generate inline here.
+                        let test = greedy_generate(&mut model, &tokenizer, &token_config, "Hello", 4);
+                        match &test {
+                            Ok(r) => {
+                                let concat: String = r.text_pieces.iter().cloned().collect();
+                                let bang_run = concat.chars().rev().take_while(|c| *c == '!').count();
+                                bang_run >= 3
+                            }
+                            Err(_) => true,
+                        }
                     }
                     Err(diag) => {
                         eprintln!("warmup-mailbox-only attempt {warmup_attempts}: FAIL — {diag}");
