@@ -2041,3 +2041,21 @@ Falsification cascade discipline for cross-GPU coherence bugs on gfx1100 (or any
 5. **Document falsified hypotheses explicitly.** Save future investigators from re-running the same dead-ends. Failure record IS load-bearing artifact.
 
 This is the "tractor squashing grape" failsafe — if you go through this cascade and reach an unreachable layer, you know it's an unreachable layer, not a "we didn't try hard enough" answer.
+
+**(o) Cure is at the dispatch layer, not the prefill layer (Exp 1, 2026-05-19, commit 5a89a64+1).**
+
+CORRECTION to (g)/(j) above. Prior analysis attributed the cold-start cure to "prefill MoE FFN dispatch" because bd tm5t showed 30/30 PASS with prefill + mailbox round-trip. That framing was wrong-direction: the load-bearing step was the MAILBOX DISPATCH itself, not prefill specifically. Prefill was incidentally exercising one mailbox transaction per worker per layer.
+
+**Exp 1 (Lane C, skip-prefill warmup, N=30):**
+  - Refactor: `Model::ensure_moe_workers_started` and `init_multi_gpu_persistent` exposed as `pub(crate)`. New `Model::minimal_mailbox_warmup_no_prefill` brings up all persistent workers (no prefill, no model forward pass) and dispatches ONE OP_D2D_COPY of 4 floats per worker mailbox + verifies the round-trip via host-mapped UC.
+  - Gate: `BRAIDINFER_WARMUP_MODE=mailbox-only` (opt-in in Commit 1; default flip planned for Commit 2 after user spot-checks other model configs).
+  - Result: 30/30 first-attempt-clean. WARN-NaN: 0/30. rc=0 (clean exit) 30/30.
+  - Cost: spawn ~318ms (irreducible — MegakernelProgram::compile_multi_gpu_p2p + cooperative kernel launch) + dispatch ~1.5ms total for 4 workers. ~320ms total vs ~680ms for full-decode warmup. **54% faster cold-start.**
+
+**Implication.** The 1.5ms dispatch is the actual cure. The ~318ms spawn time is unavoidable startup. Prefill (which previously fronted the warmup) was decoration — it exercised the same mailbox transactions but did 50+ ops worth of forward-pass overhead doing so. The cure-step is ANY mailbox dispatch through a fresh worker; the FIRST transaction per worker is the load-bearing event.
+
+**Updated mechanism narrative.** Whatever the MES μC / memory-hub state is, it gets primed by the FIRST mailbox transaction the worker consumes after `ADD_QUEUE`. The transaction's payload contents don't matter (an OP_D2D_COPY with sentinel data suffices); only the mailbox-poll → descriptor-fetch → ack-write round-trip matters. Per-worker primer dispatches in 250-700µs.
+
+**No change to (a)-(n)** other than this correction; the falsification cascade and methodology are unchanged. The §11.18 Rule 10 producer-fence hypothesis remains FALSIFIED (Exp 3, 10/30). The unreachable-layer identification (MES μC / memory hub) is unchanged. The shader-side cast-strip fix (b) is unchanged.
+
+**Cross-refs.** bd 4e2m, bd tm5t (corrects framing — "prefill is the cure-step" → "mailbox dispatch is the cure-step; prefill incidentally exercises it"), Commit 1 of Lane C ladder.

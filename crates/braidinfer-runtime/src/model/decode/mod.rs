@@ -160,7 +160,7 @@ impl Model {
     /// Lazily start MoE expert workers (GPUs 1-3) without launching the GPU 0 decode
     /// persistent cooperative kernel. Safe to call during prefill (no cooperative kernel
     /// running on GPU 0 yet, so hipMalloc is allowed).
-    pub(super) fn ensure_moe_workers_started(&mut self) -> Result<(), ModelError> {
+    pub(crate) fn ensure_moe_workers_started(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
         if self.moe_p2p.is_some() {
             return Ok(());
@@ -377,7 +377,7 @@ impl Model {
         }
     }
 
-    fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
+    pub(crate) fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
 
         let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;

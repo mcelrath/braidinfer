@@ -1098,4 +1098,102 @@ impl Model {
         }
         Ok(())
     }
+
+    /// Lane C Exp 1 / bd 4e2m: bring up persistent workers without running
+    /// prefill, then dispatch one OP_D2D_COPY per live worker mailbox and
+    /// verify the round-trip via host-mapped UC buffers.
+    ///
+    /// Returns Ok(per-worker-timing-string) on full success; Err(diagnostic)
+    /// when any worker's verify fails. Caller is expected to drop+reload the
+    /// Model on Err (same retry shape as full-decode warmup-discard).
+    ///
+    /// Goal: test whether prefill (which exercises MoE FFN dispatch through
+    /// each worker's mailbox repeatedly per layer) is load-bearing for the
+    /// cold-start cure, or whether a SINGLE op_d2d_copy round-trip per worker
+    /// is sufficient. If 30/30 with sub-100ms cost: prefill is overkill and
+    /// minimal-mailbox alone is the cure. If <30/30: prefill is doing more
+    /// than just first-mailbox-transaction warming.
+    ///
+    /// Gated by BRAIDINFER_WARMUP_MODE=mailbox-only in generate.rs.
+    pub fn minimal_mailbox_warmup_no_prefill(&mut self) -> Result<String, String> {
+        use crate::megakernel::instructions::D2dCopyInst;
+        use braidinfer_hip::memory::MappedHostBuffer;
+
+        let t_spawn = std::time::Instant::now();
+        // Bring up all persistent workers without running prefill:
+        //   - ensure_moe_workers_started (idempotent): spawns GPUs 1..N-1
+        //     for MoE models; no-op for non-MoE or single-GPU.
+        //   - init_multi_gpu_persistent: spawns GPU 0 (and creates a fresh
+        //     PersistentDispatch in the non-MoE case).
+        self.ensure_moe_workers_started()
+            .map_err(|e| format!("ensure_moe_workers_started: {e:?}"))?;
+        self.init_multi_gpu_persistent()
+            .map_err(|e| format!("init_multi_gpu_persistent: {e:?}"))?;
+        let spawn_ms = t_spawn.elapsed().as_secs_f64() * 1000.0;
+
+        let dispatch = self
+            .persistent_workers
+            .as_mut()
+            .ok_or_else(|| "no persistent_workers after spawn".to_string())?;
+
+        let gpu_count = dispatch.workers.len();
+        let live: Vec<usize> = (0..gpu_count).filter(|&i| dispatch.has_worker(i)).collect();
+        if live.is_empty() {
+            return Err("no live workers after spawn".into());
+        }
+
+        let src: MappedHostBuffer<f32> = MappedHostBuffer::alloc_portable_coherent(4)
+            .map_err(|e| format!("alloc src: {e:?}"))?;
+        let mut dst: MappedHostBuffer<f32> = MappedHostBuffer::alloc_portable_coherent(4)
+            .map_err(|e| format!("alloc dst: {e:?}"))?;
+
+        let expected = [1.0f32, 2.0, 3.0, 4.0];
+        unsafe {
+            std::slice::from_raw_parts_mut(src.host_ptr(), 4).copy_from_slice(&expected);
+        }
+        let sentinel = f32::from_bits(0xDEADBEEFu32);
+
+        let mut diag = Vec::new();
+        let mut per_worker = Vec::new();
+        let t_dispatch = std::time::Instant::now();
+        for &gpu_idx in &live {
+            unsafe {
+                for x in std::slice::from_raw_parts_mut(dst.host_ptr(), 4) {
+                    *x = sentinel;
+                }
+            }
+            let inst = D2dCopyInst::new(1, dst.as_mut_ptr(), src.device_ptr() as *const f32, 4)
+                .into_inst();
+            let t_one = std::time::Instant::now();
+            let seq = dispatch.dispatch_batch_fire(gpu_idx, &[inst]);
+            dispatch.wait_ack(gpu_idx, seq);
+            let one_us = t_one.elapsed().as_micros();
+            let got: [f32; 4] = unsafe {
+                let s = std::slice::from_raw_parts(dst.host_ptr(), 4);
+                [s[0], s[1], s[2], s[3]]
+            };
+            if got != expected {
+                diag.push(format!(
+                    "gpu{}: got [{:e},{:e},{:e},{:e}] want [1,2,3,4]",
+                    gpu_idx, got[0], got[1], got[2], got[3]
+                ));
+            }
+            per_worker.push(format!("gpu{}={}us", gpu_idx, one_us));
+        }
+        let dispatch_ms = t_dispatch.elapsed().as_secs_f64() * 1000.0;
+
+        if !diag.is_empty() {
+            return Err(format!(
+                "spawn={:.1}ms; {}",
+                spawn_ms,
+                diag.join("; ")
+            ));
+        }
+        Ok(format!(
+            "spawn={:.1}ms dispatch={:.2}ms [{}]",
+            spawn_ms,
+            dispatch_ms,
+            per_worker.join(",")
+        ))
+    }
 }

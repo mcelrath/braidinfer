@@ -90,25 +90,41 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
     let warmup_skip = std::env::var("BRAIDINFER_WARMUP_SKIP").is_ok();
+    let warmup_mode = std::env::var("BRAIDINFER_WARMUP_MODE").unwrap_or_default();
     let warmup_start = Instant::now();
     let mut warmup_attempts: usize = 0;
     if !warmup_skip {
         loop {
             warmup_attempts += 1;
-            let test = greedy_generate(&mut model, &tokenizer, &token_config, "Hello", 4);
-            let dirty = match &test {
-                Ok(r) => {
-                    let concat: String = r.text_pieces.iter().cloned().collect();
-                    // Sig A signature: NaN logits collapse to argmax of NaN array,
-                    // producing repeated low-id token (often "!" in tokenizer).
-                    let bang_run = concat
-                        .chars()
-                        .rev()
-                        .take_while(|c| *c == '!')
-                        .count();
-                    bang_run >= 3
+            let dirty = if warmup_mode == "mailbox-only" {
+                // bd 4e2m Lane C Exp 1: skip-prefill minimal-mailbox warmup.
+                // Spawn workers without running prefill, dispatch one
+                // OP_D2D_COPY per live worker mailbox, verify round-trip.
+                // Tests whether prefill is load-bearing for the cold-start
+                // cure or whether a single mailbox transaction per worker
+                // suffices.
+                match model.minimal_mailbox_warmup_no_prefill() {
+                    Ok(diag) => {
+                        eprintln!("warmup-mailbox-only attempt {warmup_attempts}: OK — {diag}");
+                        false
+                    }
+                    Err(diag) => {
+                        eprintln!("warmup-mailbox-only attempt {warmup_attempts}: FAIL — {diag}");
+                        true
+                    }
                 }
-                Err(_) => true,
+            } else {
+                let test = greedy_generate(&mut model, &tokenizer, &token_config, "Hello", 4);
+                match &test {
+                    Ok(r) => {
+                        let concat: String = r.text_pieces.iter().cloned().collect();
+                        // Sig A signature: NaN logits collapse to argmax of NaN array,
+                        // producing repeated low-id token (often "!" in tokenizer).
+                        let bang_run = concat.chars().rev().take_while(|c| *c == '!').count();
+                        bang_run >= 3
+                    }
+                    Err(_) => true,
+                }
             };
             if !dirty {
                 eprintln!(
