@@ -2,27 +2,76 @@
 
 Practical reference for `gfx1100` (RDNA3 / Navi 31) in Composable Kernel and braidinfer. Two halves: a performance-tuning guide for kernel authors, and a load-bearing **correctness ruleset** (§5.3–§5.5) for multi-agent / persistent-kernel code on this arch.
 
+## Status as of 2026-05-19
+
+The following are the currently load-bearing operational facts for any
+new code on gfx1100 multi-GPU. Read these BEFORE doing anything else:
+
+1. **§5.5 Rule 1 (a-d)** — Canonical cross-agent allocation. Every
+   cross-GPU buffer MUST be allocated per one of the four sub-rules.
+   [CURRENT]
+2. **§5.5 Rule 9** — One cooperative kernel per process lifetime. No
+   relaunch. Mechanism unknown but reproducible; recovery = process exit.
+   [CURRENT]
+3. **§11.15** — Immediate-ack protocol mandatory for persistent_worker
+   mailbox. Deferred-ack pattern (Phase 2') causes protocol deadlock.
+   [CURRENT]
+4. **§11.19** — Cold-start mailbox warmup-dispatch is the production
+   cure for the gfx1100 multi-GPU first-mailbox-transaction NaN race
+   (bd 4e2m). Production default since commit 8e3bad9. [CURRENT]
+5. **Rule 10 (producer-fence)** — FALSIFIED. Do not re-propose. The
+   §11.18 producer-fence-via-fence_device hypothesis was empirically
+   refuted by Exp 3 (CPU producer read-back, 10/30 PASS = baseline).
+   See §11.19 for the falsification cascade. [FALSIFIED]
+
+Beyond these five, the rest of the document is reference material
+(perf bench, history, falsified hypotheses preserved for record).
+TOC entries below are tagged with status flags:
+  [CURRENT]            — load-bearing today
+  [SUPERSEDED-by-§N.M] — replaced by a newer section
+  [FALSIFIED-by-§N.M]  — hypothesis tested and refuted
+  [HISTORICAL-RECORD]  — preserved for context, not load-bearing
+
+---
+
 ## Table of contents
 
-| § | Topic | When to read |
-|---|---|---|
-| 1 | Why this document exists | Once, at onboarding |
-| 2 | Architectural quick facts | Reference |
-| 3 | Execution model & wave mechanics | Designing wave/block shapes |
-| 4 | WMMA programming model | Writing any matmul / attention kernel |
-| 5.0–5.2 | Memory hierarchy & cache hints (perf) | Tuning a kernel for bandwidth/latency |
-| 5.3 | Cross-GPU peer coherence (**correctness**) | **Any** code that crosses GPU boundaries |
-| 5.4 | L2 staleness — mechanism (**correctness**) | Understanding why §5.5 rules exist |
-| **5.5** | **Authoring deterministic multi-agent code — ruleset** | **Mandatory before writing or reviewing any multi-agent / persistent-kernel code.** Contains decision tree (Rule 1), antipatterns lookup, MTYPE audit code template, PR checklist, and 5 more rules including Rule 9 (cooperative-grid relaunch wedge — one cooperative kernel per process lifetime). |
-| 6 | Kernel design patterns in CK | Implementing a CK instance |
-| 7 | Testing, profiling, validation | Sprint setup |
-| 8 | Tooling tips | Day-to-day |
-| 9 | Implementation checklist | Pre-merge gate |
-| 10 | CK vs rocWMMA comparison — moved to `CK_vs_rocWMMA.md` | Choosing between libraries (sibling doc) |
-| 11 | Empirical measurements (braidinfer 2026) | Bench archive — cite when tuning |
-| 11.4 | Grid-wide barrier benchmark + PCIe-write-before-barrier HAZARD | When in doubt about a multi-GPU barrier wedge |
-| 11.13 | Cooperative-grid relaunch wedge — empirical archive (confirmed; mechanism unknown) | Real phenomenon independent of §11.15; six MES-side patches refuted; process exit is only known recovery. Read §11.15 first if debugging a fresh wedge. |
-| 11.14 | `s_buffer_gl0_inv` / `s_buffer_gl1_inv` silently no-op on gfx11+ | When relying on scalar-cache invalidation to refresh a host-mapped UC poll |
+| § | Topic | Status | When to read |
+|---|---|---|---|
+| 1 | Why this document exists | [CURRENT] | Once, at onboarding |
+| 1.2 | Falsification methodology | [CURRENT] | Before any hypothesis-testing campaign |
+| 2 | Architectural quick facts | [CURRENT] | Reference |
+| 3 | Execution model & wave mechanics | [CURRENT] | Designing wave/block shapes |
+| 4 | WMMA programming model | [CURRENT] | Writing any matmul / attention kernel |
+| 5.0-5.2 | Memory hierarchy & cache hints (perf) | [CURRENT] | Tuning a kernel for bandwidth/latency |
+| 5.3 | Cross-GPU peer coherence (correctness) | [CURRENT] | **Any** code that crosses GPU boundaries |
+| 5.4 | L2 staleness — mechanism (correctness) | [CURRENT] | Understanding why §5.5 rules exist |
+| **5.5** | **Authoring deterministic multi-agent code — ruleset** | [CURRENT, MANDATORY] | **Mandatory before writing or reviewing any multi-agent / persistent-kernel code.** Contains decision tree (Rule 1), antipatterns lookup, MTYPE audit code template, PR checklist, and 5 more rules including Rule 9. |
+| 6 | Kernel design patterns in CK | [CURRENT] | Implementing a CK instance |
+| 7 | Testing, profiling, validation | [CURRENT] | Sprint setup |
+| 8 | Tooling tips | [CURRENT] | Day-to-day |
+| 9 | Implementation checklist | [CURRENT] | Pre-merge gate |
+| 10 | CK vs rocWMMA comparison — moved to `CK_vs_rocWMMA.md` | [HISTORICAL-RECORD] | Choosing between libraries (sibling doc) |
+| 11 | Empirical measurements preamble (braidinfer 2026) | [CURRENT] | Bench archive — cite when tuning |
+| 11.1 | Wave/reduction primitives | [CURRENT] | Implementing warp-level reductions |
+| 11.2 | Wave/reduction primitives (cont.) | [CURRENT] | Implementing warp-level reductions |
+| 11.3 | Wave/reduction primitives (cont.) | [CURRENT] | Implementing warp-level reductions |
+| 11.4 | Grid-wide barrier benchmark + PCIe-write-before-barrier HAZARD | [CURRENT] (bench); [HISTORICAL-RECORD] (HAZARD subsection) | When in doubt about a multi-GPU barrier wedge |
+| 11.5 | LDS bank conflicts | [CURRENT] | Tuning shared memory access patterns |
+| 11.6 | cp.async equivalent | [CURRENT] | Overlapping compute and memory |
+| 11.7 | ds_swizzle ctrl-bit | [CURRENT] | Using ds_swizzle for lane shuffles |
+| 11.8 | Cache invalidation issue costs | [CURRENT] | Measuring cache-control overhead |
+| 11.9 | WMMA fragment lane-mapping | [CURRENT] | Writing any WMMA kernel |
+| 11.10 | Header consolidation | [HISTORICAL-RECORD] | (consolidated; kept for context) |
+| 11.11 | Multi-GPU latency envelope | [CURRENT] | Cross-GPU communication budgeting |
+| 11.12 | Measurement hygiene | [CURRENT] | Any benchmarking campaign |
+| 11.13 | Cooperative-grid relaunch wedge — empirical archive (confirmed; mechanism unknown) | [HISTORICAL-RECORD] | Real phenomenon independent of §11.15; six MES-side patches refuted; process exit is only known recovery. Read §11.15 first if debugging a fresh wedge. |
+| 11.14 | `s_buffer_gl0_inv` / `s_buffer_gl1_inv` silently no-op on gfx11+ | [CURRENT] | When relying on scalar-cache invalidation to refresh a host-mapped UC poll |
+| 11.15 | Persistent worker ack protocol | [CURRENT] | Any change to persistent_worker dispatch loop |
+| 11.16 | UC dst alone insufficient | [SUPERSEDED-by-§11.19] | Historical; §11.19 is the authoritative account |
+| 11.17 | Warmup-to-active transition stream/event state | [CURRENT] | Any change to Model::load or worker startup sequence |
+| 11.18 | host-mapped portable-coherent + multi-GPU GART — producer L2 staleness — Rule 10 producer-fence hypothesis | [FALSIFIED-by-§11.19] | Rule 10 producer-fence hypothesis tested and refuted by Exp 3 (10/30 PASS = baseline). Do not re-propose. |
+| 11.19 | Cold-start mailbox visibility race + production cure | [CURRENT] | The canonical account of bd 4e2m; read before any multi-GPU warmup work |
 
 **For agents**: if you are debugging a `"deterministic for N steps, then divergent"` bug or writing any new cross-agent buffer, jump directly to **§5.5 Rule 4** (diagnostic) and **§5.5 Rule 1** (allocation method decision tree). Those two are the highest-yield entry points.
 
@@ -32,6 +81,22 @@ Practical reference for `gfx1100` (RDNA3 / Navi 31) in Composable Kernel and bra
 - **One place for the “gotchas”** – gfx1100 WMMA has wave-level constraints (lane replication, opsel behavior) that are easy to miss and expensive to debug.
 - **Sprint linkage** – SPRINT1 expands WMMA coverage + memory access polish; SPRINT2 adds scheduling/shape specialization; SPRINT3 hardens build/test. This doc maps architectural facts to those tasks.
 - **Direct mapping to CK work** – Each section ends with concrete “Do/Verify” bullets so the sprint workstream can land changes predictably.
+
+---
+
+## 1.2 Falsification Methodology
+
+Cross-reference: §11.19(n) for the original context where this recipe was developed.
+
+Falsification cascade discipline for cross-GPU coherence bugs on gfx1100 (or any hardware where reaching the actual cure layer is uncertain):
+
+1. **Capture symptom signature** with per-trial / per-worker / per-position resolution. Don't aggregate; the diagnostic shape lives in the dimensions.
+2. **Bisect by intervention class** — CPU-side / kernel-side / shader-side. Each class has different reach into the cache hierarchy.
+3. **Falsify each class with measurable delta vs baseline.** N=30 minimum (binomial 3σ ≈ ±5 for N=30; smaller samples are noise traps).
+4. **Don't trust partial-improvement results.** Overlapping cures from different classes signal the noise floor, not a stack of independent bugs. If glc+dlc gives 16/30 and baseline is 16/30, the 16/30 is the noise floor — not a bug-overlap.
+5. **Document falsified hypotheses explicitly.** Save future investigators from re-running the same dead-ends. Failure record IS load-bearing artifact.
+
+This is the "tractor squashing grape" failsafe — if you go through this cascade and reach an unreachable layer, you know it's an unreachable layer, not a "we didn't try hard enough" answer.
 
 ---
 
@@ -2031,6 +2096,8 @@ This is a new sub-class NOT covered by §5.5 Rule 1a–d as written, because:
 *Firmware.* MES μC could WB+inv its private cache (and any peer-GPU state it caches per `proc_ctx_addr`) on receipt of a `NEW_QUEUE` packet that includes a fresh `proc_ctx_addr`. Would need AMD firmware change. *Hardware.* A memory-hub-level fence that all consumers can issue — probably not present on gfx11 (would have been documented in the GFX11 ACE/ISA reference). RDNA4 (gfx12) adds `global_wb scope:SCOPE_SYS` and `global_inv scope:SCOPE_SYS` which together approximate this fence; on gfx1200 the bug should be self-resolved without warmup-discard.
 
 **(n) Methodology note (preserved as recipe).**
+
+(See also §1.2 for promoted methodology.)
 
 Falsification cascade discipline for cross-GPU coherence bugs on gfx1100 (or any hardware where reaching the actual cure layer is uncertain):
 
