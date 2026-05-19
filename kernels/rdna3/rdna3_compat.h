@@ -31,6 +31,51 @@
 #define RDNA3_COMPAT_BUFFER_GL1_INV    1        // expected present
 #define RDNA3_COMPAT_BUFFER_GL2_INV    0        // expected absent
 
+// ============================================================================
+// FORBIDDEN / KNOWN-BROKEN upstream APIs (do not wire on gfx11/MES1)
+// ============================================================================
+//
+// MESAPI_MISC__INV_GART  (bd 4e2m, 2026-05-19, FALSIFIED)
+//
+//   The opcode `MESAPI_MISC__INV_GART` is declared in upstream amdgpu headers
+//   at `mes_v11_api_def.h:574` but has NO CALLER anywhere in amdgpu. AMD's own
+//   comment at `kfd_chardev.c:2814-2820` names "stale process context data
+//   saved in MES" as a known phenomenon with `SET_SHADER_DEBUGGER` as the
+//   documented workaround — naturally suggesting INV_GART might be the cure
+//   for the same class of bug.
+//
+//   It is not. Wiring INV_GART from `add_queue_mes` (gated on
+//   `qpd->queue_count == 0`, first-queue-per-PASID-per-device) on a gfx11
+//   MES1 firmware produces:
+//     - 10/30 decode-clean (WORSE than 16/30 baseline; statistically
+//       indistinguishable from no-fix)
+//     - 351 `MES failed to respond` / `MES might be in unrecoverable state`
+//       advisories across all 4 GPUs in a 30-trial run
+//     - 3 process crashes (rc=250)
+//
+//   The INV_GART call ITSELF does not return error; the MES firmware
+//   goes unrecoverable as a downstream/secondary effect. Pattern matches
+//   the previously falsified linux-p2p 0014/0015 series (MES disrupts
+//   when an invalidate touches in-flight queue management).
+//
+//   VERDICT: AMD shipped the opcode declared but unwired for a real
+//   reason — it is firmware-side broken on gfx11/MES1 in this calling
+//   context. DO NOT WIRE.
+//
+//   BROADER LESSON: upstream amdgpu / ROCm exposes opcodes / APIs that
+//   may be DECLARED but not IMPLEMENTED (or broken) on gfx11. Treat
+//   undocumented / unwired opcodes as N/A unless EMPIRICALLY validated
+//   on actual hardware. The fact that a header symbol exists does not
+//   imply firmware support.
+//
+//   References:
+//     - GFX1100_ARCH.md §11.19 (q) — full falsification record
+//     - linux-p2p tree commit history — INV_GART patch built + reverted
+//     - bd braidinfer-4e2m — top investigation issue
+//     - bridge messages #3241-#3245, 2026-05-19 (udi → braidinfer)
+//     - upstream amd-gfx filing pending (TODO udi)
+//   ==========================================================================
+
 // Struct literal callers populate to declare their validation context.
 typedef struct {
     const char* hw;            // e.g. "gfx1100"

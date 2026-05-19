@@ -39,6 +39,60 @@
 //   sequential batches, asserts ack matches seq each time. Runs in ~1
 //   second standalone (no model load) and catches any protocol regression
 //   instantly. Wire into cargo test / CI gate.
+//
+// COLD-START RACE (bd 4e2m, 2026-05-19, gfx1100 multi-GPU only):
+//
+//   The FIRST mailbox transaction per process on gfx1100 multi-GPU has
+//   ~40% probability of producing NaN output (Sig A: argmax-of-NaN
+//   collapses to repeated low-id token, typically '!'). Sticky per
+//   PASID/process: once a worker queue hits the bad first transaction,
+//   it stays broken until process reload.
+//
+//   Falsification cascade (do not retry these unless empirical evidence
+//   changes):
+//     - L1+L2 cache control via glc+dlc on consumer descriptor load (Exp 1a):
+//       16/30 PASS, within statistical noise of ~16/30 baseline. NOT a cure.
+//     - CPU producer-side propagation drain via read_volatile of last
+//       descriptor word between num_instructions and seq_num writes (Exp 3):
+//       10/30 PASS, within noise. NOT a cure. Refutes the §11.18 Rule 10
+//       producer-fence hypothesis at the CPU analog.
+//     - Kernel-side ACQUIRE_MEM / HDP-flush variants (linux-p2p patches
+//       0014/0015 series): all REGRESSED. Reverted.
+//     - MESAPI_MISC__INV_GART wired from add_queue_mes on first-queue-per-
+//       PASID (today's experiment): 10/30 PASS + 351 MES failed-to-respond
+//       + 3 process crashes. REGRESSION. AMD shipped this opcode declared
+//       but unwired for a real reason — broken upstream on gfx11/MES1.
+//
+//   Identified mechanism layer: MES μC private cache or memory-hub state.
+//   Neither exposes an invalidate primitive to userspace shader or kernel-
+//   mode driver. AMD's own kfd_chardev.c:2814 comment names "stale process
+//   context data saved in MES" as a known phenomenon (with SET_SHADER_DEBUGGER
+//   as workaround).
+//
+//   Production cure (commit 8e3bad9):
+//     - Run a sacrificial mailbox round-trip immediately after Model::load,
+//       BEFORE serving real requests. Any throwaway dispatch through each
+//       worker's mailbox suffices; payload contents don't matter. The
+//       FIRST cross-state read on each worker drains whatever MES μC /
+//       memory-hub staleness exists; subsequent reads are coherent for
+//       the process lifetime.
+//     - braidinfer userspace cure: Model::minimal_mailbox_warmup_no_prefill
+//       in crates/braidinfer-runtime/src/model/state.rs. Cost ~320ms total
+//       (spawn + 1 OP_D2D_COPY per worker). Default since 8e3bad9.
+//     - Fallback for single-GPU mode (race does not manifest there since
+//       no cross-GPU reads): generate.rs runs the prior greedy_generate
+//       "Hello"/4 warmup via the "single-gpu-fallback" sentinel.
+//
+//   Validation (commit 8e3bad9 + b0cbc44):
+//     - qwen35_27b -g 2 dense              : 10/10 (single-GPU fallback)
+//     - qwen36_27b -g 4 dense              : 10/10 (single-GPU fallback)
+//     - qwen36_a3b -g 4 MoE                : 10/10 (true multi-GPU mailbox)
+//     - nemotron_cascade_30b -g 4          : 10/10 (single-GPU fallback)
+//     - qwen35_35b_a3b -g 4 (extended)     : 30/30 mailbox-only first-attempt-clean
+//
+//   Full mechanism analysis, falsification cascade, and methodology recipe
+//   at GFX1100_ARCH.md §11.19 (a)-(q). Upstream amd-gfx filing pending
+//   covering MESAPI_MISC__INV_GART firmware-side breakage.
 
 #ifndef BRAIDINFER_RDNA3_PERSISTENT_PROTOCOL_H
 #define BRAIDINFER_RDNA3_PERSISTENT_PROTOCOL_H
