@@ -68,9 +68,9 @@ TOC entries below are tagged with status flags:
 | 11.13 | Cooperative-grid relaunch wedge — empirical archive (confirmed; mechanism unknown) | [HISTORICAL-RECORD] | Real phenomenon independent of §11.15; six MES-side patches refuted; process exit is only known recovery. Read §11.15 first if debugging a fresh wedge. |
 | 11.14 | `s_buffer_gl0_inv` / `s_buffer_gl1_inv` silently no-op on gfx11+ | [CURRENT] | When relying on scalar-cache invalidation to refresh a host-mapped UC poll |
 | 11.15 | Persistent worker ack protocol | [CURRENT] | Any change to persistent_worker dispatch loop |
-| 11.16 | UC dst alone insufficient | [SUPERSEDED-by-§11.19] | Historical; §11.19 is the authoritative account |
+| 11.16 | UC dst alone insufficient | [SUPERSEDED-by-§11.19] (MERGED-to-§11.19) | Historical; content merged into §11.19 (r)-(v); §11.16 header is a stub |
 | 11.17 | Warmup-to-active transition stream/event state | [CURRENT] | Any change to Model::load or worker startup sequence |
-| 11.18 | host-mapped portable-coherent + multi-GPU GART — producer L2 staleness — Rule 10 producer-fence hypothesis | [FALSIFIED-by-§11.19] | Rule 10 producer-fence hypothesis tested and refuted by Exp 3 (10/30 PASS = baseline). Do not re-propose. |
+| 11.18 | host-mapped portable-coherent + multi-GPU GART — producer L2 staleness — Rule 10 producer-fence hypothesis | [FALSIFIED-by-§11.19] (MERGED-to-§11.19) | Rule 10 producer-fence hypothesis tested and refuted by Exp 3 (10/30 PASS = baseline). Do not re-propose. Content merged into §11.19 (w)-(aa); §11.18 header is a stub |
 | 11.19 | Cold-start mailbox visibility race + production cure | [CURRENT] | The canonical account of bd 4e2m; read before any multi-GPU warmup work |
 
 **For agents**: if you are debugging a `"deterministic for N steps, then divergent"` bug or writing any new cross-agent buffer, jump directly to **§5.5 Rule 4** (diagnostic) and **§5.5 Rule 1** (allocation method decision tree). Those two are the highest-yield entry points.
@@ -1053,6 +1053,28 @@ This section records primitive-level cycle counts measured on RX 7900 XTX
 Each rule below cites the bench directory that produced it. Numbers are
 median in-kernel cycles per op via `s_memrealtime` / `wall_clock64`.
 
+**Sub-blocks** (organizational grouping; section numbers UNCHANGED — these are
+just readers' grouping for navigation):
+
+- **11A: Single-GPU primitives and perf reference** — §11.1, §11.2, §11.3, §11.5,
+  §11.6, §11.7, §11.8, §11.9, §11.10. Stable wave/reduction/cache/swizzle/WMMA
+  fundamentals. Rarely-edited content.
+- **11B: Multi-GPU latency and measurement hygiene** — §11.11, §11.12. Includes
+  CPU SCHED_FIFO + amdgpu IRQ pinning requirements.
+- **11C: Historical / Falsified coherence-wedge investigation** — §11.4,
+  §11.13, §11.16 (stub->§11.19), §11.18 (stub->§11.19). Preserved for
+  methodology record.
+- **11D: Current coherence model** — §11.14, §11.15, §11.17, §11.19 (merged).
+  Currently load-bearing operational guidance for cross-GPU code.
+
+New readers should start with 11D. 11A and 11B are reference. 11C is preserved
+record (do NOT re-propose falsified hypotheses).
+
+Interpretation of udi #3279 ambiguities: §11.4 placed in 11C (PCIe-write-before-barrier
+HAZARD = investigation content, not perf reference); §11.9 kept in 11A only
+(WMMA lane-mapping gotcha is perf-validated, not falsified — listed in 11A despite
+udi #3279 listing it in 11C; presumed typo, pinged udi for confirmation).
+
 ### 11.1 Wave32 / sub-wave reductions (DPP + permlanex16 vs `__shfl_down`)
 
 Source: `kernels/diagnostic/reduce_bench/`.
@@ -1664,146 +1686,14 @@ test path's slow turnaround over-attributes cause to deep
 hardware/firmware mechanisms. Add the regression script to CI; do
 not let kernel-protocol changes ship without it.
 
-### 11.16 UC dst alone is insufficient — intra-kernel cached-read staleness (2026-05-17)
+### 11.16 UC dst alone is insufficient — intra-kernel cached-read staleness (2026-05-17) — MERGED INTO §11.19
 
-**Empirical finding (PROVISIONAL — root cause under investigation).**
-During the braidinfer `r7dv` chase on 2026-05-17, the multi-GPU NaN
-class was localized to the first segment after the first
-head-parallel attention gather. Reference: bridge log #377, #381.
+**Status: SUPERSEDED-by-§11.19. Content preserved at §11.19 subsections (r)-(v).**
 
-The receiving buffers (`act.attn_out`, `act.gate_attn`) are allocated
-via `hipExtMallocWithFlags(hipDeviceMallocUncached)` — i.e. they are
-**Rule 1a (UC device)** per §5.5. They should bypass L2. Yet:
-
-  - 5-decode-step output: token 0 correct (prefill writes), tokens 1+
-    100% NaN. NaN first appears at `moe-pre L3` on qwen3.6_35b_a3b.q8
-    2-GPU and at `moe-pre L8` on nemotron_super_120b.q4 4-GPU.
-    Position-invariant: ALWAYS the first segment after the first
-    attention-pre, regardless of model architecture or worker count.
-  - Inserting a CPU mailbox round-trip between gather batch and
-    consumer batch (split into two megakernel dispatches with
-    `dispatch_batch_slice` boundary) — i.e. an implicit Rule 1d
-    kernel-boundary sync — eliminates the NaN. Output becomes
-    `" Paris."`, all 40 layers × 2 tokens clean.
-  - Per `dump_mtype_audit`, `act.attn_out` reportedly shows
-    `mem_type=2 alloc_flags=0x0` (cached) at runtime, contradicting
-    the alloc-site call. This audit may be stale or probing the wrong
-    buffer; a runtime `hipPointerGetAttributes` probe at the actual
-    pointer (mandatory for r7dv close) is pending.
-
-**Three hypotheses** (to be disambiguated by the runtime MTYPE probe):
-
-  (i) **RDNA3 per-WGP L1 caches MTYPE=UC lines.** If the writer (gather
-  D2D) executes on WGP-A and the consumer (`op_output_gate` /
-  residual+rmsnorm) executes on WGP-B, B's L1 may hold a stale line
-  from the prior decode step. The `hipDeviceMallocUncached` MTYPE
-  bypasses L2 but per-WGP L1 may cache regardless. Rule 1a's promise
-  "bypass L2" would not cover this case. If true: §5.5 Rule 1a needs
-  a qualifier — UC bypasses L2 but not L1 on gfx1100; intra-kernel
-  cross-WGP writer→reader on UC buffers needs either a kernel-boundary
-  sync (Rule 1d analog via batch-mailbox round-trip) or a `buffer_gl1_inv`
-  on the reader (Rule 3 caveat: this is the case where `buffer_gl1_inv`
-  DOES help, because the staleness is at L1).
-
-  (ii) **Writer-side cached store to UC dst.** Even if dst MTYPE=UC, if
-  the writer kernel emits `buffer_global_store_dwordx4` (cached) rather
-  than a UC-aware store intrinsic, the writer's L1 may hold the
-  prior-iteration's value of that line, and the consumer reading from
-  the same WGP's L1 sees stale. The deleted comment at
-  `braidinfer/crates/braidinfer-runtime/src/multi_gpu.rs:80-86` documented
-  this exact pattern for `DeinterleaveInst` writes to host-mapped UC
-  pages. If true: a Rule 10 is needed — "writer's store-path must be
-  UC-aware when dst is MTYPE=UC."
-
-  (iii) **`hipExtMallocWithFlags(hipDeviceMallocUncached)` does not
-  produce MTYPE=UC on ROCm 7.2.x.** Verifiable by runtime
-  `hipPointerGetAttributes`. If true: this is a ROCm-version-specific
-  regression worth filing upstream; mitigation is to use
-  `hipExtMallocWithFlags(hipDeviceMallocFinegrained)` (130× slower
-  cross-agent observe per the §5.5 Rule 1 allocation method table) or
-  `MappedHostBuffer` (host-mapped UC) for any persistent-kernel-shared
-  cached-write-target buffer.
-
-**Working mitigation.** Split the gather batch and the consumer batch
-into two `dispatch_batch_slice` dispatches with an intervening CPU
-mailbox round-trip. Cost: one mailbox RTT per attention layer
-(per `RDNA3_PERF_MEGAKERNEL_DISPATCH_MEDIAN_US ≈ 2.79 µs`). On a 40-layer
-model with attention every 4th layer, that's ~10 attention boundaries ×
-2.79 µs ≈ 28 µs per token of decode overhead. Acceptable cost given
-the alternative is 100% NaN.
-
-**Surface census (pattern lineage).** Today's r7dv brings the count of
-distinct buffers requiring §5.5 Rule 1 promotion in the braidinfer
-persistent-kernel architecture to seven, distributed across the snl /
-vo0 / r7dv investigations:
-
-| Buffer | Class | First fix | Rule |
-|---|---|---|---|
-| `normed_stage` | per-GPU RMSNorm output staging | snl `5f1d745` | Rule 1b → portable-coherent |
-| `worker.attn_out` | head-parallel attn output | snl `3da5618` | Rule 1b → portable-coherent |
-| `worker.output_slots` | MoE worker output ring | snl                   | Rule 1b |
-| `worker.moe_act_uc_handoff` | MoE expert input handoff | vo0 `8f8c0e4` (today) | Rule 1b |
-| `attn_gate` | gate side of GqaAttn | (still TODO post-r7dv) | TBD |
-| `act.attn_out` (GPU 0) | gather destination | r7dv `(C) split` (today) | TBD per (i)/(ii)/(iii) |
-| `act.gate_attn` (GPU 0) | gate destination | r7dv `(C) split` (today) | TBD per (i)/(ii)/(iii) |
-
-This census is consistent with Rule 8 ("audit ALL persistent buffers,
-not just activation flow") — every persistent buffer crossing a
-write-then-read boundary inside the persistent kernel is a candidate.
-The remaining intra-kernel writer→reader pattern (last three rows) is
-distinct from the cross-agent pattern (first four rows) and is the
-class §11.16 documents.
-
-**Cross-engine confirmation.** llama.cpp encountered the same §11.4
-mitigation pattern on its HIP backend during the 2026-05-17 SSM /
-prefix-cache work:
-
-  - `44855024b` — fattn-sp peer FA output writeback migrated to SDMA
-    via a UC staging slab. Rule 1a (UC device) applied to a previously
-    cached peer-buffer.
-  - `878bc9df0` — MoE_FUSED SDMA combine path routed through a
-    per-secondary UC writer slab, with `ep_sync_signal_kernel` fence
-    deleted. Rule 1a applied; fence dropped because UC bypasses the
-    coherence requirement it was guarding.
-  - `6161adee5` — server warn-once when prompt cache silently no-ops in
-    KV-shard mode. (Separate concern, surfaced same day.)
-  - `29c424825` — auto-default `GGML_KV_SHARD_READ=0` for
-    hybrid/recurrent models pending bd `llamacpp-cb5` root cause. (SSM
-    attractor lock-in under shard-mode reductions; separate concern
-    from §11.16 but documented same day.)
-
-Pattern: Rule 1a / 1b promotion is the structural fix for any
-cross-agent buffer the persistent / cooperative kernel touches. The
-audit framework should be type-level (a `CrossGpuStaging<T>` Rust
-abstraction is planned in braidinfer's `t8fl` epic; the analogous
-encoding in llama.cpp's HIP backend would be a per-buffer-class
-allocator wrapper).
-
-**Pending work to close this finding.**
-
-  1. braidinfer runtime MTYPE probe at model init for `act.attn_out`,
-     `act.gate_attn`, `worker.attn_out`, `worker.attn_gate` —
-     disambiguates (i) / (ii) / (iii). r7dv close-gate.
-  2. Once mechanism is known, this section is updated from PROVISIONAL
-     to CONFIRMED with the actual cause, and §5.5 gets either:
-       - A Rule 1a qualifier ("UC bypasses L2 but not L1; intra-kernel
-         cross-WGP cached-read on UC buffers still needs Rule 1d
-         analog") if (i), OR
-       - A new Rule 10 ("writer-store-path-must-be-UC-aware-when-dst-is-UC")
-         if (ii), OR
-       - A ROCm-version note + Rule 1a deprecation in favor of Rule 1b
-         on 7.2.x if (iii).
-  3. Until then, the working mitigation (Rule 1d analog via
-     `dispatch_batch_slice` boundary) is the canonical fix for any
-     intra-persistent-kernel writer→consumer pattern on a UC buffer.
-
-**Lesson.** MTYPE=UC is necessary but provisionally not sufficient on
-gfx1100 within persistent-kernel execution. The §5.5 Rule 1 allocation
-table guarantees cross-AGENT coherence (Rule 1's framing) but the
-intra-kernel cross-WGP behavior on UC is not yet characterized.
-Treat any new persistent-buffer addition that crosses
-`dispatch_batch_slice` boundaries as a §11.16 review item until the
-runtime MTYPE audit and mechanism determination are complete.
+See §11.19 for the merged falsification record. The UC dst staleness investigation
+(PROVISIONAL, r7dv 2026-05-17, intra-kernel cross-WGP cached-read on
+`hipDeviceMallocUncached` buffers) is recorded as §11.19 (r)-(v) with its original
+hypotheses, working mitigation, surface census, and cross-engine confirmation intact.
 
 ### 11.17 Warmup→active transition leaves stale stream/event state (2026-05-17)
 
@@ -1908,148 +1798,20 @@ mode is fine, but the transition leaves caller-invisible state that
 breaks after hundreds of dispatches. Treat any new mode-transition in
 a long-lived backend as a §11.17 review item.
 
-### 11.18 Host-mapped portable-coherent buffer + multi-GPU GART read → producer L2 staleness → UTCL2 TCP PERMISSION_FAULT cascade (2026-05-18)
+### 11.18 Host-mapped portable-coherent buffer + multi-GPU GART read → producer L2 staleness → UTCL2 TCP PERMISSION_FAULT cascade (2026-05-18) — MERGED INTO §11.19
 
-**Status update 2026-05-19: G9 producer-fence hypothesis FALSIFIED. See §11.19 for the resolution cascade (CPU producer read-back ≡ shader fence_device analog at the producer side: 10/30 PASS, within noise of 16/30 baseline). The cure layer is below userspace/kernel-mode reach (MES μC private cache or memory-hub state). Production cure is warmup-discard (commit a048318).**
+**Status: FALSIFIED-by-§11.19. Content preserved at §11.19 subsections (w)-(aa).**
 
-**Empirical finding (originally PROVISIONAL — G9 producer-fence hypothesis under empirical test as braidinfer p4 trial; preserved below as historical record).**
+The G9 producer-fence hypothesis (Rule 10 `fence_device()` at RMSNorm exit) was
+empirically tested as braidinfer sm16 p4 trial. Result: 10/30 PASS = within noise
+of 16/30 baseline. FALSIFIED. See §11.19 (d) for the falsification record and §11.19 (f)-(g)
+for the identified mechanism (MES μC private cache / memory-hub state, below
+userspace/kernel-mode reach) and production cure (warmup-discard, commit a048318).
 
-**Trigger.** GPU 0 RMSNorm writes per-token activations into `normed_stage`, allocated via `MappedHostBuffer::alloc_portable_coherent` (`hipHostMallocMapped | hipHostMallocPortable | hipHostMallocCoherent`, flags `0x40000003`). Worker GPUs (GPU 1+) then read `normed_stage` through the GART (host-mapped page) during `D2dCopyInst` broadcast. Under a subset of cold-start trials (~10–20%), the worker observes partially-stale data: a 128-fp32 head-aligned cluster of NaN / zero values at the start of the buffer, with correct data in the tail. In the failure-path extreme, the UTCL2 TLB controller on the worker GPU issues a TCP PERMISSION_FAULT (UTCL2 error code `PERMISSION_FAULT=0x3, MAPPING_ERROR=0x0`) against a GART page address.
-
-**Observed data (braidinfer sm16 investigation, boot of 2026-05-18):**
-
-- 28/28 gfxhub page faults this boot originated from braidinfer `generate` process.
-- Fault type: `UTCL2 TCP PERMISSION_FAULT=0x3 MAPPING_ERROR=0x0` — kernel attempted read/write of a GPU VA that was either unmapped or had stale TLB state.
-- Page-fault storm → MES `REMOVE_QUEUE` timeout → `MODE1 GPU reset` → VRAM loss → llama-server processes on the same GPU receive `HSA HW Exception GPU_HANG` → `HwExceptionHandler` → abort.
-- 94 GPU reset events total this boot. 5 llama-server coredumps, all with identical victim-path stack.
-- Failure rate at consumer: ~10–20% per cold-start trial (`H-B` alone showed 8/20 PASS). Per-trial PASS/FAIL is binary (either the NaN cluster appears or it does not); no gradual degradation.
-- NaN cluster geometry: exactly 128 FP32 values (512 bytes) aligned to a GPU 0 L2 cache-line cluster boundary (RDNA3 cache line = 128 B; 512 B = 4 lines). Fresh data appears in the tail. This is the L2-dirty-line-cluster fingerprint documented in §5.4.
-
-**Mechanism (G9 producer-fence hypothesis).**
-
-`alloc_portable_coherent` flags force `MTYPE=UC` (uncached) on the allocating GPU at allocation time. However, on gfx1100 with `hipHostMallocPortable`, the MTYPE seen from the allocating GPU's perspective is `0x40000001` (fine-grained coherent host memory) — which is write-back + hardware snoops, NOT MTYPE=UC. This is distinct from `hipExtMallocWithFlags(hipDeviceMallocUncached)` (MTYPE=0x3, pure UC on device side) documented in §5.5 Rule 1a.
-
-Critical difference: a `MappedHostBuffer::alloc_portable_coherent` buffer is GART-mapped host memory. When GPU 0 writes to it via normal vector stores (`buffer_store_dwordx4`), those stores enter GPU 0's L2 as write-back dirty lines. The hardware snoop mechanism is designed to keep the host-side view coherent, but the snoop is triggered on CPU-side access or on the next hardware-managed eviction — NOT on GPU-side peer reads through GART. Concretely:
-
-1. GPU 0 RMSNorm writes to `normed_stage` (GART-backed, write-back + snoops).
-2. GPU 0's L2 holds the fresh bytes as dirty write-back lines.
-3. Worker GPU reads `normed_stage` through GART (P2P path via PCIe bridge).
-4. If GPU 0 has NOT flushed those L2 lines to host DRAM yet, the GART read from the worker hits the physical host-DRAM address before GPU 0's dirty lines have landed there.
-
-Two sub-outcomes:
-
-- **Stale-data path**: the worker reads stale (prior-iteration or zero-initialized) bytes. Observable as the 128-fp32 head-NaN pattern.
-- **Fault path**: if the GART page TLB entry on the worker side hasn't been committed yet (demand-mapped on first GPU touch, with the mapping committed by the process that allocated the buffer), the worker's UTCL2 issues a TCP PERMISSION_FAULT. This is the fault-storm trigger.
-
-**Why intuition is wrong: "host-mapped coherent" ≠ "write-through" on RDNA3.**
-
-The term "coherent" in `hipHostMallocCoherent` refers to CPU-GPU coherence maintained by the hardware snoop mechanism — it guarantees that the CPU can observe GPU writes without explicit cache-flush API calls, and vice versa. It does NOT guarantee that GPU-to-GPU peer reads through the GART observe the latest GPU-0 dirty bytes. The snoop mechanism is between the GPU's cache hierarchy and the host's CPU-visible memory controller; there is no equivalent GPU-to-GPU snoop path through PCIe on gfx1100.
-
-Contrast with `hipExtMallocWithFlags(hipDeviceMallocUncached)` (device-side MTYPE=UC): writes on the allocating GPU bypass L2 entirely and go directly to VRAM/HBM. Peer reads via P2P then read from VRAM, which is already up-to-date. This is why UC device buffers (Rule 1a) work for cross-GPU spin-wait but host-mapped portable-coherent buffers do not without producer-side fencing.
-
-**Required producer fence.**
-
-GPU 0 must issue `__threadfence()` (agent-scope fence, equivalent to `__builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent")`, see `rdna3_barrier.h:96-99`) at RMSNorm exit, BEFORE the ack/signal that triggers worker reads. This drains GPU 0's L2 dirty lines to DRAM so that the GART-mapped host address holds the fresh values when workers read via PCIe.
-
-Note: `__threadfence_system()` (system-scope fence) HANGS on gfx1100 (see §5.3 and `rdna3_barrier.h:102-113`). The agent-scope fence `__threadfence()` is the correct and sufficient primitive here because the goal is to push GPU 0's L2 dirty lines to host DRAM — a drain to L2's backing DRAM, not a cross-GPU cache invalidation. Once the bytes reach host DRAM, the GART read from the worker accesses physical host DRAM and is coherent.
-
-**Required consumer cache state.**
-
-If a worker GPU has previously read `normed_stage` (prior iteration, same GART page), its L1 may hold a stale line from that prior read. Before re-reading `normed_stage` on each iteration:
-
-```asm
-buffer_gl0_inv      // invalidate per-SIMD vector cache (L0)
-buffer_gl1_inv      // invalidate per-WGP shader-array cache (L1)
-s_waitcnt vmcnt(0)  // wait for the invalidation to complete
-```
-
-Note: `buffer_gl2_inv` does not exist on gfx1100 (see §5.3). L2 staleness for GART reads is handled by the producer-side fence (above), not by consumer-side L2 invalidation. The `buffer_gl1_inv` is for the consumer's L1 only.
-
-**TLB/mapping commit timing hazard.**
-
-`alloc_portable_coherent` pages are demand-mapped: on gfx1100, a GART page may not have its GPU VA TLB entry committed in a peer GPU's UTCL2 until first touch. If the allocating process (GPU 0's context) established the mapping but the worker process (separate GPU context, separate PASID) has not yet been granted the mapped-page TLB entry, the first GART read from the worker triggers a page fault — not because the data is stale, but because the mapping itself is uncommitted in that UTCL2 context. This is the `PERMISSION_FAULT=0x3 MAPPING_ERROR=0x0` event: PERMISSION_FAULT (not MAPPING_ERROR) indicates the page table entry exists but the read is attempted before the entry is fully propagated.
-
-Mitigation: ensure worker GPU contexts access `normed_stage` at least once (dummy read) during model-load / init time to force UTCL2 TLB entry establishment, before the first live token's RMSNorm write.
-
-**Cross-process blast radius.**
-
-A UTCL2 fault from any process triggers a MES `REMOVE_QUEUE` timeout for that process's queues. On gfx1100, `MODE1 GPU reset` follows after the MES timeout. A `MODE1 GPU reset` on a shared device drops ALL queues on that device, including queues from unrelated processes (e.g., llama-server instances sharing the GPU). Every process with a queue on the reset device receives `HSA HW Exception GPU_HANG` via the HwExceptionHandler and must abort. A single page-fault from the braidinfer process can cascade to kill all co-resident inference servers on that physical GPU.
-
-See §11.13 for the cooperative-grid relaunch wedge (different mechanism, same MES-storm fingerprint). The distinction: §11.13 is a cooperative-kernel protocol deadlock; §11.18 is a GART coherence race leading to a UTCL2 fault.
-
-**SAFE vs UNSAFE pattern.**
-
-UNSAFE (triggers NaN / fault at ~10–20% cold-start rate):
-
-```cpp
-// GPU 0 RMSNorm kernel exit — NO fence
-__global__ void rmsnorm_kernel(..., float* normed_stage, ...) {
-    // ... compute RMSNorm output into normed_stage ...
-    normed_stage[idx] = result;      // write-back into GPU 0 L2
-    // kernel exits: L2 dirty lines NOT guaranteed flushed to host DRAM
-}
-// host: signal workers; workers read normed_stage via GART
-// => workers may read stale host DRAM (dirty bytes still in GPU 0 L2)
-```
-
-SAFE (G9 fix — `__threadfence()` at RMSNorm exit):
-
-```cpp
-// GPU 0 RMSNorm kernel exit — WITH agent-scope drain
-__global__ void rmsnorm_kernel(..., float* normed_stage, ...) {
-    // ... compute RMSNorm output into normed_stage ...
-    normed_stage[idx] = result;
-    __syncthreads();                 // gather all threads in this block
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        // Agent-scope fence: drain GPU 0 L2 dirty lines to host DRAM.
-        // DO NOT use __threadfence_system() — HANGS on gfx1100 (§5.3).
-        // fence_device() from rdna3_barrier.h:96 is equivalent.
-        __threadfence();             // == __builtin_amdgcn_fence(ACQ_REL, "agent")
-        // Signal: write ack/status word after fence so workers see
-        // the ack ONLY after dirty lines have drained.
-        status_word[0] = RMSNORM_DONE;
-    }
-}
-// Workers: poll status_word (GART-visible), then read normed_stage
-// => host DRAM is up-to-date before workers' GART reads begin
-```
-
-Consumer-side worker (with L1 invalidation before re-read):
-
-```cpp
-// Worker GPU D2dCopyInst (or equivalent GART read path)
-// Before reading normed_stage for each new token:
-asm volatile(
-    "buffer_gl0_inv\n\t"    // L0 invalidate (per-SIMD)
-    "buffer_gl1_inv\n\t"    // L1 invalidate (per-WGP)
-    "s_waitcnt vmcnt(0)\n\t"
-    ::: "memory");
-// NOW read normed_stage via the GART-mapped device pointer
-float val = normed_stage_dev_ptr[idx];  // fresh from host DRAM
-```
-
-**Library integration.**
-
-The proposed `rdna3_coherent_host_publish.h` library extension (D1 design) wraps these patterns into `RDNA3_COHERENT_WRITE_PUBLISH(buf, status, done_val)` (producer side) and `RDNA3_COHERENT_WAIT_READ(buf, status, expected_val)` (consumer side). See the D1 design kb entry tagged `rdna3-coherent-publish-wait-design-2026-05-18` for full API, macro signatures, compile-time safety assertions, and chaos-testing option.
-
-**Call sites to migrate in braidinfer.**
-
-- `normed_stage` write exit in `megakernel_f32` / `persistent_worker` RMSNorm dispatch: add `fence_device()` (from `rdna3_barrier.h:96`) after the final store, before writing the ack status. See `rdna3_persistent_protocol.h:141-149` for the canonical ack pattern — the fence belongs BETWEEN the last RMSNorm store and the `persistent_iter_ack` call.
-- `D2dCopyInst` consumer path for `normed_stage`: add `buffer_gl0_inv` + `buffer_gl1_inv` before the first GART load on each new dispatch. This is in the worker GPU's copy kernel, not the host.
-- `moe_p2p.rs` allocations using `alloc_portable_coherent` for `output_slots` and `moe_act_uc_handoff` (see `moe_p2p.rs:220,239`): audit whether the writer GPU also needs `fence_device()` before posting the ack. Rule of thumb: any `alloc_portable_coherent` buffer where the GPU-side writer and the GPU-side reader are on different devices needs the producer fence at the write exit.
-- Add a UTCL2 TLB warm-up pass during `MoeP2pState::new` init (after `hipDeviceEnablePeerAccess`, before first inference) that touches each `alloc_portable_coherent` buffer from each peer GPU context to establish TLB entries.
-
-**Relation to existing §5.5 rules.**
-
-This is a new sub-class NOT covered by §5.5 Rule 1a–d as written, because:
-
-- The buffer is NOT plain `hipMalloc` (Rule 1a/b/c/d framing assumes either UC device or host-mapped coherent is the "correct" allocation for cross-agent use). `alloc_portable_coherent` IS the §5.5 Rule 1b analog — yet the bug still fires.
-- The missing piece is the PRODUCER-SIDE FENCE at write exit. §5.5 addresses allocation method and reader-side discipline; it does not prescribe a mandatory fence at the producer's write boundary.
-- Proposed addition: **Rule 10** — "For any `alloc_portable_coherent` (or equivalent GART-backed host-mapped) buffer written by a GPU kernel and read by a PEER GPU kernel, the GPU writer MUST issue `fence_device()` (agent-scope fence) after the final store and before signaling the consumer. `__threadfence_system()` is FORBIDDEN on gfx1100 (§5.3). The `buffer_gl0_inv` + `buffer_gl1_inv` sequence on the consumer side MAY additionally be required if the consumer runs in a persistent kernel that has previously cached the same GART page."
-
-**Evidence chain reference.** braidinfer sm16 investigation, G9 hypothesis, p4 test (in flight). kb entry `gpu-hang-cascade` (if present). Confirmation placeholder: "verified empirically via braidinfer sm16 p4 test (2026-05-18) — result pending."
-
-**RDNA4 context.** gfx12 adds `global_wb scope:SCOPE_SYS` and `global_inv scope:SCOPE_SYS`. On gfx1200, `__threadfence_system()` is expected to function and would serve as the producer fence. This workaround is gfx1100-specific.
+See §11.19 for the full merged record including: trigger/observed-data (w), mechanism
+and coherence analysis (x), required-fence and TLB-hazard details (y), code patterns
+(z), library integration and call-site migration (aa-i), §5.5 Rule 10 proposal (aa-ii).
+Do not re-propose the G9 producer-fence hypothesis — it is empirically falsified.
 
 ### 11.19 Cold-start mailbox visibility race — falsification cascade & production cure (2026-05-19)
 
@@ -2184,3 +1946,330 @@ Pattern matches the previously falsified linux-p2p 0014/0015 series: invalidate-
 **Upstream amd-gfx filing TODO (highest-value forward action).** Subject: "MESAPI_MISC__INV_GART opcode causes MES unrecoverable-state cascade on gfx11/MES1 when called from add_queue_mes". Include: motivation from `kfd_chardev.c:2814` + observable cold-start NaN race; approach (wire INV_GART); result (351 MES failures + 3 crashes on 30-trial run); reproducer (braidinfer cold-start with `BRAIDINFER_WARMUP_SKIP=1` + the patch); question to AMD (is INV_GART intended safe-to-call from `add_queue_mes`, or firmware-side broken; if latter, what IS the correct path to clear MES per-PASID cached state on first-queue setup).
 
 **Cross-refs.** bd 4e2m (top), bd 20fp / 1uak / 1i1c / iwn0 (follow-ups), this commit, linux-p2p tree (INV_GART patch reverted but preserved in branch history for upstream filing reference), bridge thread #3239-#3257.
+
+---
+
+**(r) [Merged from §11.16] UC dst alone is insufficient — intra-kernel cached-read staleness (2026-05-17) — status PROVISIONAL (mechanism undetermined; working mitigation active).**
+
+During the braidinfer `r7dv` chase on 2026-05-17, the multi-GPU NaN
+class was localized to the first segment after the first
+head-parallel attention gather. Reference: bridge log #377, #381.
+
+The receiving buffers (`act.attn_out`, `act.gate_attn`) are allocated
+via `hipExtMallocWithFlags(hipDeviceMallocUncached)` — i.e. they are
+**Rule 1a (UC device)** per §5.5. They should bypass L2. Yet:
+
+  - 5-decode-step output: token 0 correct (prefill writes), tokens 1+
+    100% NaN. NaN first appears at `moe-pre L3` on qwen3.6_35b_a3b.q8
+    2-GPU and at `moe-pre L8` on nemotron_super_120b.q4 4-GPU.
+    Position-invariant: ALWAYS the first segment after the first
+    attention-pre, regardless of model architecture or worker count.
+  - Inserting a CPU mailbox round-trip between gather batch and
+    consumer batch (split into two megakernel dispatches with
+    `dispatch_batch_slice` boundary) — i.e. an implicit Rule 1d
+    kernel-boundary sync — eliminates the NaN. Output becomes
+    `" Paris."`, all 40 layers × 2 tokens clean.
+  - Per `dump_mtype_audit`, `act.attn_out` reportedly shows
+    `mem_type=2 alloc_flags=0x0` (cached) at runtime, contradicting
+    the alloc-site call. This audit may be stale or probing the wrong
+    buffer; a runtime `hipPointerGetAttributes` probe at the actual
+    pointer (mandatory for r7dv close) is pending.
+
+**(s) [Merged from §11.16] Three hypotheses (to be disambiguated by the runtime MTYPE probe).**
+
+  (i) **RDNA3 per-WGP L1 caches MTYPE=UC lines.** If the writer (gather
+  D2D) executes on WGP-A and the consumer (`op_output_gate` /
+  residual+rmsnorm) executes on WGP-B, B's L1 may hold a stale line
+  from the prior decode step. The `hipDeviceMallocUncached` MTYPE
+  bypasses L2 but per-WGP L1 may cache regardless. Rule 1a's promise
+  "bypass L2" would not cover this case. If true: §5.5 Rule 1a needs
+  a qualifier — UC bypasses L2 but not L1 on gfx1100; intra-kernel
+  cross-WGP writer→reader on UC buffers needs either a kernel-boundary
+  sync (Rule 1d analog via batch-mailbox round-trip) or a `buffer_gl1_inv`
+  on the reader (Rule 3 caveat: this is the case where `buffer_gl1_inv`
+  DOES help, because the staleness is at L1).
+
+  (ii) **Writer-side cached store to UC dst.** Even if dst MTYPE=UC, if
+  the writer kernel emits `buffer_global_store_dwordx4` (cached) rather
+  than a UC-aware store intrinsic, the writer's L1 may hold the
+  prior-iteration's value of that line, and the consumer reading from
+  the same WGP's L1 sees stale. The deleted comment at
+  `braidinfer/crates/braidinfer-runtime/src/multi_gpu.rs:80-86` documented
+  this exact pattern for `DeinterleaveInst` writes to host-mapped UC
+  pages. If true: a Rule 10 is needed — "writer's store-path must be
+  UC-aware when dst is MTYPE=UC."
+
+  (iii) **`hipExtMallocWithFlags(hipDeviceMallocUncached)` does not
+  produce MTYPE=UC on ROCm 7.2.x.** Verifiable by runtime
+  `hipPointerGetAttributes`. If true: this is a ROCm-version-specific
+  regression worth filing upstream; mitigation is to use
+  `hipExtMallocWithFlags(hipDeviceMallocFinegrained)` (130× slower
+  cross-agent observe per the §5.5 Rule 1 allocation method table) or
+  `MappedHostBuffer` (host-mapped UC) for any persistent-kernel-shared
+  cached-write-target buffer.
+
+**(t) [Merged from §11.16] Working mitigation.**
+
+Split the gather batch and the consumer batch
+into two `dispatch_batch_slice` dispatches with an intervening CPU
+mailbox round-trip. Cost: one mailbox RTT per attention layer
+(per `RDNA3_PERF_MEGAKERNEL_DISPATCH_MEDIAN_US ≈ 2.79 µs`). On a 40-layer
+model with attention every 4th layer, that's ~10 attention boundaries ×
+2.79 µs ≈ 28 µs per token of decode overhead. Acceptable cost given
+the alternative is 100% NaN.
+
+**(u) [Merged from §11.16] Surface census (pattern lineage).**
+
+Today's r7dv brings the count of
+distinct buffers requiring §5.5 Rule 1 promotion in the braidinfer
+persistent-kernel architecture to seven, distributed across the snl /
+vo0 / r7dv investigations:
+
+| Buffer | Class | First fix | Rule |
+|---|---|---|---|
+| `normed_stage` | per-GPU RMSNorm output staging | snl `5f1d745` | Rule 1b -> portable-coherent |
+| `worker.attn_out` | head-parallel attn output | snl `3da5618` | Rule 1b -> portable-coherent |
+| `worker.output_slots` | MoE worker output ring | snl                   | Rule 1b |
+| `worker.moe_act_uc_handoff` | MoE expert input handoff | vo0 `8f8c0e4` (today) | Rule 1b |
+| `attn_gate` | gate side of GqaAttn | (still TODO post-r7dv) | TBD |
+| `act.attn_out` (GPU 0) | gather destination | r7dv `(C) split` (today) | TBD per (i)/(ii)/(iii) |
+| `act.gate_attn` (GPU 0) | gate destination | r7dv `(C) split` (today) | TBD per (i)/(ii)/(iii) |
+
+This census is consistent with Rule 8 ("audit ALL persistent buffers,
+not just activation flow") — every persistent buffer crossing a
+write-then-read boundary inside the persistent kernel is a candidate.
+The remaining intra-kernel writer→reader pattern (last three rows) is
+distinct from the cross-agent pattern (first four rows) and is the
+class this investigation documents.
+
+**(v) [Merged from §11.16] Cross-engine confirmation and lesson.**
+
+llama.cpp encountered the same §11.4
+mitigation pattern on its HIP backend during the 2026-05-17 SSM /
+prefix-cache work:
+
+  - `44855024b` — fattn-sp peer FA output writeback migrated to SDMA
+    via a UC staging slab. Rule 1a (UC device) applied to a previously
+    cached peer-buffer.
+  - `878bc9df0` — MoE_FUSED SDMA combine path routed through a
+    per-secondary UC writer slab, with `ep_sync_signal_kernel` fence
+    deleted. Rule 1a applied; fence dropped because UC bypasses the
+    coherence requirement it was guarding.
+  - `6161adee5` — server warn-once when prompt cache silently no-ops in
+    KV-shard mode. (Separate concern, surfaced same day.)
+  - `29c424825` — auto-default `GGML_KV_SHARD_READ=0` for
+    hybrid/recurrent models pending bd `llamacpp-cb5` root cause. (SSM
+    attractor lock-in under shard-mode reductions; separate concern
+    from this finding but documented same day.)
+
+Pattern: Rule 1a / 1b promotion is the structural fix for any
+cross-agent buffer the persistent / cooperative kernel touches. The
+audit framework should be type-level (a `CrossGpuStaging<T>` Rust
+abstraction is planned in braidinfer's `t8fl` epic; the analogous
+encoding in llama.cpp's HIP backend would be a per-buffer-class
+allocator wrapper).
+
+Lesson: MTYPE=UC is necessary but provisionally not sufficient on
+gfx1100 within persistent-kernel execution. The §5.5 Rule 1 allocation
+table guarantees cross-AGENT coherence (Rule 1's framing) but the
+intra-kernel cross-WGP behavior on UC is not yet characterized.
+Treat any new persistent-buffer addition that crosses
+`dispatch_batch_slice` boundaries as a review item for §11.19 (r)-(v)
+until the runtime MTYPE audit and mechanism determination are complete.
+
+Pending work to close: (1) braidinfer runtime MTYPE probe at model init
+for `act.attn_out`, `act.gate_attn`, `worker.attn_out`, `worker.attn_gate`
+— disambiguates (i)/(ii)/(iii), r7dv close-gate. (2) Once mechanism known,
+§5.5 updated with appropriate Rule 1a qualifier, Rule 10, or ROCm-version
+note. (3) Until then, working mitigation is canonical fix.
+
+---
+
+**(w) [Merged from §11.18] Trigger and observed data (2026-05-18) — status: G9 producer-fence hypothesis FALSIFIED (see (d) above).**
+
+GPU 0 RMSNorm writes per-token activations into `normed_stage`, allocated via
+`MappedHostBuffer::alloc_portable_coherent` (`hipHostMallocMapped | hipHostMallocPortable
+| hipHostMallocCoherent`, flags `0x40000003`). Worker GPUs (GPU 1+) then read `normed_stage`
+through the GART (host-mapped page) during `D2dCopyInst` broadcast. Under a subset of
+cold-start trials (~10-20%), the worker observes partially-stale data: a 128-fp32
+head-aligned cluster of NaN / zero values at the start of the buffer, with correct data
+in the tail. In the failure-path extreme, the UTCL2 TLB controller on the worker GPU
+issues a TCP PERMISSION_FAULT (UTCL2 error code `PERMISSION_FAULT=0x3, MAPPING_ERROR=0x0`)
+against a GART page address.
+
+Observed data (braidinfer sm16 investigation, boot of 2026-05-18):
+
+- 28/28 gfxhub page faults this boot originated from braidinfer `generate` process.
+- Fault type: `UTCL2 TCP PERMISSION_FAULT=0x3 MAPPING_ERROR=0x0` — kernel attempted
+  read/write of a GPU VA that was either unmapped or had stale TLB state.
+- Page-fault storm -> MES `REMOVE_QUEUE` timeout -> `MODE1 GPU reset` -> VRAM loss ->
+  llama-server processes on the same GPU receive `HSA HW Exception GPU_HANG` ->
+  `HwExceptionHandler` -> abort.
+- 94 GPU reset events total this boot. 5 llama-server coredumps, all with identical
+  victim-path stack.
+- Failure rate at consumer: ~10-20% per cold-start trial (`H-B` alone showed 8/20 PASS).
+  Per-trial PASS/FAIL is binary; no gradual degradation.
+- NaN cluster geometry: exactly 128 FP32 values (512 bytes) aligned to a GPU 0 L2
+  cache-line cluster boundary (RDNA3 cache line = 128 B; 512 B = 4 lines). Fresh data
+  appears in the tail. This is the L2-dirty-line-cluster fingerprint documented in §5.4.
+
+**(x) [Merged from §11.18] Mechanism (G9 producer-fence hypothesis) and coherence analysis.**
+
+`alloc_portable_coherent` flags force `MTYPE=UC` (uncached) on the allocating GPU at
+allocation time. However, on gfx1100 with `hipHostMallocPortable`, the MTYPE seen from
+the allocating GPU's perspective is `0x40000001` (fine-grained coherent host memory) —
+write-back + hardware snoops, NOT MTYPE=UC. This is distinct from
+`hipExtMallocWithFlags(hipDeviceMallocUncached)` (MTYPE=0x3, pure UC on device side)
+documented in §5.5 Rule 1a.
+
+Critical difference: a `MappedHostBuffer::alloc_portable_coherent` buffer is GART-mapped
+host memory. When GPU 0 writes to it via normal vector stores (`buffer_store_dwordx4`),
+those stores enter GPU 0's L2 as write-back dirty lines. The hardware snoop mechanism is
+designed to keep the host-side view coherent, but the snoop is triggered on CPU-side
+access or on the next hardware-managed eviction — NOT on GPU-side peer reads through GART.
+
+  1. GPU 0 RMSNorm writes to `normed_stage` (GART-backed, write-back + snoops).
+  2. GPU 0's L2 holds the fresh bytes as dirty write-back lines.
+  3. Worker GPU reads `normed_stage` through GART (P2P path via PCIe bridge).
+  4. If GPU 0 has NOT flushed those L2 lines to host DRAM yet, the GART read from the
+     worker hits the physical host-DRAM address before GPU 0's dirty lines have landed.
+
+Two sub-outcomes: (a) stale-data path — worker reads stale bytes, observable as the
+128-fp32 head-NaN pattern; (b) fault path — if GART page TLB entry on the worker side
+hasn't been committed yet, the worker's UTCL2 issues a TCP PERMISSION_FAULT.
+
+Why intuition is wrong: "host-mapped coherent" does NOT equal "write-through" on RDNA3.
+`hipHostMallocCoherent` refers to CPU-GPU coherence via hardware snoops — guarantees the
+CPU can observe GPU writes, but NOT that GPU-to-GPU peer reads through the GART observe
+the latest GPU-0 dirty bytes. There is no GPU-to-GPU snoop path through PCIe on gfx1100.
+
+Contrast with `hipExtMallocWithFlags(hipDeviceMallocUncached)` (device-side MTYPE=UC):
+writes bypass L2 entirely, going directly to VRAM/HBM. Peer reads via P2P then read from
+VRAM (already up-to-date). This is why UC device buffers (Rule 1a) work for cross-GPU
+spin-wait but host-mapped portable-coherent buffers do not without producer-side fencing.
+
+**(y) [Merged from §11.18] Required producer fence and consumer cache state (G9 hypothesis — FALSIFIED by §11.19 (d), preserved for record).**
+
+GPU 0 must issue `__threadfence()` (agent-scope fence, equivalent to
+`__builtin_amdgcn_fence(__ATOMIC_ACQ_REL, "agent")`, see `rdna3_barrier.h:96-99`) at
+RMSNorm exit, BEFORE the ack/signal that triggers worker reads. This drains GPU 0's L2
+dirty lines to DRAM so that the GART-mapped host address holds the fresh values when
+workers read via PCIe.
+
+NOTE: `__threadfence_system()` (system-scope fence) HANGS on gfx1100 (see §5.3 and
+`rdna3_barrier.h:102-113`). The agent-scope fence `__threadfence()` is the correct
+primitive here because the goal is to push GPU 0's L2 dirty lines to host DRAM.
+
+Consumer cache state: if a worker GPU has previously read `normed_stage` (prior iteration,
+same GART page), its L1 may hold a stale line. Before re-reading `normed_stage`:
+
+```asm
+buffer_gl0_inv      // invalidate per-SIMD vector cache (L0)
+buffer_gl1_inv      // invalidate per-WGP shader-array cache (L1)
+s_waitcnt vmcnt(0)  // wait for the invalidation to complete
+```
+
+Note: `buffer_gl2_inv` does not exist on gfx1100 (see §5.3). L2 staleness for GART reads
+is handled by the producer-side fence (above), not by consumer-side L2 invalidation.
+
+TLB/mapping commit timing hazard: `alloc_portable_coherent` pages are demand-mapped. On
+gfx1100, a GART page may not have its GPU VA TLB entry committed in a peer GPU's UTCL2
+until first touch. The `PERMISSION_FAULT=0x3 MAPPING_ERROR=0x0` event indicates the page
+table entry exists but the read is attempted before the entry is fully propagated.
+Mitigation: ensure worker GPU contexts access `normed_stage` at least once (dummy read)
+during model-load / init time to force UTCL2 TLB entry establishment.
+
+**(z) [Merged from §11.18] SAFE vs UNSAFE code patterns.**
+
+UNSAFE (triggers NaN / fault at ~10-20% cold-start rate):
+
+```cpp
+// GPU 0 RMSNorm kernel exit — NO fence
+__global__ void rmsnorm_kernel(..., float* normed_stage, ...) {
+    normed_stage[idx] = result;      // write-back into GPU 0 L2
+    // kernel exits: L2 dirty lines NOT guaranteed flushed to host DRAM
+}
+// host: signal workers; workers read normed_stage via GART
+// => workers may read stale host DRAM (dirty bytes still in GPU 0 L2)
+```
+
+SAFE (G9 fix — `__threadfence()` at RMSNorm exit; note G9 hypothesis FALSIFIED for
+cold-start cure but pattern may still be correct engineering for other GPU-as-producer paths):
+
+```cpp
+__global__ void rmsnorm_kernel(..., float* normed_stage, ...) {
+    normed_stage[idx] = result;
+    __syncthreads();
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        __threadfence();             // == __builtin_amdgcn_fence(ACQ_REL, "agent")
+        status_word[0] = RMSNORM_DONE;
+    }
+}
+```
+
+Consumer-side worker (with L1 invalidation before re-read):
+
+```cpp
+asm volatile(
+    "buffer_gl0_inv\n\t"
+    "buffer_gl1_inv\n\t"
+    "s_waitcnt vmcnt(0)\n\t"
+    ::: "memory");
+float val = normed_stage_dev_ptr[idx];
+```
+
+**(aa) [Merged from §11.18] Library integration, call sites, §5.5 Rule 10 proposal, and RDNA4 context.**
+
+Library: the proposed `rdna3_coherent_host_publish.h` extension (D1 design) wraps these
+patterns into `RDNA3_COHERENT_WRITE_PUBLISH(buf, status, done_val)` (producer side) and
+`RDNA3_COHERENT_WAIT_READ(buf, status, expected_val)` (consumer side). See kb entry tagged
+`rdna3-coherent-publish-wait-design-2026-05-18` for full API and macro signatures.
+
+Call sites to migrate in braidinfer:
+- `normed_stage` write exit in `megakernel_f32` / `persistent_worker` RMSNorm dispatch:
+  add `fence_device()` (from `rdna3_barrier.h:96`) after final store, before writing ack
+  status. See `rdna3_persistent_protocol.h:141-149` for canonical ack pattern.
+- `D2dCopyInst` consumer path for `normed_stage`: add `buffer_gl0_inv` + `buffer_gl1_inv`
+  before the first GART load on each new dispatch (worker GPU's copy kernel, not host).
+- `moe_p2p.rs` allocations using `alloc_portable_coherent` for `output_slots` and
+  `moe_act_uc_handoff` (see `moe_p2p.rs:220,239`): audit whether writer GPU needs
+  `fence_device()` before posting the ack.
+- Add a UTCL2 TLB warm-up pass during `MoeP2pState::new` init (after
+  `hipDeviceEnablePeerAccess`, before first inference) to establish TLB entries.
+
+§5.5 Rule 10 proposal (FALSIFIED as cold-start cure but structurally valid for
+GPU-as-producer patterns): "For any `alloc_portable_coherent` (or equivalent GART-backed
+host-mapped) buffer written by a GPU kernel and read by a PEER GPU kernel, the GPU writer
+MUST issue `fence_device()` (agent-scope fence) after the final store and before signaling
+the consumer. `__threadfence_system()` is FORBIDDEN on gfx1100 (§5.3). The
+`buffer_gl0_inv` + `buffer_gl1_inv` sequence on the consumer side MAY additionally be
+required if the consumer runs in a persistent kernel that has previously cached the same
+GART page."
+
+Cross-process blast radius: a UTCL2 fault from any process triggers MES `REMOVE_QUEUE`
+timeout, then `MODE1 GPU reset`, which drops ALL queues on that device including unrelated
+processes (e.g., llama-server). See §11.13 for the cooperative-grid relaunch wedge
+(different mechanism, same MES-storm fingerprint).
+
+RDNA4 context: gfx12 adds `global_wb scope:SCOPE_SYS` and `global_inv scope:SCOPE_SYS`.
+On gfx1200, `__threadfence_system()` is expected to function. This workaround is
+gfx1100-specific.
+
+Evidence chain reference: braidinfer sm16 investigation, G9 hypothesis, p4 test (2026-05-18).
+kb entry `gpu-hang-cascade` (if present).
+
+---
+
+**Subsection cross-reference (post-merge backward-compat):**
+
+- old §11.16 (2026-05-17) symptom and localization -> §11.19 (r)
+- old §11.16 three hypotheses -> §11.19 (s)
+- old §11.16 working mitigation -> §11.19 (t)
+- old §11.16 surface census -> §11.19 (u)
+- old §11.16 cross-engine confirmation and lesson -> §11.19 (v)
+- old §11.18 trigger and observed data -> §11.19 (w)
+- old §11.18 mechanism and coherence analysis -> §11.19 (x)
+- old §11.18 required producer fence and consumer cache state -> §11.19 (y)
+- old §11.18 SAFE vs UNSAFE patterns -> §11.19 (z)
+- old §11.18 library integration, call sites, Rule 10, RDNA4 context -> §11.19 (aa)
+- old §11.19 (a)-(q) -> §11.19 (a)-(q) [unchanged]
