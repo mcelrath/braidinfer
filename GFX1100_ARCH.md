@@ -2,12 +2,18 @@
 
 Practical reference for `gfx1100` (RDNA3 / Navi 31) in Composable Kernel and braidinfer. Two halves: a performance-tuning guide for kernel authors, and a load-bearing **correctness ruleset** (§5.3–§5.5) for multi-agent / persistent-kernel code on this arch.
 
+**Recent reorgs:** 2026-05-19 — §1.2 falsification methodology promoted from §11.19(n);
+§11.16+§11.18 merged into §11.19 with sequential re-lettering; §5.0 extracted to
+`GFX1100_CACHE_HINTS.md`; §11.13 extracted to `mes/MES_PROBE_ARCHIVE.md`; Appendix A
+"Falsified hypotheses (do not retry)" added; TOC marked with status flags. See
+`git log GFX1100_ARCH.md` for full history.
+
 ## Status as of 2026-05-19
 
 The following are the currently load-bearing operational facts for any
 new code on gfx1100 multi-GPU. Read these BEFORE doing anything else:
 
-1. **§5.5 Rule 1 (a-d)** — Canonical cross-agent allocation. Every
+1. **§5.5 Rule 1 — Canonical cross-agent allocation method (4 sub-rules a/b/c/d).** Every
    cross-GPU buffer MUST be allocated per one of the four sub-rules.
    [CURRENT]
 2. **§5.5 Rule 9** — One cooperative kernel per process lifetime. No
@@ -51,7 +57,7 @@ TOC entries below are tagged with status flags:
 | 7 | Testing, profiling, validation | [CURRENT] | Sprint setup |
 | 8 | Tooling tips | [CURRENT] | Day-to-day |
 | 9 | Implementation checklist | [CURRENT] | Pre-merge gate |
-| 10 | CK vs rocWMMA comparison — moved to `CK_vs_rocWMMA.md` | [HISTORICAL-RECORD] | Choosing between libraries (sibling doc) |
+| 10 | CK vs rocWMMA comparison — moved to `CK_vs_rocWMMA.md` | [EXTRACTED-to-CK_vs_rocWMMA.md] | Choosing between libraries (sibling doc) |
 | 11 | Empirical measurements preamble (braidinfer 2026) | [CURRENT] | Bench archive — cite when tuning |
 | 11.1 | Wave/reduction primitives | [CURRENT] | Implementing warp-level reductions |
 | 11.2 | Wave/reduction primitives (cont.) | [CURRENT] | Implementing warp-level reductions |
@@ -62,7 +68,7 @@ TOC entries below are tagged with status flags:
 | 11.7 | ds_swizzle ctrl-bit | [CURRENT] | Using ds_swizzle for lane shuffles |
 | 11.8 | Cache invalidation issue costs | [CURRENT] | Measuring cache-control overhead |
 | 11.9 | WMMA fragment lane-mapping | [CURRENT] | Writing any WMMA kernel |
-| 11.10 | Header consolidation | [HISTORICAL-RECORD] | (consolidated; kept for context) |
+| 11.10 | Header consolidation (rdna3/ primitive library file layout) | [CURRENT] | Map of `rdna3_*.h` headers — actively maintained primitive library |
 | 11.11 | Multi-GPU latency envelope | [CURRENT] | Cross-GPU communication budgeting |
 | 11.12 | Measurement hygiene | [CURRENT] | Any benchmarking campaign |
 | 11.13 | Cooperative-grid relaunch wedge — empirical archive (confirmed; mechanism unknown) | [HISTORICAL-RECORD] | Real phenomenon independent of §11.15; six MES-side patches refuted; process exit is only known recovery. Read §11.15 first if debugging a fresh wedge. |
@@ -249,6 +255,11 @@ microbenches — has been extracted to **GFX1100_CACHE_HINTS.md** for
 focus. The load-bearing operational rules remain in §5.5.
 
 See: [GFX1100_CACHE_HINTS.md](./GFX1100_CACHE_HINTS.md)
+
+Topics in the extracted sibling: GLC/SLC/DLC raw bandwidth, pointer-chase
+latency vs working-set, hot-vs-streaming pollution, paged-KV gather
+(block-table indirection), stride/page sensitivity, attention-shaped
+microbenches across Kimi/MiniMax/GLM/Focus-A/Focus-B regimes.
 
 
 ### 5.1 Scalar Cache & Global Data Share (GDS)
@@ -947,10 +958,7 @@ just readers' grouping for navigation):
 New readers should start with 11D. 11A and 11B are reference. 11C is preserved
 record (do NOT re-propose falsified hypotheses).
 
-Interpretation of udi #3279 ambiguities: §11.4 placed in 11C (PCIe-write-before-barrier
-HAZARD = investigation content, not perf reference); §11.9 kept in 11A only
-(WMMA lane-mapping gotcha is perf-validated, not falsified — listed in 11A despite
-udi #3279 listing it in 11C; presumed typo, pinged udi for confirmation).
+§11.4 placement: 11C (HAZARD content). §11.9 placement: 11A (WMMA gotcha, perf-validated).
 
 ### 11.1 Wave32 / sub-wave reductions (DPP + permlanex16 vs `__shfl_down`)
 
@@ -1335,6 +1343,12 @@ that failed to clear it, the V0/skeleton reproducer history, and the
 protocol deadlock.
 
 See: [mes/MES_PROBE_ARCHIVE.md](./mes/MES_PROBE_ARCHIVE.md)
+
+Topics in the extracted archive: 15+ user-space probes, 6 MES-side kernel
+patches (Designs D–I), V0 skeleton reproducer history, cross-chip
+corroboration (gfx1103/1150/1152 framework reports), and the
+process-exit teardown sequence (what actually clears the wedge).
+
 ### 11.14 `s_buffer_gl0_inv` / `s_buffer_gl1_inv` silently no-op on gfx11+ (2026-05-14)
 
 **Empirical finding.** During the 2026-05-14 wedge chase, a
@@ -1472,7 +1486,7 @@ zero HW exceptions, zero GPU hangs, zero `0x464351` segfaults.
 sub-classes already documented:
 
   - **Cross-GPU peer-UC store under PCIe pressure** (V7 reproducer,
-    `rdna3_peer.h`): SYSTEM-scope `vscnt`-drain failure under
+    `kernels/rdna3/rdna3_peer.h`): SYSTEM-scope `vscnt`-drain failure under
     multi-GPU concurrent UC stores. Mitigation: deferred-write
     pattern (`rdna3_peer_write_deferred`).
   - **Cached-store-on-UC-dst writer hazard** (DeinterleaveInst
@@ -1490,7 +1504,7 @@ All three sub-classes share the §11.4 MES-wedge fingerprint at
 ROCm-runtime level (HW Exception by GPU node-N: GPU Hang), but their
 mitigations are different. The drain primitive (Rule 1d analog)
 addresses sub-class 3; UC allocation (Rule 1a/1b) addresses sub-class
-2; deferred-write (`rdna3_peer.h`) addresses sub-class 1.
+2; deferred-write (`kernels/rdna3/rdna3_peer.h`) addresses sub-class 1.
 
 **Production fix lineage 2026-05-17.** Three commits in the llama.cpp
 HIP backend stack as the canonical §11.4 mitigation suite:
@@ -1503,9 +1517,10 @@ HIP backend stack as the canonical §11.4 mitigation suite:
 
 Three independent failure modes, three independent fixes, all under
 the §11.4 wedge umbrella. The `kb_add` entry tagged
-`§11.4-mitigation-suite-2026-05-17` documents this as a recovery
-point — the multi-turn-segfault and §11.4-class wedge surfaces are
-substantially closed on the llama.cpp side after these three commits.
+`§11.4-mitigation-suite-2026-05-17` (documents the 3 commits above
+as the canonical §11.4 recovery point on the llama.cpp side) records
+this as a recovery point — the multi-turn-segfault and §11.4-class
+wedge surfaces are substantially closed after these three commits.
 
 **Acceptance evidence.**
   - Gate 1 (warmup runs): `common_init_from_params: warming up the
@@ -1578,7 +1593,7 @@ Do not re-propose the G9 producer-fence hypothesis — it is empirically falsifi
 
 **(i) Forward defense: rdna3_mailbox.h primitives.** `mailbox_load_descriptor<T>(const volatile T*) -> T` and `mailbox_store_descriptor<T>(volatile T*, T)`. Forces volatile-preserving load/store. Documented at point-of-use; prevents future cast-strip recurrence. Zero runtime cost. Migrated megakernel.hip:203 to use the helper in commit 6bd6635.
 
-**(j) Audit task — bd braidinfer-20fp (P3).** ~150 non-flagged `global_load_b64` instructions remain in `persistent_worker` disasm. Each is potentially a cast-strip risk if it crosses a producer-consumer cache boundary. Audit method: trace each disasm offset back to source line, classify as (a) safe-purely-local, (b) cast-strip-risk-needs-migration, (c) deliberately-cacheable. Deferred; not blocking.
+**(j) Audit task — bd braidinfer-20fp (CLOSED 2026-05-19).** ~150 non-flagged `global_load_b64` instructions remained in `persistent_worker` disasm at the time (j) was written. Each was potentially a cast-strip risk if it crosses a producer-consumer cache boundary. Audit method: trace each disasm offset back to source line, classify as (a) safe-purely-local, (b) cast-strip-risk-needs-migration, (c) deliberately-cacheable. **Audit completed in subsection (p) below** (2026-05-19): ~125 distinct source sites classified, zero new mailbox_load_descriptor migrations needed beyond the megakernel.hip:203 fix already landed in commit 6bd6635, one follow-up filed as bd braidinfer-1uak (coop_copy P2P L1-invalidate question, P3). bd 20fp closed.
 
 **(k) Cross-references.**
 - bd braidinfer-4e2m (top issue, this race)
@@ -1600,19 +1615,12 @@ Do not re-propose the G9 producer-fence hypothesis — it is empirically falsifi
 
 *Firmware.* MES μC could WB+inv its private cache (and any peer-GPU state it caches per `proc_ctx_addr`) on receipt of a `NEW_QUEUE` packet that includes a fresh `proc_ctx_addr`. Would need AMD firmware change. *Hardware.* A memory-hub-level fence that all consumers can issue — probably not present on gfx11 (would have been documented in the GFX11 ACE/ISA reference). RDNA4 (gfx12) adds `global_wb scope:SCOPE_SYS` and `global_inv scope:SCOPE_SYS` which together approximate this fence; on gfx1200 the bug should be self-resolved without warmup-discard.
 
-**(n) Methodology note (preserved as recipe).**
+**(n) Methodology note (original context — PROMOTED to §1.2).**
 
-(See also §1.2 for promoted methodology.)
-
-Falsification cascade discipline for cross-GPU coherence bugs on gfx1100 (or any hardware where reaching the actual cure layer is uncertain):
-
-1. **Capture symptom signature** with per-trial / per-worker / per-position resolution. Don't aggregate; the diagnostic shape lives in the dimensions.
-2. **Bisect by intervention class** — CPU-side / kernel-side / shader-side. Each class has different reach into the cache hierarchy.
-3. **Falsify each class with measurable delta vs baseline.** N=30 minimum (binomial 3σ ≈ ±5 for N=30; smaller samples are noise traps).
-4. **Don't trust partial-improvement results.** Overlapping cures from different classes signal the noise floor, not a stack of independent bugs. If glc+dlc gives 16/30 and baseline is 16/30, the 16/30 is the noise floor — not a bug-overlap.
-5. **Document falsified hypotheses explicitly.** Save future investigators from re-running the same dead-ends. Failure record IS load-bearing artifact.
-
-This is the "tractor squashing grape" failsafe — if you go through this cascade and reach an unreachable layer, you know it's an unreachable layer, not a "we didn't try hard enough" answer.
+The 5-step falsification-cascade recipe was developed in this
+investigation (bd 4e2m, 2026-05-19) and PROMOTED to top-level §1.2
+"Falsification Methodology". See §1.2 for the full recipe; this entry
+marks the original derivation context.
 
 **(o) Cure is at the dispatch layer, not the prefill layer (Exp 1, 2026-05-19, commit 5a89a64+1).**
 
@@ -1655,7 +1663,9 @@ Categories:
 
 **Cross-refs.** bd 20fp (this audit), bd 4e2m, bd 1uak (coop_copy P2P L1-invalidate follow-up), GFX1100_ARCH.md §5.4 / §11.18 / §11.19 (b), commit 6bd6635 (cast-strip fix), this commit (audit + op_d2d_copy comment).
 
-**(q) Production state as of 2026-05-19 — mailbox-only default with single-GPU fallback. Plus D1 v1 deadlock lesson and INV_GART kernel-patch falsification.**
+**(q) Production state + D1 v1 lesson + INV_GART falsification (composite; three labeled sub-blocks below).**
+
+**(q.1) Production state — mailbox-only default with single-GPU fallback (2026-05-19).**
 
 **Default warmup behavior.** `BRAIDINFER_WARMUP_MODE` defaults to `mailbox-only`:
   - True multi-GPU MoE: spawn persistent workers (via `ensure_moe_workers_started` + `init_multi_gpu_persistent`, both `pub(crate)`), dispatch one `OP_D2D_COPY` of 4 floats per worker mailbox + verify via host-mapped UC round-trip. ~320ms cold-start cost (mostly worker spawn ~318ms; dispatch ~1.5ms). 30/30 first-attempt-clean on qwen35_35b_a3b.q4 -g 4 + qwen36_35b_a3b.q4 -g 4.
@@ -1666,13 +1676,15 @@ Env opt-outs (preserved):
   - `BRAIDINFER_WARMUP_SKIP=1` — skip warmup entirely (diagnostic / testing only; cold-start race remains unprotected).
   - `BRAIDINFER_WARMUP_RETRIES=N` — max retries per cold-start before exit-100 (default 5).
 
-**D1 v1 deadlock lesson (preserved for future contributors).** First attempt at single-GPU mailbox-only warmup (Lane 1 D1 v1) extended `init_multi_gpu_persistent` to handle the `multi_gpu == None` case by allocating a single-slot `PersistentDispatch` for GPU 0 and spawning its persistent_worker. This APPEARED clean: 10/10 trials decode-coherent, mailbox round-trip ~600µs, no NaN. BUT every trial exited rc=1 with `panic at decode/mod.rs:59: 'Option::unwrap() on a None value'`. Root cause: the persistent worker holds all CUs on GPU 0 once launched. The subsequent user prompt's `prefill` saw `persistent_workers.is_some() && !has_moe` and routed AROUND `prefill_paged` — which is the ONLY init path that lazily populates `paged_seq` / `page_allocator` / `megakernel_paged`. `decode_step_persistent` then panicked unwrapping `paged_seq`. The fundamental conflict: `prefill_paged` uses `hipMemcpy` to populate paged chunks, and `hipMemcpy` deadlocks once a cooperative kernel is holding all CUs. So spawning the worker before prefill is mutually exclusive with the existing init flow.
+**(q.2) D1 v1 deadlock lesson (preserved for future contributors).**
+
+First attempt at single-GPU mailbox-only warmup (Lane 1 D1 v1) extended `init_multi_gpu_persistent` to handle the `multi_gpu == None` case by allocating a single-slot `PersistentDispatch` for GPU 0 and spawning its persistent_worker. This APPEARED clean: 10/10 trials decode-coherent, mailbox round-trip ~600µs, no NaN. BUT every trial exited rc=1 with `panic at decode/mod.rs:59: 'Option::unwrap() on a None value'`. Root cause: the persistent worker holds all CUs on GPU 0 once launched. The subsequent user prompt's `prefill` saw `persistent_workers.is_some() && !has_moe` and routed AROUND `prefill_paged` — which is the ONLY init path that lazily populates `paged_seq` / `page_allocator` / `megakernel_paged`. `decode_step_persistent` then panicked unwrapping `paged_seq`. The fundamental conflict: `prefill_paged` uses `hipMemcpy` to populate paged chunks, and `hipMemcpy` deadlocks once a cooperative kernel is holding all CUs. So spawning the worker before prefill is mutually exclusive with the existing init flow.
 
 **D1 v2 resolution (current commit).** Sentinel-based fallback: `minimal_mailbox_warmup_no_prefill` returns `Err("single-gpu-fallback")` when `multi_gpu.is_none()`. `generate.rs` detects the sentinel and runs `greedy_generate("Hello", 4)` inline. No worker spawn before prefill; no `hipMemcpy` deadlock; behavior identical to pre-flip for single-GPU configs.
 
 **Forward lesson:** spawning the persistent worker BEFORE prefill is architecturally incompatible with the current paged-KV lazy-init pattern on this codebase. If a future contributor wants to unify warmup further, the path is to refactor `prefill_paged` to use cooperative-kernel dispatch instead of `hipMemcpy` (significant work), not to spawn the worker earlier.
 
-**INV_GART kernel-patch experiment — FALSIFIED at MES firmware level (2026-05-19, linux-p2p tree).** Sub-agent investigation surfaced `MESAPI_MISC__INV_GART` opcode declared in `mes_v11_api_def.h:574` with no caller anywhere in amdgpu. `kfd_chardev.c:2814-2820` has AMD's own comment naming "stale process context data saved in MES" as a known phenomenon with `SET_SHADER_DEBUGGER` as workaround — matches our cold-start race 1:1.
+**(q.3) INV_GART kernel-patch experiment — FALSIFIED at MES firmware level (2026-05-19, linux-p2p tree).** Sub-agent investigation surfaced `MESAPI_MISC__INV_GART` opcode declared in `mes_v11_api_def.h:574` with no caller anywhere in amdgpu. `kfd_chardev.c:2814-2820` has AMD's own comment naming "stale process context data saved in MES" as a known phenomenon with `SET_SHADER_DEBUGGER` as workaround — matches our cold-start race 1:1.
 
 Kernel patch (in linux-p2p tree): new `amdgpu_mes_inv_gart()` wrapper + `MES_MISC_OP_INV_GART` enum + `mes_v11_0_misc_op` case + call from `add_queue_mes` gated on `qpd->queue_count == 0` (first queue per PASID per device). Built clean. Symbol `amdgpu_mes_inv_gart` confirmed in `/proc/kallsyms` after install.
 
@@ -1980,14 +1992,28 @@ Call sites to migrate in braidinfer:
 - Add a UTCL2 TLB warm-up pass during `MoeP2pState::new` init (after
   `hipDeviceEnablePeerAccess`, before first inference) to establish TLB entries.
 
-§5.5 Rule 10 proposal (FALSIFIED as cold-start cure but structurally valid for
-GPU-as-producer patterns): "For any `alloc_portable_coherent` (or equivalent GART-backed
-host-mapped) buffer written by a GPU kernel and read by a PEER GPU kernel, the GPU writer
-MUST issue `fence_device()` (agent-scope fence) after the final store and before signaling
-the consumer. `__threadfence_system()` is FORBIDDEN on gfx1100 (§5.3). The
-`buffer_gl0_inv` + `buffer_gl1_inv` sequence on the consumer side MAY additionally be
-required if the consumer runs in a persistent kernel that has previously cached the same
-GART page."
+§5.5 Rule 10 proposal — **FALSIFIED**. The Rule 10 producer-fence hypothesis
+was tested at the CPU producer analog in Exp 3 (10/30 PASS = baseline noise
+floor; see subsection (d) above). Per the identified mechanism layer in
+subsection (f) — MES μC private cache or memory-hub state, below
+userspace-shader/kernel-mode reach — the GPU-as-producer analog is expected
+to fail equivalently and is therefore **not separately tested** (the
+producer is the CPU on this code path; testing the GPU-as-producer analog
+would require synthesizing a code path we don't ship). DO NOT re-propose
+Rule 10 as a cold-start cure. The original proposal text follows for the
+historical record, including the consumer-side `buffer_gl0_inv` +
+`buffer_gl1_inv` pair which remains structurally correct hygiene for cached
+peer-VRAM reads (see §11.18 (y) merged into here) even though it is NOT
+sufficient for cold-start cure:
+
+> "For any `alloc_portable_coherent` (or equivalent GART-backed
+> host-mapped) buffer written by a GPU kernel and read by a PEER GPU
+> kernel, the GPU writer MUST issue `fence_device()` (agent-scope fence)
+> after the final store and before signaling the consumer.
+> `__threadfence_system()` is FORBIDDEN on gfx1100 (§5.3). The
+> `buffer_gl0_inv` + `buffer_gl1_inv` sequence on the consumer side MAY
+> additionally be required if the consumer runs in a persistent kernel
+> that has previously cached the same GART page."
 
 Cross-process blast radius: a UTCL2 fault from any process triggers MES `REMOVE_QUEUE`
 timeout, then `MODE1 GPU reset`, which drops ALL queues on that device including unrelated
@@ -2021,102 +2047,100 @@ kb entry `gpu-hang-cascade` (if present).
 
 ## Appendix A — Falsified hypotheses (do not retry)
 
-Single-place index of every empirically-refuted hypothesis tested during
-the bd 4e2m investigation arc (and adjacent investigations). Preserved
-so future investigators don't re-run dead-ends. Each entry: hypothesis,
-verdict, where to read the falsification record.
+Cross-investigation falsified-hypothesis index covering bd 4e2m
+(cold-start mailbox race) AND §11.13 (cooperative-grid relaunch wedge)
+AND adjacent investigations. Preserved so future investigators don't
+re-run dead-ends. Grouped by source investigation to make ownership
+clear. Each entry: hypothesis, verdict, where to read the falsification
+record.
 
-**Userspace shader interventions (consumer-side cache control)**
+### bd 4e2m falsifications (cold-start mailbox race)
 
-- `buffer_gl0_inv` + `buffer_gl1_inv` before mailbox descriptor load. NO
-  EFFECT on §11.13 wedge. See §11.13 stub → `mes/MES_PROBE_ARCHIVE.md`.
-- `global_load_b32 ... glc dlc` on consumer descriptor (Exp 1a, bd 4e2m).
-  16/30 PASS = baseline noise floor. Volatile-cast → L0/L1/L2
+- `global_load_b32 ... glc dlc` on consumer descriptor (Exp 1a). 16/30
+  PASS = baseline noise floor. Volatile-cast → L0/L1/L2
   invalidate-on-load is necessary correctness hygiene but NOT sufficient
   for cold-start cure. See §11.19 (c).
-- `global_atomic_or_b32` with mask 0 on poll address. NO EFFECT on
-  §11.13 wedge. See `mes/MES_PROBE_ARCHIVE.md`.
-- Wide 16-byte loads, inject 128 v_mad cycles between polls, cache-line
-  isolation (60-byte pad). NO EFFECT. See `mes/MES_PROBE_ARCHIVE.md`.
-- Inline-asm `slc` bypass on consumer load was not run end-to-end (per
-  udi #3237 directive: not worth experimenting given Exp 1a result).
-  Recorded as DEFERRED rather than falsified.
-
-**Userspace producer-side interventions (CPU)**
-
-- CPU `_mm_mfence`, `_mm_clflush + mfence` after host-mapped write.
-  NO EFFECT on §11.13 wedge. See `mes/MES_PROBE_ARCHIVE.md`.
 - CPU `read_volatile` of last descriptor word between
-  `num_instructions` and `seq_num` writes (Exp 3, bd 4e2m). 10/30 PASS =
-  baseline noise floor. Refutes §11.18 Rule 10 producer-fence hypothesis
-  at the CPU analog. See §11.19 (d).
-- `hipHostMallocCoherent`, `hipHostRegister` mapping mode variants. NO
-  EFFECT on §11.13 wedge. See `mes/MES_PROBE_ARCHIVE.md`.
-- `mmap(MAP_HUGETLB)`, fresh-page mmap. NO EFFECT. See
-  `mes/MES_PROBE_ARCHIVE.md`.
-- Stream rotation (hipStreamDestroy + hipStreamCreate between trials).
-  NO EFFECT. See `mes/MES_PROBE_ARCHIVE.md`.
-- Non-cooperative-kernel interleave between trials. NO EFFECT. See
-  `mes/MES_PROBE_ARCHIVE.md`.
-
-**Kernel-mode interventions (linux-p2p tree)**
-
+  `num_instructions` and `seq_num` writes (Exp 3). 10/30 PASS = baseline
+  noise floor. Refutes §11.18 Rule 10 producer-fence hypothesis at the
+  CPU analog. See §11.19 (d).
 - `MESAPI_MISC__INV_GART` opcode wired from `add_queue_mes` on
-  first-queue-per-PASID-per-device (bd 4e2m, 2026-05-19). 10/30 PASS
-  PLUS 351 `MES failed to respond` + `MES might be in unrecoverable
-  state` advisories + 3 process crashes on N=30 cold-starts. REGRESSION.
+  first-queue-per-PASID-per-device (2026-05-19). 10/30 PASS PLUS 351
+  `MES failed to respond` / `MES might be in unrecoverable state`
+  advisories + 3 process crashes on N=30 cold-starts. REGRESSION.
   Opcode declared in upstream `mes_v11_api_def.h:574` but firmware-side
   broken on gfx11/MES1 in this call context. AMD shipped it but did NOT
-  wire it for a real reason. See §11.19 (q); reverted in linux-p2p
+  wire it for a real reason. See §11.19 (q.3); reverted in linux-p2p
   tree; also documented in `kernels/rdna3/rdna3_compat.h` as FORBIDDEN.
 - linux-p2p patches 0014 / 0014v2 (MQD HDP flush during init_mqd_hiq).
   REGRESSED to 0-3/10. Broke HIQ MQD privilege bits. See §11.19 (e),
   `~/builds/linux-p2p/0014*.patch.reverted`.
-- linux-p2p patches 0015 / 0015v2 (KIQ ACQUIRE_MEM with GC L2 invalidate).
-  REGRESSED to 0/10 (and 5/5 only with warmup-discard already active,
-  indicating near-zero kernel-side contribution). Disrupted MES on
-  concurrent compute. See §11.19 (e), `~/builds/linux-p2p/0015*.patch.reverted`.
-- MES MISC `NOTIFY_TO_UNMAP_PROCESSES` (Design D). WEDGE persists. See
-  `mes/MES_PROBE_ARCHIVE.md`.
-- MES MISC `SET_SHADER_DEBUGGER` (Design F). WEDGE persists; HIP
-  already uses the first SHADER_DEBUGGER call at `hipInit`. See
-  `mes/MES_PROBE_ARCHIVE.md`.
-- Raw MES `REMOVE_QUEUE` + `ADD_QUEUE` with `skip_process_ctx_clear=0`
-  override (Design G). WEDGE persists. See `mes/MES_PROBE_ARCHIVE.md`.
-- Raw REMOVE-all + ADD-all reaching "last gang in process" condition
-  (Design H). WEDGE persists. See `mes/MES_PROBE_ARCHIVE.md`.
-- Per-PASID heavy `amdgpu_gmc_flush_gpu_tlb_pasid` + Design H. WEDGE
-  persists. See `mes/MES_PROBE_ARCHIVE.md`.
-- `amdgpu.cwsr_enable=0` (helps SOME framework users for adjacent wedge
-  classes). REJECTED for our case via empirical reboot test. See
-  `mes/MES_PROBE_ARCHIVE.md`.
-
-**Architectural / framing hypotheses**
-
-- "Rule 9 violation fully explains the §11.13 wedge" (2026-05-14
-  morning take). WRONG. Standalone reproducer with ZERO prior
-  cooperative launches wedged identically. Actual root cause was the
-  Phase 2' deferred-ack protocol deadlock (§11.15). Rule 9 is still
-  valid as a separate guideline; it just isn't the §11.13 mechanism.
-  See §11.15 + §11.13 stub.
+- linux-p2p patches 0015 / 0015v2 (KIQ ACQUIRE_MEM with GC L2
+  invalidate). REGRESSED to 0/10 (and 5/5 only with warmup-discard
+  already active, indicating near-zero kernel-side contribution).
+  Disrupted MES on concurrent compute. See §11.19 (e),
+  `~/builds/linux-p2p/0015*.patch.reverted`.
+- "§11.18 Rule 10 producer-fence (fence_device after store) is the
+  systematic fix for cross-cache GART staleness". FALSIFIED by Exp 3 at
+  the CPU producer analog. The cure layer is below userspace; MES μC
+  private cache or memory-hub state. See §11.19 (d), (f), (y), (aa).
+- "MTYPE_UC on the destination buffer alone is sufficient for cross-
+  cache reads" (early §11.16 framing). SUPERSEDED — UC on the dst is
+  necessary but the FIRST cross-cache read from a fresh worker still
+  reads stale state on cold-start. See §11.19 (r)-(v) (merged §11.16).
 - "Prefill is the cold-start cure-step" (bd tm5t framing, 2026-05-19
   morning take). REFINED: Lane C Exp 1 (commit 38b05b1) showed
   worker-spawn + 1 mailbox round-trip (NO prefill) = 30/30 at ~320ms.
   Prefill was decoration; the actual cure-step is ANY mailbox dispatch
   through a fresh worker. See §11.19 (o).
-- "§11.18 Rule 10 producer-fence (fence_device after store) is the
-  systematic fix for cross-cache GART staleness". FALSIFIED by Exp 3 at
-  the CPU producer analog. The cure layer is below userspace; MES μC
-  private cache or memory-hub state. See §11.19 (d), (f), (y).
-- "MTYPE_UC on the destination buffer alone is sufficient for cross-
-  cache reads" (early §11.16 framing). SUPERSEDED — UC on the dst is
-  necessary but the FIRST cross-cache read from a fresh worker still
-  reads stale state on cold-start. See §11.19 (r)-(v) (merged §11.16).
+- Inline-asm `slc` bypass on consumer load: NOT RUN end-to-end (per
+  udi directive: not worth experimenting given Exp 1a result).
+  Recorded as DEFERRED, not falsified.
+
+### §11.13 falsifications (cooperative-grid relaunch wedge)
+
+Userspace probes (all WEDGE persists):
+- `buffer_gl0_inv` + `buffer_gl1_inv` before poll-address load.
+- `global_load_b32 ... glc dlc` on poll address.
+- `global_atomic_or_b32` with mask 0 on poll address.
+- Wide 16-byte loads, inject 128 v_mad cycles between polls, cache-line
+  isolation (60-byte pad).
+- CPU `_mm_mfence`, `_mm_clflush + mfence` after host-mapped write.
+- `hipHostMallocCoherent`, `hipHostRegister` mapping-mode variants.
+- `mmap(MAP_HUGETLB)`, fresh-page mmap.
+- Stream rotation (`hipStreamDestroy` + `hipStreamCreate` between trials).
+- Non-cooperative-kernel interleave between trials.
+- 10-100ms zero-queue-delay between trials.
+
+Kernel-side patches (all WEDGE persists):
+- MES MISC `NOTIFY_TO_UNMAP_PROCESSES` (Design D).
+- MES MISC `SET_SHADER_DEBUGGER` (Design F); HIP already uses the
+  first SHADER_DEBUGGER call at `hipInit`.
+- Raw MES `REMOVE_QUEUE` + `ADD_QUEUE` with `skip_process_ctx_clear=0`
+  override (Design G).
+- Raw REMOVE-all + ADD-all reaching "last gang in process" condition
+  (Design H).
+- Per-PASID heavy `amdgpu_gmc_flush_gpu_tlb_pasid` + Design H.
+
+Configurations:
+- `amdgpu.cwsr_enable=0` (helps SOME framework users for adjacent wedge
+  classes). REJECTED for our case via empirical reboot test.
+
+All §11.13 entries cross-reference `mes/MES_PROBE_ARCHIVE.md` for the
+full probe table and dmesg evidence.
+
+Framing:
+- "Rule 9 violation fully explains the §11.13 wedge" (2026-05-14
+  morning take). WRONG. Standalone reproducer with ZERO prior
+  cooperative launches wedged identically. Actual root cause was the
+  Phase 2' deferred-ack protocol deadlock (§11.15). Rule 9 itself is
+  still valid as a separate guideline; it just isn't the §11.13
+  mechanism. See §11.15 + §11.13 stub.
 - `hsa-rocr-coop-force-destroy-gfx11.patch` (obsolete approach).
   REJECTED due to double-free risk. See bridge thread / linux-p2p
   history.
 
-**Common reasoning pitfalls (do not re-derive)**
+### Common reasoning pitfalls (apply across both investigations)
 
 - "Partial improvement at one intervention class is additive evidence
   that combining classes will cure" — NO. If glc+dlc gives 16/30 and
