@@ -152,6 +152,13 @@ unsafe extern "C" {
     pub fn hipEventSynchronize(event: hipEvent_t) -> hipError_t;
     pub fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, stop: hipEvent_t) -> hipError_t;
 
+    // Device info
+    pub fn hipDeviceGetPCIBusId(
+        pci_bus_id: *mut std::os::raw::c_char,
+        len: c_int,
+        device: c_int,
+    ) -> hipError_t;
+
     // Peer access
     pub fn hipDeviceEnablePeerAccess(peer_device: c_int, flags: c_uint) -> hipError_t;
     pub fn hipDeviceCanAccessPeer(

@@ -105,6 +105,19 @@ impl MultiGpuContext {
             return Ok(None);
         }
 
+        // bd braidinfer-sm16 / udi #3012 (IV) topology probe: dump each HIP
+        // device's PCI BDF so cold-start logs map HIP-index → physical card.
+        // Per-process latched-worker failures need this to discriminate
+        // faulty-card vs init-sequence-race causes.
+        for i in 0..num_devices {
+            let mut buf = [0i8; 32];
+            unsafe {
+                let _ = ffi::hipDeviceGetPCIBusId(buf.as_mut_ptr(), 32, i as i32);
+            }
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+            eprintln!("Multi-GPU: HIP {i} = PCI {}", cstr.to_string_lossy());
+        }
+
         // Enable P2P access between all device pairs.
         // DeviceGuard saves the caller's current device and restores it on
         // drop, so the loop never leaves a stale current-device behind.
