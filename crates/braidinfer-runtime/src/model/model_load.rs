@@ -1129,7 +1129,6 @@ impl Model {
             last_checkpoint_slot: None,
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
             has_moe,
-            persistent: std::env::var("PERSISTENT").as_deref() == Ok("1"),
             kv_quant: std::env::var("KV_QUANT").as_deref() == Ok("1"),
             sync_debug: std::env::var("SYNC_DEBUG").is_ok(),
             debug_p2p_hidden: std::env::var("DEBUG_P2P_HIDDEN").is_ok(),

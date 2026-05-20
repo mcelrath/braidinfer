@@ -37,23 +37,20 @@ impl Model {
         }
         // Persistent + paged (non-MoE): use paged prefill so decode sees KV in paged chunks.
         // Worker not yet started so hipMemcpy is still allowed.
-        if self.persistent && !self.has_moe && self.persistent_workers.is_none() {
+        // bd 9gmh Phase 3: persistent is always true, so condition reduces to:
+        // !has_moe && persistent_workers not yet launched.
+        if !self.has_moe && self.persistent_workers.is_none() {
             return self.prefill_paged(tokens);
         }
-        // MoE + persistent: mixed batched path (compile_prefill_segment + moe_ffn_forward).
+        // MoE: mixed batched path (compile_prefill_segment + moe_ffn_forward).
         if self.has_moe && self.persistent_workers.is_none() {
             return self.prefill_batched(tokens);
         }
-        // Sequential fallback: use paged path if worker not started (coherent with decode_step_paged reference).
-        let use_paged = self.persistent_workers.is_none();
+        // Sequential fallback: persistent worker already running — route through decode_step.
         let mut logits = vec![];
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = self.seq_len + i as u32;
-            logits = if use_paged {
-                self.decode_step_paged(tok, pos)?
-            } else {
-                self.decode_step(tok, pos)?
-            };
+            logits = self.decode_step(tok, pos)?;
         }
         Ok(logits)
     }

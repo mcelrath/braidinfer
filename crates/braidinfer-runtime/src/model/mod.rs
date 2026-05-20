@@ -67,7 +67,6 @@ pub struct Model {
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) debug_nan: bool,
     pub(crate) has_moe: bool,          // cached at load time: any layer has FfnType::MoE
-    pub(crate) persistent: bool,       // cached from PERSISTENT env var at load time
     pub(crate) kv_quant: bool,         // cached from KV_QUANT env var at load time
     pub(crate) sync_debug: bool,       // cached from SYNC_DEBUG env var at load time
     pub(crate) debug_p2p_hidden: bool, // cached from DEBUG_P2P_HIDDEN env var at load time
@@ -203,47 +202,27 @@ impl Model {
     /// GPU-resident argmax: run decode step and return token ID without transferring logits.
     pub fn decode_step_token(&mut self, token_id: u32, position: u32) -> Result<u32, ModelError> {
         let logits = self.decode_step(token_id, position)?;
-        if self.persistent_workers.is_some() {
-            let nan_count = logits.iter().filter(|v| v.is_nan()).count();
-            if nan_count > 0 {
-                eprintln!("WARN: {nan_count}/{} NaN in logits", logits.len());
-            }
-            let (idx, _) = logits
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
-                .unwrap();
-            Ok(idx as u32)
-        } else {
-            let result = self.kernels.argmax.forward(
-                &self.activations.logits,
-                &mut self.activations.argmax_result,
-                self.config.vocab_size as u32,
-                &self.stream,
-            )?;
-            Ok(result)
+        // Persistent path: logits already copied to host-mapped buffer by
+        // decode_step_persistent / decode_step_p2p — do CPU argmax.
+        let nan_count = logits.iter().filter(|v| v.is_nan()).count();
+        if nan_count > 0 {
+            eprintln!("WARN: {nan_count}/{} NaN in logits", logits.len());
         }
+        let (idx, _) = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Less))
+            .unwrap();
+        Ok(idx as u32)
     }
 
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        let is_multi_gpu = self.multi_gpu.is_some();
-        if is_multi_gpu {
-            if self.persistent {
-                return self.decode_step_persistent_multi_gpu(token_id, position);
-            }
-            return Err(ModelError::InvalidConfig(
-                "Multi-GPU inference requires persistent mode (set PERSISTENT=1)".to_string(),
-            ));
+        if self.multi_gpu.is_some() {
+            return self.decode_step_persistent_multi_gpu(token_id, position);
         }
-        if self.persistent {
-            // bd 3fiz: KV_QUANT+PERSISTENT incompatibility now validated at
-            // Model::load entry (model_load.rs). No late check needed here.
-            return self.decode_step_persistent(token_id, position);
-        }
-        if self.kv_quant {
-            return self.decode_step_paged_quantized(token_id, position);
-        }
-        self.decode_step_paged(token_id, position)
+        // bd 9gmh Phase 3: PERSISTENT is always true — always route through the
+        // cooperative megakernel worker path.
+        self.decode_step_persistent(token_id, position)
     }
 }

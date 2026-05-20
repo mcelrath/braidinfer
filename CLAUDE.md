@@ -2,6 +2,45 @@
 
 GPU-native LLM inference engine in Rust + HIP, targeting AMD RDNA3 (gfx1100, 7900XTX).
 
+## System Software Deviates From Stock — Patch Manifest
+
+This host runs **custom-patched** kernel and ROCm. Behaviors may differ from upstream documentation. **Check this list before debugging kernel/GPU coherence anomalies.**
+
+> **Maintenance**: kernel/ROCm patch work happens in `../exterior_algebra/` (authoritative source for this section). When a patch is permanently added/removed/falsified there, this section MUST be re-mirrored from `../exterior_algebra/AGENTS.md` (or `CLAUDE.md` — same file via symlink) to keep agents aligned. Do not edit the manifest here directly without also updating the other two project CLAUDE.md files (`../exterior_algebra/` and `../llama.cpp/`).
+
+### Kernel — `linux-p2p` package at `/home/mcelrath/builds/linux-p2p/`
+
+Source tree at `src/linux-7.0.9/`. PKGBUILD lists active `source+=('NNNN-...patch')` entries. Quick map:
+
+- **0001** MTYPE_UC for peer GPU VRAM on gfx11 (`amdgpu_amdkfd_gpuvm.c:kfd_mem_attach`) — workaround for missing `buffer_wbl2` on gfx11. Peer VRAM mapped uncached so writes bypass writer's L2.
+- **0002** smu13_0_0 if_version bump to 0x40 — accept newer SMU firmware.
+- **0003 / 0007 / 0009** PCIe error handling: coredump + bail, dedup PCI-error coredump, dedup coredump in ASIC reset.
+- **0005 / 0008 / 0010** SMU mailbox: skip on channel failure, prefail markers, ratelimit bus errors.
+- **0006** Skip `halt_activities` on non-hive frozen recovery to avoid NULL deref.
+- **0012** HDP flush after CPU memset of `proc_ctx_bo` (`kfd_process_queue_manager.c:386`) — closes gfx11 multi-GPU coherence gap.
+- **0013** HDP flush after CPU memset of `gang_ctx_bo` (same file, per-queue) — companion to 0012.
+- **0016** HDP flush on worker adev before MES ADD_QUEUE (`kfd_device_queue_manager.c:add_queue_mes`) — closes page-table-BO coherence gap, eliminates WALKER_ERROR:0x6 / MAPPING_ERROR:0x1 dmesg signature.
+- **0017** PTE-update fence synchronous wait in MAP_MEMORY_TO_GPU (`amdgpu_amdkfd_gpuvm.c:2119`, change `unreserve_bo_and_vms(&ctx, false, false)` → `(&ctx, true, false)`) — closes PERMISSION_FAULTS:0x3 race.
+- **0018** HDP flush after debug-trap proc_ctx memset (`kfd_debug.c:372`) — mirror of 0012 for debug-trap path.
+
+Reverted/falsified (DO NOT REAPPLY): `0014.REVERTED`, `0015.FALSIFIED`, older `0016-...stb-log....FALSIFIED`, `0019-...peer-adevs....FALSIFIED_DEADLOCK`. Sit in the same directory with `.FALSIFIED*` suffix.
+
+Module is auto-loaded with `amdgpu.mes_log_enable=1` (modprobe.d): exposes per-card MES Scheduler Log at `/sys/kernel/debug/dri/<bdf>/amdgpu_mes_event_log` (intr_history only; api_history NOT exposed by this flag — see `bd show exterior_algebra-6gv.13`).
+
+### HSA Runtime — `hsa-rocr` package at `/home/mcelrath/builds/hsa-rocr/`
+
+- **`hsa-rocr-p2p-mtype-uc-gfx11.patch`** ACTIVE — forces peer VRAM mappings on multi-GPU gfx11 to `HSA_CACHING_NONCACHED`. Workaround for missing `buffer_wbl2` writer-side gap; without it, GPU compute writes to P2P-mapped peer VRAM never reach the remote GPU (stay in writer's L2). Touches `amd_memory_region.cpp:510`.
+- **`hsa-rocr-coop-force-destroy-gfx11.patch`** OBSOLETE since 2026-05-12, NOT applied. Patch file retained for history with explanatory header. Removed because it introduced a `delete this` double-free.
+
+### Implications for agent reasoning
+
+- "GPU L2 doesn't flush to peer VRAM on gfx11" is a known issue worked around by 0001 (kernel) + hsa-rocr-p2p-mtype-uc (userspace). Don't rediscover.
+- HDP-flush-on-owner-adev-only is the coherence-gap pattern 0012/0013/0016/0018 close. If you see new `WALKER_ERROR` / `MAPPING_ERROR` / `PERMISSION_FAULTS` signatures in dmesg for multi-GPU paths, suspect another instance of this class.
+- `s_buffer_gl0_inv` / `s_buffer_gl1_inv` are **silently no-op on gfx11+** for host-mapped UC scalar loads (see braidinfer `GFX1100_ARCH.md §11.14`). Do not assume scalar-cache invalidation works.
+- Production cold-start cure: userspace warmup-discard + mailbox-only default. The race is "MES μC private cache / memory-hub state, identified-but-unreachable from userspace" per bd memory `gfx1100-cold-start-race-bd-4e2m-final-state`. Kernel patches 0016/0017 close upstream-visible portions but do NOT fix the userspace symptom.
+- `bd 6gv` epic (in exterior_algebra project) is the cumulative reinvestigation record. Search `bd memories 6gv` and `bd list --parent=exterior_algebra-6gv` for current status.
+- `rocgdb` package is **`rocm-gdb`** in Arch repos (extra), NOT `rocgdb`.
+
 ## GPU Binary Launch Requirements
 
 **MANDATORY**: Always use `scripts/launch-gpu.py` to run any command that uses GPUs. This includes cargo tests, benchmarks, profiling, and any binary that touches HIP. **No exceptions. No workarounds.**
@@ -321,6 +360,19 @@ Always include in review prompts:
 **model.rs > 1000 lines → split before adding more.** Any source file over 1000 lines
 should be split into focused modules before new features are added. This prevents god
 objects from accumulating.
+
+### Retired: PERSISTENT env var (bd 9gmh Phase 3, 2026-05-20)
+
+`PERSISTENT=0` is a no-op. The persistent cooperative megakernel path is always
+used. All configurations are validated:
+- Single-GPU dense: 2.1x speedup confirmed (original validation).
+- Single-GPU MoE: validated 2026-05-20 (qwen35_35b_a3b, -g 1, N=5, 5/5 PASS).
+- KV_QUANT=1: validated 2026-05-20 via quantize_sealed_chunk_via_worker.
+- WEIGHT_QUANT=rnf4/mixed: confirmed 2026-05-20.
+- Multi-GPU: always required persistent, unchanged.
+
+`Model::persistent` field deleted. `decode_step_paged` / `decode_step_paged_quantized`
+retained as public methods for test coverage (kv_quant_e2e_test, persistent_paged_test).
 
 ### Review History
 - 2026-03-25 round 1: 21 findings → epic braidinfer-ji9, 13 fixed, 8 deferred

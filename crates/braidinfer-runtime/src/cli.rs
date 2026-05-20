@@ -221,55 +221,33 @@ pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
         unsafe { std::env::set_var("MULTI_GPU", "1") };
     }
 
-    let _has_moe = detect_moe(model_dir);
-    // PERSISTENT: enabled by default for all model architectures.
-    //   - Multi-GPU: required (only the cooperative megakernel path supports
-    //     P2P worker dispatch).
-    //   - Single-GPU non-MoE: 2.1× speedup vs the paged path.
-    //   - Single-GPU MoE: validated 2026-05-20 (qwen35_35b_a3b.q4 -g 1 N=5
-    //     PERSISTENT=1: 5/5 PASS @ 14-18 tok/s with coherent output).
-    // Opt out with PERSISTENT=0 (still needed for KV_QUANT=1 and
-    // WEIGHT_QUANT=rnf4/mixed configurations until those land on the
-    // megakernel path).
-    let persistent = std::env::var("PERSISTENT").as_deref() != Ok("0");
-    if persistent && std::env::var("PERSISTENT").is_err() {
-        let reason = if multi_gpu {
-            "required for multi-GPU"
-        } else {
-            "default for all model architectures"
-        };
-        eprintln!("Auto: PERSISTENT enabled ({reason})");
+    // PERSISTENT: always enabled (bd 9gmh Phase 3 retired PERSISTENT=0 path).
+    // All configurations — single-GPU dense, single-GPU MoE, multi-GPU,
+    // KV_QUANT=1, WEIGHT_QUANT=rnf4/mixed — are validated on the persistent
+    // cooperative megakernel path. Setting PERSISTENT=0 is now a no-op.
+    if std::env::var("PERSISTENT").as_deref() == Ok("0") {
+        eprintln!("Warning: PERSISTENT=0 is deprecated and has no effect. The persistent cooperative megakernel path is always used.");
+    } else if std::env::var("PERSISTENT").is_err() {
         unsafe { std::env::set_var("PERSISTENT", "1") };
     }
+    let persistent = true;
 
     validate_env_combos(multi_gpu, persistent);
     (multi_gpu, persistent)
 }
 
 /// Reject combinations of env vars that are guaranteed to crash at runtime
-/// or load time. Surfacing these at startup (after MULTI_GPU/PERSISTENT have
-/// been resolved) gives the user an immediate, actionable error instead of
-/// a panic or InvalidConfig after several seconds of model load.
-fn validate_env_combos(multi_gpu: bool, persistent: bool) {
-    // WEIGHT_QUANT=rnf4|mixed: the megakernel handles packed weights via
-    // emit_batched_linear_proj → linear_proj_opcode_ptr (dispatches Bf16/Packed →
-    // OP_LINEAR_PROJ/_RNF4/_PCG32). All remaining as_bf16_ptr call sites are
-    // gated by `if all_bf16` checks (compile_layers.rs:248,258,377,383) or
-    // intentionally bf16-only (compile_layers.rs:57,58 GDN w_a/w_b per
-    // SKIP_PATTERNS in bqnt_quantize.rs). The prior incompatibility guard was
-    // overly conservative; removed 2026-05-20 after audit (bridge thread).
-    //
-    // KV_QUANT is not yet wired through the persistent or multi-GPU paths
-    // (paged-only). Both binaries can hit this; centralize the guard here
-    // so generate doesn't also silently produce wrong output.
-    // bd 9gmh: KV_QUANT under PERSISTENT now supported (chunk-seal quantization
+/// or load time. Surfacing these at startup (after MULTI_GPU is resolved)
+/// gives the user an immediate, actionable error instead of a panic or
+/// InvalidConfig after several seconds of model load.
+fn validate_env_combos(multi_gpu: bool, _persistent: bool) {
+    // KV_QUANT under PERSISTENT is supported (bd 9gmh: chunk-seal quantization
     // routed via persistent worker mailbox in quantize_sealed_chunk_via_worker).
-    // Multi-GPU paged dispatch still not implemented.
+    // Multi-GPU paged KV dispatch is still not implemented.
     let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
     if kv_quant && multi_gpu {
         eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");
         eprintln!("  Multi-GPU paged KV dispatch not yet implemented.");
         std::process::exit(1);
     }
-    let _ = persistent;
 }
