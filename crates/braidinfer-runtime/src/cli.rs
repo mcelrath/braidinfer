@@ -221,16 +221,22 @@ pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
         unsafe { std::env::set_var("MULTI_GPU", "1") };
     }
 
-    let has_moe = detect_moe(model_dir);
-    // PERSISTENT: required for multi-GPU; enabled for non-MoE single-GPU
-    // (2.1× speedup). Single-GPU MoE stays on the paged path until validated.
-    let persistent =
-        std::env::var("PERSISTENT").as_deref() == Ok("1") || multi_gpu || !has_moe;
+    let _has_moe = detect_moe(model_dir);
+    // PERSISTENT: enabled by default for all model architectures.
+    //   - Multi-GPU: required (only the cooperative megakernel path supports
+    //     P2P worker dispatch).
+    //   - Single-GPU non-MoE: 2.1× speedup vs the paged path.
+    //   - Single-GPU MoE: validated 2026-05-20 (qwen35_35b_a3b.q4 -g 1 N=5
+    //     PERSISTENT=1: 5/5 PASS @ 14-18 tok/s with coherent output).
+    // Opt out with PERSISTENT=0 (still needed for KV_QUANT=1 and
+    // WEIGHT_QUANT=rnf4/mixed configurations until those land on the
+    // megakernel path).
+    let persistent = std::env::var("PERSISTENT").as_deref() != Ok("0");
     if persistent && std::env::var("PERSISTENT").is_err() {
         let reason = if multi_gpu {
             "required for multi-GPU"
         } else {
-            "non-MoE model"
+            "default for all model architectures"
         };
         eprintln!("Auto: PERSISTENT enabled ({reason})");
         unsafe { std::env::set_var("PERSISTENT", "1") };
