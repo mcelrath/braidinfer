@@ -272,6 +272,19 @@ impl Tracer {
         }
     }
 
+    /// Construct with an explicit filter and borrowed SDMA streams. Used by
+    /// `DecodeMirror` to wrap its hipMemcpyAsync sites without changing the
+    /// `BRAIDINFER_DECODE_MIRROR` env-var gate (Phase 2a facade).
+    #[doc(hidden)]
+    pub fn with_filter_and_streams(streams: Vec<ffi::hipStream_t>, filter: ProbeFilter) -> Self {
+        Tracer {
+            streams,
+            shadows: HashMap::new(),
+            sink: None,
+            filter,
+        }
+    }
+
     #[inline(always)]
     pub fn enabled(&self) -> bool {
         !self.filter.is_none()

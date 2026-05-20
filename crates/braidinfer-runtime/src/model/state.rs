@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use braidinfer_hip::memory::DeviceBuffer;
 
 use crate::paged_kv::{self, RecurrentCheckpointPool};
@@ -7,6 +9,7 @@ use super::ModelError;
 use crate::config::*;
 use crate::weights::*;
 use crate::gpu_utils::d2d_copy_f32;
+use crate::tracer::{Probe, Tracer};
 
 impl Model {
     /// Save the current GDN recurrent states into a checkpoint pool slot.
@@ -668,6 +671,100 @@ impl Model {
         self.activations.logits.copy_to_host(&mut logits)?;
         self.seq_len = position + 1;
         Ok((logits, traces))
+    }
+
+    /// Tracer-based decode step. Captures the same checkpoints as
+    /// `decode_step_traced` (embed, layer_{i}, final_norm, top10_logits) using
+    /// the `Tracer` API instead of synchronous D2H copies. The caller is
+    /// responsible for constructing the `Tracer` (with SDMA streams and a
+    /// `ProbeFilter`) and for reading results from it after this call returns.
+    ///
+    /// Phase 3a of PLAN-tmo8. Phase 4 will collapse this with `decode_step_traced`.
+    pub fn decode_step_traced_v2(
+        &mut self,
+        token_id: u32,
+        position: u32,
+        tracer: &mut Tracer,
+    ) -> Result<Vec<f32>, ModelError> {
+        let hs = self.config.hidden_size as u32;
+        let vs = self.config.vocab_size as u32;
+
+        if self
+            .config
+            .layers
+            .iter()
+            .any(|layer| layer.layer_type == LayerType::Attention)
+        {
+            self.append_paged_decode_token(position)?;
+        }
+
+        self.kernels.embedding.forward(
+            &mut self.activations.hidden,
+            &self.embed_weight,
+            token_id as i32,
+            hs,
+            &self.stream,
+        )?;
+        tracer.capture_f32(0, Probe::Embed, &self.activations.hidden)?;
+
+        let mut gdn_idx = 0usize;
+        let mut kv_idx = 0usize;
+        for i in 0..self.config.num_layers {
+            if self.config.layers[i].layer_type == LayerType::Attention {
+                self.attention_forward(i, kv_idx, position)?;
+                kv_idx += 1;
+            } else {
+                self.gdn_forward(i, gdn_idx)?;
+                gdn_idx += 1;
+            }
+            if tracer.enabled() {
+                tracer.capture_f32(
+                    0,
+                    Probe::Custom(Cow::Owned(format!("layer_{i}"))),
+                    &self.activations.hidden,
+                )?;
+            }
+        }
+
+        unsafe {
+            d2d_copy_f32(
+                &mut self.activations.normed,
+                0,
+                &self.activations.hidden,
+                0,
+                hs as usize,
+                &self.stream,
+            )?;
+        }
+        self.kernels.rmsnorm.forward(
+            &mut self.activations.hidden,
+            &self.activations.normed,
+            &self.final_norm_weight,
+            1,
+            hs,
+            self.config.rms_norm_eps,
+            self.config.rms_norm_one_plus_w,
+            &self.stream,
+        )?;
+        tracer.capture_f32(0, Probe::FinalNorm, &self.activations.hidden)?;
+
+        self.kernels.lm_head.forward(
+            &mut self.activations.logits,
+            &self.embed_weight,
+            &self.activations.hidden,
+            vs,
+            hs,
+            &self.stream,
+        )?;
+        tracer.capture_f32(0, Probe::Logits { top_k: 10 }, &self.activations.logits)?;
+
+        tracer.drain()?;
+
+        self.stream.synchronize()?;
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        self.activations.logits.copy_to_host(&mut logits)?;
+        self.seq_len = position + 1;
+        Ok(logits)
     }
 
     fn read_buf(&self, buf: &DeviceBuffer<f32>) -> Result<Vec<f32>, ModelError> {
