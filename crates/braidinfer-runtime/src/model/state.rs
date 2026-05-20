@@ -7,7 +7,6 @@ use crate::paged_kv::{self, RecurrentCheckpointPool};
 use super::Model;
 use super::ModelError;
 use crate::config::*;
-use crate::weights::*;
 use crate::gpu_utils::d2d_copy_f32;
 use crate::tracer::{Probe, Tracer};
 
@@ -597,81 +596,6 @@ impl Model {
         Ok(buf)
     }
 
-    pub fn decode_step_traced(
-        &mut self,
-        token_id: u32,
-        position: u32,
-    ) -> Result<(Vec<f32>, Vec<(String, Vec<f32>)>), ModelError> {
-        let hs = self.config.hidden_size as u32;
-        let vs = self.config.vocab_size as u32;
-        let mut traces: Vec<(String, Vec<f32>)> = Vec::new();
-        if self
-            .config
-            .layers
-            .iter()
-            .any(|layer| layer.layer_type == LayerType::Attention)
-        {
-            self.append_paged_decode_token(position)?;
-        }
-
-        self.kernels.embedding.forward(
-            &mut self.activations.hidden,
-            &self.embed_weight,
-            token_id as i32,
-            hs,
-            &self.stream,
-        )?;
-        traces.push(("embed".into(), self.read_hidden()?));
-
-        let mut gdn_idx = 0usize;
-        let mut kv_idx = 0usize;
-        for i in 0..self.config.num_layers {
-            if self.config.layers[i].layer_type == LayerType::Attention {
-                self.attention_forward(i, kv_idx, position)?;
-                kv_idx += 1;
-            } else {
-                self.gdn_forward(i, gdn_idx)?;
-                gdn_idx += 1;
-            }
-            traces.push((format!("layer_{i}"), self.read_hidden()?));
-        }
-
-        unsafe {
-            d2d_copy_f32(
-                &mut self.activations.normed,
-                0,
-                &self.activations.hidden,
-                0,
-                hs as usize,
-                &self.stream,
-            )?;
-        }
-        self.kernels.rmsnorm.forward(
-            &mut self.activations.hidden,
-            &self.activations.normed,
-            &self.final_norm_weight,
-            1,
-            hs,
-            self.config.rms_norm_eps,
-            self.config.rms_norm_one_plus_w,
-            &self.stream,
-        )?;
-        traces.push(("final_norm".into(), self.read_hidden()?));
-
-        self.kernels.lm_head.forward(
-            &mut self.activations.logits,
-            &self.embed_weight,
-            &self.activations.hidden,
-            vs,
-            hs,
-            &self.stream,
-        )?;
-        self.stream.synchronize()?;
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.activations.logits.copy_to_host(&mut logits)?;
-        self.seq_len = position + 1;
-        Ok((logits, traces))
-    }
 
     /// Tracer-based decode step. Captures the same checkpoints as
     /// `decode_step_traced` (embed, layer_{i}, final_norm, top10_logits) using
