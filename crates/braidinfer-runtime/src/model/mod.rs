@@ -237,16 +237,8 @@ impl Model {
             ));
         }
         if self.persistent {
-            // Critical guard: KV_QUANT under persistent is not yet wired through
-            // (post_step_paged is not invoked in the persistent path, so chunks
-            // never seal/quantize). Return InvalidConfig rather than silently
-            // running unquantized. Tracked as a follow-up under braidinfer-8gz.
-            if self.kv_quant {
-                return Err(ModelError::InvalidConfig(
-                    "KV_QUANT=1 with PERSISTENT=1 is not yet supported. \
-                     Either unset KV_QUANT or unset PERSISTENT.".into(),
-                ));
-            }
+            // bd 3fiz: KV_QUANT+PERSISTENT incompatibility now validated at
+            // Model::load entry (model_load.rs). No late check needed here.
             return self.decode_step_persistent(token_id, position);
         }
         if self.kv_quant {

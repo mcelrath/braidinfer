@@ -251,21 +251,14 @@ pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
 /// been resolved) gives the user an immediate, actionable error instead of
 /// a panic or InvalidConfig after several seconds of model load.
 fn validate_env_combos(multi_gpu: bool, persistent: bool) {
-    // WEIGHT_QUANT=rnf4|mixed is incompatible with the megakernel path
-    // (LinearWeight::as_bf16_ptr panics on Packed). The megakernel is the
-    // backbone of persistent + multi-GPU paths. Fail fast.
-    match std::env::var("WEIGHT_QUANT").as_deref() {
-        Ok("rnf4") | Ok("mixed") if persistent => {
-            eprintln!(
-                "Error: WEIGHT_QUANT={} is not supported on the megakernel path \
-                 (auto-enabled via PERSISTENT=1 / multi-GPU). Either unset \
-                 WEIGHT_QUANT, or set PERSISTENT=0 and run a single-GPU MoE model.",
-                std::env::var("WEIGHT_QUANT").unwrap_or_default()
-            );
-            std::process::exit(1);
-        }
-        _ => {}
-    }
+    // WEIGHT_QUANT=rnf4|mixed: the megakernel handles packed weights via
+    // emit_batched_linear_proj → linear_proj_opcode_ptr (dispatches Bf16/Packed →
+    // OP_LINEAR_PROJ/_RNF4/_PCG32). All remaining as_bf16_ptr call sites are
+    // gated by `if all_bf16` checks (compile_layers.rs:248,258,377,383) or
+    // intentionally bf16-only (compile_layers.rs:57,58 GDN w_a/w_b per
+    // SKIP_PATTERNS in bqnt_quantize.rs). The prior incompatibility guard was
+    // overly conservative; removed 2026-05-20 after audit (bridge thread).
+    //
     // KV_QUANT is not yet wired through the persistent or multi-GPU paths
     // (paged-only). Both binaries can hit this; centralize the guard here
     // so generate doesn't also silently produce wrong output.

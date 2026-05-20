@@ -28,6 +28,22 @@ impl Model {
         device: DeviceId,
         max_seq_len: Option<usize>,
     ) -> Result<Self, ModelError> {
+        // bd 3fiz: validate env-var combos BEFORE allocating any GPU resources.
+        // The decode_step KV_QUANT+PERSISTENT check at mod.rs:244 used to fire
+        // only after Model::load returned a fully-allocated model (tens of GB
+        // VRAM + multi-GPU expert distribution wasted). Catch it here instead.
+        let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
+        let persistent_env = std::env::var("PERSISTENT").as_deref() == Ok("1");
+        let multi_gpu_env = std::env::var("MULTI_GPU").is_ok();
+        if kv_quant && (persistent_env || multi_gpu_env) {
+            return Err(ModelError::InvalidConfig(
+                "KV_QUANT=1 is not supported with PERSISTENT=1 / MULTI_GPU \
+                 (post_step_paged chunk-seal uses hipMemcpy which deadlocks \
+                 under the persistent cooperative kernel). Either unset \
+                 KV_QUANT, or unset PERSISTENT/MULTI_GPU.".into(),
+            ));
+        }
+
         let config_path = model_dir.join("config.json");
         let mut config = if config_path.exists() {
             ModelConfig::from_config_json(&config_path)
