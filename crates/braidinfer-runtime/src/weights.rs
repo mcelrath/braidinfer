@@ -22,7 +22,6 @@ pub struct GdnLayerWeights {
     pub w_a: LinearWeight,             // [16, 1024]
     pub w_b: LinearWeight,             // [16, 1024]
     pub w_z: LinearWeight,             // [2048, 1024]
-    pub conv1d_weight: Option<DeviceBuffer<u16>>, // bf16 [6144, 4] — trace path only
     pub conv1d_weight_q: DeviceBuffer<u16>, // bf16 [nh*kd, ck] pre-split Q slice
     pub conv1d_weight_k: DeviceBuffer<u16>, // bf16 [nh*kd, ck] pre-split K slice
     pub conv1d_weight_v: DeviceBuffer<u16>, // bf16 [nh*vd, ck] pre-split V slice

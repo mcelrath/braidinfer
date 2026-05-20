@@ -632,14 +632,6 @@ impl Model {
                 let conv_raw: &[u16] = unsafe {
                     std::slice::from_raw_parts(conv_raw_bytes.as_ptr() as *const u16, conv_total)
                 };
-                let trace_path = std::env::var("TRACE").ok();
-                let conv1d_weight_buf = if trace_path.is_some() {
-                    let mut buf = DeviceBuffer::<u16>::alloc(device, conv_total)?;
-                    buf.copy_from_host(conv_raw)?;
-                    Some(buf)
-                } else {
-                    None
-                };
                 let mut conv_w_q_buf = DeviceBuffer::<u16>::alloc(device, q_dim * ck)?;
                 let mut conv_w_k_buf = DeviceBuffer::<u16>::alloc(device, q_dim * ck)?;
                 let mut conv_w_v_buf = DeviceBuffer::<u16>::alloc(device, v_dim * ck)?;
@@ -658,7 +650,6 @@ impl Model {
                     w_a: load_lw(&format!("{p}linear_attn.in_proj_a.weight"), nvh, hs)?,
                     w_b: load_lw(&format!("{p}linear_attn.in_proj_b.weight"), nvh, hs)?,
                     w_z: load_lw(&format!("{p}linear_attn.in_proj_z.weight"), z_out, hs)?,
-                    conv1d_weight: conv1d_weight_buf, // Some only when TRACE env var set
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
                     conv1d_weight_v: conv_w_v_buf,

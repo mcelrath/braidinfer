@@ -2,7 +2,6 @@
 //!
 //! Replaces three legacy diagnostic paths:
 //!   - `decode/trace.rs` per-layer checkpoints (BTRC writer)
-//!   - `state.rs::gdn_layer0_trace` GDN deep-dive
 //!   - `mirror.rs::DecodeMirror` multi-GPU coherence snapshots
 //!
 //! All capture issues `hipMemcpyAsync(DeviceToHost)` on a borrowed per-GPU SDMA
