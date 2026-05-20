@@ -431,6 +431,45 @@ impl Tracer {
         }
     }
 
+    /// Expose the filter's match predicate for callers that have already
+    /// constructed the name string (e.g., drain_trace_dump in persistent_dispatch).
+    #[inline(always)]
+    pub fn filter_matches(&self, name: &str) -> bool {
+        self.filter.matches(name)
+    }
+
+    /// Insert pre-decoded host bytes directly into the shadow map. Used by
+    /// `PersistentDispatch::drain_trace_dump` which reads dump slots from VRAM
+    /// via SDMA and has already copied the payload to the CPU.
+    ///
+    /// Allocates or reuses a `PinnedBuffer<u8>` sized to `bytes.len()` keyed by
+    /// `name`. The buffer is allocated via `hipHostMalloc` (pinned DRAM), NOT via
+    /// SDMA — this is safe because `drain_trace_dump` is called from CPU-only
+    /// code that runs outside the persistent worker's batch dispatch window.
+    pub fn insert_shadow(&mut self, name: String, bytes: &[u8]) {
+        use braidinfer_hip::memory::PinnedBuffer;
+        let shadow = match self.shadows.get_mut(&name) {
+            Some(s) if s.len() >= bytes.len() => s,
+            _ => {
+                // hipHostMalloc is allowed here: drain_trace_dump is called after
+                // wait_ack, outside any kernel dispatch, so no cooperative kernel
+                // holds CUs at this point in the decode loop.
+                let buf = match PinnedBuffer::<u8>::alloc(bytes.len()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!("[braidinfer] Tracer::insert_shadow: alloc failed for {name}: {e:?}");
+                        return;
+                    }
+                };
+                self.shadows.insert(name.clone(), buf);
+                self.shadows.get_mut(&name).unwrap()
+            }
+        };
+        // SAFETY: PinnedBuffer<u8> owns len bytes of pinned DRAM; copying into it is safe.
+        let dst = unsafe { shadow.as_mut_slice() };
+        dst[..bytes.len()].copy_from_slice(bytes);
+    }
+
     /// Close + flush the sink (if any). Safe to call multiple times; subsequent
     /// calls are no-ops.
     pub fn close_sink(&mut self) -> std::io::Result<()> {

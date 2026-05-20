@@ -505,6 +505,150 @@ impl PersistentDispatch {
         Ok(())
     }
 
+    /// Wire the dump buffer from `program` into the persistent worker's WorkerQueue
+    /// so that `dispatch_opcode` writes per-instruction output into it.
+    ///
+    /// Preconditions:
+    ///   - `program.dump_buffer` and `program.dump_counter` must be Some (i.e.
+    ///     `enable_dump_persistent` was called on the program beforehand).
+    ///   - Must be called BEFORE the next `dispatch_batch_slice` — the persistent
+    ///     worker reads `queue->dump_base` at the start of each batch.
+    ///
+    /// SAFE to call while the persistent worker is running: the write goes through
+    /// host-mapped memory (write_volatile), which does not require HIP API calls.
+    pub fn set_trace_dump_ptrs(
+        &mut self,
+        gpu_idx: usize,
+        program: &crate::megakernel::MegakernelProgram,
+    ) {
+        let dump_buf = match program.dump_buffer.as_ref() {
+            Some(b) => b.as_ptr() as *mut std::ffi::c_void,
+            None => return,
+        };
+        let dump_count = match program.dump_counter.as_ref() {
+            Some(c) => c.as_ptr() as *mut i32,
+            None => return,
+        };
+        let capacity = program.dump_capacity;
+        let worker = match self.workers.get(gpu_idx).and_then(|w| w.as_ref()) {
+            Some(w) => w,
+            None => return,
+        };
+        let q_ptr = worker.queue.host_ptr() as *mut WorkerQueueLayout;
+        unsafe {
+            std::ptr::addr_of_mut!((*q_ptr).dump_base).write_volatile(dump_buf);
+            std::ptr::addr_of_mut!((*q_ptr).dump_count).write_volatile(dump_count);
+            std::ptr::addr_of_mut!((*q_ptr).dump_capacity).write_volatile(capacity);
+        }
+    }
+
+    /// Drain trace dump slots from `program`'s dump_buffer into `tracer`'s shadow map.
+    ///
+    /// Uses the SDMA stream for `gpu_idx` to copy VRAM → pinned host asynchronously,
+    /// then synchronizes before decoding. Safe under the persistent cooperative worker
+    /// (SDMA runs independently of held CUs).
+    ///
+    /// After draining, resets dump_count to 0 via hipMemcpyAsync so the next batch
+    /// can reuse the buffer from slot 0.
+    ///
+    /// No-op if dump_buffer is None, dump_count is 0, or tracer is disabled.
+    pub fn drain_trace_dump(
+        &mut self,
+        gpu_idx: usize,
+        program: &crate::megakernel::MegakernelProgram,
+        tracer: &mut crate::tracer::Tracer,
+    ) -> HipResult<()> {
+        if !tracer.enabled() {
+            return Ok(());
+        }
+        let dump_buf = match program.dump_buffer.as_ref() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let dump_counter = match program.dump_counter.as_ref() {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Ok(());
+        }
+
+        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
+
+        // Read dump_count from VRAM via SDMA
+        let mut count_host = [0i32; 1];
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                count_host.as_mut_ptr() as *mut std::ffi::c_void,
+                dump_counter.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of::<i32>(),
+                ffi::hipMemcpyDeviceToHost,
+                stream,
+            )
+        })?;
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })?;
+
+        let num_slots = (count_host[0].min(program.dump_capacity)) as usize;
+        if num_slots == 0 {
+            return Ok(());
+        }
+
+        // Copy slot data from VRAM to a host Vec
+        let total_bytes = num_slots * DUMP_SLOT_BYTES;
+        let mut host_buf = vec![0u8; total_bytes];
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                host_buf.as_mut_ptr() as *mut std::ffi::c_void,
+                dump_buf.as_ptr() as *const std::ffi::c_void,
+                total_bytes,
+                ffi::hipMemcpyDeviceToHost,
+                stream,
+            )
+        })?;
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })?;
+
+        // Reset dump_count to 0
+        let zero = [0i32; 1];
+        braidinfer_hip::error::check(unsafe {
+            ffi::hipMemcpyAsync(
+                dump_counter.as_ptr() as *mut std::ffi::c_void,
+                zero.as_ptr() as *const std::ffi::c_void,
+                std::mem::size_of::<i32>(),
+                ffi::hipMemcpyHostToDevice,
+                stream,
+            )
+        })?;
+        // No sync needed after reset — next batch starts after dispatch_batch_slice returns
+
+        // Decode slots and insert into tracer
+        for i in 0..num_slots {
+            let slot = &host_buf[i * DUMP_SLOT_BYTES..];
+            let inst_idx = u32::from_le_bytes(slot[4..8].try_into().unwrap()) as usize;
+            let size = u32::from_le_bytes(slot[8..12].try_into().unwrap()) as usize;
+            if size == 0 || size > 8192 {
+                continue;
+            }
+            // Look up Probe from trace_probe_map
+            let probe = program.trace_probe_map.iter()
+                .find(|(idx, _)| *idx == inst_idx)
+                .map(|(_, p)| p.clone());
+            let probe = match probe {
+                Some(p) => p,
+                None => continue,
+            };
+            let name = probe.name();
+            if !tracer.filter_matches(name.as_ref()) {
+                continue;
+            }
+            let payload_bytes = size * 4;
+            let payload = &slot[16..16 + payload_bytes];
+            tracer.insert_shadow(name.into_owned(), payload);
+        }
+
+        Ok(())
+    }
+
     /// Single-GPU init helper (unchanged signature for non-MoE callers).
     /// Allocates a single-slot dispatcher launched on `devices[0]`.
     pub fn init(devices: &[DeviceId], shared_mem: u32, hidden_size: usize, watchdog: std::sync::Arc<WatchdogThread>) -> HipResult<Self> {

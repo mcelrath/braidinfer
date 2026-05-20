@@ -130,6 +130,11 @@ pub struct MegakernelProgram {
     /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.
     /// Avoids a Vec allocation per decode step.
     pub(crate) flat_program: Vec<u64>,
+    /// Map from instruction index → Probe emitted at that instruction (when
+    /// dump_buffer is enabled). Populated at compile time by emit_attention_layer
+    /// / compile_gdn_layer / compile_ffn / compile_embedding sites. Drained by
+    /// PersistentDispatch::drain_trace_dump.
+    pub(crate) trace_probe_map: Vec<(usize, crate::tracer::Probe)>,
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,
@@ -331,6 +336,27 @@ impl MegakernelProgram {
             results.push((opcode, inst_idx, data));
         }
         Ok(results)
+    }
+
+    /// Enable per-instruction dump mode for the persistent worker path.
+    ///
+    /// Unlike `enable_dump` (which prepends a NOP header and rebuilds device_program
+    /// for the one-shot megakernel_f32 path), this variant ONLY allocates the VRAM
+    /// dump buffer and counter. The persistent_worker reads dump pointers from
+    /// `WorkerQueue.dump_base/count/capacity` (written by
+    /// `PersistentDispatch::set_trace_dump_ptrs`), not from a NOP header.
+    ///
+    /// Safe to call while the persistent worker is running because it does not
+    /// touch device_program or issue any HIP API that requires free CUs.
+    pub fn enable_dump_persistent(&mut self, max_slots: i32) -> HipResult<()> {
+        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
+        let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
+        self.dump_buffer = Some(DeviceBuffer::<u8>::alloc(self.device, buf_size)?);
+        let mut counter = DeviceBuffer::<i32>::alloc(self.device, 1)?;
+        counter.copy_from_host(&[0i32])?;
+        self.dump_counter = Some(counter);
+        self.dump_capacity = max_slots;
+        Ok(())
     }
 
     pub fn dump_active(&self) -> bool {

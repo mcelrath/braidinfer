@@ -78,6 +78,7 @@ impl MegakernelProgram {
         let mut kv_base_ptrs = Vec::new();
         let mut barrier_layer_map: Vec<(usize, usize)> = Vec::new();
         let mut multi_gpu_attn_boundaries: Vec<(usize, usize)> = Vec::new();
+        let mut trace_probe_map: Vec<(usize, crate::tracer::Probe)> = Vec::new();
 
         let hs = cfg.hidden_size;
         let nh_gdn = cfg.linear_num_heads;
@@ -102,6 +103,7 @@ impl MegakernelProgram {
             0, // token_id — updated per step
             hs as i32,
         ).into_inst());
+        trace_probe_map.push((embedding_inst_idx, crate::tracer::Probe::Embed));
 
         // Layers
         let mut attn_paged_inst_indices = Vec::new();
@@ -157,6 +159,8 @@ impl MegakernelProgram {
                             &mut kv_base_ptrs,
                         );
                     }
+                    // PostMixer probe at the last instruction emitted by the attention block
+                    trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     attn_layer_count += 1;
                     kv_idx += 1;
                 }
@@ -170,6 +174,8 @@ impl MegakernelProgram {
                         &mut instructions,
                         num_blocks,
                     );
+                    // PostMixer probe at the ScaleAdd (residual) that ends compile_gdn_layer
+                    trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     gdn_idx += 1;
                 }
                 LayerType::Mamba2 => {
@@ -180,6 +186,8 @@ impl MegakernelProgram {
                         &model.mamba2_states[mamba2_idx],
                         &mut instructions,
                     );
+                    // PostMixer probe at the ResidualAdd that ends compile_mamba2_layer
+                    trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -196,6 +204,8 @@ impl MegakernelProgram {
             match &cfg.layers[layer_i].ffn_type {
                 crate::model::FfnType::Dense => {
                     Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
+                    // PostFfn probe at the last instruction emitted by compile_ffn
+                    trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
                 }
                 crate::model::FfnType::MoE { .. } => {
                     if multi_gpu {
@@ -244,6 +254,7 @@ impl MegakernelProgram {
             act.hidden.as_write_ptr(), act.normed.as_ptr(),
             model.final_norm_weight.as_ptr(), hs as i32, eps,
         ).into_inst());
+        trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::FinalNorm));
 
         // LM head
         {
@@ -307,6 +318,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
+            trace_probe_map,
             barrier_layer_map,
             multi_gpu_attn_boundaries,
             flat_program,
@@ -738,6 +750,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
+            trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
@@ -1131,6 +1144,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
+            trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
@@ -1406,6 +1420,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
+            trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,
@@ -1487,6 +1502,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
+            trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             flat_program,

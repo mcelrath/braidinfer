@@ -177,6 +177,24 @@ impl Model {
             }
         }
 
+        // Enable dump buffer on first traced step. enable_dump_persistent allocates VRAM
+        // buffers only (no NOP header / device_program rebuild — persistent path reads
+        // dump pointers from WorkerQueue). set_trace_dump_ptrs writes them into the queue.
+        // Slot count: embed(1) + per-layer PostMixer+PostFfn(2 per layer) + FinalNorm(1).
+        if self.tracer.enabled() {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            if !mk.dump_active() {
+                let num_layers = self.config.num_layers;
+                let max_slots = (1 + num_layers * 2 + 1) as i32;
+                if let Err(e) = mk.enable_dump_persistent(max_slots) {
+                    eprintln!("[braidinfer] enable_dump_persistent failed: {e:?}");
+                } else {
+                    let dispatch = self.persistent_workers.as_mut().unwrap();
+                    dispatch.set_trace_dump_ptrs(self.device.0 as usize, mk);
+                }
+            }
+        }
+
         // Write position_ids directly to host-mapped memory (no hipMemcpy)
         self.set_position(position).map_err(ModelError::Hip)?;
 
@@ -210,6 +228,17 @@ impl Model {
         let dispatch = self.persistent_workers.as_mut().unwrap();
         dispatch.dispatch_batch_slice(0, &mk.instructions[..halt_idx]);
 
+        // Drain trace dump after ack (dispatch_batch_slice is synchronous: wait_ack
+        // already returned). SDMA copies slot data from VRAM to host shadows in tracer.
+        if self.tracer.enabled() {
+            let mk_ref = self.megakernel_paged.as_ref().unwrap();
+            let gpu_idx = self.device.0 as usize;
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            if let Err(e) = dispatch.drain_trace_dump(gpu_idx, mk_ref, &mut self.tracer) {
+                eprintln!("[braidinfer] drain_trace_dump failed: {e:?}");
+            }
+        }
+
         // Read logits directly from host-mapped memory (no hipMemcpy needed)
         let logits = unsafe {
             std::slice::from_raw_parts(
@@ -219,10 +248,12 @@ impl Model {
         }
         .to_vec();
 
-        // Tracer: capture final_norm (VRAM, SDMA) + top10_logits (host-side) per step.
-        // Per-layer probes (embed, L{i}.post_mixer, etc.) require decode_step_traced_v2.
+        // Tracer: per-layer probes (embed, L{i}.post_mixer, L{i}.post_ffn, final_norm)
+        // are now populated by drain_trace_dump above. Top10 logits are host-side only.
         if self.tracer.enabled() {
             use crate::tracer::Probe;
+            // FinalNorm is already in shadows from drain_trace_dump; no SDMA needed.
+            // Keep the explicit capture as a fallback if trace_probe_map is incomplete.
             let _ = self.tracer.capture_f32(0, Probe::FinalNorm, &self.activations.normed);
             let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
             indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
