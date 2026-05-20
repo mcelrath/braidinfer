@@ -740,4 +740,55 @@ impl Model {
             per_worker.join(",")
         ))
     }
+
+    /// bd 4e2m Probe (a) variant (udi #3327): dispatch an empty packet
+    /// (num_inst=0) per worker to trigger persistent_iter_poll_barrier
+    /// first-iteration code path WITHOUT executing any opcode. Tests the
+    /// hypothesis that "first poll-barrier success on the worker" is the
+    /// cure mechanism, distinct from "any opcode dispatch via worker".
+    /// If this cures cold-start NaN, the cure is poll-barrier specific.
+    pub fn minimal_mailbox_warmup_empty_packet(&mut self) -> Result<String, String> {
+        if self.multi_gpu.is_none() {
+            return Err("single-gpu-fallback".into());
+        }
+        let t_spawn = std::time::Instant::now();
+        self.ensure_moe_workers_started()
+            .map_err(|e| format!("ensure_moe_workers_started: {e:?}"))?;
+        self.init_multi_gpu_persistent()
+            .map_err(|e| format!("init_multi_gpu_persistent: {e:?}"))?;
+        let spawn_ms = t_spawn.elapsed().as_secs_f64() * 1000.0;
+
+        let dispatch = self
+            .persistent_workers
+            .as_mut()
+            .ok_or_else(|| "no persistent_workers after spawn".to_string())?;
+
+        let gpu_count = dispatch.workers.len();
+        let live: Vec<usize> = (0..gpu_count).filter(|&i| dispatch.has_worker(i)).collect();
+        if live.is_empty() {
+            return Err("no live workers after spawn".into());
+        }
+
+        let mut per_worker = Vec::new();
+        let t_dispatch = std::time::Instant::now();
+        for &gpu_idx in &live {
+            let t_one = std::time::Instant::now();
+            // num_inst=0 batch: worker exits poll-barrier on seq > last_seq,
+            // reads num_inst=0, skips the inner instruction loop, acks
+            // immediately. Triggers the FIRST-ITERATION poll-barrier path
+            // without running any opcode.
+            let seq = dispatch.dispatch_batch_fire(gpu_idx, &[]);
+            dispatch.wait_ack(gpu_idx, seq);
+            let one_us = t_one.elapsed().as_micros();
+            per_worker.push(format!("gpu{}={}us", gpu_idx, one_us));
+        }
+        let dispatch_ms = t_dispatch.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(format!(
+            "spawn={:.1}ms empty-dispatch={:.2}ms [{}]",
+            spawn_ms,
+            dispatch_ms,
+            per_worker.join(",")
+        ))
+    }
 }

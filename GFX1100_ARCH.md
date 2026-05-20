@@ -2043,6 +2043,27 @@ kb entry `gpu-hang-cascade` (if present).
 - old §11.18 library integration, call sites, Rule 10, RDNA4 context -> §11.19 (aa)
 - old §11.19 (a)-(q) -> §11.19 (a)-(q) [unchanged]
 
+**(ab) Cure mechanism narrowed: poll-barrier first-iteration, not opcode-specific (2026-05-20, bridge thread #3322–#3331).**
+
+The (g)/(o) framing established "mailbox dispatch is the cure-step, not prefill". This subsection narrows further: **the cure is `persistent_iter_poll_barrier` first-iteration success on the worker, not any specific opcode dispatched within that batch.**
+
+**Falsification of host-side weight-coherence cure (Angle B, N=10).** Added `hipDeviceSynchronize()` per worker GPU at end of `init_split_attn_weights` (after the `copy_weight_slice` loop, before `init_multi_gpu_persistent`). Hypothesis: synchronous fence on the dst device flushes any pending peer SDMA writes to L2 before persistent_worker reads them. Result: 0/10 PASS with `BRAIDINFER_WARMUP_SKIP=1` on qwen35_35b_a3b.q4 -g 4. Reverted. **Falsifies "weight L2 staleness is the cure target".** Mechanism: `hipDeviceSynchronize` only orders host-visible ops on the calling device; the worker's own L2 is touched lazily on first VRAM read, AFTER the sync.
+
+**Probe (a) variant — empty packet (N=10, 10/10 PASS).** New `Model::minimal_mailbox_warmup_empty_packet` dispatches `dispatch_batch_fire(gpu_idx, &[])` per worker. The worker exits `persistent_iter_poll_barrier` on `seq > last_seq`, reads `num_inst=0`, skips the inner instruction loop, ack=seq. No opcode executes. 10/10 PASS on qwen35_35b_a3b.q4 -g 4 cold-start `BRAIDINFER_WARMUP_MODE=empty-packet`. Per-trial: `warmup-empty-packet attempt 1: OK — spawn=304-379ms empty-dispatch=1.46-1.49ms`. Latency essentially identical to D2D_COPY variant (~1.25ms).
+
+**MES log corroboration (udi bridge #3331).** Post-run MES_INTR_ME_1 count across 8 cards × 10 trials averaged **2.3/trial — firmly in PASS territory** (preserved-data baselines: PASS=3.3, FAIL_nan=6.8, FAIL_rc250=31.4). Zero FAIL-class dmesg signatures. The empty-packet cure produces a PASS-class MES signature, not a post-hoc-corrected FAIL signature.
+
+**Updated mechanism narrative.** Whatever the MES μC / memory-hub state is, the FIRST poll-barrier exit per worker primes it. The worker's first `seq > last_seq` transition includes an `atomic_block_barrier` with `__threadfence_system`-class ordering that either (i) primes the worker's L2 walkers for subsequent VRAM reads, or (ii) flushes MES μC per-PASID state via the side effect of MES processing the ack write. Either way, the cure is dispatch-layer-first-iteration, not opcode-payload-specific.
+
+**Production change (2026-05-20 commit follow-this-section).** `BRAIDINFER_WARMUP_MODE` defaults to `empty-packet`. Opt-outs:
+  - `BRAIDINFER_WARMUP_MODE=mailbox` — D2D_COPY variant (preserved for diagnostic comparison; equivalent latency)
+  - `BRAIDINFER_WARMUP_MODE=full-decode` — full 4-token decode warmup (pre-flip default)
+  - `BRAIDINFER_WARMUP_SKIP=1` — skip warmup entirely (testing only)
+
+**Optional principled fix (deferred).** Adding an explicit `buffer_inv` / `__threadfence_system` at `persistent_worker` entry (one-shot at outer-loop entry, before the per-batch loop) might eliminate the need for any warmup packet — the spawn itself would prime the worker. Not implemented in this commit; tracked as a follow-up. The empty-packet cure is sufficient for production and ~1.5ms is acceptable cold-start overhead on top of the unavoidable ~300ms spawn time.
+
+**Cross-refs.** bd 4e2m, bridge thread 2026-05-20 #3321–#3331 (udi Angle B falsification, Probe A withdrawal, Probe (a) variant design), commit (this) — empty-packet default + this subsection.
+
 ---
 
 ## Appendix A — Falsified hypotheses (do not retry)

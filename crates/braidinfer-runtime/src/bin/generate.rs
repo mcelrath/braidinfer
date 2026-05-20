@@ -107,8 +107,43 @@ fn main() {
             // falls back to full-decode warmup via "single-gpu-fallback"
             // sentinel (no race in single-GPU; spawning a worker before
             // prefill would also break the lazy paged-KV init).
-            let use_mailbox = warmup_mode != "full-decode";
-            let dirty = if use_mailbox {
+            // bd 4e2m cure mechanism (udi #3327/#3330/#3331): empty-packet
+            // (num_inst=0) warmup is DEFAULT as of this commit. Confirmed
+            // 10/10 PASS on qwen35_35b_a3b.q4 -g 4 cold-start; MES_INTR_ME_1
+            // post-run analysis (udi #3331) shows full PASS-class signature
+            // (2.3/trial, slightly below warmup-on baseline 3.3). Cure is
+            // persistent_iter_poll_barrier first-iteration success on the
+            // worker, NOT any specific opcode dispatch — so the simpler
+            // num_inst=0 packet is sufficient (and equally fast: ~1.5ms vs
+            // D2D_COPY's ~1.25ms). Opt back via BRAIDINFER_WARMUP_MODE=mailbox
+            // (D2D_COPY variant, retained for diagnostic) or "full-decode".
+            let use_empty_packet = warmup_mode != "full-decode" && warmup_mode != "mailbox";
+            let use_mailbox = warmup_mode == "mailbox";
+            let dirty = if use_empty_packet {
+                match model.minimal_mailbox_warmup_empty_packet() {
+                    Ok(diag) => {
+                        eprintln!("warmup-empty-packet attempt {warmup_attempts}: OK — {diag}");
+                        false
+                    }
+                    Err(diag) if diag == "single-gpu-fallback" => {
+                        eprintln!("warmup-empty-packet attempt {warmup_attempts}: single-GPU mode — falling back to full-decode warmup");
+                        mailbox_fallback_to_decode.set(true);
+                        let test = greedy_generate(&mut model, &tokenizer, &token_config, "Hello", 4);
+                        match &test {
+                            Ok(r) => {
+                                let concat: String = r.text_pieces.iter().cloned().collect();
+                                let bang_run = concat.chars().rev().take_while(|c| *c == '!').count();
+                                bang_run >= SIG_A_MIN_BANG_RUN
+                            }
+                            Err(_) => true,
+                        }
+                    }
+                    Err(diag) => {
+                        eprintln!("warmup-empty-packet attempt {warmup_attempts}: FAIL — {diag}");
+                        true
+                    }
+                }
+            } else if use_mailbox {
                 match model.minimal_mailbox_warmup_no_prefill() {
                     Ok(diag) => {
                         eprintln!("warmup-mailbox-only attempt {warmup_attempts}: OK — {diag}");
