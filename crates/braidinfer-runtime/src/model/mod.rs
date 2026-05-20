@@ -13,7 +13,7 @@ pub use crate::weights::*;
 
 mod attention_forward; // attention_forward
 mod decode; // decode_step_* implementations and dispatch helpers
-mod forward; // gdn_forward, ffn_forward, mamba2_forward
+mod forward; // gdn_forward (used by decode_step_traced + decode_step_traced_v2)
 mod model_load; // weight loading and initialization
 mod moe_forward; // moe_ffn_forward
 mod state; // save/restore checkpoint, prefill, read_hidden, reset_state
