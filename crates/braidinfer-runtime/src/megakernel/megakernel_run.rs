@@ -8,6 +8,7 @@ use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
 
 use crate::paged_kv::{PageAllocator, SequenceState};
+use crate::persistent_dispatch::PersistentDispatch;
 
 use super::{
     CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
@@ -528,6 +529,11 @@ impl MegakernelProgram {
     /// Allocate the next chunk if the current one just filled up.
     /// If quantized_kv is enabled, quantizes the sealed chunk.
     /// Call after execute() + stream sync, before next update_step_paged().
+    ///
+    /// `dispatch`: if `Some`, quantize_sealed_chunk runs via the persistent worker
+    /// mailbox (safe under the cooperative kernel). If `None`, falls back to the
+    /// legacy megakernel_f32 path (only valid before the persistent worker is launched,
+    /// i.e. on the non-persistent decode path).
     pub fn post_step_paged(
         &mut self,
         position: u32,
@@ -536,6 +542,7 @@ impl MegakernelProgram {
         quant_allocator: Option<&mut PageAllocator>,
         cfg: &crate::model::ModelConfig,
         stream: &Stream,
+        dispatch: Option<&mut PersistentDispatch>,
     ) -> HipResult<()> {
         if (position as usize + 1) % CHUNK_TOKENS == 0 {
             // Chunk just sealed
@@ -550,9 +557,17 @@ impl MegakernelProgram {
                         braidinfer_hip::ffi::hipErrorOutOfMemory,
                     ))?;
 
-                    // Run quantize kernel
-                    self.quantize_sealed_chunk(f32_ptr, q_ptr, cfg, stream)?;
-                    stream.synchronize()?;
+                    // Run quantize kernel: use mailbox path under persistent worker,
+                    // or legacy megakernel_f32 path for non-persistent.
+                    match dispatch {
+                        Some(d) => {
+                            self.quantize_sealed_chunk_via_worker(d, 0, f32_ptr, q_ptr, cfg)?;
+                        }
+                        None => {
+                            self.quantize_sealed_chunk(f32_ptr, q_ptr, cfg, stream)?;
+                            stream.synchronize()?;
+                        }
+                    }
 
                     // Track slot for cleanup
                     seq.quant_slots.push(q_slot);
@@ -571,6 +586,60 @@ impl MegakernelProgram {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Quantize a sealed f32 chunk via the persistent worker mailbox.
+    /// Builds the same OP_KV_QUANTIZE instruction list as `quantize_sealed_chunk`
+    /// but dispatches via `dispatch_batch_fire` + `wait_ack` instead of
+    /// `launch_cooperative` — safe while the persistent cooperative kernel holds all CUs.
+    pub fn quantize_sealed_chunk_via_worker(
+        &self,
+        dispatch: &mut PersistentDispatch,
+        gpu_idx: usize,
+        f32_chunk_ptr: *const u8,
+        quant_chunk_ptr: *mut u8,
+        cfg: &crate::model::ModelConfig,
+    ) -> HipResult<()> {
+        use crate::paged_kv::quantized_kv_offsets;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+        let num_attn_layers = cfg
+            .layers
+            .iter()
+            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .count();
+        let kv_stride = nkh * hd;
+        let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();
+
+        let mut instructions: Vec<Instruction> = Vec::new();
+        for layer_i in 0..num_attn_layers {
+            let f32_base = f32_chunk_ptr as u64 + (layer_i * f32_layer_bytes) as u64;
+            let f32_k = f32_base;
+            let f32_v = f32_base + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+
+            for (is_v, f32_src) in [(false, f32_k), (true, f32_v)] {
+                let (q1d, q1s, rd, rs) = quantized_kv_offsets(cfg, CHUNK_TOKENS, layer_i, is_v);
+                instructions.push(KvQuantizeInst {
+                    opcode_gridx: make_opcode_gridx(OP_KV_QUANTIZE, (nkh * hd) as u32),
+                    src:          f32_src as *const f32,
+                    q1_data:      (quant_chunk_ptr as u64 + q1d as u64) as *mut u8,
+                    q1_scale:     (quant_chunk_ptr as u64 + q1s as u64) as *mut f32,
+                    r_data:       (quant_chunk_ptr as u64 + rd as u64) as *mut u8,
+                    r_scale:      (quant_chunk_ptr as u64 + rs as u64) as *mut f32,
+                    num_kv_heads: nkh as i32,
+                    head_dim:     hd as i32,
+                    chunk_tokens: CHUNK_TOKENS as i32,
+                    _pad0:        0,
+                    _pad:         [0; 10],
+                }.into_inst());
+            }
+        }
+        // NOTE: No HALT instruction — the persistent worker mailbox must NOT receive HALT
+        // (it would terminate the worker). dispatch_batch_fire sends the batch and
+        // wait_ack blocks until the worker has processed all instructions in the batch.
+        let seq = dispatch.dispatch_batch_fire(gpu_idx, &instructions);
+        dispatch.wait_ack(gpu_idx, seq);
         Ok(())
     }
 

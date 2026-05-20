@@ -277,19 +277,16 @@ impl Model {
             let _ = self.tracer.drain();
         }
 
-        // Post-step: handle chunk-seal lifecycle. For unquantized persistent, this is
-        // a no-op (post_step_paged early-returns when self.quantized_kv is false).
-        // For future persistent+quant wiring, this is where quantization would fire —
-        // but quantize_sealed_chunk + stream.synchronize() are HIP API calls that would
-        // deadlock under the cooperative kernel. The PERSISTENT+KV_QUANT combination
-        // is therefore guarded with InvalidConfig in decode_step (mod.rs); when that
-        // combination is properly wired, this call site will be the integration point
-        // (and quantize_sealed_chunk will need a cooperative-safe variant).
+        // Post-step: handle chunk-seal lifecycle (including KV quantization via mailbox).
+        // quantize_sealed_chunk_via_worker dispatches OP_KV_QUANTIZE instructions over
+        // the persistent worker mailbox — safe under the cooperative kernel (no hipMemcpy).
         {
             let mk = self.megakernel_paged.as_mut().unwrap();
             let seq_mut = self.paged_seq.as_mut().unwrap();
             let alloc_mut = self.page_allocator.as_mut().unwrap();
-            mk.post_step_paged(position, seq_mut, alloc_mut, None, &self.config, &self.stream)
+            let q_alloc = self.quant_allocator.as_mut();
+            let dispatch = self.persistent_workers.as_mut();
+            mk.post_step_paged(position, seq_mut, alloc_mut, q_alloc, &self.config, &self.stream, dispatch)
                 .map_err(ModelError::Hip)?;
         }
 
@@ -1594,7 +1591,7 @@ impl Model {
         mk.execute(stream)?;
         stream.synchronize()?;
 
-        // Post-step: handle chunk seal + quantization
+        // Post-step: handle chunk seal + quantization (non-persistent path: None dispatch).
         {
             let mk = self.megakernel_paged.as_mut().unwrap();
             let seq_mut = self.paged_seq.as_mut().unwrap();
@@ -1607,6 +1604,7 @@ impl Model {
                 q_alloc,
                 &self.config,
                 &self.stream,
+                None,
             )?;
         }
 

@@ -28,19 +28,17 @@ impl Model {
         device: DeviceId,
         max_seq_len: Option<usize>,
     ) -> Result<Self, ModelError> {
-        // bd 3fiz: validate env-var combos BEFORE allocating any GPU resources.
-        // The decode_step KV_QUANT+PERSISTENT check at mod.rs:244 used to fire
-        // only after Model::load returned a fully-allocated model (tens of GB
-        // VRAM + multi-GPU expert distribution wasted). Catch it here instead.
+        // bd 9gmh: KV_QUANT+PERSISTENT guard removed — quantize_sealed_chunk now dispatches
+        // via persistent worker mailbox (quantize_sealed_chunk_via_worker), which is safe
+        // under the cooperative kernel. KV_QUANT+MULTI_GPU remains unsupported (multi-GPU
+        // paged dispatch not yet implemented).
         let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
-        let persistent_env = std::env::var("PERSISTENT").as_deref() == Ok("1");
         let multi_gpu_env = std::env::var("MULTI_GPU").is_ok();
-        if kv_quant && (persistent_env || multi_gpu_env) {
+        if kv_quant && multi_gpu_env {
             return Err(ModelError::InvalidConfig(
-                "KV_QUANT=1 is not supported with PERSISTENT=1 / MULTI_GPU \
-                 (post_step_paged chunk-seal uses hipMemcpy which deadlocks \
-                 under the persistent cooperative kernel). Either unset \
-                 KV_QUANT, or unset PERSISTENT/MULTI_GPU.".into(),
+                "KV_QUANT=1 is not supported with MULTI_GPU \
+                 (multi-GPU paged KV dispatch not yet implemented). \
+                 Either unset KV_QUANT, or unset MULTI_GPU.".into(),
             ));
         }
 

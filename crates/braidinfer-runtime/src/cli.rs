@@ -262,15 +262,14 @@ fn validate_env_combos(multi_gpu: bool, persistent: bool) {
     // KV_QUANT is not yet wired through the persistent or multi-GPU paths
     // (paged-only). Both binaries can hit this; centralize the guard here
     // so generate doesn't also silently produce wrong output.
+    // bd 9gmh: KV_QUANT under PERSISTENT now supported (chunk-seal quantization
+    // routed via persistent worker mailbox in quantize_sealed_chunk_via_worker).
+    // Multi-GPU paged dispatch still not implemented.
     let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
     if kv_quant && multi_gpu {
         eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");
-        eprintln!("  KV quantization only works in single-GPU mode.");
+        eprintln!("  Multi-GPU paged KV dispatch not yet implemented.");
         std::process::exit(1);
     }
-    if kv_quant && persistent {
-        eprintln!("Error: KV_QUANT=1 is not yet supported with PERSISTENT=1");
-        eprintln!("  Either unset KV_QUANT or set PERSISTENT=0.");
-        std::process::exit(1);
-    }
+    let _ = persistent;
 }
