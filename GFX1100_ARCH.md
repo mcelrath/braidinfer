@@ -2060,9 +2060,21 @@ The (g)/(o) framing established "mailbox dispatch is the cure-step, not prefill"
   - `BRAIDINFER_WARMUP_MODE=full-decode` — full 4-token decode warmup (pre-flip default)
   - `BRAIDINFER_WARMUP_SKIP=1` — skip warmup entirely (testing only)
 
-**Optional principled fix (deferred).** Adding an explicit `buffer_inv` / `__threadfence_system` at `persistent_worker` entry (one-shot at outer-loop entry, before the per-batch loop) might eliminate the need for any warmup packet — the spawn itself would prime the worker. Not implemented in this commit; tracked as a follow-up. The empty-packet cure is sufficient for production and ~1.5ms is acceptable cold-start overhead on top of the unavoidable ~300ms spawn time.
+**Principled in-kernel fix tested and FALSIFIED (bridge #3333–#3336, 2026-05-20).** Hypothesis: add `atomic_block_barrier(&g_gbs)` at `persistent_worker` entry (after `cg::grid_group grid = cg::this_grid();`, before `uint32_t last_seq = 0;`) to prime per-CU L0/L1 invalidation at spawn — eliminating the need for any warmup packet. Result: N=10 `BRAIDINFER_WARMUP_SKIP=1` on qwen35_35b_a3b.q4 -g 4: **7/10 PASS** (significant improvement from 0/10 baseline, but below the 8+/10 production threshold). Two failures (T4, T5) produced a **NEW failure class**: GPU page faults at non-VRAM userspace VAs (0x14e46907e000, 0x150cac800000) with rc=250. One (T6) was a classic NaN cascade.
 
-**Cross-refs.** bd 4e2m, bridge thread 2026-05-20 #3321–#3331 (udi Angle B falsification, Probe A withdrawal, Probe (a) variant design), commit (this) — empty-packet default + this subsection.
+MES log corroboration (udi #3336): `MES_INTR_ME_1` count averaged 2.4/trial — **same as 10/10-PASS empty-packet baseline (2.3)**, not the historical `FAIL_rc250=31.4/trial`. dmesg showed zero new gfxhub/walker/permission/mapping faults. The 3 failures in the in-kernel-barrier run are therefore **invisible to MES IH logging and NOT the same class as the historical NaN race**. Conclusion: the in-shader barrier alone does not address the original race mechanism; it introduces a separate failure mode (likely barrier-firing-before-cooperative-grid-fully-scheduled).
+
+**Refined mechanism narrative.** The cure-step is NOT shader-side cache invalidation. The **host→GPU UC PCIe write to `queue->seq_num`** is itself load-bearing. Required sequence:
+  1. Host UC-mapped write to a PASID-tagged address (typically the mailbox `seq_num`) ON THE PCIe BUS, AFTER `persistent_worker` is spawned but BEFORE its first work-iteration.
+  2. Worker UC-read of that address followed by `atomic_block_barrier` (the natural sequence inside `persistent_iter_poll_barrier`).
+
+Neither alone is sufficient: barrier-without-host-write fails 30% (this experiment); host-write-without-barrier was not directly tested but the worker code path requires the barrier. The host PCIe write carries a memory-hub or MES-level priming side effect that an in-shader fence does NOT replicate — `__builtin_amdgcn_fence(__ATOMIC_*, "agent")` traverses the worker's L0/L1/L2, but does NOT traverse the PCIe bus → GPU memory hub → MES/CP visibility path that the host UC write does.
+
+This bracket-from-above on the §11.19 (f) "MES μC private cache / memory-hub-level state, identified-but-unreachable from userspace" framing: the priming event IS a host UC PCIe write — the unreachable layer's input pathway has now been triangulated. No kernel-mode patch (KIQ ACQUIRE_MEM, INV_GART, MES misc ops — all FALSIFIED in 6gv epic) and no in-shader fence (this experiment, FALSIFIED) can substitute for the host→GPU PCIe transaction.
+
+**Production state (final).** Empty-packet warmup (`BRAIDINFER_WARMUP_MODE=empty-packet`) is the minimum correct cure at 10/10 PASS. ~1.5ms overhead on top of the unavoidable ~300ms spawn. No in-kernel substitute exists. bd `yuby` closed as not-actionable.
+
+**Cross-refs.** bd 4e2m, bd yuby (principled-fix CLOSED 2026-05-20), bridge thread 2026-05-20 #3321–#3336 (udi Angle B falsification, Probe A withdrawal, Probe (a) variant 10/10 PASS, in-shader barrier 7/10 partial+new-failure-class, refined PCIe-write-load-bearing narrative), commit 2ce674b — empty-packet default + this subsection.
 
 ---
 
