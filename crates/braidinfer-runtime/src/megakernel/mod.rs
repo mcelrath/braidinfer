@@ -328,15 +328,15 @@ impl MegakernelProgram {
         let total_bytes = num_slots * DUMP_SLOT_BYTES;
         let mut host = vec![0u8; total_bytes];
         if num_slots > 0 {
-            unsafe {
+            braidinfer_hip::error::check(unsafe {
                 braidinfer_hip::ffi::hipMemcpyAsync(
                     host.as_mut_ptr() as *mut std::ffi::c_void,
                     buf.as_ptr() as *const std::ffi::c_void,
                     total_bytes,
                     braidinfer_hip::ffi::hipMemcpyDeviceToHost,
                     stream.raw(),
-                );
-            }
+                )
+            })?;
             stream.synchronize()?;
         }
 
