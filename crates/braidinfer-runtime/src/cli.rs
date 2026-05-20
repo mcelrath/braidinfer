@@ -208,10 +208,44 @@ pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
     let free_per_gpu = vram_free_per_gpu();
     let single_gpu_vram = free_per_gpu.first().copied().unwrap_or(0);
     // 15% headroom — MULTI_GPU when model exceeds 85% of a single card.
-    let multi_gpu = std::env::var("MULTI_GPU").is_ok()
-        || (bqnt_size > 0
-            && bqnt_size as usize > single_gpu_vram * 85 / 100
-            && free_per_gpu.len() > 1);
+    // BUT only for MoE models: braidinfer currently only supports MoE-expert
+    // distribution (init_split_attn_weights head-splits attention + expert
+    // weights distributed). Dense multi-GPU (tensor-parallel or pipeline-parallel)
+    // is not implemented — see bd tp1/tp2 (CLOSED), dp1 (assumes weights fit
+    // per-GPU). For dense models too big for one GPU, the user must reduce
+    // quantization (e.g. q8 → q4) or model size. Fail fast here with a clear
+    // message instead of OOM'ing during weight load.
+    let has_moe_model = detect_moe(model_dir);
+    let auto_multi_gpu = bqnt_size > 0
+        && bqnt_size as usize > single_gpu_vram * 85 / 100
+        && free_per_gpu.len() > 1;
+    if auto_multi_gpu && !has_moe_model {
+        eprintln!(
+            "Error: model {:.1}GB exceeds single-GPU {:.1}GB free, but multi-GPU \
+             is only supported for MoE models (expert distribution + head-parallel \
+             attention). Dense multi-GPU (tensor/pipeline parallel) is not yet \
+             implemented in braidinfer.",
+            bqnt_size as f64 / 1e9,
+            single_gpu_vram as f64 / 1e9,
+        );
+        eprintln!("  Options:");
+        eprintln!("    - reduce quantization: try q4 instead of q8 (.q4.bqnt)");
+        eprintln!("    - reduce MAX_SEQ_LEN to free more VRAM");
+        eprintln!("    - use a smaller dense model");
+        std::process::exit(1);
+    }
+    let multi_gpu = std::env::var("MULTI_GPU").is_ok() || auto_multi_gpu;
+    // Reject manual MULTI_GPU=1 on dense models (auto path already exited above).
+    if multi_gpu && !has_moe_model {
+        eprintln!(
+            "Error: MULTI_GPU=1 set but model has no MoE layers. Dense multi-GPU \
+             (tensor-parallel / pipeline-parallel) is not implemented in braidinfer. \
+             enable_multi_gpu() silently no-ops on dense models, so MULTI_GPU=1 \
+             has no effect — the model runs single-GPU regardless. Unset MULTI_GPU=1 \
+             or pick an MoE model."
+        );
+        std::process::exit(1);
+    }
     if multi_gpu && std::env::var("MULTI_GPU").is_err() {
         eprintln!(
             "Auto: MULTI_GPU enabled (model {:.1}GB > single-GPU {:.1}GB free)",

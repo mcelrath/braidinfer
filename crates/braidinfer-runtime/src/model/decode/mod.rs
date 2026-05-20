@@ -330,12 +330,28 @@ impl Model {
             self.init_multi_gpu_persistent()?;
         }
 
-        // P2P megakernel is always initialized above when has_moe && num_gpus > 1.
-        // For non-MoE multi-GPU models, fall through to decode_step_paged.
-        if self.megakernel_multi_gpu_p2p.is_some() {
-            return self.decode_step_p2p(token_id, position);
+        // P2P megakernel is always initialized when has_moe && num_gpus > 1.
+        // For non-MoE multi-GPU models, this fallthrough would route to
+        // decode_step_paged → mk.execute(stream) → launch_cooperative on GPU 0,
+        // which deadlocks against the persistent_worker spawned at L330.
+        //
+        // This path was historically unreachable in production because
+        // enable_multi_gpu() at model_load.rs:1149 silently no-ops on !has_moe
+        // (the dense multi-GPU split path was never implemented). The cli.rs
+        // auto-rule now hard-errors on dense-too-big-for-one-GPU before reaching
+        // here. Belt-and-suspenders InvalidConfig in case a future load-rule
+        // change ever lets a non-MoE multi-GPU Model construct successfully.
+        if self.megakernel_multi_gpu_p2p.is_none() {
+            return Err(ModelError::InvalidConfig(
+                "decode_step_persistent_multi_gpu reached without an MoE-P2P \
+                 megakernel program. This indicates a non-MoE multi-GPU Model \
+                 was constructed, which is not a supported configuration in \
+                 braidinfer (no tensor-parallel/pipeline-parallel dispatch for \
+                 dense models). cli.rs::apply_auto_modes should have rejected \
+                 this at startup; this is a defensive guard.".into(),
+            ));
         }
-        self.decode_step_paged(token_id, position)
+        self.decode_step_p2p(token_id, position)
     }
 
     /// Lazily start MoE expert workers (GPUs 1-3) without launching the GPU 0 decode
