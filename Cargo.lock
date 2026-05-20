@@ -82,6 +82,7 @@ dependencies = [
  "minijinja-contrib",
  "rand 0.8.5",
  "rayon",
+ "regex",
  "safetensors",
  "serde",
  "serde_json",

@@ -18,3 +18,4 @@ rayon = "1"
 dirs = "6"
 memmap2 = "0.9"
 libc = "0.2"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
