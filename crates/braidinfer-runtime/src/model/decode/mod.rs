@@ -180,12 +180,25 @@ impl Model {
         // Enable dump buffer on first traced step. enable_dump_persistent allocates VRAM
         // buffers only (no NOP header / device_program rebuild — persistent path reads
         // dump pointers from WorkerQueue). set_trace_dump_ptrs writes them into the queue.
-        // Slot count: embed(1) + per-layer PostMixer+PostFfn(2 per layer) + FinalNorm(1).
+        //
+        // CAPACITY SIZING: the kernel-side dump pipeline (kernels/dump.h) fires
+        // unconditionally on EVERY dump-eligible opcode (OP_RMSNORM, OP_LINEAR_PROJ,
+        // OP_RESIDUAL_ADD, OP_SCALE_ADD, OP_FFN_DOWN_RES, etc.), not only the ones
+        // listed in MegakernelProgram::trace_probe_map. Drain-side filtering
+        // (PersistentDispatch::drain_trace_dump) maps inst_idx → Probe via
+        // trace_probe_map and discards slots that don't match. Therefore the slot
+        // capacity must accommodate ALL dump-eligible instructions in the program.
+        // We use instructions.len() as a safe upper bound (worst case: every
+        // instruction is dump-eligible). Bounded at 4096 to cap the VRAM footprint
+        // at 4096 × 32KB = 128MB.
+        //
+        // Follow-up bd k357 will add a kernel-side trace_mask filter so dumps fire
+        // ONLY at trace_probe_map sites — eliminating the bandwidth waste and
+        // allowing capacity = trace_probe_map.len() + small safety.
         if self.tracer.enabled() {
             let mk = self.megakernel_paged.as_mut().unwrap();
             if !mk.dump_active() {
-                let num_layers = self.config.num_layers;
-                let max_slots = (1 + num_layers * 2 + 1) as i32;
+                let max_slots = (mk.instructions.len() as i32).min(4096);
                 if let Err(e) = mk.enable_dump_persistent(max_slots) {
                     eprintln!("[braidinfer] enable_dump_persistent failed: {e:?}");
                 } else {

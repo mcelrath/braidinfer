@@ -54,6 +54,12 @@ __device__ __forceinline__ void dump_instruction_output(
         case OP_RESIDUAL_ADD:
             size = (int)((const ResidualAddInst*)inst)->n;
             break;
+        case OP_SCALE_ADD:
+            // GDN/Mamba2 blocks end with OP_SCALE_ADD (in-place residual via
+            // scaled add). Output is the post-residual hidden state — exactly
+            // what PostMixer{layer} probes want.
+            size = (int)((const ScaleAddInst*)inst)->size;
+            break;
         case OP_SILU_MUL:
             size = (int)((const SiluMulInst*)inst)->size;
             break;

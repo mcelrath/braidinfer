@@ -22,6 +22,55 @@
 //!   - Callers that build runtime-formatted Custom probes MUST gate their
 //!     `format!()` with `if self.tracer.enabled() { ... }` to avoid the
 //!     allocation. See R4 in the plan.
+//!
+//! # Dump pipeline contract (production decode path)
+//!
+//! Per-layer probes on the production `decode_step_persistent` path are emitted
+//! via the megakernel's in-kernel dump pipeline (`kernels/dump.h` +
+//! `kernels/megakernel_dispatch.hip`). When `Tracer::enabled()` returns true on
+//! a model's first traced step, `enable_dump_persistent` allocates a VRAM
+//! `dump_buffer` + host-mapped `dump_counter`, and
+//! `PersistentDispatch::set_trace_dump_ptrs` plumbs them into the worker's
+//! `WorkerQueue`. After each batch ack, the dispatcher calls
+//! `drain_trace_dump` which SDMA-copies populated slots from `dump_buffer` to
+//! pinned host, decodes each slot via [`decode_dump_slot`] (pure, unit-tested),
+//! looks up the instruction's `Probe` in `MegakernelProgram::trace_probe_map`,
+//! and inserts the payload into [`Tracer::insert_shadow`].
+//!
+//! ## Important: drain-side filtering, not kernel-side
+//!
+//! The kernel's `dump_instruction_output` fires on EVERY dump-eligible opcode
+//! (see the `switch` block in `kernels/dump.h`: `OP_RMSNORM`, `OP_LINEAR_PROJ`,
+//! `OP_RESIDUAL_ADD`, `OP_SCALE_ADD`, `OP_FFN_DOWN_RES`, `OP_EMBEDDING`,
+//! `OP_GDN_GATE`, `OP_QK_NORM`, `OP_MROPE`, `OP_OUTPUT_GATE`, `OP_MOE_GATE`,
+//! `OP_MOE_FFN`, plus FFN and LINEAR_PROJ variants). It does NOT consult
+//! `trace_probe_map`. Filtering happens drain-side in
+//! `PersistentDispatch::drain_trace_dump`: slots whose `inst_idx` doesn't match
+//! a probe entry are discarded.
+//!
+//! Consequence: `dump_buffer` capacity must accommodate ALL dump-eligible
+//! instructions in the program, not just the probe sites. The decode path
+//! sizes `max_slots = min(instructions.len(), 4096)` for that reason.
+//!
+//! A future optimization (bd k357) will add a kernel-side `trace_mask` so the
+//! kernel skips non-probe ops, allowing exact-sized capacity.
+//!
+//! ## Probe → opcode mapping
+//!
+//! `MegakernelProgram::trace_probe_map` is populated by `compile_inner` at
+//! these sites:
+//!
+//! | Probe variant       | Compile site                                            | Underlying opcode |
+//! |---------------------|---------------------------------------------------------|-------------------|
+//! | `Embed`             | After `EmbeddingInst` push                              | `OP_EMBEDDING`    |
+//! | `PostMixer{layer}`  | Last inst of `compile_attention_layer*` / `_gdn_layer` / `_mamba2_layer` | `OP_RESIDUAL_ADD` (attn) / `OP_SCALE_ADD` (GDN/Mamba2) |
+//! | `PostFfn{layer}`    | Last inst of `compile_ffn` (Dense FFN)                  | `OP_FFN_DOWN_RES` |
+//! | `FinalNorm`         | Final RMSNorm before LM head                            | `OP_RMSNORM*`     |
+//!
+//! Every opcode in this table must be present in `kernels/dump.h`'s switch
+//! statement. If a new mixer/FFN variant lands with a non-dump-eligible final
+//! opcode, the probe will silently fail to capture. To detect this regression,
+//! add the new opcode to dump.h's switch.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -154,6 +203,54 @@ impl ProbeFilter {
             ProbeFilter::Regex(re) => re.is_match(name),
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dump slot decoder — pure function, testable without GPU
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Byte size of a single dump slot. Must match `DUMP_SLOT_BYTES` in
+/// `kernels/dump.h`: 4 u32 header + 8192 f32 payload = 32784 bytes.
+pub const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
+pub const DUMP_HEADER_INTS: usize = 4;
+pub const DUMP_MAX_FLOATS: usize = 8192;
+
+/// Parsed view of one dump slot. `payload` borrows from the input buffer.
+#[derive(Debug, Clone, Copy)]
+pub struct DumpSlot<'a> {
+    pub opcode: u32,
+    pub inst_idx: u32,
+    /// Number of f32 floats in the payload. May be 0 if the opcode wasn't
+    /// dump-eligible (kernel writes header only). May be capped at
+    /// `DUMP_MAX_FLOATS` if the op's natural output exceeded the slot.
+    pub size: u32,
+    pub payload: &'a [f32],
+}
+
+/// Decode one dump slot from raw bytes. Returns `None` if `bytes` is too short
+/// for a full slot. Format mirrors `kernels/dump.h`:
+///   [opcode:u32 | inst_idx:u32 | size:u32 | pad:u32] [data:f32[size]]
+pub fn decode_dump_slot(bytes: &[u8]) -> Option<DumpSlot<'_>> {
+    if bytes.len() < DUMP_HEADER_INTS * 4 {
+        return None;
+    }
+    let opcode = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let inst_idx = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    let size = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    // pad at bytes[12..16] — reserved.
+    let payload_floats = (size as usize).min(DUMP_MAX_FLOATS);
+    let payload_bytes = payload_floats * 4;
+    let payload_start = DUMP_HEADER_INTS * 4;
+    if bytes.len() < payload_start + payload_bytes {
+        return None;
+    }
+    let payload = unsafe {
+        std::slice::from_raw_parts(
+            bytes[payload_start..].as_ptr() as *const f32,
+            payload_floats,
+        )
+    };
+    Some(DumpSlot { opcode, inst_idx, size, payload })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -580,6 +677,54 @@ mod tests {
         let count = u32::from_le_bytes([bytes[n - 4], bytes[n - 3], bytes[n - 2], bytes[n - 1]]);
         assert_eq!(count, 2);
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn dump_slot_decode_well_formed() {
+        // Build a slot the way kernels/dump.h would: [opcode, inst_idx, size, pad]
+        // header then `size` f32 payload, padded out to DUMP_SLOT_BYTES.
+        let mut bytes = vec![0u8; DUMP_SLOT_BYTES];
+        bytes[0..4].copy_from_slice(&36u32.to_le_bytes()); // OP_SCALE_ADD
+        bytes[4..8].copy_from_slice(&17u32.to_le_bytes()); // inst_idx 17
+        bytes[8..12].copy_from_slice(&3u32.to_le_bytes()); // size 3
+        // pad at [12..16] = zero
+        let payload = [1.5_f32, -2.25, 3.125];
+        for (i, &v) in payload.iter().enumerate() {
+            bytes[16 + i * 4..16 + (i + 1) * 4].copy_from_slice(&v.to_le_bytes());
+        }
+        let slot = decode_dump_slot(&bytes).expect("decode well-formed slot");
+        assert_eq!(slot.opcode, 36);
+        assert_eq!(slot.inst_idx, 17);
+        assert_eq!(slot.size, 3);
+        assert_eq!(slot.payload, &[1.5_f32, -2.25, 3.125]);
+    }
+
+    #[test]
+    fn dump_slot_decode_caps_oversized_size() {
+        // Kernel writes size > DUMP_MAX_FLOATS (truncated by dump.h:133 to
+        // DUMP_MAX_FLOATS). The decoder's payload slice should also cap at
+        // DUMP_MAX_FLOATS to match what the kernel actually wrote.
+        let mut bytes = vec![0u8; DUMP_SLOT_BYTES];
+        bytes[8..12].copy_from_slice(&((DUMP_MAX_FLOATS as u32) * 2).to_le_bytes());
+        let slot = decode_dump_slot(&bytes).unwrap();
+        assert_eq!(slot.payload.len(), DUMP_MAX_FLOATS);
+    }
+
+    #[test]
+    fn dump_slot_decode_zero_size() {
+        // size=0 = opcode wasn't dump-eligible (kernel returns early before
+        // writing payload). Decoder returns empty payload slice.
+        let bytes = vec![0u8; DUMP_SLOT_BYTES];
+        let slot = decode_dump_slot(&bytes).unwrap();
+        assert_eq!(slot.size, 0);
+        assert_eq!(slot.payload.len(), 0);
+    }
+
+    #[test]
+    fn dump_slot_decode_short_buffer() {
+        // Truncated buffer (less than header bytes) → None.
+        let bytes = vec![0u8; 8];
+        assert!(decode_dump_slot(&bytes).is_none());
     }
 
     #[test]

@@ -603,29 +603,37 @@ impl PersistentDispatch {
         // Reset dump_count to 0 via host-mapped pointer (CPU-side, no HIP call needed).
         unsafe { *dump_counter.host_ptr() = 0i32; }
 
-        // Decode slots and insert into tracer
+        // Decode slots and insert into tracer.
+        // decode_dump_slot is the shared (pure, testable) slot parser — same
+        // logic used by enable_dump's read_dump path, exercised by unit tests
+        // in tracer::tests::dump_slot_decode_*. Do NOT reimplement parsing here.
         for i in 0..num_slots {
-            let slot = &host_buf[i * DUMP_SLOT_BYTES..];
-            let inst_idx = u32::from_le_bytes(slot[4..8].try_into().unwrap()) as usize;
-            let size = u32::from_le_bytes(slot[8..12].try_into().unwrap()) as usize;
-            if size == 0 || size > 8192 {
+            let slot_bytes = &host_buf[i * DUMP_SLOT_BYTES..(i + 1) * DUMP_SLOT_BYTES];
+            let Some(slot) = crate::tracer::decode_dump_slot(slot_bytes) else {
+                continue;
+            };
+            if slot.size == 0 {
                 continue;
             }
-            // Look up Probe from trace_probe_map
-            let probe = program.trace_probe_map.iter()
-                .find(|(idx, _)| *idx == inst_idx)
+            let probe = program
+                .trace_probe_map
+                .iter()
+                .find(|(idx, _)| *idx as u32 == slot.inst_idx)
                 .map(|(_, p)| p.clone());
-            let probe = match probe {
-                Some(p) => p,
-                None => continue,
-            };
+            let Some(probe) = probe else { continue };
             let name = probe.name();
             if !tracer.filter_matches(name.as_ref()) {
                 continue;
             }
-            let payload_bytes = size * 4;
-            let payload = &slot[16..16 + payload_bytes];
-            tracer.insert_shadow(name.into_owned(), payload);
+            // SAFETY: slot.payload is a &[f32] view into host_buf; reinterpret
+            // as &[u8] for insert_shadow (just bytes-as-bytes, no alignment risk).
+            let payload_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    slot.payload.as_ptr() as *const u8,
+                    slot.payload.len() * 4,
+                )
+            };
+            tracer.insert_shadow(name.into_owned(), payload_bytes);
         }
 
         Ok(())
