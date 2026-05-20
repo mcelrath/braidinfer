@@ -355,10 +355,11 @@ unsafe impl Send for PersistentDispatch {}
 unsafe impl Sync for PersistentDispatch {}
 
 fn multiprocessor_count(device: DeviceId) -> HipResult<u32> {
-    // hipDeviceAttributeMultiprocessorCount = 63 in the HIP enum (verified via hipcc)
+    // hipDeviceAttributeMultiprocessorCount = 63 (verified via hipcc on ROCm 7.2.x).
+    const HIP_DEVICE_ATTR_MULTIPROCESSOR_COUNT: i32 = 63;
     let mut val = 0i32;
     braidinfer_hip::error::check(unsafe {
-        ffi::hipDeviceGetAttribute(&mut val, 63, device.0 as i32)
+        ffi::hipDeviceGetAttribute(&mut val, HIP_DEVICE_ATTR_MULTIPROCESSOR_COUNT, device.0 as i32)
     })?;
     Ok(val as u32)
 }
@@ -560,9 +561,10 @@ impl PersistentDispatch {
             std::ptr::addr_of_mut!(queue_ptr).cast(),
             std::ptr::addr_of_mut!(wd_ptr).cast(),
         ];
+        // Max 2 blocks per SM: beyond that, register pressure outweighs occupancy gain.
+        const MAX_BLOCKS_PER_SM: i32 = 2;
         let bpsm_raw = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
-        let bpsm_max = bpsm_raw.min(2);
-        let bpsm = bpsm_max;
+        let bpsm = bpsm_raw.min(MAX_BLOCKS_PER_SM);
         let num_cus = multiprocessor_count(device)?;
         let num_blocks = (bpsm as u32 * num_cus).max(num_cus);
         func.launch_cooperative(
@@ -773,8 +775,12 @@ impl PersistentDispatch {
             );
         }
 
-        // Trigger worker
-        w.seq_counter += 1;
+        // Trigger worker. seq=0 is the initial ack state; seq=0xFFFFFFFF is
+        // reserved for shutdown. Wrap to 1 instead of 0 to avoid ambiguity.
+        w.seq_counter = match w.seq_counter.wrapping_add(1) {
+            0 | 0xFFFFFFFF => 1,
+            s => s,
+        };
         let seq = w.seq_counter;
         unsafe {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);
@@ -857,7 +863,12 @@ impl PersistentDispatch {
                 instructions.len() as u32,
             );
         }
-        w.seq_counter += 1;
+        // seq=0 is the initial ack state; seq=0xFFFFFFFF is reserved for
+        // shutdown. Wrap to 1 instead of 0 to avoid ambiguity after u32 rollover.
+        w.seq_counter = match w.seq_counter.wrapping_add(1) {
+            0 | 0xFFFFFFFF => 1,
+            s => s,
+        };
         let seq = w.seq_counter;
         unsafe {
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*q_ptr).seq_num), seq);

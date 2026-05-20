@@ -152,16 +152,24 @@ fn main() {
         println!("cargo:rerun-if-changed={}", src.display());
     }
 
-    // Track all .hip include files so changes trigger recompile
-    for entry in std::fs::read_dir(&kernel_dir).expect("read kernel dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("hip")
-            || path.extension().and_then(|e| e.to_str()) == Some("h")
-        {
-            println!("cargo:rerun-if-changed={}", path.display());
+    // Track all .hip and .h include files (recursively) so changes trigger
+    // recompile. kernels/rdna3/*.h and other subdirectory headers must be
+    // included here — a non-recursive walk would silently miss them.
+    fn walk_for_rerun(dir: &std::path::Path) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_for_rerun(&path);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("hip") | Some("h")
+            ) {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
         }
     }
+    walk_for_rerun(&kernel_dir);
 
     // Write kernel directory to a file that other crates can include
     let kernel_dir_file = out_dir.join("kernel_dir.txt");

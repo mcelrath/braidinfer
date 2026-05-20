@@ -1,6 +1,6 @@
 mod trace;
 
-use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, OP_HALT, SHARED_LPROJ_TOTAL};
+use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, OP_HALT, OP_LM_HEAD, SHARED_LPROJ_TOTAL};
 use crate::persistent_dispatch::BatchDispatcher;
 use crate::weights::LayerWeights;
 
@@ -35,8 +35,14 @@ impl Model {
             // pre-compiled by prefill_paged (which doesn't patch logits_mapped).
             {
                 let mk = self.megakernel_paged.as_mut().unwrap();
-                let n_inst = mk.instructions.len();
-                let lm_head_idx = n_inst - 2; // second-to-last (before HALT)
+                // Search for OP_LM_HEAD by opcode rather than using a hardcoded
+                // offset (n_inst-2). words[0] encodes opcode in the low 32 bits.
+                let lm_head_idx = mk
+                    .instructions
+                    .iter()
+                    .rposition(|inst| (inst.words[0] as u32) == OP_LM_HEAD)
+                    .expect("lm_head not found in paged megakernel");
+                // words[1] = output pointer (LinearProjInst layout; see instructions.rs:556).
                 mk.instructions[lm_head_idx].words[1] =
                     self.activations.logits_mapped.as_write_ptr() as u64;
             }
@@ -175,7 +181,11 @@ impl Model {
         if num_gpus <= 1 {
             return Ok(());
         }
-        let moe_worker_shared_mem = 1024u32 * 4 + 256;
+        // moe_gemv_worker LDS layout: 1024 f32 elements (expert accumulator tile)
+        // + 256 bytes overhead (header / sync primitives in the kernel).
+        const MOE_WORKER_LDS_ELEMS: u32 = 1024;
+        const MOE_WORKER_LDS_OVERHEAD_BYTES: u32 = 256;
+        let moe_worker_shared_mem = MOE_WORKER_LDS_ELEMS * 4 + MOE_WORKER_LDS_OVERHEAD_BYTES;
         let shared_mem_persistent = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
         let hs = self.config.hidden_size;
         let max_eis = self
@@ -382,7 +392,11 @@ impl Model {
         let _ = PersistentDispatch::init; // silence unused import in single-gpu-skip path
 
         let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-        let moe_worker_shared_mem = 1024u32 * 4 + 256;
+        // moe_gemv_worker LDS layout: 1024 f32 elements (expert accumulator tile)
+        // + 256 bytes overhead (header / sync primitives in the kernel).
+        const MOE_WORKER_LDS_ELEMS: u32 = 1024;
+        const MOE_WORKER_LDS_OVERHEAD_BYTES: u32 = 256;
+        let moe_worker_shared_mem = MOE_WORKER_LDS_ELEMS * 4 + MOE_WORKER_LDS_OVERHEAD_BYTES;
         let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
         let hs = self.config.hidden_size;
         // For MoE multi-GPU: workers (GPUs 1..N-1) were already launched by
@@ -531,8 +545,14 @@ impl Model {
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
         mk.update_step_host_only(token_id, position)?;
-        let n_inst = mk.instructions.len();
-        mk.instructions[n_inst - 2].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
+        // Search for OP_LM_HEAD by opcode rather than using a hardcoded offset.
+        // words[1] = output pointer (LinearProjInst layout; see instructions.rs:556).
+        let lm_head_idx = mk
+            .instructions
+            .iter()
+            .rposition(|inst| (inst.words[0] as u32) == OP_LM_HEAD)
+            .expect("lm_head not found in p2p megakernel");
+        mk.instructions[lm_head_idx].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
         let _hs = self.config.hidden_size;
         let has_head_parallel = self

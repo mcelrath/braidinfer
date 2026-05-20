@@ -1,4 +1,8 @@
 use braidinfer_core::types::DeviceId;
+
+// Sig A: NaN logits collapse to repeated low-id token (often '!' in the tokenizer).
+// 3 consecutive '!' at the end of a 4-token warmup decode is the detection threshold.
+const SIG_A_MIN_BANG_RUN: usize = 3;
 use braidinfer_runtime::cli::{
     apply_auto_modes, extract_cli_flags, resolve_model_arg, vram_usage_mb,
 };
@@ -121,7 +125,7 @@ fn main() {
                             Ok(r) => {
                                 let concat: String = r.text_pieces.iter().cloned().collect();
                                 let bang_run = concat.chars().rev().take_while(|c| *c == '!').count();
-                                bang_run >= 3
+                                bang_run >= SIG_A_MIN_BANG_RUN
                             }
                             Err(_) => true,
                         }
@@ -139,7 +143,7 @@ fn main() {
                         // Sig A signature: NaN logits collapse to argmax of NaN array,
                         // producing repeated low-id token (often "!" in tokenizer).
                         let bang_run = concat.chars().rev().take_while(|c| *c == '!').count();
-                        bang_run >= 3
+                        bang_run >= SIG_A_MIN_BANG_RUN
                     }
                     Err(_) => true,
                 }

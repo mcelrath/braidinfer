@@ -127,10 +127,6 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     if (threadIdx.x == 0) {
         atomicAdd((unsigned int*)&queue->block_alive_count, 1u);
     }
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("persistent_worker: started, queue=%p\n", (void*)queue);
-    }
-
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
 
@@ -277,9 +273,6 @@ void simple_persistent_worker(
 ) {
     if (threadIdx.x == 0) {
         atomicAdd((unsigned int*)&queue->block_alive_count, 1u);
-    }
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        printf("simple_persistent_worker: started, queue=%p\n", (void*)queue);
     }
     namespace cg = cooperative_groups;
     cg::grid_group grid = cg::this_grid();
