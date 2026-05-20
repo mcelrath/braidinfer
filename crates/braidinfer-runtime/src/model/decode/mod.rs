@@ -959,8 +959,8 @@ impl Model {
         .to_vec();
 
         if self.tracer.enabled() {
-            // Persistent path: only top10_logits available from host-mapped logits_mapped.
-            // Per-layer probes (embed, L{i}.post_mixer, etc.) require decode_step_traced_v2.
+            // Persistent path: only top10_logits captured here (from host-mapped logits_mapped).
+            // Per-layer probes (embed, L{i}.post_mixer, etc.) are emitted via the SDMA dump pipeline.
             use crate::tracer::Probe;
             let mut indexed: Vec<(usize, f32)> =
                 logits.iter().copied().enumerate().collect();
