@@ -1,5 +1,3 @@
-mod trace;
-
 use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, OP_HALT, OP_LM_HEAD, SHARED_LPROJ_TOTAL};
 use crate::persistent_dispatch::BatchDispatcher;
 use crate::weights::LayerWeights;
@@ -162,9 +160,21 @@ impl Model {
 
             // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
             let shared_mem = SHARED_LPROJ_TOTAL as u32;
-            let dispatch =
+            let mut dispatch =
                 PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
+            // Ensure SDMA stream for GPU 0 so tracer can issue async D2H copies.
+            dispatch.ensure_sdma_stream(self.device).map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
+
+            // Lazy-init tracer from env vars now that SDMA stream is available.
+            if !self.tracer.enabled() {
+                let sdma = self.persistent_workers.as_ref().unwrap()
+                    .sdma_stream(self.device.0 as usize);
+                match crate::tracer::Tracer::from_env(vec![sdma]) {
+                    Ok(t) => self.tracer = t,
+                    Err(e) => eprintln!("[braidinfer] tracer init failed: {e:?}"),
+                }
+            }
         }
 
         // Write position_ids directly to host-mapped memory (no hipMemcpy)
@@ -208,6 +218,20 @@ impl Model {
             )
         }
         .to_vec();
+
+        // Tracer: capture final_norm (VRAM, SDMA) + top10_logits (host-side) per step.
+        // Per-layer probes (embed, L{i}.post_mixer, etc.) require decode_step_traced_v2.
+        if self.tracer.enabled() {
+            use crate::tracer::Probe;
+            let _ = self.tracer.capture_f32(0, Probe::FinalNorm, &self.activations.normed);
+            let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top10: Vec<f32> = indexed.iter().take(10)
+                .flat_map(|&(id, val)| [id as f32, val])
+                .collect();
+            self.tracer.record_host_f32(Probe::Logits { top_k: 10 }, &top10);
+            let _ = self.tracer.drain();
+        }
 
         // Post-step: handle chunk-seal lifecycle. For unquantized persistent, this is
         // a no-op (post_step_paged early-returns when self.quantized_kv is false).
@@ -903,9 +927,10 @@ impl Model {
         }
         .to_vec();
 
-        if self.trace.is_some() {
-            // Multi-GPU trace: only top10_logits available. hidden/normed are in GPU VRAM
-            // and inaccessible while the persistent cooperative worker holds all CUs.
+        if self.tracer.enabled() {
+            // Persistent path: only top10_logits available from host-mapped logits_mapped.
+            // Per-layer probes (embed, L{i}.post_mixer, etc.) require decode_step_traced_v2.
+            use crate::tracer::Probe;
             let mut indexed: Vec<(usize, f32)> =
                 logits.iter().copied().enumerate().collect();
             indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -914,7 +939,8 @@ impl Model {
                 .take(10)
                 .flat_map(|&(id, val)| [id as f32, val])
                 .collect();
-            self.trace.as_mut().unwrap().write_checkpoint("top10_logits", &top10);
+            self.tracer.record_host_f32(Probe::Logits { top_k: 10 }, &top10);
+            let _ = self.tracer.drain();
         }
 
         // (MoE worker timing report removed with the unified-worker cutover —

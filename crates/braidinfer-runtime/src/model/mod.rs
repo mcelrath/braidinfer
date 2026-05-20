@@ -67,7 +67,6 @@ pub struct Model {
     pub(crate) paged_position_table: Option<DeviceBuffer<i32>>,
     pub(crate) checkpoint_pool: Option<RecurrentCheckpointPool>,
     pub(crate) last_checkpoint_slot: Option<u32>,
-    pub(crate) trace: Option<crate::trace::TraceWriter>,
     pub(crate) debug_nan: bool,
     pub(crate) has_moe: bool,          // cached at load time: any layer has FfnType::MoE
     pub(crate) persistent: bool,       // cached from PERSISTENT env var at load time
@@ -209,15 +208,6 @@ impl Model {
     /// Run a single decode step. Returns logits [vocab_size].
     pub fn decode_step(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         let is_multi_gpu = self.multi_gpu.is_some();
-        if self.trace.is_some() {
-            if is_multi_gpu {
-                // Multi-GPU trace: use P2P path. Only top10_logits checkpoint is available;
-                // hidden/normed are in GPU VRAM and inaccessible while persistent worker runs.
-                return self.decode_step_persistent_multi_gpu(token_id, position);
-            }
-            // Single-GPU trace: use per-layer path with full per-layer checkpoints.
-            return self.decode_step_trace(token_id, position);
-        }
         if is_multi_gpu {
             if self.persistent {
                 return self.decode_step_persistent_multi_gpu(token_id, position);

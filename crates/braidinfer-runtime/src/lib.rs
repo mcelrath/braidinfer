@@ -14,7 +14,6 @@ pub mod paged_kv;
 pub mod persistent_dispatch;
 pub mod quant;
 pub mod sampling;
-pub mod trace;
 pub mod tracer;
 pub mod watchdog;
 pub mod weights;

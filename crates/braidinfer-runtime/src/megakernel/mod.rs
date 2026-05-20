@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::model::ModelConfig;
-use crate::trace::TraceWriter;
+use crate::tracer::TraceSink;
 use crate::watchdog::WatchdogThread;
 
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
@@ -350,10 +350,10 @@ impl MegakernelProgram {
     /// Names are derived from opcode + sequential index (e.g., "inst003_LINEAR_PROJ").
     pub fn write_dump_btrc(&self, stream: &Stream, path: &str) -> HipResult<()> {
         let slots = self.read_dump(stream)?;
-        let mut tw = TraceWriter::open(path).expect("failed to open dump trace file");
+        let mut tw = TraceSink::open(path).expect("failed to open dump trace file");
         for (opcode, inst_idx, data) in &slots {
             let name = format!("inst{:03}_{}", inst_idx, opcode_name(*opcode));
-            tw.write_checkpoint(&name, data);
+            tw.write_checkpoint(&name, data).expect("failed to write checkpoint");
         }
         tw.close().expect("failed to close dump trace file");
         eprintln!(

@@ -1122,9 +1122,6 @@ impl Model {
             paged_position_table: None,
             checkpoint_pool: None,
             last_checkpoint_slot: None,
-            trace: std::env::var("TRACE")
-                .ok()
-                .and_then(|path| crate::trace::TraceWriter::open(&path).ok()),
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),
             has_moe,
             persistent: std::env::var("PERSISTENT").as_deref() == Ok("1"),

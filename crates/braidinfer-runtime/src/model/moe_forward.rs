@@ -108,34 +108,6 @@ impl Model {
 
         let used_multi_gpu = false; // multi-GPU dispatch via OP_MOE_DISPATCH megakernel (moe_p2p.rs)
 
-        // Trace: MoE routing (after gate, before expert FFN)
-        if self.trace.is_some() {
-            self.stream.synchronize()?;
-            let mut normed_buf = vec![0.0f32; hs];
-            self.activations.normed.copy_to_host(&mut normed_buf)?;
-            self.trace
-                .as_mut()
-                .unwrap()
-                .write_checkpoint(&format!("L{layer_idx}.moe_normed"), &normed_buf);
-
-            let ids = unsafe {
-                std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr(), k)
-            };
-            let ids_f32: Vec<f32> = ids.iter().map(|&x| x as f32).collect();
-            self.trace
-                .as_mut()
-                .unwrap()
-                .write_checkpoint(&format!("L{layer_idx}.moe_expert_ids"), &ids_f32);
-
-            let weights = unsafe {
-                std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr(), k)
-            };
-            self.trace
-                .as_mut()
-                .unwrap()
-                .write_checkpoint(&format!("L{layer_idx}.moe_expert_weights"), weights);
-        }
-
         if !used_multi_gpu {
             // Single-GPU path: read back expert_ids + weights via host pointer (no hipMemcpy)
             self.stream.synchronize()?;
@@ -407,17 +379,6 @@ impl Model {
             eprintln!("  MoE L{layer_idx} ffn_down(len={ffn_len}) max_abs={max_abs:.4}");
         }
 
-        // Trace: ffn_down after expert accumulation + shared expert (before residual)
-        if self.trace.is_some() {
-            self.stream.synchronize()?;
-            let mut buf = vec![0.0f32; hs];
-            self.activations.ffn_down.copy_to_host(&mut buf)?;
-            self.trace
-                .as_mut()
-                .unwrap()
-                .write_checkpoint(&format!("L{layer_idx}.moe_ffn_down"), &buf);
-        }
-
         // 7. Residual add: hidden = residual + ffn_down
         self.kernels.residual_add.forward(
             &mut self.activations.hidden,
@@ -512,14 +473,6 @@ impl Model {
             )?;
             self.stream.synchronize()?;
 
-            // Trace: capture normed (pre-fc1) for token 0 — safe here, persistent worker not started.
-            if t == 0 && self.trace.is_some() {
-                let mut normed_buf = vec![0.0f32; hs];
-                self.activations.normed.copy_to_host(&mut normed_buf)?;
-                self.trace.as_mut().unwrap()
-                    .write_checkpoint(&format!("L{layer_idx}.moe_normed"), &normed_buf);
-            }
-
             let act_src = if fc1_ptr.is_some() {
                 self.activations.moe_latent.as_ptr()
             } else {
@@ -541,15 +494,6 @@ impl Model {
             };
             all_expert_ids[t * k..(t + 1) * k].copy_from_slice(ids_src);
             all_expert_weights[t * k..(t + 1) * k].copy_from_slice(wts_src);
-        }
-
-        // Trace: write expert IDs and weights for token 0
-        if self.trace.is_some() {
-            let ids_f32: Vec<f32> = all_expert_ids[0..k].iter().map(|&x| x as f32).collect();
-            self.trace.as_mut().unwrap()
-                .write_checkpoint(&format!("L{layer_idx}.moe_expert_ids"), &ids_f32);
-            self.trace.as_mut().unwrap()
-                .write_checkpoint(&format!("L{layer_idx}.moe_expert_weights"), &all_expert_weights[0..k]);
         }
 
         // Step 2: Stage activations + per-token routing into GPU 0 VRAM (UC) so
@@ -865,15 +809,6 @@ impl Model {
                         1.0, hs as u32, &self.stream,
                     )?;
                 }
-            }
-
-            // Trace: ffn_down after all expert accumulation + shared expert (token 0 only)
-            if t == 0 && self.trace.is_some() {
-                self.stream.synchronize()?;
-                let mut buf = vec![0.0f32; hs];
-                self.activations.ffn_down.copy_to_host(&mut buf)?;
-                self.trace.as_mut().unwrap()
-                    .write_checkpoint(&format!("L{layer_idx}.moe_ffn_down"), &buf);
             }
 
             // Residual add → write back to prefill_hidden[t * hs]

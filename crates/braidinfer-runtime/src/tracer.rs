@@ -414,6 +414,24 @@ impl Tracer {
         })
     }
 
+    /// Write host-side f32 data directly to the BTRC sink (if set). Use this
+    /// when data is already on the CPU (e.g., host-mapped logits) and no SDMA
+    /// copy is needed. No-op if filter doesn't match or sink is absent.
+    pub fn record_host_f32(&mut self, probe: Probe, data: &[f32]) {
+        if self.filter.is_none() {
+            return;
+        }
+        let name = probe.name();
+        if !self.filter.matches(&name) {
+            return;
+        }
+        if let Some(sink) = self.sink.as_mut() {
+            if let Err(e) = sink.write_checkpoint(&name, data) {
+                eprintln!("[braidinfer] Tracer::record_host_f32: sink write failed for {name}: {e}");
+            }
+        }
+    }
+
     /// Close + flush the sink (if any). Safe to call multiple times; subsequent
     /// calls are no-ops.
     pub fn close_sink(&mut self) -> std::io::Result<()> {
