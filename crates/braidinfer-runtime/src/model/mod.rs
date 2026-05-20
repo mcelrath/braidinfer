@@ -141,6 +141,25 @@ impl Model {
     pub fn tracer(&self) -> &crate::tracer::Tracer {
         &self.tracer
     }
+
+    /// SDMA-capture all GDN/Mamba2 recurrent SSM state buffers into the tracer.
+    /// Safe under the persistent cooperative worker (SDMA engine is independent
+    /// of CUs). Probes are named `gdn_state_{layer_idx}`. No-op if tracer is
+    /// disabled. Call after a decode_step to inspect the recurrent matrices.
+    pub fn snapshot_gdn_states(&mut self) -> HipResult<()> {
+        if !self.tracer.enabled() {
+            return Ok(());
+        }
+        use std::borrow::Cow;
+        for (i, state) in self.gdn_states.iter().enumerate() {
+            self.tracer.capture_f32(
+                0,
+                crate::tracer::Probe::Custom(Cow::Owned(format!("gdn_state_{i}"))),
+                &state.recurrent,
+            )?;
+        }
+        self.tracer.drain()
+    }
     pub fn stream(&self) -> &Stream {
         &self.stream
     }

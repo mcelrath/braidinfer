@@ -112,9 +112,13 @@ pub struct MegakernelProgram {
     pub(crate) quant_kv: Option<QuantizedKvState>,
     // Prefill-specific caching (Some only for prefill programs)
     pub(crate) prefill_cache: Option<PrefillCacheState>,
-    // Dump mode: per-instruction activation capture
+    // Dump mode: per-instruction activation capture.
+    // dump_counter is host-mapped (MappedHostBuffer) so we can initialize it
+    // and read/reset it from the CPU without a hipMemcpy — the persistent
+    // cooperative kernel holds CUs and would deadlock on copy_from_host.
+    // GPU side does atomicAdd on host-mapped UC memory (validated wt1 pattern).
     pub(crate) dump_buffer: Option<DeviceBuffer<u8>>, // slot data
-    pub(crate) dump_counter: Option<DeviceBuffer<i32>>, // atomic slot counter
+    pub(crate) dump_counter: Option<MappedHostBuffer<i32>>, // atomic slot counter (host-mapped)
     pub(crate) dump_capacity: i32,
     /// (instruction_idx, layer_idx) for each OP_BARRIER in the program.
     /// CPU dispatch loop uses layer_idx to look up DistributedMoeWeights.
@@ -269,8 +273,8 @@ impl MegakernelProgram {
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
         let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
         self.dump_buffer = Some(DeviceBuffer::<u8>::alloc(self.device, buf_size)?);
-        let mut counter = DeviceBuffer::<i32>::alloc(self.device, 1)?;
-        counter.copy_from_host(&[0i32])?;
+        let counter = MappedHostBuffer::<i32>::alloc(1)?;
+        unsafe { *counter.host_ptr() = 0i32; }
         self.dump_counter = Some(counter);
         self.dump_capacity = max_slots;
 
@@ -279,7 +283,7 @@ impl MegakernelProgram {
             opcode_gridx: make_opcode_gridx(OP_NOP, 0),
             dump_buf: self.dump_buffer.as_ref().unwrap().as_ptr(),
             max_slots: max_slots as u64,
-            dump_counter: self.dump_counter.as_ref().unwrap().as_ptr(),
+            dump_counter: self.dump_counter.as_ref().unwrap().device_ptr(),
             _pad: [0; 14],
         }.into_inst();
 
@@ -301,9 +305,8 @@ impl MegakernelProgram {
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
         let counter = self.dump_counter.as_ref().unwrap();
         stream.synchronize()?;
-        let mut count = [0i32];
-        counter.copy_to_host(&mut count)?;
-        let num_slots = count[0].min(self.dump_capacity) as usize;
+        let count_val = unsafe { *counter.host_ptr() };
+        let num_slots = count_val.min(self.dump_capacity) as usize;
 
         let buf = self.dump_buffer.as_ref().unwrap();
         let total_bytes = num_slots * DUMP_SLOT_BYTES;
@@ -352,8 +355,8 @@ impl MegakernelProgram {
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
         let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
         self.dump_buffer = Some(DeviceBuffer::<u8>::alloc(self.device, buf_size)?);
-        let mut counter = DeviceBuffer::<i32>::alloc(self.device, 1)?;
-        counter.copy_from_host(&[0i32])?;
+        let counter = MappedHostBuffer::<i32>::alloc(1)?;
+        unsafe { *counter.host_ptr() = 0i32; }
         self.dump_counter = Some(counter);
         self.dump_capacity = max_slots;
         Ok(())

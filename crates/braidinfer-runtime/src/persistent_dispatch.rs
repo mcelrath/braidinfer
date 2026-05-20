@@ -526,7 +526,9 @@ impl PersistentDispatch {
             None => return,
         };
         let dump_count = match program.dump_counter.as_ref() {
-            Some(c) => c.as_ptr() as *mut i32,
+            // device_ptr() returns the GPU-side mapping of the host-mapped UC
+            // counter — kernel atomicAdd writes through to the host page.
+            Some(c) => c.device_ptr() as *mut i32,
             None => return,
         };
         let capacity = program.dump_capacity;
@@ -576,20 +578,10 @@ impl PersistentDispatch {
 
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
 
-        // Read dump_count from VRAM via SDMA
-        let mut count_host = [0i32; 1];
-        braidinfer_hip::error::check(unsafe {
-            ffi::hipMemcpyAsync(
-                count_host.as_mut_ptr() as *mut std::ffi::c_void,
-                dump_counter.as_ptr() as *const std::ffi::c_void,
-                std::mem::size_of::<i32>(),
-                ffi::hipMemcpyDeviceToHost,
-                stream,
-            )
-        })?;
-        braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })?;
-
-        let num_slots = (count_host[0].min(program.dump_capacity)) as usize;
+        // dump_counter is host-mapped (MappedHostBuffer); read directly from CPU.
+        // GPU atomicAdd into UC host memory is visible to CPU without SDMA D2H.
+        let count_val = unsafe { *dump_counter.host_ptr() };
+        let num_slots = (count_val.min(program.dump_capacity)) as usize;
         if num_slots == 0 {
             return Ok(());
         }
@@ -608,18 +600,8 @@ impl PersistentDispatch {
         })?;
         braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })?;
 
-        // Reset dump_count to 0
-        let zero = [0i32; 1];
-        braidinfer_hip::error::check(unsafe {
-            ffi::hipMemcpyAsync(
-                dump_counter.as_ptr() as *mut std::ffi::c_void,
-                zero.as_ptr() as *const std::ffi::c_void,
-                std::mem::size_of::<i32>(),
-                ffi::hipMemcpyHostToDevice,
-                stream,
-            )
-        })?;
-        // No sync needed after reset — next batch starts after dispatch_batch_slice returns
+        // Reset dump_count to 0 via host-mapped pointer (CPU-side, no HIP call needed).
+        unsafe { *dump_counter.host_ptr() = 0i32; }
 
         // Decode slots and insert into tracer
         for i in 0..num_slots {
