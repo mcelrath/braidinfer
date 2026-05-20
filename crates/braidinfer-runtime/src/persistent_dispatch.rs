@@ -346,7 +346,7 @@ pub struct PersistentDispatch {
     /// `init_kv_chunk_mirror` is called. One mirror covers all GPUs in the
     /// model — chunks from each GPU are written through in seal order.
     /// `None` in non-debug / production paths to avoid pinned-memory overhead.
-    pub kv_chunk_mirror: Option<crate::mirror::KvChunkMirror>,
+    pub kv_chunk_mirror: Option<crate::kv_chunk_mirror::KvChunkMirror>,
 }
 
 // Raw pointer in PersistentDispatch — caller must keep the underlying
@@ -458,7 +458,7 @@ impl PersistentDispatch {
     /// full chunk (all attention layers K+V, same layout as PageAllocator slots).
     /// Allocates `KvChunkMirror` into `self.kv_chunk_mirror`.
     pub fn init_kv_chunk_mirror(&mut self, chunk_bytes: usize) {
-        self.kv_chunk_mirror = Some(crate::mirror::KvChunkMirror::new(chunk_bytes));
+        self.kv_chunk_mirror = Some(crate::kv_chunk_mirror::KvChunkMirror::new(chunk_bytes));
     }
 
     /// Enqueue an SDMA copy of a just-sealed VRAM chunk to pinned host memory.

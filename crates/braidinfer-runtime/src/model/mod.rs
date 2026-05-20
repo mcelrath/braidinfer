@@ -79,9 +79,15 @@ pub struct Model {
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     // Multi-GPU megakernel programs
     pub(crate) megakernel_multi_gpu_p2p: Option<MegakernelProgram>,
-    /// SDMA-based VRAM→host mirror for decode-step debugging (snl wt1 minimal).
-    /// Lazy-init in init_multi_gpu_persistent BEFORE persistent_workers launch.
-    pub(crate) decode_mirror: Option<crate::mirror::DecodeMirror>,
+    /// SDMA-based unified tracer (Phase 2b). Replaces DecodeMirror.
+    /// Constructed in ensure_moe_workers_started (for multi-GPU MoE) via
+    /// Tracer::from_env, or with ProbeFilter::All when BRAIDINFER_DECODE_MIRROR=1
+    /// and BRAIDINFER_TRACE is unset (deprecated compat shim — Phase 5 will
+    /// consolidate env vars). Field is declared AFTER persistent_workers in source
+    /// order; because Rust drops fields in REVERSE declaration order, tracer
+    /// drops FIRST, releasing its PinnedBuffer shadows before PersistentDispatch
+    /// releases the SDMA streams they borrowed.
+    pub(crate) tracer: crate::tracer::Tracer,
 }
 
 // ---- Model impl ----

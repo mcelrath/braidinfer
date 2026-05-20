@@ -1138,7 +1138,7 @@ impl Model {
             watchdog,
             megakernel_multi_gpu_p2p: None,
             persistent_workers: None,
-            decode_mirror: None,
+            tracer: crate::tracer::Tracer::disabled(),
         })
     }
 

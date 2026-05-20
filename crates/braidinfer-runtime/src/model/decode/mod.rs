@@ -7,6 +7,116 @@ use crate::weights::LayerWeights;
 use super::Model;
 use super::ModelError;
 
+// ---- Decode-mirror print helpers (Phase 2b) --------------------------------
+
+fn print_stats_decode(
+    tracer: &crate::tracer::Tracer,
+    label: &str,
+    position: u32,
+    num_workers: usize,
+    max_seq_len: usize,
+    head_dim: usize,
+) {
+    use crate::tracer::Probe;
+    let stat = |name: &str, slice: &[f32]| {
+        let mut n_nan = 0usize;
+        let mut n_inf = 0usize;
+        let mut max_abs = 0.0f32;
+        for &x in slice {
+            if x.is_nan() { n_nan += 1; }
+            else if x.is_infinite() { n_inf += 1; }
+            else if x.abs() > max_abs { max_abs = x.abs(); }
+        }
+        eprintln!(
+            "[snap {label} pos={position}] {name}: n={} nan={} inf={} max_abs={:.4} first4={:?}",
+            slice.len(), n_nan, n_inf, max_abs, &slice[..slice.len().min(4)]
+        );
+    };
+    let empty: &[f32] = &[];
+    stat("act.hidden", tracer.read_f32(Probe::Hidden { gpu: 0, head_only: false }).unwrap_or(empty));
+    stat("act.attn_out", tracer.read_f32(Probe::Custom(std::borrow::Cow::Borrowed("act.attn_out"))).unwrap_or(empty));
+    for w_idx in 0..num_workers {
+        stat(&format!("g{}.attn_normed", w_idx + 1), tracer.read_f32(Probe::AttnNormed { gpu: w_idx + 1 }).unwrap_or(empty));
+    }
+    for w_idx in 0..num_workers {
+        stat(&format!("g{}.attn_q_gate", w_idx + 1), tracer.read_f32(Probe::AttnQGate { gpu: w_idx + 1 }).unwrap_or(empty));
+    }
+    for w_idx in 0..num_workers {
+        stat(&format!("g{}.attn_k", w_idx + 1), tracer.read_f32(Probe::AttnK { gpu: w_idx + 1 }).unwrap_or(empty));
+    }
+    let used = (position as usize + 1).min(max_seq_len);
+    let slice_len = used * head_dim;
+    let num_gpus = 1 + num_workers;
+    for gpu_i in 0..num_gpus {
+        for layer_i in 0..2usize {
+            if let Some(k_full) = tracer.read_f32(Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: true, head: 0 }) {
+                let k_slice = &k_full[..slice_len.min(k_full.len())];
+                stat(&format!("g{gpu_i}.kv[{layer_i}].k(h0,p0..{used})"), k_slice);
+            }
+            if let Some(v_full) = tracer.read_f32(Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: false, head: 0 }) {
+                let v_slice = &v_full[..slice_len.min(v_full.len())];
+                stat(&format!("g{gpu_i}.kv[{layer_i}].v(h0,p0..{used})"), v_slice);
+            }
+        }
+    }
+}
+
+fn print_moe_stats_decode(
+    tracer: &crate::tracer::Tracer,
+    label: &str,
+    output_slots_host: *const f32,
+    num_gpus: usize,
+    hidden_size: usize,
+) {
+    use crate::tracer::Probe;
+    let stat = |name: &str, slice: &[f32]| {
+        let mut n_nan = 0usize;
+        let mut n_inf = 0usize;
+        let mut max_abs = 0.0f32;
+        for &x in slice {
+            if x.is_nan() { n_nan += 1; }
+            else if x.is_infinite() { n_inf += 1; }
+            else if x.abs() > max_abs { max_abs = x.abs(); }
+        }
+        eprintln!(
+            "[moe {label}] {name}: n={} nan={} inf={} max_abs={:.4} first4={:?}",
+            slice.len(), n_nan, n_inf, max_abs, &slice[..slice.len().min(4)]
+        );
+    };
+    for gpu_id in 0..num_gpus {
+        let slice = unsafe { std::slice::from_raw_parts(output_slots_host.add(gpu_id * hidden_size), hidden_size) };
+        stat(&format!("output_slots[gpu{}]", gpu_id), slice);
+    }
+    let empty: &[f32] = &[];
+    let num_workers = num_gpus.saturating_sub(1);
+    for w_idx in 0..num_workers {
+        let buf = tracer.read_f32(Probe::WorkerFfnOut { worker: w_idx, layer: 0 }).unwrap_or(empty);
+        stat(&format!("worker{}_ffn_out(gpu{})", w_idx, w_idx + 1), buf);
+    }
+}
+
+fn print_normed_stage_stats(label: &str, position: u32, normed_stage_host: &[f32]) {
+    let mut n_nan = 0usize;
+    let mut n_inf = 0usize;
+    let mut n_denorm = 0usize;
+    let mut max_abs = 0.0f32;
+    for &x in normed_stage_host {
+        let bits = x.to_bits();
+        let exp = (bits >> 23) & 0xFF;
+        let mant = bits & 0x7F_FFFF;
+        if x.is_nan() { n_nan += 1; }
+        else if x.is_infinite() { n_inf += 1; }
+        else if exp == 0 && mant != 0 { n_denorm += 1; }
+        else if x.abs() > max_abs { max_abs = x.abs(); }
+    }
+    eprintln!(
+        "[snap {label}] normed_stage(CPU-view): n={} nan={} inf={} denorm={} max_abs={:.4} first4={:?}",
+        normed_stage_host.len(), n_nan, n_inf, n_denorm, max_abs,
+        &normed_stage_host[..normed_stage_host.len().min(4)]
+    );
+    let _ = position;
+}
+
 impl Model {
     /// Persistent worker decode using paged KV cache.
     /// On first call: compiles paged megakernel, initializes page allocator + sequence,
@@ -255,46 +365,31 @@ impl Model {
             );
         }
 
-        // Decode-mirror: lazy-init from env var. Borrows SDMA streams from
-        // PersistentDispatch (owned there; destroyed in that Drop after
-        // workers have exited).
-        if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_none() {
-            let num_attn_layers = self
-                .config
-                .layers
-                .iter()
-                .filter(|l| l.layer_type == crate::config::LayerType::Attention)
-                .count();
+        // Tracer: lazy-init from env vars. Borrows SDMA streams from PersistentDispatch
+        // (owned there; destroyed in PersistentDispatch::Drop after workers exit).
+        // BRAIDINFER_DECODE_MIRROR=1 is a deprecated compat shim: if BRAIDINFER_TRACE is
+        // unset, construct with ProbeFilter::All. TODO Phase 5: consolidate env vars.
+        if !self.tracer.enabled() {
             let dispatch = self
                 .persistent_workers
                 .as_ref()
-                .expect("PersistentDispatch must be initialized before DecodeMirror");
+                .expect("PersistentDispatch must be initialized before Tracer");
             let mut streams: Vec<braidinfer_hip::ffi::hipStream_t> =
                 Vec::with_capacity(1 + worker_devices.len());
             streams.push(dispatch.sdma_stream(self.device.0 as usize));
             for &dev in &worker_devices {
                 streams.push(dispatch.sdma_stream(dev.0 as usize));
             }
-            let mirror = crate::mirror::DecodeMirror::alloc(
-                self.device,
-                &worker_devices,
-                streams,
-                self.config.num_kv_heads,
-                self.config.max_seq_len,
-                self.config.head_dim,
-                num_attn_layers,
-                hs,
-                self.config.num_q_heads,
-            )
-            .map_err(ModelError::Hip)?;
-            self.decode_mirror = Some(mirror);
-            eprintln!("  decode_mirror: SDMA H2D mirror allocated ({num_attn_layers} attn layers × {} gpus)", num_gpus);
-        }
-        // Allocate per-worker FFN_REMOTE output shadows if MoE is present.
-        if let (Some(mirror), Some(p2p)) = (self.decode_mirror.as_mut(), self.moe_p2p.as_ref()) {
-            let worker_devs: Vec<_> = p2p.workers.iter().map(|w| w.device).collect();
-            mirror.alloc_moe_workers(&worker_devs, p2p.hidden_size)
-                .map_err(ModelError::Hip)?;
+            let tracer = if std::env::var("BRAIDINFER_TRACE").is_err()
+                && std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok()
+            {
+                // Deprecated compat: BRAIDINFER_DECODE_MIRROR=1, BRAIDINFER_TRACE unset.
+                eprintln!("  tracer: BRAIDINFER_DECODE_MIRROR compat — ProbeFilter::All ({} streams)", streams.len());
+                crate::tracer::Tracer::with_filter_and_streams(streams, crate::tracer::ProbeFilter::All)
+            } else {
+                crate::tracer::Tracer::from_env(streams).map_err(ModelError::Hip)?
+            };
+            self.tracer = tracer;
         }
         Ok(())
     }
@@ -369,22 +464,44 @@ impl Model {
         eprintln!("=== end MTYPE audit ===");
     }
 
-    /// DEBUG_P2P_HIDDEN probe: copy first 16 floats of `activations.hidden` via
-    /// `DecodeMirror::snapshot_hidden_head16` (SDMA engine, GPU 0 stream) and
-    /// print a one-line diagnostic. Safe under the persistent cooperative kernel —
-    /// SDMA operates independently of the CUs held by `persistent_worker`.
-    /// No-op when `decode_mirror` is None or `debug_p2p_hidden` is false.
+    /// DEBUG_P2P_HIDDEN probe: copy first 16 floats of `activations.hidden` via SDMA
+    /// (GPU 0 stream) and print a one-line diagnostic. Safe under the persistent
+    /// cooperative kernel — SDMA operates independently of the held CUs.
+    /// No-op when `debug_p2p_hidden` is false or tracer is disabled.
     fn probe_hidden_after_segment(&mut self, label: &str) {
-        if !self.debug_p2p_hidden {
+        if !self.debug_p2p_hidden || !self.tracer.enabled() {
             return;
         }
+        use braidinfer_hip::device::DeviceGuard;
+        use crate::tracer::Probe;
         let hidden_ptr = self.activations.hidden.as_ptr() as *const f32;
         let device = self.device;
-        if let Some(mirror) = self.decode_mirror.as_mut() {
-            if let Err(e) = mirror.snapshot_hidden_head16(device, hidden_ptr, label) {
-                eprintln!("DBG hidden[{label}] snapshot_hidden_head16 error: {e:?}");
-            }
+        let hidden_size = self.config.hidden_size;
+        let _guard = match DeviceGuard::switch_to(device) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("DBG hidden[{label}] DeviceGuard error: {e:?}"); return; }
+        };
+        let n = 16usize.min(hidden_size);
+        let copy_bytes = n * std::mem::size_of::<f32>();
+        if let Err(e) = self.tracer.capture(0, Probe::Hidden { gpu: 0, head_only: true }, hidden_ptr as *const u8, copy_bytes) {
+            eprintln!("DBG hidden[{label}] capture error: {e:?}");
+            return;
         }
+        if let Err(e) = self.tracer.drain() {
+            eprintln!("DBG hidden[{label}] drain error: {e:?}");
+            return;
+        }
+        let buf = self.tracer.read_f32(Probe::Hidden { gpu: 0, head_only: true }).unwrap_or(&[]);
+        let buf = &buf[..n.min(buf.len())];
+        if buf.len() < 4 { return; }
+        let mut nan = false;
+        let mut inf = false;
+        let mut max_abs = 0.0f32;
+        for &v in buf { if v.is_nan() { nan = true; } if v.is_infinite() { inf = true; } if v.abs() > max_abs { max_abs = v.abs(); } }
+        eprintln!(
+            "DBG hidden[{label}] nan={nan} inf={inf} max_abs={max_abs:.3e} h[0..4]={:.3e},{:.3e},{:.3e},{:.3e}",
+            buf[0], buf[1], buf[2], buf[3]
+        );
     }
 
     pub(crate) fn init_multi_gpu_persistent(&mut self) -> Result<(), ModelError> {
@@ -429,75 +546,138 @@ impl Model {
         Ok(())
     }
 
-    /// GPU-native P2P MoE decode: OP_MOE_DISPATCH handled entirely by megakernel.
-    /// No CPU-side expert dispatching. Attention is still head-parallel (same as before).
     /// SDMA-based snapshot of cross-GPU debug-relevant tensors (KV caches +
-    /// GPU 0 activations) into pinned host buffers, with per-buffer stats
-    /// printed to stderr. No-op if BRAIDINFER_DECODE_MIRROR is unset.
+    /// GPU 0 activations) into pinned host buffers via tracer, with per-buffer
+    /// stats printed to stderr. No-op if tracer is disabled or multi_gpu is None.
     pub(super) fn decode_mirror_snapshot(&mut self, label: &str, position: u32) {
-        if self.decode_mirror.is_none() || self.multi_gpu.is_none() {
+        if !self.tracer.enabled() || self.multi_gpu.is_none() {
             return;
         }
+        use braidinfer_hip::device::{Device, DeviceGuard};
+        use crate::tracer::Probe;
+        let gpu0 = self.device;
+        let hs = self.config.hidden_size;
+        let local_nkh = self.config.num_kv_heads;
+        let max_seq_len = self.config.max_seq_len;
+        let head_dim = self.config.head_dim;
+        let hs_bytes = hs * 4;
         let mgpu = self.multi_gpu.as_ref().unwrap();
         let worker_devices: Vec<_> = mgpu.workers.iter().skip(1).map(|w| w.device).collect();
-        let workers_kv_refs: Vec<&[crate::weights::KvCache]> =
-            mgpu.workers.iter().map(|w| w.attn_kv_caches.as_slice()).collect();
-        let workers_normed: Vec<Option<*const f32>> = mgpu
-            .workers
-            .iter()
-            .map(|w| w.attn_normed.as_ref().map(|b| b.as_ptr() as *const f32))
-            .collect();
-        let workers_q_gate: Vec<Option<(*const f32, usize)>> = mgpu
-            .workers
-            .iter()
-            .map(|w| w.attn_q_gate.as_ref().map(|b| (b.as_ptr() as *const f32, b.len())))
-            .collect();
-        let workers_k: Vec<Option<*const f32>> = mgpu
-            .workers
-            .iter()
-            .map(|w| w.attn_k.as_ref().map(|b| b.as_ptr() as *const f32))
-            .collect();
-        let mirror = self.decode_mirror.as_mut().unwrap();
+        let workers_kv_refs: Vec<Vec<(*const u8, *const u8)>> =
+            mgpu.workers.iter().map(|w| {
+                w.attn_kv_caches.iter().map(|kv| (kv.k.as_ptr() as *const u8, kv.v.as_ptr() as *const u8)).collect()
+            }).collect();
+        let workers_normed: Vec<Option<*const f32>> = mgpu.workers.iter()
+            .map(|w| w.attn_normed.as_ref().map(|b| b.as_ptr() as *const f32)).collect();
+        let workers_q_gate: Vec<Option<(*const f32, usize)>> = mgpu.workers.iter()
+            .map(|w| w.attn_q_gate.as_ref().map(|b| (b.as_ptr() as *const f32, b.len()))).collect();
+        let workers_k: Vec<Option<*const f32>> = mgpu.workers.iter()
+            .map(|w| w.attn_k.as_ref().map(|b| b.as_ptr() as *const f32)).collect();
+        let num_workers = worker_devices.len();
+        let nqh_total = self.config.num_q_heads;
+        let attn_out_floats = nqh_total * head_dim;
+        let attn_out_bytes = attn_out_floats * 4;
+        let kv_bytes = local_nkh * max_seq_len * head_dim * 4;
         let dispatch = self.persistent_workers.as_ref().unwrap();
-        if let Err(e) = mirror.snapshot(self.device, &worker_devices, &self.activations, &workers_kv_refs, &workers_normed, &workers_q_gate, &workers_k, dispatch) {
-            eprintln!("[snap {label}] FAILED: {e:?}");
-            return;
+
+        let _guard = match DeviceGuard::switch_to(gpu0) {
+            Ok(g) => g,
+            Err(e) => { eprintln!("[snap {label}] DeviceGuard error: {e:?}"); return; }
+        };
+        // GPU 0: act.hidden + act.attn_out
+        if let Err(e) = self.tracer.capture(0, Probe::Hidden { gpu: 0, head_only: false }, self.activations.hidden.as_ptr() as *const u8, hs_bytes) {
+            eprintln!("[snap {label}] FAILED: {e:?}"); return;
         }
-        mirror.print_stats(label, position);
+        if let Err(e) = self.tracer.capture(0, Probe::Custom(std::borrow::Cow::Borrowed("act.attn_out")), self.activations.attn_out.as_ptr() as *const u8, attn_out_bytes) {
+            eprintln!("[snap {label}] FAILED: {e:?}"); return;
+        }
+        // Per-GPU attn_kv (GPU 0 first, then workers).
+        for (gpu_i, kv_layers) in workers_kv_refs.iter().enumerate() {
+            let dev = if gpu_i == 0 { gpu0 } else { worker_devices[gpu_i - 1] };
+            if let Err(e) = Device::set_current(dev) { eprintln!("[snap {label}] set_current: {e:?}"); return; }
+            if gpu_i > 0 {
+                if let Err(e) = dispatch.record_kv_event(dev.0 as usize) { eprintln!("[snap {label}] record_kv_event: {e:?}"); return; }
+                if let Err(e) = dispatch.wait_kv_event_on_sdma(dev.0 as usize) { eprintln!("[snap {label}] wait_kv_event: {e:?}"); return; }
+            }
+            for (layer_i, &(k_ptr, v_ptr)) in kv_layers.iter().enumerate() {
+                if let Err(e) = self.tracer.capture(gpu_i, Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: true, head: 0 }, k_ptr, kv_bytes) {
+                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
+                }
+                if let Err(e) = self.tracer.capture(gpu_i, Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: false, head: 0 }, v_ptr, kv_bytes) {
+                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
+                }
+            }
+        }
+        // Per-worker attn_normed / attn_q_gate / attn_k
+        let local_nqh = attn_out_floats / head_dim / (1 + num_workers);
+        for (w_idx, &dev) in worker_devices.iter().enumerate() {
+            if let Err(e) = Device::set_current(dev) { eprintln!("[snap {label}] set_current: {e:?}"); return; }
+            if let Some(Some(p)) = workers_normed.get(w_idx + 1).copied() {
+                if let Err(e) = self.tracer.capture(w_idx + 1, Probe::AttnNormed { gpu: w_idx + 1 }, p as *const u8, hs_bytes) {
+                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
+                }
+            }
+            if let Some(Some((p, n))) = workers_q_gate.get(w_idx + 1).copied() {
+                let cap = local_nqh * head_dim * 2;
+                let copy_bytes = n.min(cap) * 4;
+                if let Err(e) = self.tracer.capture(w_idx + 1, Probe::AttnQGate { gpu: w_idx + 1 }, p as *const u8, copy_bytes) {
+                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
+                }
+            }
+            if let Some(Some(p)) = workers_k.get(w_idx + 1).copied() {
+                let copy_bytes = local_nkh * head_dim * 4;
+                if let Err(e) = self.tracer.capture(w_idx + 1, Probe::AttnK { gpu: w_idx + 1 }, p as *const u8, copy_bytes) {
+                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
+                }
+            }
+        }
+        if let Err(e) = self.tracer.drain() {
+            eprintln!("[snap {label}] drain FAILED: {e:?}"); return;
+        }
+        print_stats_decode(&self.tracer, label, position, num_workers, max_seq_len, head_dim);
     }
 
     /// Snapshot MoE output_slots (host-mapped, direct read) and per-worker FFN_REMOTE
-    /// local_output (SDMA copy) into pinned shadows, then print stats. No-op if
-    /// decode_mirror or moe_p2p is None.
+    /// local_output (SDMA copy) via tracer, then print stats. No-op if tracer is
+    /// disabled or moe_p2p is None.
     fn decode_mirror_moe_snapshot(&mut self, layer_idx: usize) {
-        let (Some(p2p), Some(mirror)) = (self.moe_p2p.as_ref(), self.decode_mirror.as_mut()) else {
-            return;
-        };
+        if !self.tracer.enabled() { return; }
+        let Some(p2p) = self.moe_p2p.as_ref() else { return; };
+        use braidinfer_hip::device::{Device, DeviceGuard};
+        use crate::tracer::Probe;
         let output_slots_host = p2p.output_slots.host_ptr() as *const f32;
         let worker_local_outputs: Vec<*const f32> = p2p.workers.iter()
-            .map(|w| w.local_output.as_ptr() as *const f32)
-            .collect();
+            .map(|w| w.local_output.as_ptr() as *const f32).collect();
         let worker_devs: Vec<_> = p2p.workers.iter().map(|w| w.device).collect();
         let num_gpus = p2p.num_gpus;
         let hidden_size = p2p.hidden_size;
-        if let Err(e) = mirror.snapshot_moe(
-            output_slots_host,
-            &worker_local_outputs,
-            &worker_devs,
-            num_gpus,
-            hidden_size,
-        ) {
-            eprintln!("[moe mirror L{layer_idx}] snapshot failed: {e:?}");
-            return;
+        let copy_bytes = hidden_size * std::mem::size_of::<f32>();
+        let _guard = match worker_devs.first().copied() {
+            Some(d) => match DeviceGuard::switch_to(d) {
+                Ok(g) => Some(g),
+                Err(e) => { eprintln!("[moe mirror L{layer_idx}] DeviceGuard: {e:?}"); return; }
+            },
+            None => None,
+        };
+        for (w_idx, &dev) in worker_devs.iter().enumerate() {
+            if w_idx >= worker_local_outputs.len() { break; }
+            if let Err(e) = Device::set_current(dev) { eprintln!("[moe mirror L{layer_idx}] set_current: {e:?}"); return; }
+            let src = worker_local_outputs[w_idx];
+            if let Err(e) = self.tracer.capture(w_idx + 1, Probe::WorkerFfnOut { worker: w_idx, layer: 0 }, src as *const u8, copy_bytes) {
+                eprintln!("[moe mirror L{layer_idx}] capture failed: {e:?}"); return;
+            }
         }
-        mirror.print_moe_stats(&format!("L{layer_idx}"), output_slots_host, num_gpus, hidden_size);
+        if let Err(e) = self.tracer.drain() {
+            eprintln!("[moe mirror L{layer_idx}] drain failed: {e:?}"); return;
+        }
+        let label = format!("L{layer_idx}");
+        print_moe_stats_decode(&self.tracer, &label, output_slots_host, num_gpus, hidden_size);
     }
 
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        let mirror_on = std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok();
         let max_steps: u32 = std::env::var("BRAIDINFER_DECODE_MIRROR_STEPS")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-        let do_snap = mirror_on && (position < (self.seq_len + max_steps));
+        let do_snap = self.tracer.enabled() && (position < (self.seq_len + max_steps));
         if do_snap {
             self.decode_mirror_snapshot(&format!("step-begin pos={position}"), position);
         }
@@ -653,7 +833,7 @@ impl Model {
                 // but only after GPU 0's PRE has completed.
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
                 // MoE mirror: snapshot output_slots + worker FFN outputs after ack.
-                if self.decode_mirror.is_some() {
+                if self.tracer.enabled() {
                     self.decode_mirror_moe_snapshot(layer_idx);
                 }
                 // Resume segment AT i+1 (OP_MOE_DISPATCH_POST and beyond).
@@ -1117,7 +1297,7 @@ impl Model {
         // first turns NaN. attn_i==0 alone catches downstream propagation but
         // misses which attn layer originated the NaN.
         let all_attn = std::env::var("BRAIDINFER_DECODE_MIRROR_ALL_ATTN").is_ok();
-        if std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok() && self.decode_mirror.is_some() && (attn_i == 0 || all_attn) {
+        if self.tracer.enabled() && (attn_i == 0 || all_attn) {
             let normed_stage_host: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(
                     self.activations.normed_stage.host_ptr() as *const f32,
@@ -1126,9 +1306,7 @@ impl Model {
             }.to_vec();
             let label = format!("attn{attn_i}-post-ack pos={position}");
             self.decode_mirror_snapshot(&label, position);
-            if let Some(mirror) = self.decode_mirror.as_ref() {
-                mirror.print_stats_with_normed_stage(&label, position, &normed_stage_host);
-            }
+            print_normed_stage_stats(&label, position, &normed_stage_host);
         }
 
         // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.

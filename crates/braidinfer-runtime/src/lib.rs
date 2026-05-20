@@ -5,7 +5,7 @@ pub mod config;
 pub mod generate;
 pub mod kernel;
 pub mod megakernel;
-pub mod mirror;
+pub mod kv_chunk_mirror;
 pub mod model;
 pub mod moe_p2p;
 pub mod multi_gpu;
