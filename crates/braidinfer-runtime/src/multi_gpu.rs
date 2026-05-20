@@ -330,6 +330,11 @@ impl MultiGpuContext {
         in_dim: usize,
     ) -> HipResult<crate::quant::LinearWeight> {
         use braidinfer_hip::memory::DeviceBuffer;
+        // bd 4e2m audit candidate #1: DeviceBuffer::alloc(dst_device) silently
+        // sets current device; the subsequent memcpy_d2d would then run under
+        // dst_device context with NO guarantee about restoration on early-return.
+        // Wrap in DeviceGuard for explicit save/restore. See bd 4e2m NOTES.
+        let _guard = DeviceGuard::switch_to(dst_device)?;
         let byte_offset = src.row_byte_offset_dim(row_start, in_dim);
         let byte_len = src.row_byte_offset_dim(num_rows, in_dim);
         let dst_buf = DeviceBuffer::<u8>::alloc(dst_device, byte_len)?;
