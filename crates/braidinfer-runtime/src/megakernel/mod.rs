@@ -69,13 +69,11 @@ pub(crate) struct PagedKvState {
 pub(crate) struct QuantizedKvState {
     #[allow(dead_code)]
     pub quant_scratch: Option<DeviceBuffer<f32>>,
-    /// Stays as DeviceBuffer for now — host-mapped conversion deferred to a separate
-    /// phase. Initial Phase 1 validation showed converting quant_page_table to
-    /// MappedHostBuffer breaks quant decode (NaN logits on step 0); needs separate
-    /// investigation. The quant_page_table is only written when chunks seal (every
-    /// CHUNK_TOKENS=64 tokens), so the persistent-kernel-deadlock concern is less
-    /// acute than for page_table (which updates more frequently).
-    pub quant_page_table: Option<DeviceBuffer<u64>>,
+    /// Host-mapped (MappedHostBuffer) to avoid hipMemcpy under the persistent
+    /// cooperative kernel. Same pattern as page_table. Written from CPU via
+    /// host_ptr().write_volatile when a chunk seals (~once per 64 tokens);
+    /// read from GPU via device_ptr() patched into OP_ATTN_PAGED_Q instructions.
+    pub quant_page_table: Option<MappedHostBuffer<u64>>,
     pub last_quant_page_table_len: usize,
 }
 

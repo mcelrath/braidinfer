@@ -249,7 +249,7 @@ impl MegakernelProgram {
                 .quant_page_table
                 .as_ref()
                 .expect("quant_page_table not allocated")
-                .as_ptr() as u64;
+                .device_ptr() as u64;
 
             // Patch OP_ATTN_PAGED_Q: enable (grid_x=nqh), quant page table, sealed seq_len
             for &idx in &attn_quant_inst_indices {
@@ -461,7 +461,7 @@ impl MegakernelProgram {
                 .quant_page_table
                 .as_ref()
                 .expect("quant_page_table not allocated")
-                .as_ptr() as u64;
+                .device_ptr() as u64;
 
             for &idx in &attn_quant_inst_indices {
                 unsafe {
@@ -557,25 +557,16 @@ impl MegakernelProgram {
                     // Track slot for cleanup
                     seq.quant_slots.push(q_slot);
 
-                    // Upload quantized page table.
-                    // TODO(paged-primary follow-up): convert to host-mapped write_volatile
-                    // pattern (matching page_table) once the NaN regression is understood.
+                    // Upload quantized page table — host-mapped, no HIP API call.
                     let num_sealed = seq.chunks.len();
                     let quant_kv = self.quant_kv.as_mut().expect("quant_kv not initialized");
                     let quant_pt = quant_kv
                         .quant_page_table
                         .as_mut()
                         .expect("quant_page_table not allocated");
-                    let q_ptr_val = q_ptr as u64;
-                    let offset = (num_sealed - 1) * std::mem::size_of::<u64>();
-                    braidinfer_hip::error::check(unsafe {
-                        braidinfer_hip::ffi::hipMemcpy(
-                            (quant_pt.as_mut_ptr() as *mut u8).add(offset).cast(),
-                            std::ptr::addr_of!(q_ptr_val).cast(),
-                            std::mem::size_of::<u64>(),
-                            braidinfer_hip::ffi::hipMemcpyHostToDevice,
-                        )
-                    })?;
+                    unsafe {
+                        quant_pt.host_ptr().add(num_sealed - 1).write_volatile(q_ptr as u64);
+                    }
                     quant_kv.last_quant_page_table_len = num_sealed;
                 }
             }
@@ -621,7 +612,20 @@ impl MegakernelProgram {
         let scratch_per_layer = nqh * (2 + hd);
         let total_scratch = num_attn_layers * scratch_per_layer;
         let quant_scratch = DeviceBuffer::alloc(self.device, total_scratch)?;
-        let quant_page_table = DeviceBuffer::alloc(self.device, max_chunks)?;
+        // bd 4qh/8gz Phase 5 (deferred 2026-05-01, attempted 2026-05-20): host-mapped
+        // quant_page_table so chunk-seal updates use host_ptr write_volatile instead of
+        // hipMemcpy. Required for KV_QUANT on the persistent path (the deferred phase
+        // had a NaN regression; this attempt re-tries with explicit init to zero).
+        let quant_page_table = MappedHostBuffer::<u64>::alloc(max_chunks)?;
+        // Initialize all slots to 0 — the kernel reads pages up to last_quant_page_table_len
+        // but defensive zeroing avoids any uninitialized-bits class issues that may have
+        // caused the prior NaN regression.
+        unsafe {
+            let host = quant_page_table.host_ptr();
+            for i in 0..max_chunks {
+                host.add(i).write_volatile(0u64);
+            }
+        }
 
         // Patch OP_ATTN_PAGED_Q scratch pointers and OP_ATTN_PAGED partial_state pointers
         let scratch_base = quant_scratch.as_ptr() as u64;
