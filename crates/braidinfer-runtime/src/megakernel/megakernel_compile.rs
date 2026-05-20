@@ -421,7 +421,6 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
-                    kv_idx == 0 && super::k_trace_5ax_enabled(),
                 );
 
                 // Scan emitted instructions for KV-write D2dCopy and AttnPrefillInst.
@@ -1256,7 +1255,6 @@ impl MegakernelProgram {
                     &mut Vec::new(),
                     &mut Vec::new(),
                     &mut Vec::new(),
-                    kv_idx == 0 && super::k_trace_5ax_enabled(),
                 );
 
                 let nkh = cfg.num_kv_heads;

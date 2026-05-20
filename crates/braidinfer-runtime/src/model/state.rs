@@ -486,52 +486,6 @@ impl Model {
         Ok(result)
     }
 
-    /// Read K-trace diagnostic buffer (5ax). Returns three Vec<f32>:
-    ///   phase 0: pre-LINEAR_PROJ K (normed, length hidden_size)
-    ///   phase 1: post-LINEAR_PROJ K (length num_kv_heads * head_dim)
-    ///   phase 2: post-QK_NORM K (length num_kv_heads * head_dim)
-    /// Returns Vec::new() if prefill_bufs is not initialized.
-    /// Captured only for the first attention layer of the most recent prefill (n=1).
-    pub fn read_k_trace_phases(&self) -> Result<Vec<Vec<f32>>, ModelError> {
-        self.stream.synchronize()?;
-        let Some(pb) = self.prefill_bufs.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let hs = self.config.hidden_size;
-        let nkh = self.config.num_kv_heads;
-        let hd = self.config.head_dim;
-        let total = hs + 2 * nkh * hd;
-        let mut buf = vec![0.0f32; total];
-        pb.k_trace.copy_to_host(&mut buf)?;
-        let phase0 = buf[0..hs].to_vec();
-        let phase1 = buf[hs..hs + nkh * hd].to_vec();
-        let phase2 = buf[hs + nkh * hd..hs + 2 * nkh * hd].to_vec();
-        Ok(vec![phase0, phase1, phase2])
-    }
-
-    /// Read 5ax MROPE in-kernel dump. Returns one entry per (k_head, pair) for token 0:
-    ///   [pair, pos, theta_bits, cos_bits, sin_bits, x0_bits, x1_bits, out0_bits, out1_bits]
-    /// Length = num_kv_heads * (rope_dim/2). Empty if prefill_bufs not initialized.
-    pub fn read_mrope_dump(&self) -> Result<Vec<[u32; 9]>, ModelError> {
-        self.stream.synchronize()?;
-        let Some(pb) = self.prefill_bufs.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let nkh = self.config.num_kv_heads;
-        let total_pairs = self.config.rope_dim / 2;
-        let n_words = nkh * total_pairs * 9;
-        let mut buf = vec![0u32; n_words];
-        pb.mrope_dump.copy_to_host(&mut buf)?;
-        let n_entries = nkh * total_pairs;
-        let mut out: Vec<[u32; 9]> = Vec::with_capacity(n_entries);
-        for e in 0..n_entries {
-            let mut entry = [0u32; 9];
-            entry.copy_from_slice(&buf[e * 9..e * 9 + 9]);
-            out.push(entry);
-        }
-        Ok(out)
-    }
-
     /// Read per-GPU attn_kv_caches for the first attention layer, all KV heads,
     /// positions [0..max_pos). Returns Vec of (gpu_idx, k_slice, v_slice).
     /// Diagnostic for braidinfer-sew: compares against read_legacy_kv_caches[0]

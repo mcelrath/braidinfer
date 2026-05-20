@@ -32,6 +32,13 @@ from pathlib import Path
 LOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "launch-llama"
 VRAM_IN_USE_THRESHOLD_MB = 100  # Idle GPU has ~27MB used; 512 was too high
 
+# Process names that open the GPU device for monitoring but do not allocate work.
+# A held device with only these holders is treated as available.
+MONITORING_COMMS = {"btop", "nvtop", "amdgpu_top", "radeontop", "rocm-smi", "rocprof", "rocminfo"}
+
+# Threshold for "this PID holds the GPU" via /sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>.
+KFD_HOLD_THRESHOLD_BYTES = 1 * 1024 * 1024  # 1 MiB — anything non-trivial
+
 
 def compute_rocr_visible_devices():
     """Compute ROCR_VISIBLE_DEVICES to make HIP device IDs match PCI bus order.
@@ -241,8 +248,86 @@ def _get_gpu_vram_sysfs():
     return gpus
 
 
+def _kfd_gpu_id_to_hip_index():
+    """Build {kfd_gpu_id: hip_index}. HIP index = PCI-BDF-sorted position among
+    nodes with simd_count>0, matching compute_rocr_visible_devices() ordering."""
+    topo = Path("/sys/class/kfd/kfd/topology/nodes")
+    if not topo.exists():
+        return {}
+    entries = []  # (location_id, gpu_id)
+    for node_dir in sorted(topo.iterdir(), key=lambda p: int(p.name)):
+        props = node_dir / "properties"
+        gpu_id_file = node_dir / "gpu_id"
+        if not props.exists() or not gpu_id_file.exists():
+            continue
+        simd_count = 0
+        location = None
+        for line in props.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                if parts[0] == "simd_count":
+                    simd_count = int(parts[1])
+                elif parts[0] == "location_id":
+                    location = int(parts[1])
+        if simd_count > 0 and location is not None:
+            try:
+                gpu_id = int(gpu_id_file.read_text().strip())
+            except (ValueError, OSError):
+                continue
+            entries.append((location, gpu_id))
+    entries.sort(key=lambda x: x[0])
+    return {gpu_id: hip_idx for hip_idx, (_, gpu_id) in enumerate(entries)}
+
+
+def get_held_gpus():
+    """Return set of HIP indices held by any non-monitoring process.
+
+    Reads /sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>. A PID is considered
+    a holder of a GPU if its vram_<gpu_id> exceeds KFD_HOLD_THRESHOLD_BYTES.
+    PIDs whose /proc/<pid>/comm is in MONITORING_COMMS are skipped.
+    Self (this script's pid) is also skipped — we are not yet a holder.
+    """
+    kfd_proc = Path("/sys/class/kfd/kfd/proc")
+    if not kfd_proc.exists():
+        return set()
+    gpu_id_to_hip = _kfd_gpu_id_to_hip_index()
+    if not gpu_id_to_hip:
+        return set()
+    self_pid = os.getpid()
+    held = set()
+    for pid_dir in kfd_proc.iterdir():
+        try:
+            pid = int(pid_dir.name)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        try:
+            comm = (Path("/proc") / str(pid) / "comm").read_text().strip()
+        except OSError:
+            continue
+        if comm in MONITORING_COMMS:
+            continue
+        for vram_file in pid_dir.glob("vram_*"):
+            try:
+                gpu_id = int(vram_file.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            hip_idx = gpu_id_to_hip.get(gpu_id)
+            if hip_idx is None:
+                continue
+            try:
+                used = int(vram_file.read_text().strip())
+            except (ValueError, OSError):
+                continue
+            if used >= KFD_HOLD_THRESHOLD_BYTES:
+                held.add(hip_idx)
+    return held
+
+
 def find_free_gpus(count, min_vram_mb):
     gpus = get_gpu_vram()
+    held = get_held_gpus()
     candidates = []
     for idx, total, used in gpus:
         free = total - used
@@ -250,6 +335,8 @@ def find_free_gpus(count, min_vram_mb):
             continue
         lock_info = read_lock_info(idx)
         if lock_info and is_pid_alive(lock_info.get("pid", -1)):
+            continue
+        if idx in held:
             continue
         if used > VRAM_IN_USE_THRESHOLD_MB:
             continue

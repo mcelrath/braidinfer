@@ -382,10 +382,6 @@ impl MropeInst {
         }
     }
 
-    /// 5ax diag: set dump pointer on already-built MropeInst. Pass null to disable.
-    pub(crate) fn set_dump(&mut self, dump: *mut u32) {
-        self.dump = dump;
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

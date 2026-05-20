@@ -19,7 +19,6 @@ impl MegakernelProgram {
         kv_base_ptrs: &mut Vec<(u64, u64)>,
         attn_paged_indices: &mut Vec<usize>,
         attn_quant_indices: &mut Vec<usize>,
-        trace_first_attn: bool,
     ) {
         let hs = cfg.hidden_size;
         let nqh = cfg.num_q_heads;
@@ -78,40 +77,10 @@ impl MegakernelProgram {
         // 1. RMSNorm
         instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), n as u32, normed_ptr, hidden_ptr, w.input_norm.as_ptr(), hs as i32, eps).into_inst());
 
-        // 5ax K-trace: capture the four phase snapshots into prefill.k_trace.
-        // Only active for first attention layer when prefill && n == 1.
-        let k_trace_active = trace_first_attn
-            && prefill.is_some()
-            && n == 1;
-        let k_trace_ptr: *mut f32 = if k_trace_active {
-            prefill.as_ref().unwrap().0.k_trace.as_write_ptr()
-        } else {
-            std::ptr::null_mut()
-        };
-        // Phase 0: pre-LINEAR_PROJ K → snapshot normed [0..hs]
-        if k_trace_active {
-            instructions.push(D2dCopyInst::new(
-                div_ceil(hs as u32, 256),
-                k_trace_ptr,
-                normed_ptr as *const f32,
-                hs as i32,
-            ).into_inst());
-        }
-
         // 2. Q(+gate), K, V projections
         let q_mult = if cfg.has_output_gate { 2 } else { 1 };
         emit_batched_linear_proj(&w.w_q_gate, q_gate_attn_ptr, normed_ptr, nqh * hd * q_mult, hs, n, instructions);
         emit_batched_linear_proj(&w.w_k, k_attn_ptr, normed_ptr, nkh * hd, hs, n, instructions);
-        // Phase 1: post-LINEAR_PROJ K → snapshot k_attn [0..nkh*hd]
-        if k_trace_active {
-            let dst = unsafe { k_trace_ptr.add(hs) };
-            instructions.push(D2dCopyInst::new(
-                div_ceil((nkh * hd) as u32, 256),
-                dst,
-                k_attn_ptr as *const f32,
-                (nkh * hd) as i32,
-            ).into_inst());
-        }
         emit_batched_linear_proj(&w.w_v, v_attn_ptr, normed_ptr, nkh * hd, hs, n, instructions);
 
         // 3. Deinterleave Q+gate → Q, gate
@@ -170,17 +139,6 @@ impl MegakernelProgram {
                 if n > 1 { n as i32 } else { 0 },
             ).into_inst());
         }
-        // Phase 2: post-QK_NORM K → snapshot k_attn [0..nkh*hd]
-        if k_trace_active {
-            let dst = unsafe { k_trace_ptr.add(hs + nkh * hd) };
-            instructions.push(D2dCopyInst::new(
-                div_ceil((nkh * hd) as u32, 256),
-                dst,
-                k_attn_ptr as *const f32,
-                (nkh * hd) as i32,
-            ).into_inst());
-        }
-
         // Steps 5/6: variant-specific attention ops. PagedKv KV write already done above.
 
         // Variant-specific: KV write placement and attention op
@@ -314,7 +272,7 @@ impl MegakernelProgram {
                 // mRoPE first (batched)
                 let mrope_idx = instructions.len();
                 mrope_indices.push(mrope_idx);
-                let mut mrope_inst = MropeInst::new(
+                let mrope_inst = MropeInst::new(
                     (n * (nqh + nkh)) as u32,
                     q_attn_ptr, k_attn_ptr,
                     act.inv_freq.as_ptr(), position_ids_ptr,
@@ -324,9 +282,6 @@ impl MegakernelProgram {
                     cfg.mrope_sections()[2] as i32,
                     n as i32,
                 );
-                if k_trace_active {
-                    mrope_inst.set_dump(prefill.as_ref().unwrap().0.mrope_dump.as_write_ptr());
-                }
                 instructions.push(mrope_inst.into_inst());
                 // Note: phase-3 (post-MROPE K) snapshot is redundant —
                 // legacy_kv_caches[0][0..nkh*hd] captures exactly the post-MROPE K
@@ -465,7 +420,6 @@ impl MegakernelProgram {
             kv_base_ptrs,
             &mut Vec::new(),
             &mut Vec::new(),
-            false,
         );
     }
 
@@ -600,7 +554,6 @@ impl MegakernelProgram {
             kv_base_ptrs,
             attn_paged_indices,
             attn_quant_indices,
-            false,
         );
     }
 }

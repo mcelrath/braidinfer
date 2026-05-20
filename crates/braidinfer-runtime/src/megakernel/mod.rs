@@ -171,15 +171,6 @@ pub struct PrefillBuffers {
     pub ffn_gate_scratch: DeviceBuffer<f32>, // [intermediate_size]
     pub ffn_up_scratch: DeviceBuffer<f32>,   // [intermediate_size]
     pub ffn_down_scratch: DeviceBuffer<f32>, // [hidden_size]
-    // 5ax K-trace diagnostic: 3 phases. Layout:
-    //   phase 0 (pre LINEAR_PROJ K, normed):  offset 0,                      length hs
-    //   phase 1 (post LINEAR_PROJ K):         offset hs,                     length nkh*hd
-    //   phase 2 (post QK_NORM K):             offset hs +   nkh*hd,          length nkh*hd
-    // (phase 3 post-MROPE is redundant with legacy_kv_caches[0][0..nkh*hd]).
-    pub k_trace: DeviceBuffer<f32>,
-    // 5ax MROPE in-kernel dump: nkh * (rope_dim/2) entries, 9 u32 each.
-    // Per (k_head, pair): [pair, pos, theta_bits, cos_bits, sin_bits, x0_bits, x1_bits, out0_bits, out1_bits]
-    pub mrope_dump: DeviceBuffer<u32>,
 }
 
 impl PrefillBuffers {
@@ -199,16 +190,6 @@ impl PrefillBuffers {
         }
         self.position_ids.copy_from_host(&pos_data)
     }
-}
-
-/// 5ax K-trace + MROPE in-kernel dump diagnostic gate. The
-/// `BRAIDINFER_K_TRACE_5AX` env var was retired by braidinfer-wuf.3
-/// (the qwen35_35b_a3b MROPE investigation it served is closed; see kb
-/// `5ax-k-trace-2026-05-06-result-commit`). Helper kept so the existing
-/// call sites in megakernel_compile.rs and braid_bench compile; always
-/// returns false now. Remove call sites + this helper as a follow-up.
-pub fn k_trace_5ax_enabled() -> bool {
-    false
 }
 
 impl PrefillBuffers {
@@ -253,11 +234,6 @@ impl PrefillBuffers {
             ffn_gate_scratch: DeviceBuffer::alloc(device, is)?,
             ffn_up_scratch: DeviceBuffer::alloc(device, is)?,
             ffn_down_scratch: DeviceBuffer::alloc(device, hs)?,
-            // 5ax K-trace: hs (normed) + 2 × nkh*hd (post-LINEAR_PROJ, post-QK_NORM).
-            k_trace: DeviceBuffer::alloc(device, hs + 2 * nkh * hd)?,
-            // 5ax MROPE in-kernel dump: nkh * (rope_dim/2) entries × 9 u32 each.
-            // rope_dim is part of cfg; size based on max possible (rope_dim<=hd).
-            mrope_dump: DeviceBuffer::alloc(device, nkh * (cfg.rope_dim / 2) * 9)?,
         })
     }
 }
