@@ -181,23 +181,6 @@ impl<T> DeviceBuffer<T> {
         })
     }
 
-    /// Async H2D copy using an explicit stream. Avoids synchronizing with other streams
-    /// (e.g. a running cooperative kernel on the same device). Note: heap-allocated src
-    /// may degrade to synchronous transfer internally, but will NOT block on other streams.
-    pub fn copy_from_host_async(&mut self, data: &[T], stream: &crate::stream::Stream) -> HipResult<()> {
-        assert!(data.len() <= self.len, "source larger than buffer");
-        let size = data.len() * std::mem::size_of::<T>();
-        error::check(unsafe {
-            ffi::hipMemcpyAsync(
-                self.ptr.cast(),
-                data.as_ptr().cast(),
-                size,
-                ffi::hipMemcpyHostToDevice,
-                stream.raw(),
-            )
-        })
-    }
-
     pub fn copy_to_host(&self, data: &mut [T]) -> HipResult<()> {
         crate::assert_no_persistent_worker_on("DeviceBuffer::copy_to_host", self.device);
         assert!(data.len() >= self.len, "destination smaller than buffer");
