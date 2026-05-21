@@ -276,6 +276,10 @@ The cooperative watchdog recovery test lives in `../exterior_algebra/scripts/wat
 - Cooperative variant: 100/100 PASS, mean recovery 4.7 ± 0.7 ms
 - Stubborn variant: documented as platform-limited — `hipDeviceReset` blocks indefinitely on RDNA3/gfx1100 (ROCm has no GPU TDR preemption for compute). Process abort is the correct escalation path.
 
+## Pre-existing Issues — File First, Then Move On
+
+When you encounter a failure, bug, or stale state that pre-dates your current task (test was already failing on HEAD, doc is out of date, dead code unrelated to your change, etc.): **first run `bd list --status=open` (grep for related keywords) to see if it's tracked. If not, `bd create` immediately with a precise repro/description.** Then continue your task. Do not silently fix or silently skip — the bead is the audit trail. Applies to: pre-existing test failures, latent bugs surfaced by your build, doc drift, orphan files, dead code outside your task's scope.
+
 ## Mandatory Review Workflow
 
 Reviews are always approved and expected. Do not ask the user for permission to review.
