@@ -67,7 +67,17 @@ pub(crate) struct PagedKvState {
 
 /// Quantized KV state — only populated when `quantized_kv=true`.
 pub(crate) struct QuantizedKvState {
-    #[allow(dead_code)]
+    /// VRAM scratch region (nqh × (2 + hd) f32s per attention layer) for
+    /// OP_ATTN_PAGED_Q's partial_state accumulators. The DeviceBuffer is
+    /// never read by Rust after enable_quantized_kv() patches its `as_ptr()`
+    /// into the OP_ATTN_PAGED_Q + OP_ATTN_PAGED instruction `scratch` /
+    /// `partial_state` fields (megakernel_run.rs:626-645). This Option keeps
+    /// the underlying allocation alive for the program's lifetime — the GPU
+    /// kernel reads/writes via the baked-in raw pointer.
+    /// bd loyy 2026-05-21: was #[allow(dead_code)]; replaced with doc comment.
+    /// Field MUST remain even though dead_code lint would flag — dropping it
+    /// would free VRAM the kernel still has pointers into.
+    #[allow(dead_code)]  // RAII anchor, see doc above
     pub quant_scratch: Option<DeviceBuffer<f32>>,
     /// Host-mapped (MappedHostBuffer) to avoid hipMemcpy under the persistent
     /// cooperative kernel. Same pattern as page_table. Written from CPU via
