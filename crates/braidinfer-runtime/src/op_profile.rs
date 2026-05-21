@@ -157,7 +157,7 @@ pub fn opcode_name(op: u32) -> &'static str {
         32 => "OP_SIGMOID_WEIGHTED_ADD",
         33 => "OP_BARRIER",
         34 => "OP_MOE_DISPATCH",
-        35 => "OP_EXPERT_FFN",
+        // 35 reserved (was OP_EXPERT_FFN — removed per bd ntz6)
         36 => "OP_SCALE_ADD",
         37 => "OP_RELU_SQ",
         38 => "OP_MAMBA2_CONV1D",

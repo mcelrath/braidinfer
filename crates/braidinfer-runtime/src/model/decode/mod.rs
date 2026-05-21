@@ -372,12 +372,10 @@ impl Model {
         if num_gpus <= 1 {
             return Ok(());
         }
-        // moe_gemv_worker LDS layout: 1024 f32 elements (expert accumulator tile)
-        // + 256 bytes overhead (header / sync primitives in the kernel).
-        const MOE_WORKER_LDS_ELEMS: u32 = 1024;
-        const MOE_WORKER_LDS_OVERHEAD_BYTES: u32 = 256;
-        let moe_worker_shared_mem = MOE_WORKER_LDS_ELEMS * 4 + MOE_WORKER_LDS_OVERHEAD_BYTES;
-        let shared_mem_persistent = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
+        // bd ntz6: the moe_gemv_worker.hip kernel was orphaned (never compiled,
+        // OP_EXPERT_FFN had no producer/consumer). Workers run persistent_worker.hsaco
+        // via OP_MOE_FFN_REMOTE. shared_mem floor is just SHARED_LPROJ_TOTAL.
+        let shared_mem_persistent = SHARED_LPROJ_TOTAL;
         let hs = self.config.hidden_size;
         let max_eis = self
             .config
@@ -406,7 +404,7 @@ impl Model {
             max_eis,
             num_total_layers,
             &dist_refs,
-            moe_worker_shared_mem,
+            shared_mem_persistent,
         )
         .map_err(ModelError::Hip)?;
         let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
@@ -590,12 +588,8 @@ impl Model {
         let _ = PersistentDispatch::init; // silence unused import in single-gpu-skip path
 
         let num_gpus = self.multi_gpu.as_ref().unwrap().num_devices;
-        // moe_gemv_worker LDS layout: 1024 f32 elements (expert accumulator tile)
-        // + 256 bytes overhead (header / sync primitives in the kernel).
-        const MOE_WORKER_LDS_ELEMS: u32 = 1024;
-        const MOE_WORKER_LDS_OVERHEAD_BYTES: u32 = 256;
-        let moe_worker_shared_mem = MOE_WORKER_LDS_ELEMS * 4 + MOE_WORKER_LDS_OVERHEAD_BYTES;
-        let shared_mem = moe_worker_shared_mem.max(SHARED_LPROJ_TOTAL);
+        // bd ntz6: moe_gemv_worker.hip orphan deleted; shared_mem floor is SHARED_LPROJ_TOTAL.
+        let shared_mem = SHARED_LPROJ_TOTAL;
         let hs = self.config.hidden_size;
         // For MoE multi-GPU: workers (GPUs 1..N-1) were already launched by
         // ensure_moe_workers_started during prefill. Add GPU 0 now (after
