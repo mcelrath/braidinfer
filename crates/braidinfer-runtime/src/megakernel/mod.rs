@@ -438,11 +438,20 @@ impl MegakernelProgram {
     /// NOT from the instruction stream. No OP_NOP header is required even
     /// when self.dump_buffer.is_some().
     pub fn dispatch_via_worker(
-        &mut self,
+        &self,
         dispatch: &mut crate::persistent_dispatch::PersistentDispatch,
         gpu_idx: usize,
     ) -> HipResult<()> {
-        dispatch.dispatch_batch_slice(gpu_idx, &self.instructions);
+        // HALT EXCLUSION: the persistent cooperative kernel loops forever
+        // waiting for the next batch; HALT would cause it to exit. Strip any
+        // trailing HALT instructions (compile_prefill / compile_final_norm_lm_head
+        // append OP_HALT for the one-shot megakernel_f32 entry).
+        let halt_idx = self
+            .instructions
+            .iter()
+            .position(|inst| (inst.words[0] as u32) == OP_HALT)
+            .unwrap_or(self.instructions.len());
+        dispatch.dispatch_batch_slice(gpu_idx, &self.instructions[..halt_idx]);
         Ok(())
     }
 }

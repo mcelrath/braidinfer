@@ -119,69 +119,81 @@ impl Model {
     /// Persistent worker decode using paged KV cache.
     /// On first call: compiles paged megakernel, initializes page allocator + sequence,
     /// then launches persistent worker.
+    /// bd 9gmh Phase 2D: lazy-init the persistent worker. Extracted from
+    /// decode_step_persistent so Model::prefill can spawn the worker before
+    /// the first prefill call (prefill paths now route through mailbox, not
+    /// hipMemcpy, so worker-before-prefill no longer deadlocks).
+    ///
+    /// Idempotent: returns Ok immediately if persistent_workers is already
+    /// Some. The logits_mapped pointer patch on OP_LM_HEAD writes the same
+    /// pointer value to the same instruction slot each call — safe to apply
+    /// at prefill entry even though prefill writes logits to activations.logits
+    /// (not logits_mapped); the decode path reads logits_mapped, and prefill
+    /// never re-executes the paged megakernel program (it uses compile_prefill*).
+    pub(crate) fn ensure_persistent_worker_spawned(&mut self) -> Result<(), ModelError> {
+        use crate::persistent_dispatch::PersistentDispatch;
+        if self.persistent_workers.is_some() {
+            return Ok(());
+        }
+
+        let max_chunks = self.max_paged_chunks();
+
+        if self.megakernel_paged.is_none() {
+            let mut mk = MegakernelProgram::compile_paged(self)?;
+            mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
+            // bd 9gmh Phase 2F: KV_QUANT now wired here (was: separate
+            // decode_step_paged_quantized entry that passed quantized=true).
+            // Multi-GPU + KV_QUANT is rejected in Model::load (model_load.rs:37).
+            if std::env::var("KV_QUANT").as_deref() == Ok("1") {
+                mk.enable_quantized_kv(max_chunks, &self.config).map_err(ModelError::Hip)?;
+            }
+            self.megakernel_paged = Some(mk);
+        }
+
+        // Patch LM head instruction to write to logits_mapped (host-mapped)
+        // so CPU can read without hipMemcpy. Idempotent: writes same pointer
+        // each call.
+        {
+            let mk = self.megakernel_paged.as_mut().unwrap();
+            let lm_head_idx = mk
+                .instructions
+                .iter()
+                .rposition(|inst| (inst.words[0] as u32) == OP_LM_HEAD)
+                .expect("lm_head not found in paged megakernel");
+            mk.instructions[lm_head_idx].words[1] =
+                self.activations.logits_mapped.as_write_ptr() as u64;
+        }
+
+        // Ensure paged decode state (page_allocator + paged_seq) is initialized.
+        self.ensure_paged_decode_state(false)?;
+
+        // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
+        let shared_mem = SHARED_LPROJ_TOTAL as u32;
+        let mut dispatch =
+            PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
+        dispatch.ensure_sdma_stream(self.device).map_err(ModelError::Hip)?;
+        self.persistent_workers = Some(dispatch);
+
+        // Lazy-init tracer from env vars now that SDMA stream is available.
+        if !self.tracer.enabled() {
+            let sdma = self.persistent_workers.as_ref().unwrap()
+                .sdma_stream(self.device.0 as usize);
+            match crate::tracer::Tracer::from_env(vec![sdma]) {
+                Ok(t) => self.tracer = t,
+                Err(e) => eprintln!("[braidinfer] tracer init failed: {e:?}"),
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn decode_step_persistent(
         &mut self,
         token_id: u32,
         position: u32,
     ) -> Result<Vec<f32>, ModelError> {
-        use crate::persistent_dispatch::PersistentDispatch;
-
-        // Lazy-init: compile PAGED megakernel FIRST (needs GPU queries),
-        // then launch persistent worker (occupies all SMs).
-        if self.persistent_workers.is_none() {
-            let max_chunks = self.max_paged_chunks();
-
-            if self.megakernel_paged.is_none() {
-                let mut mk = MegakernelProgram::compile_paged(self)?;
-                mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
-                // bd 9gmh Phase 2F: KV_QUANT now wired here (was: separate
-                // decode_step_paged_quantized entry that passed quantized=true).
-                // Multi-GPU + KV_QUANT is rejected in Model::load (model_load.rs:37).
-                if std::env::var("KV_QUANT").as_deref() == Ok("1") {
-                    mk.enable_quantized_kv(max_chunks, &self.config).map_err(ModelError::Hip)?;
-                }
-                self.megakernel_paged = Some(mk);
-            }
-
-            // Patch LM head instruction to write to logits_mapped (host-mapped)
-            // so CPU can read without hipMemcpy (which deadlocks the cooperative kernel).
-            // This must be done whether megakernel_paged was just compiled or
-            // pre-compiled by prefill_paged (which doesn't patch logits_mapped).
-            {
-                let mk = self.megakernel_paged.as_mut().unwrap();
-                // Search for OP_LM_HEAD by opcode rather than using a hardcoded
-                // offset (n_inst-2). words[0] encodes opcode in the low 32 bits.
-                let lm_head_idx = mk
-                    .instructions
-                    .iter()
-                    .rposition(|inst| (inst.words[0] as u32) == OP_LM_HEAD)
-                    .expect("lm_head not found in paged megakernel");
-                // words[1] = output pointer (LinearProjInst layout; see instructions.rs:556).
-                mk.instructions[lm_head_idx].words[1] =
-                    self.activations.logits_mapped.as_write_ptr() as u64;
-            }
-
-            // Ensure paged decode state (page_allocator + paged_seq) is initialized.
-            self.ensure_paged_decode_state(false)?;
-
-            // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
-            let shared_mem = SHARED_LPROJ_TOTAL as u32;
-            let mut dispatch =
-                PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
-            // Ensure SDMA stream for GPU 0 so tracer can issue async D2H copies.
-            dispatch.ensure_sdma_stream(self.device).map_err(ModelError::Hip)?;
-            self.persistent_workers = Some(dispatch);
-
-            // Lazy-init tracer from env vars now that SDMA stream is available.
-            if !self.tracer.enabled() {
-                let sdma = self.persistent_workers.as_ref().unwrap()
-                    .sdma_stream(self.device.0 as usize);
-                match crate::tracer::Tracer::from_env(vec![sdma]) {
-                    Ok(t) => self.tracer = t,
-                    Err(e) => eprintln!("[braidinfer] tracer init failed: {e:?}"),
-                }
-            }
-        }
+        // bd 9gmh Phase 2D: lazy worker spawn extracted to helper. Called from
+        // Model::prefill entry; here as a no-op if already spawned.
+        self.ensure_persistent_worker_spawned()?;
 
         // Enable dump buffer on first traced step. enable_dump_persistent allocates VRAM
         // buffers only (no NOP header / device_program rebuild — persistent path reads
