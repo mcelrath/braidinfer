@@ -684,8 +684,8 @@ impl PersistentDispatch {
             std::ptr::addr_of_mut!((*q).dump_capacity).write(0);
         }
         let stream = Stream::new(device)?;
-        // zqw merge: persistent_worker entry now lives in megakernel.hsaco
-        // alongside megakernel_f32. One module load, get the right function.
+        // persistent_worker is the sole entry point in megakernel.hsaco
+        // (bd 9gmh Phase 4: megakernel_f32 one-shot entry deleted).
         let module = Module::load(device, &kernel_dir.join("megakernel.hsaco"))?;
         let func = module.get_function("persistent_worker")?;
         let mut queue_ptr = queue.device_ptr() as *mut std::ffi::c_void;

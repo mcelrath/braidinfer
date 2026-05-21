@@ -1,6 +1,6 @@
-// Per-instruction trace dump helper used by both kernel entry points
-// (megakernel_f32 one-shot path and persistent_worker mailbox path) via
-// kernels/megakernel_dispatch.hip.
+// Per-instruction trace dump helper used by the persistent_worker mailbox
+// path via kernels/megakernel_dispatch.hip. bd 9gmh Phase 4: the prior
+// megakernel_f32 one-shot path was deleted; only persistent_worker remains.
 //
 // Block 0 atomically allocates a slot in dump_buffer, writes a header
 // {opcode, pc, size, pad}, then copies the instruction's output region
@@ -9,9 +9,8 @@
 // Output region is determined per-opcode from the typed *Inst structs
 // in megakernel_common.h (which must be included before this header).
 //
-// Compatibility: this header was extracted from kernels/megakernel.hip
-// in the braidinfer-zqw merge so persistent_worker.hip can also dump
-// (was previously megakernel-only).
+// History: this header was extracted from kernels/megakernel.hip in the
+// braidinfer-zqw merge so dump support could be shared across entry points.
 #ifndef BRAIDINFER_DUMP_H
 #define BRAIDINFER_DUMP_H
 
