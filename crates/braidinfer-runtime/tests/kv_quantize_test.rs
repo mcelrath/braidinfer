@@ -83,6 +83,11 @@ fn test_kv_quantize_residual_pc() {
     let mut r_data_buf = DeviceBuffer::<u8>::alloc(device, data_bytes).expect("alloc r_data");
     let mut r_scale_buf = DeviceBuffer::<f32>::alloc(device, scale_elems).expect("alloc r_scale");
 
+    // KvQuantizeInst packs (num_kv_heads:i32, head_dim:i32) into word[6]
+    // and (chunk_tokens:i32, _pad0:i32) into word[7]. See
+    // crates/braidinfer-runtime/src/megakernel/instructions.rs:783-803.
+    let packed_nkh_hd = (nkh as u64) | ((hd as u64) << 32);
+    let packed_ct_pad = ct as u64;
     let quant_inst = build_instruction(
         OP_KV_QUANTIZE,
         total_channels as u32,
@@ -92,9 +97,8 @@ fn test_kv_quantize_residual_pc() {
             (3, q1_scale_buf.as_mut_ptr() as u64),
             (4, r_data_buf.as_mut_ptr() as u64),
             (5, r_scale_buf.as_mut_ptr() as u64),
-            (6, nkh as u64),
-            (7, hd as u64),
-            (8, ct as u64),
+            (6, packed_nkh_hd),
+            (7, packed_ct_pad),
         ],
     );
     let halt_inst = build_instruction(OP_HALT, 0, &[]);
@@ -324,6 +328,10 @@ fn test_attn_paged_quant_vs_f32() {
             .add(2 * data_bytes + scale_bytes)
     };
 
+    // KvQuantizeInst packs (num_kv_heads:i32, head_dim:i32) into word[6]
+    // and (chunk_tokens:i32, _pad0:i32) into word[7] — see instructions.rs:783.
+    let packed_nkh_hd = (nkh as u64) | ((hd as u64) << 32);
+    let packed_ct_pad = ct as u64;
     let quant_k_inst = build_instruction(
         OP_KV_QUANTIZE,
         (nkh * hd) as u32,
@@ -333,9 +341,8 @@ fn test_attn_paged_quant_vs_f32() {
             (3, k_q1scale_ptr as u64),
             (4, k_rdata_ptr as u64),
             (5, k_rscale_ptr as u64),
-            (6, nkh as u64),
-            (7, hd as u64),
-            (8, ct as u64),
+            (6, packed_nkh_hd),
+            (7, packed_ct_pad),
         ],
     );
 
@@ -366,9 +373,8 @@ fn test_attn_paged_quant_vs_f32() {
             (3, v_q1scale_ptr as u64),
             (4, v_rdata_ptr as u64),
             (5, v_rscale_ptr as u64),
-            (6, nkh as u64),
-            (7, hd as u64),
-            (8, ct as u64),
+            (6, packed_nkh_hd),
+            (7, packed_ct_pad),
         ],
     );
 
