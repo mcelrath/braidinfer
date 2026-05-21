@@ -457,36 +457,33 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_hash_entries() {
+        // Build a valid 2-tensor file via BqntWriter, then mutate entry 1's
+        // hash bytes to match entry 0's. The reader's per-entry checks (size,
+        // data_offset >= table_end, no metadata overlap) all pass on the
+        // writer-produced layout, so validation reaches the duplicate-hash
+        // gate at bqnt.rs:402.
         let path = temp_path("dup-hash");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&VERSION.to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        let metadata_offset = HEADER_SIZE + 2 * ENTRY_SIZE;
-        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut w = BqntWriter::create(&path, 2).unwrap();
+        w.write_tensor("a", WeightFormat::Bf16, 1, 1, 2, &[0, 0]).unwrap();
+        w.write_tensor("b", WeightFormat::Bf16, 1, 1, 2, &[0, 0]).unwrap();
+        w.finish("{}").unwrap();
 
-        let hash = 0x1234u64;
-        for _ in 0..2 {
-            bytes.extend_from_slice(&hash.to_le_bytes());
-            bytes.extend_from_slice(&[0, 0, 0, 0]);
-            bytes.extend_from_slice(&1u32.to_le_bytes());
-            bytes.extend_from_slice(&1u32.to_le_bytes());
-            bytes.extend_from_slice(&2u32.to_le_bytes());
-            bytes.extend_from_slice(&metadata_offset.to_le_bytes());
-            bytes.extend_from_slice(&2u64.to_le_bytes());
-            bytes.extend_from_slice(&0u64.to_le_bytes());
-        }
-        bytes.extend_from_slice(&[0u8, 0u8]);
-
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Entry table starts at HEADER_SIZE (32). Each entry is ENTRY_SIZE (48).
+        // Copy entry 0's hash (bytes 32..40) into entry 1's hash slot (80..88).
+        let hash0 = bytes[32..40].to_vec();
+        bytes[80..88].copy_from_slice(&hash0);
         std::fs::write(&path, bytes).unwrap();
+
         let err = match BqntFile::open(&path) {
             Ok(_) => panic!("expected duplicate-hash BQNT to be rejected"),
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("duplicate tensor hash"));
+        assert!(
+            err.to_string().contains("duplicate tensor hash"),
+            "{err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -515,33 +512,31 @@ mod tests {
 
     #[test]
     fn rejects_tensor_range_overlapping_metadata() {
+        // Build a valid 1-tensor file via BqntWriter, then mutate entry 0's
+        // data_offset (bytes 56..64) to point at metadata_offset (read from
+        // header bytes 16..24). The reader's data_offset >= table_end check
+        // still passes (both regions sit well past the aligned table), so
+        // validation reaches the ranges_overlap gate at bqnt.rs:395.
         let path = temp_path("metadata-overlap");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&MAGIC.to_le_bytes());
-        bytes.extend_from_slice(&VERSION.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        let metadata_offset = HEADER_SIZE + ENTRY_SIZE + 8;
-        bytes.extend_from_slice(&metadata_offset.to_le_bytes());
-        bytes.extend_from_slice(&4u64.to_le_bytes());
+        let mut w = BqntWriter::create(&path, 1).unwrap();
+        w.write_tensor("x", WeightFormat::Bf16, 1, 1, 2, &[0, 0]).unwrap();
+        w.finish("{}").unwrap();
 
-        bytes.extend_from_slice(&0x1234u64.to_le_bytes());
-        bytes.extend_from_slice(&[0, 0, 0, 0]);
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
-        bytes.extend_from_slice(&2u32.to_le_bytes());
-        bytes.extend_from_slice(&(metadata_offset - 2).to_le_bytes());
-        bytes.extend_from_slice(&4u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&[0u8; 12]);
-
+        let mut bytes = std::fs::read(&path).unwrap();
+        let metadata_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        // Entry 0 data_offset is at offset HEADER_SIZE + 24 = 56.
+        bytes[56..64].copy_from_slice(&metadata_offset.to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
+
         let err = match BqntFile::open(&path) {
             Ok(_) => panic!("expected metadata-overlapping tensor to be rejected"),
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("overlaps metadata range"), "{err}");
+        assert!(
+            err.to_string().contains("overlaps metadata range"),
+            "{err}"
+        );
         let _ = std::fs::remove_file(path);
     }
 
