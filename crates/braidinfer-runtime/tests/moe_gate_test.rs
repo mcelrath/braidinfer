@@ -123,9 +123,13 @@ fn test_moe_gate_softmax() {
     let func = module.get_function("megakernel_f32").expect("func");
     let num_inst: i32 = 3;
     let prog_ptr = prog_buf.as_ptr();
+    let watchdog_ptr: *mut std::ffi::c_void = std::ptr::null_mut(); // null = disabled
+    let op_profile_ptr: *mut std::ffi::c_void = std::ptr::null_mut(); // null = disabled
     let mut args: Vec<*mut std::ffi::c_void> = vec![
         &prog_ptr as *const _ as *mut std::ffi::c_void,
         &num_inst as *const _ as *mut std::ffi::c_void,
+        &watchdog_ptr as *const _ as *mut std::ffi::c_void,
+        &op_profile_ptr as *const _ as *mut std::ffi::c_void,
     ];
     launch_megakernel(&func, &stream, &mut args);
     stream.synchronize().expect("sync");

@@ -114,9 +114,13 @@ fn test_kv_quantize_residual_pc() {
 
     let num_instructions: i32 = 2;
     let program_ptr = program_buf.as_ptr();
+    let watchdog_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let op_profile_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut args: Vec<*mut std::ffi::c_void> = vec![
         &program_ptr as *const _ as *mut std::ffi::c_void,
         &num_instructions as *const _ as *mut std::ffi::c_void,
+        &watchdog_ptr as *const _ as *mut std::ffi::c_void,
+        &op_profile_ptr as *const _ as *mut std::ffi::c_void,
     ];
 
     launch_megakernel(&func, &stream, &mut args);
@@ -276,9 +280,13 @@ fn test_attn_paged_quant_vs_f32() {
     let func = module.get_function("megakernel_f32").expect("get function");
     let num_inst: i32 = 2;
     let prog_ptr = prog_buf.as_ptr();
+    let watchdog_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let op_profile_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut args: Vec<*mut std::ffi::c_void> = vec![
         &prog_ptr as *const _ as *mut std::ffi::c_void,
         &num_inst as *const _ as *mut std::ffi::c_void,
+        &watchdog_ptr as *const _ as *mut std::ffi::c_void,
+        &op_profile_ptr as *const _ as *mut std::ffi::c_void,
     ];
     launch_megakernel(&func, &stream, &mut args);
     stream.synchronize().expect("sync f32");
@@ -439,9 +447,13 @@ fn test_attn_paged_quant_vs_f32() {
 
     let num_inst2: i32 = 5;
     let prog2_ptr = prog2_buf.as_ptr();
+    let watchdog2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let op_profile2_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     let mut args2: Vec<*mut std::ffi::c_void> = vec![
         &prog2_ptr as *const _ as *mut std::ffi::c_void,
         &num_inst2 as *const _ as *mut std::ffi::c_void,
+        &watchdog2_ptr as *const _ as *mut std::ffi::c_void,
+        &op_profile2_ptr as *const _ as *mut std::ffi::c_void,
     ];
     launch_megakernel(&func, &stream, &mut args2);
     stream.synchronize().expect("sync quant");
