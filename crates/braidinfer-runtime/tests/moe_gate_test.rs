@@ -6,7 +6,7 @@ use braidinfer_hip::stream::Stream;
 const OP_LINEAR_PROJ: u32 = 2;
 const OP_MOE_GATE: u32 = 23;
 const OP_HALT: u32 = 16;
-const INST_SIZE: usize = 17;
+const INST_SIZE: usize = 18; // must match megakernel::mod.rs INST_SIZE
 const SHARED_MEM_BYTES: u32 = 31_776;
 const BLOCK_SIZE: u32 = 256;
 const NUM_CUS: u32 = 48;
