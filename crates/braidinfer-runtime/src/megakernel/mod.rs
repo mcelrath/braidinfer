@@ -6,7 +6,7 @@ use braidinfer_hip::stream::Stream;
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use crate::model::ModelConfig;
+use crate::config::ModelConfig;
 use crate::tracer::TraceSink;
 use crate::watchdog::WatchdogThread;
 

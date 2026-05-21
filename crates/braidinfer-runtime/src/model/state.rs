@@ -3,7 +3,7 @@ use braidinfer_hip::memory::DeviceBuffer;
 use crate::paged_kv::{self, RecurrentCheckpointPool};
 
 use super::Model;
-use super::ModelError;
+use crate::weights::ModelError;
 use crate::config::*;
 
 impl Model {

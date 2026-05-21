@@ -20,7 +20,8 @@ use super::{
     OP_QK_NORM, OP_RELU_SQ, OP_RESIDUAL_ADD, OP_RMSNORM, OP_RMSNORM_GATE, OP_RMSNORM_WX,
     OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
 };
-use crate::model::{LayerWeights, Model};
+use crate::model::Model;
+use crate::weights::LayerWeights;
 
 impl MegakernelProgram {
     pub fn compile_paged(model: &Model) -> HipResult<Self> {
@@ -55,7 +56,7 @@ impl MegakernelProgram {
         let has_moe = cfg
             .layers
             .iter()
-            .any(|l| matches!(l.ffn_type, crate::model::FfnType::MoE { .. }));
+            .any(|l| matches!(l.ffn_type, crate::config::FfnType::MoE { .. }));
         // OP_MOE_GATE needs 1024 floats = 4KB. GDN recurrent needs 2KB.
         // OP_LINEAR_PROJ_PCG32/RNF4 tiled-LDS: (8+7680+256)*4 = 31776 bytes per block.
         // 2 blocks/CU: 2*31776 = 63552 < 65536 ✓ — no occupancy reduction.
@@ -114,7 +115,7 @@ impl MegakernelProgram {
         let mut mamba2_idx = 0usize;
         let mut kv_idx = 0usize;
         for layer_i in 0..cfg.num_layers {
-            use crate::model::LayerType;
+            use crate::config::LayerType;
             match cfg.layers[layer_i].layer_type {
                 LayerType::Attention => {
                     if paged {
@@ -202,12 +203,12 @@ impl MegakernelProgram {
 
             // FFN dispatch
             match &cfg.layers[layer_i].ffn_type {
-                crate::model::FfnType::Dense => {
+                crate::config::FfnType::Dense => {
                     Self::compile_ffn(cfg, &model.layers[layer_i], act, &mut instructions);
                     // PostFfn probe at the last instruction emitted by compile_ffn
                     trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
                 }
-                crate::model::FfnType::MoE { .. } => {
+                crate::config::FfnType::MoE { .. } => {
                     if multi_gpu {
                         let moe = model.moe_weights[layer_i].as_ref().unwrap();
                         // emit_post_barrier=false for fc2_latent_proj layers (Nemotron-H): the
@@ -241,7 +242,7 @@ impl MegakernelProgram {
                         }
                     }
                 }
-                crate::model::FfnType::None => {
+                crate::config::FfnType::None => {
                     // No FFN for this layer (Nemotron M/* layers)
                 }
             }
@@ -398,7 +399,7 @@ impl MegakernelProgram {
         let mut prefill_kv_base_ptrs: Vec<(u64, u64)> = Vec::new();
 
         for layer_i in 0..cfg.num_layers {
-            use crate::model::LayerType;
+            use crate::config::LayerType;
             if cfg.layers[layer_i].layer_type == LayerType::Attention {
                 let w = match &model.layers[layer_i] {
                     LayerWeights::Attention(w) => w,
@@ -826,7 +827,7 @@ impl MegakernelProgram {
         let mut mamba2_idx = 0usize;
         let mut kv_idx = 0usize;
         for i in 0..layer_start {
-            use crate::model::LayerType;
+            use crate::config::LayerType;
             match cfg.layers[i].layer_type {
                 LayerType::Gdn => gdn_idx += 1,
                 LayerType::Mamba2 => mamba2_idx += 1,
@@ -841,7 +842,7 @@ impl MegakernelProgram {
         let mut _attn_layer_count = 0usize;
 
         for layer_i in layer_start..layer_end {
-            use crate::model::LayerType;
+            use crate::config::LayerType;
             if cfg.layers[layer_i].layer_type == LayerType::Attention {
                 let w = match &model.layers[layer_i] {
                     LayerWeights::Attention(w) => w,
@@ -1145,7 +1146,7 @@ impl MegakernelProgram {
             let moe = model.moe_weights[layer_idx].as_ref().unwrap();
             let dist = model.distributed_moe[layer_idx].as_ref();
             let (k, eis) = match &cfg.layers[layer_idx].ffn_type {
-                crate::model::FfnType::MoE {
+                crate::config::FfnType::MoE {
                     num_active,
                     expert_intermediate_size,
                     ..
@@ -1292,7 +1293,7 @@ impl MegakernelProgram {
                     let num_workers = p2p.workers.len();
                     let num_gpus = p2p.num_gpus;
                     let (k, eis) = match &cfg.layers[layer_idx].ffn_type {
-                        crate::model::FfnType::MoE {
+                        crate::config::FfnType::MoE {
                             num_active,
                             expert_intermediate_size,
                             ..
@@ -1352,7 +1353,7 @@ impl MegakernelProgram {
                         // Shared expert (relu² path for Nemotron-H, no gate_proj)
                         if let Some(ref se) = moe.shared_expert {
                             let se_is = match &cfg.layers[layer_idx].ffn_type {
-                                crate::model::FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                                crate::config::FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
                                     if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
                                 }
                                 _ => { let Some(ref d) = model.distributed_moe[layer_idx] else { continue }; d.expert_intermediate_size }

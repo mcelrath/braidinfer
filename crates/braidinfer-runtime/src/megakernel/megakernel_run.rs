@@ -475,7 +475,7 @@ impl MegakernelProgram {
         seq: &mut SequenceState,
         allocator: &mut PageAllocator,
         quant_allocator: Option<&mut PageAllocator>,
-        cfg: &crate::model::ModelConfig,
+        cfg: &crate::config::ModelConfig,
         stream: &Stream,
         dispatch: Option<&mut PersistentDispatch>,
     ) -> HipResult<()> {
@@ -534,7 +534,7 @@ impl MegakernelProgram {
         gpu_idx: usize,
         f32_chunk_ptr: *const u8,
         quant_chunk_ptr: *mut u8,
-        cfg: &crate::model::ModelConfig,
+        cfg: &crate::config::ModelConfig,
     ) -> HipResult<()> {
         use crate::paged_kv::quantized_kv_offsets;
         let nkh = cfg.num_kv_heads;
@@ -542,7 +542,7 @@ impl MegakernelProgram {
         let num_attn_layers = cfg
             .layers
             .iter()
-            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .filter(|l| l.layer_type == crate::config::LayerType::Attention)
             .count();
         let kv_stride = nkh * hd;
         let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();
@@ -603,14 +603,14 @@ impl MegakernelProgram {
     pub fn enable_quantized_kv(
         &mut self,
         max_chunks: usize,
-        cfg: &crate::model::ModelConfig,
+        cfg: &crate::config::ModelConfig,
     ) -> HipResult<()> {
         let nqh = cfg.num_q_heads;
         let hd = cfg.head_dim;
         let num_attn_layers = cfg
             .layers
             .iter()
-            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .filter(|l| l.layer_type == crate::config::LayerType::Attention)
             .count();
         // Scratch: [nqh × (2+hd)] per attention layer (each layer gets its own scratch region)
         let scratch_per_layer = nqh * (2 + hd);
@@ -666,7 +666,7 @@ impl MegakernelProgram {
         &self,
         f32_chunk_ptr: *const u8,
         quant_chunk_ptr: *mut u8,
-        cfg: &crate::model::ModelConfig,
+        cfg: &crate::config::ModelConfig,
         stream: &Stream,
     ) -> HipResult<()> {
         use crate::paged_kv::quantized_kv_offsets;
@@ -675,7 +675,7 @@ impl MegakernelProgram {
         let num_attn_layers = cfg
             .layers
             .iter()
-            .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+            .filter(|l| l.layer_type == crate::config::LayerType::Attention)
             .count();
         let kv_stride = nkh * hd;
         let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();

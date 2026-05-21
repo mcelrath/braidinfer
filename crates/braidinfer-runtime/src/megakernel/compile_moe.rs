@@ -4,13 +4,14 @@ use super::compile_common::{div_ceil, linear_proj_opcode_ptr, rmsnorm_opcode};
 use super::instructions::*;
 use super::{Instruction, INST_SIZE, MegakernelProgram};
 use super::{OP_LINEAR_PROJ, OP_MOE_FFN};
-use crate::model::{ActivationBuffers, LayerWeights, ModelConfig};
+use crate::config::ModelConfig;
+use crate::weights::{ActivationBuffers, LayerWeights};
 
 impl MegakernelProgram {
     /// Emit shared expert instructions into `instructions`.
     pub(super) fn emit_shared_expert(
         se: &crate::weights::DenseFfnWeights,
-        moe: &crate::model::MoeWeights,
+        moe: &crate::weights::MoeWeights,
         act: &ActivationBuffers,
         hs: usize,
         se_is: usize,
@@ -41,7 +42,7 @@ impl MegakernelProgram {
     // Overload for ffn_down_stage output (multi-GPU path)
     pub(super) fn emit_shared_expert_stage(
         se: &crate::weights::DenseFfnWeights,
-        moe: &crate::model::MoeWeights,
+        moe: &crate::weights::MoeWeights,
         act: &ActivationBuffers,
         hs: usize,
         se_is: usize,
@@ -74,11 +75,11 @@ impl MegakernelProgram {
         cfg: &ModelConfig,
         layer_idx: usize,
         layer: &LayerWeights,
-        moe: &crate::model::MoeWeights,
+        moe: &crate::weights::MoeWeights,
         act: &ActivationBuffers,
         instructions: &mut Vec<Instruction>,
     ) {
-        use crate::model::{FfnType, GateType};
+        use crate::config::{FfnType, GateType};
         let hs = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
 
@@ -195,12 +196,12 @@ impl MegakernelProgram {
         cfg: &ModelConfig,
         layer_idx: usize,
         layer: &LayerWeights,
-        moe: &crate::model::MoeWeights,
+        moe: &crate::weights::MoeWeights,
         act: &ActivationBuffers,
         instructions: &mut Vec<Instruction>,
         emit_post_barrier: bool,
     ) -> usize {
-        use crate::model::{FfnType, GateType};
+        use crate::config::{FfnType, GateType};
         let hs = cfg.hidden_size;
         let eps = cfg.rms_norm_eps;
 

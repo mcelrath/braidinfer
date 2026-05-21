@@ -6,10 +6,12 @@ use braidinfer_hip::stream::Stream;
 use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram};
 use crate::paged_kv::{PageAllocator, RecurrentCheckpointPool, SequenceState};
 
-// Re-export weight types and config for backward compatibility
-pub use crate::config::*;
 pub use crate::kernel::AllKernels;
-pub use crate::weights::*;
+
+use crate::config::ModelConfig;
+use crate::weights::{
+    ActivationBuffers, GdnState, KvCache, LayerWeights, Mamba2State, ModelError, MoeWeights,
+};
 
 mod decode; // decode_step_* implementations and dispatch helpers
 mod model_load; // weight loading and initialization

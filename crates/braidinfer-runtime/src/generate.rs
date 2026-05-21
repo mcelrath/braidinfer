@@ -1,7 +1,8 @@
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-use crate::model::{Model, ModelError};
+use crate::model::Model;
+use crate::weights::ModelError;
 
 pub struct ChatMessage<'a> {
     pub role: &'a str,

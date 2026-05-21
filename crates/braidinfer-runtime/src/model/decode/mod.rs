@@ -3,7 +3,7 @@ use crate::persistent_dispatch::BatchDispatcher;
 use crate::weights::LayerWeights;
 
 use super::Model;
-use super::ModelError;
+use crate::weights::ModelError;
 
 // ---- Decode-mirror print helpers (Phase 2b) --------------------------------
 
@@ -382,7 +382,7 @@ impl Model {
             .layers
             .iter()
             .filter_map(|l| match &l.ffn_type {
-                crate::model::FfnType::MoE { expert_intermediate_size, .. } => {
+                crate::config::FfnType::MoE { expert_intermediate_size, .. } => {
                     Some(*expert_intermediate_size)
                 }
                 _ => None,

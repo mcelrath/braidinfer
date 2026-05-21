@@ -1,4 +1,4 @@
-use braidinfer_runtime::model::ModelConfig;
+use braidinfer_runtime::config::ModelConfig;
 use std::path::Path;
 
 #[test]

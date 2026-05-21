@@ -631,9 +631,9 @@ impl Model {
             if let Some(dist) = &self.distributed_moe[layer_idx] {
                 let buf0 = &dist.expert_buffers[0];
                 let func_name = match dist.weight_format {
-                    crate::model::WeightFormat::Bf16 => "linear_proj_f32",
-                    crate::model::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
-                    crate::model::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
+                    crate::weights::WeightFormat::Bf16 => "linear_proj_f32",
+                    crate::weights::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
+                    crate::weights::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
                 };
                 for j in 0..k {
                     let eid = all_expert_ids[t * k + j] as usize;

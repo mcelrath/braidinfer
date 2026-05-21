@@ -1,4 +1,4 @@
-use braidinfer_runtime::model::{FfnType, LayerType, ModelConfig};
+use braidinfer_runtime::config::{FfnType, LayerType, ModelConfig};
 use std::path::Path;
 
 fn parse_config(dir: &str) -> Option<ModelConfig> {

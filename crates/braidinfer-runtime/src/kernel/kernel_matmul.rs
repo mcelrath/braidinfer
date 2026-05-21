@@ -183,7 +183,7 @@ impl LinearProjKernel {
     pub fn forward_packed(
         &self,
         output: &mut DeviceBuffer<f32>,
-        weight: &crate::model::PackedWeights,
+        weight: &crate::weights::PackedWeights,
         input: &DeviceBuffer<f32>,
         stream: &Stream,
     ) -> HipResult<()> {
@@ -191,9 +191,9 @@ impl LinearProjKernel {
         let in_dim = weight.in_dim as u32;
 
         let func_name = match weight.format {
-            crate::model::WeightFormat::Bf16 => "linear_proj_f32",
-            crate::model::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
-            crate::model::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
+            crate::weights::WeightFormat::Bf16 => "linear_proj_f32",
+            crate::weights::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
+            crate::weights::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
         };
         let func = self.module.get_function(func_name)?;
 

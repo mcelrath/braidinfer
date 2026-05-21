@@ -6,7 +6,7 @@ use braidinfer_hip::error::check as hip_check;
 use braidinfer_hip::memory::{DeviceBuffer, PinnedBuffer};
 use braidinfer_hip::{HipError, HipResult, ffi};
 
-use crate::model::ModelConfig;
+use crate::config::ModelConfig;
 
 // ---- Derived geometry (computed from ModelConfig at runtime) ----
 

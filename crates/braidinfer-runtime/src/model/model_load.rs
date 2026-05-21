@@ -935,7 +935,7 @@ impl Model {
             // attn_layer_count from compile_attention).
             normed_seq: {
                 let n_attn = config.layers.iter()
-                    .filter(|l| l.layer_type == crate::model::LayerType::Attention)
+                    .filter(|l| l.layer_type == crate::config::LayerType::Attention)
                     .count()
                     .max(1);
                 braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc_portable_coherent(n_attn)?

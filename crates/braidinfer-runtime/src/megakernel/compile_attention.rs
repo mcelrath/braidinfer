@@ -3,7 +3,8 @@
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, rmsnorm_opcode};
 use super::instructions::*;
 use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, PrefillBuffers};
-use crate::model::{ActivationBuffers, AttentionLayerWeights, KvCache, LayerWeights, ModelConfig};
+use crate::config::ModelConfig;
+use crate::weights::{ActivationBuffers, AttentionLayerWeights, KvCache, LayerWeights};
 
 impl MegakernelProgram {
     pub(super) fn emit_attention_layer(

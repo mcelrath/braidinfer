@@ -6,7 +6,7 @@ use super::{
     OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4, OP_FFN_GATE_UP_RNF4_WX, OP_FFN_GATE_UP_WX,
     OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_RMSNORM, OP_RMSNORM_WX,
 };
-use crate::model::{KvCache, LinearWeight, WeightFormat};
+use crate::weights::{KvCache, LinearWeight, WeightFormat};
 
 /// Emit a batched linear projection. For bf16, uses single batched instruction.
 /// For quantized (PCG32/RNF4), emits per-token loop (kernel batching TODO: braidinfer-xxy).

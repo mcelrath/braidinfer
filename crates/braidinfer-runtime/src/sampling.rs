@@ -1,7 +1,8 @@
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
-use crate::model::{Model, ModelError};
+use crate::model::Model;
+use crate::weights::ModelError;
 
 pub struct SamplingParams {
     pub temperature: f32,

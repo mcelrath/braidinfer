@@ -6,9 +6,9 @@ use super::instructions::*;
 use super::{Instruction, MegakernelProgram, PrefillBuffers};
 use super::{OP_FFN_DOWN_RES, OP_FFN_DOWN_RES_RNF4};
 #[allow(unused_imports)]
-use crate::model::{
-    ActivationBuffers, GdnState, LayerWeights, Mamba2State, ModelConfig, RecurrentLayerKind,
-};
+use crate::config::{ModelConfig, RecurrentLayerKind};
+#[allow(unused_imports)]
+use crate::weights::{ActivationBuffers, GdnState, LayerWeights, Mamba2State};
 
 impl MegakernelProgram {
     pub(super) fn compile_gdn_layer(
@@ -48,8 +48,8 @@ impl MegakernelProgram {
         // 3. Project a, b, z. w_a + w_b are always bf16 (excluded from quantization in
         //    bqnt_quantize.rs SKIP_PATTERNS) and have the same out_dim=nvh. Fuse them into
         //    OP_LINEAR_PROJ_2X to save one grid.sync per GDN layer.
-        let wa_bf16 = matches!(w.w_a, crate::model::LinearWeight::Bf16(_));
-        let wb_bf16 = matches!(w.w_b, crate::model::LinearWeight::Bf16(_));
+        let wa_bf16 = matches!(w.w_a, crate::weights::LinearWeight::Bf16(_));
+        let wb_bf16 = matches!(w.w_b, crate::weights::LinearWeight::Bf16(_));
         if wa_bf16 && wb_bf16 {
             instructions.push(LinearProj2xInst::new(
                 act.a_proj.as_write_ptr(),
@@ -218,7 +218,8 @@ impl MegakernelProgram {
         n: usize,
         instructions: &mut Vec<Instruction>,
     ) {
-        use crate::model::{FfnType, LinearWeight};
+        use crate::config::FfnType;
+        use crate::weights::LinearWeight;
         match &cfg.layers[layer_i].ffn_type {
             FfnType::MoE { .. } | FfnType::None => return,
             FfnType::Dense => {}
@@ -350,7 +351,7 @@ impl MegakernelProgram {
         act: &ActivationBuffers,
         instructions: &mut Vec<Instruction>,
     ) {
-        use crate::model::LinearWeight;
+        use crate::weights::LinearWeight;
         let hs = cfg.hidden_size;
         let is = cfg.intermediate_size;
         let eps = cfg.rms_norm_eps;
