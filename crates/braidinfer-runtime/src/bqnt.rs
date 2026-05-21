@@ -149,6 +149,19 @@ impl BqntWriter {
         packed_data: &[u8],
     ) -> io::Result<()> {
         let hash = fnv1a_64(name);
+        // bd 6n01: detect FNV-1a hash collisions at write time. If two distinct
+        // tensor names hash to the same u64, panic with both names so the user
+        // can rename one. With FNV-1a 64-bit on typical tensor counts (≤2¹⁶)
+        // collisions are astronomically unlikely (~2⁻³³ per pair) but possible.
+        if let Some(existing) = self.names.get(&hash) {
+            if existing != name {
+                panic!(
+                    "BQNT writer: FNV-1a hash collision detected. Names {existing:?} and \
+                     {name:?} both hash to {hash:#018x}. Rename one of them or report \
+                     this as a hash-function issue."
+                );
+            }
+        }
         self.names.insert(hash, name.to_string());
 
         // Compute aligned offset — first tensor starts after header + table + alignment
@@ -198,13 +211,30 @@ impl BqntWriter {
 
     /// Finalize: write header, tensor table, and JSON metadata.
     pub fn finish(mut self, metadata_json: &str) -> io::Result<()> {
+        // bd 6n01: inject the {hash -> name} table into the metadata JSON so
+        // the reader can verify on lookup that a tensor name maps to the
+        // expected hash entry (detects post-write corruption / future
+        // hash-function changes / catastrophically improbable collisions).
+        // Hex-encoded u64 keys so JSON stays parseable.
+        let augmented_metadata = {
+            let mut v: serde_json::Value = serde_json::from_str(metadata_json)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            let mut name_table = serde_json::Map::new();
+            for (hash, name) in &self.names {
+                name_table.insert(format!("{hash:#018x}"), serde_json::Value::String(name.clone()));
+            }
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("name_table".to_string(), serde_json::Value::Object(name_table));
+            }
+            v.to_string()
+        };
         // Write JSON metadata at current position
         let metadata_offset = align_up(self.current_offset, 8);
         if metadata_offset > self.current_offset {
             let padding = vec![0u8; (metadata_offset - self.current_offset) as usize];
             self.writer.write_all(&padding)?;
         }
-        let metadata_bytes = metadata_json.as_bytes();
+        let metadata_bytes = augmented_metadata.as_bytes();
         self.writer.write_all(metadata_bytes)?;
 
         // Seek back and write header
@@ -555,6 +585,10 @@ mod tests {
 pub struct MmapBqnt {
     mmap: Mmap,
     header: BqntFile,
+    /// bd 6n01: hash → name table parsed from metadata JSON. Used by
+    /// tensor_data to verify that a name lookup didn't return a collided
+    /// entry. None for v1 BQNT files written before bd 6n01 landed.
+    name_table: Option<HashMap<u64, String>>,
 }
 
 impl MmapBqnt {
@@ -563,7 +597,32 @@ impl MmapBqnt {
         let header = BqntFile::open(path)?;
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        Ok(Self { mmap, header })
+        // Parse name_table from metadata JSON if present.
+        let name_table = {
+            let start = header.metadata_offset as usize;
+            let end = start + header.metadata_size as usize;
+            if end <= mmap.len() && header.metadata_size > 0 {
+                std::str::from_utf8(&mmap[start..end])
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("name_table").cloned())
+                    .and_then(|v| v.as_object().cloned())
+                    .map(|obj| {
+                        let mut m = HashMap::with_capacity(obj.len());
+                        for (k, v) in obj {
+                            let hash = u64::from_str_radix(k.trim_start_matches("0x"), 16).ok();
+                            let name = v.as_str().map(|s| s.to_string());
+                            if let (Some(h), Some(n)) = (hash, name) {
+                                m.insert(h, n);
+                            }
+                        }
+                        m
+                    })
+            } else {
+                None
+            }
+        };
+        Ok(Self { mmap, header, name_table })
     }
 
     /// Number of tensors in the file.
@@ -595,8 +654,26 @@ impl MmapBqnt {
     /// Get raw packed bytes for a tensor — zero-copy from mmap.
     /// The returned slice is 64KB-aligned and byte-identical to what
     /// the GPU dequant kernel expects. Pass directly to hipMemcpyAsync.
+    ///
+    /// bd 6n01: if the file contains a `name_table` in its metadata,
+    /// verify the resolved hash entry matches the requested name. Returns
+    /// None (with a stderr warning) on collision; this should never fire
+    /// in practice but is the cheap defense against silent corruption.
     pub fn tensor_data(&self, name: &str) -> Option<&[u8]> {
         let entry = self.header.get(name)?;
+        if let Some(name_table) = self.name_table.as_ref() {
+            let hash = fnv1a_64(name);
+            if let Some(stored) = name_table.get(&hash) {
+                if stored != name {
+                    eprintln!(
+                        "WARN: BQNT name-table mismatch for {name:?}: hash {hash:#018x} \
+                         maps to entry stored as {stored:?}. Likely FNV-1a collision. \
+                         Returning None (treat as missing weight)."
+                    );
+                    return None;
+                }
+            }
+        }
         let start = entry.data_offset as usize;
         let end = start + entry.data_bytes as usize;
         if end <= self.mmap.len() {
