@@ -424,6 +424,27 @@ impl MegakernelProgram {
             &mut args,
         )
     }
+
+    /// Route this program's instruction stream through the persistent worker
+    /// mailbox. Replaces execute(stream) under always-persistent.
+    ///
+    /// Worker must already be spawned on this program's device — caller
+    /// (Model::prefill / decode_step_persistent) handles spawn ordering.
+    /// dispatch_batch_slice chunks into MAX_BATCH_INSTRUCTIONS=256 slices
+    /// and wait_acks each slice synchronously (no separate stream sync needed).
+    ///
+    /// Dump-buffer note: worker reads dump_base / dump_count from
+    /// WorkerQueueLayout (populated by PersistentDispatch::set_trace_dump_ptrs),
+    /// NOT from the instruction stream. No OP_NOP header is required even
+    /// when self.dump_buffer.is_some().
+    pub fn dispatch_via_worker(
+        &mut self,
+        dispatch: &mut crate::persistent_dispatch::PersistentDispatch,
+        gpu_idx: usize,
+    ) -> HipResult<()> {
+        dispatch.dispatch_batch_slice(gpu_idx, &self.instructions);
+        Ok(())
+    }
 }
 
 /// Upload an instruction slice to a new device buffer.
