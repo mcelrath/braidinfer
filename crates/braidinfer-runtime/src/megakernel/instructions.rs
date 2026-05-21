@@ -43,6 +43,24 @@ macro_rules! impl_inst {
                 unsafe { std::mem::transmute(self) }
             }
         }
+        // SAFETY: *Inst structs hold raw `*mut f32` / `*const f32` device pointers
+        // that are valid in exactly one HIP context — the device on which the
+        // megakernel program will execute. The structs are constructed by the
+        // host (compiler-side) and consumed by the GPU kernel; once handed to
+        // the kernel via the host-mapped WorkerQueue mailbox or as a device-
+        // program upload, the host MUST NOT dereference them (HIP context
+        // ordering would be violated). Sending an Instruction across threads
+        // is safe because:
+        //   (a) the host never derefs the pointers — they're opaque u64s in
+        //       the on-wire instruction layout.
+        //   (b) the receiving thread that hands them to the GPU does so under
+        //       the same DeviceGuard ownership discipline as the constructor.
+        //   (c) the GPU side has its own per-CU access; thread-of-origin on
+        //       the host is irrelevant.
+        // This Send impl is required because Rust auto-derives !Send for any
+        // struct holding raw pointers. The actual safety invariant is the
+        // device-context discipline above, not pointer aliasing — there is no
+        // aliasing because the host never touches the data once dispatched.
         unsafe impl Send for $t {}
     };
 }
