@@ -40,6 +40,7 @@ fn test_prefill_correctness() {
     }
     let seq_argmax = argmax(&seq_logits);
     println!("Sequential: argmax={seq_argmax}");
+    drop(model_seq); // bd b8iy: persistent worker holds GPU 0 CUs; must release before next load
 
     // Prefill
     let mut model_pre = Model::load(model_dir, device).expect("load");
@@ -78,6 +79,7 @@ fn test_prefill_batched_multi_token() {
     }
     let seq_argmax = argmax(&seq_logits);
     println!("Sequential: argmax={seq_argmax}");
+    drop(model_seq); // bd b8iy: release persistent worker before next load
 
     // Public prefill path
     let mut model_pre = Model::load(model_dir, device).expect("load");
@@ -107,6 +109,7 @@ fn test_prefill_single_token() {
     let prefill_logits = model.prefill(&[9707]).expect("prefill");
     let prefill_argmax = argmax(&prefill_logits);
     println!("Prefill single token: argmax={prefill_argmax}");
+    drop(model); // bd b8iy: release persistent worker before next load
 
     // Compare with decode
     let mut model2 = Model::load(model_dir, device).expect("load");
@@ -139,6 +142,7 @@ fn test_prefill_cross_chunk_correctness() {
     for (i, &tok) in tokens.iter().enumerate() {
         seq_logits = model_seq.decode_step(tok, i as u32).expect("decode");
     }
+    drop(model_seq); // bd b8iy: release persistent worker before next load
 
     let mut model_pre = Model::load(model_dir, device).expect("load");
     let pre_logits = model_pre.prefill(&tokens).expect("prefill");
@@ -191,6 +195,7 @@ fn test_prefill_benchmark() {
     for (i, &tok) in tokens[..8].iter().enumerate() {
         model_seq.decode_step_paged(tok, i as u32).expect("warmup");
     }
+    drop(model_seq);
     let mut model_seq = Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
     for (i, &tok) in tokens.iter().enumerate() {
@@ -204,9 +209,11 @@ fn test_prefill_benchmark() {
         elapsed.as_secs_f64()
     );
 
+    drop(model_seq);
     // Public prefill API (currently routes through the paged decode path)
     let mut model_pre = Model::load(model_dir, device).expect("reload");
     model_pre.prefill(&tokens[..8]).expect("warmup");
+    drop(model_pre);
     let mut model_pre = Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
     let _logits = model_pre.prefill(&tokens).expect("prefill");
@@ -221,9 +228,11 @@ fn test_prefill_benchmark() {
     // One-chunk public prefill benchmark
     let nb = 64;
     let batch_tokens: Vec<u32> = (0..nb).map(|i| 9707 + (i % 10) as u32).collect();
+    drop(model_pre);
     let mut model2 = Model::load(model_dir, device).expect("reload");
     model2.prefill(&batch_tokens).expect("warmup");
 
+    drop(model2);
     let mut model3 = Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
     let _ = model3.prefill(&batch_tokens).expect("prefill");
@@ -255,6 +264,7 @@ fn test_prefill_per_token_loop_matches_batched_bz0() {
     for &tok in &tokens {
         loop_logits = model_loop.prefill(&[tok]).expect("per-token prefill");
     }
+    drop(model_loop); // bd b8iy: release persistent worker before next load
 
     let mut model_batch = Model::load(model_dir, device).expect("load");
     let batch_logits = model_batch.prefill(&tokens).expect("batched prefill");

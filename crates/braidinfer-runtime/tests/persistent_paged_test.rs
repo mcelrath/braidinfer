@@ -1,14 +1,18 @@
-//! Smoke test for the new persistent paged decode path (braidinfer-8gz).
+//! Smoke test for the persistent paged decode path (braidinfer-8gz).
 //!
 //! Verifies:
 //! 1. Model loads in PERSISTENT mode without panic.
 //! 2. A short decode loop produces sensible (non-NaN, non-degenerate) tokens.
-//! 3. KV_QUANT=1 with PERSISTENT=1 returns InvalidConfig (currently unsupported combination).
 //!
 //! Does NOT compare against flat-cache reference because:
 //! - test_quantized_kv_vs_f32_paged (kv_quant_e2e_test.rs) already shows that path is flaky
 //!   with bare-token input (no chat template). Tracked as exterior_algebra-cxf.
 //! - This is a smoke test for the new code path, not a numerical equivalence test.
+//!
+//! bd b8iy 2026-05-21: removed obsolete test_persistent_kv_quant_returns_error.
+//! KV_QUANT+PERSISTENT is now supported (bd 9gmh) via
+//! quantize_sealed_chunk_via_worker; the InvalidConfig guard it asserted on
+//! has been removed.
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::model::Model;
@@ -63,28 +67,3 @@ fn test_persistent_paged_decode_smoke() {
     );
 }
 
-#[test]
-fn test_persistent_kv_quant_returns_error() {
-    let device = DeviceId(0);
-    let model_dir = Path::new(MODEL_DIR);
-    if !model_dir.exists() {
-        eprintln!("Model not found, skipping");
-        return;
-    }
-
-    unsafe { std::env::set_var("PERSISTENT", "1") };
-    unsafe { std::env::set_var("KV_QUANT", "1") };
-
-    let mut model = Model::load(model_dir, device).expect("load model");
-
-    let result = model.decode_step(9707u32, 0);
-
-    unsafe { std::env::remove_var("KV_QUANT") };
-
-    let err = result.expect_err("decode_step should return Err for PERSISTENT+KV_QUANT");
-    let msg = format!("{}", err);
-    assert!(
-        msg.contains("KV_QUANT") && msg.contains("PERSISTENT"),
-        "expected error mentioning KV_QUANT and PERSISTENT, got: {msg}"
-    );
-}
