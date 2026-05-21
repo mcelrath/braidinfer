@@ -1,8 +1,6 @@
 //! Megakernel runtime: per-step instruction patching, paged KV management, execution.
 //! Extracted from megakernel.rs for maintainability.
 
-use std::ffi::c_void;
-
 use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
@@ -12,9 +10,8 @@ use crate::persistent_dispatch::PersistentDispatch;
 
 use super::{
     CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
-    upload_program,
 };
-use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingInst, GqaAttnInst, HaltInst, KvQuantizeInst, make_opcode_gridx};
+use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingInst, GqaAttnInst, KvQuantizeInst, make_opcode_gridx};
 
 impl MegakernelProgram {
     fn patch_kv_write_offsets(&mut self, position: u32) {
@@ -462,13 +459,12 @@ impl MegakernelProgram {
     }
 
     /// Allocate the next chunk if the current one just filled up.
-    /// If quantized_kv is enabled, quantizes the sealed chunk.
+    /// If quantized_kv is enabled, quantizes the sealed chunk via the
+    /// persistent worker mailbox.
     /// Call after execute() + stream sync, before next update_step_paged().
     ///
-    /// `dispatch`: if `Some`, quantize_sealed_chunk runs via the persistent worker
-    /// mailbox (safe under the cooperative kernel). If `None`, falls back to the
-    /// legacy megakernel_f32 path (only valid before the persistent worker is launched,
-    /// i.e. on the non-persistent decode path).
+    /// bd 9gmh Phase 2F: dispatch is now required (was Option). The legacy
+    /// quantize_sealed_chunk (launch_cooperative) fallback has been deleted.
     pub fn post_step_paged(
         &mut self,
         position: u32,
@@ -476,8 +472,7 @@ impl MegakernelProgram {
         allocator: &mut PageAllocator,
         quant_allocator: Option<&mut PageAllocator>,
         cfg: &crate::config::ModelConfig,
-        stream: &Stream,
-        dispatch: Option<&mut PersistentDispatch>,
+        dispatch: &mut PersistentDispatch,
     ) -> HipResult<()> {
         if (position as usize + 1) % CHUNK_TOKENS == 0 {
             // Chunk just sealed
@@ -492,17 +487,8 @@ impl MegakernelProgram {
                         braidinfer_hip::ffi::hipErrorOutOfMemory,
                     ))?;
 
-                    // Run quantize kernel: use mailbox path under persistent worker,
-                    // or legacy megakernel_f32 path for non-persistent.
-                    match dispatch {
-                        Some(d) => {
-                            self.quantize_sealed_chunk_via_worker(d, 0, f32_ptr, q_ptr, cfg)?;
-                        }
-                        None => {
-                            self.quantize_sealed_chunk(f32_ptr, q_ptr, cfg, stream)?;
-                            stream.synchronize()?;
-                        }
-                    }
+                    // Quantize via persistent worker mailbox (the sole code path).
+                    self.quantize_sealed_chunk_via_worker(dispatch, 0, f32_ptr, q_ptr, cfg)?;
 
                     // Track slot for cleanup
                     seq.quant_slots.push(q_slot);
@@ -660,74 +646,8 @@ impl MegakernelProgram {
         Ok(())
     }
 
-    /// Quantize a sealed f32 chunk. Call from post_step_paged when a chunk fills up.
-    /// Launches OP_KV_QUANTIZE for each layer's K and V via the megakernel.
-    pub fn quantize_sealed_chunk(
-        &self,
-        f32_chunk_ptr: *const u8,
-        quant_chunk_ptr: *mut u8,
-        cfg: &crate::config::ModelConfig,
-        stream: &Stream,
-    ) -> HipResult<()> {
-        use crate::paged_kv::quantized_kv_offsets;
-        let nkh = cfg.num_kv_heads;
-        let hd = cfg.head_dim;
-        let num_attn_layers = cfg
-            .layers
-            .iter()
-            .filter(|l| l.layer_type == crate::config::LayerType::Attention)
-            .count();
-        let kv_stride = nkh * hd;
-        let f32_layer_bytes = 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>();
-
-        let mut instructions: Vec<Instruction> = Vec::new();
-        for layer_i in 0..num_attn_layers {
-            let f32_base = f32_chunk_ptr as u64 + (layer_i * f32_layer_bytes) as u64;
-            let f32_k = f32_base;
-            let f32_v = f32_base + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
-
-            for (is_v, f32_src) in [(false, f32_k), (true, f32_v)] {
-                let (q1d, q1s, rd, rs) = quantized_kv_offsets(cfg, CHUNK_TOKENS, layer_i, is_v);
-                instructions.push(KvQuantizeInst {
-                    opcode_gridx: make_opcode_gridx(OP_KV_QUANTIZE, (nkh * hd) as u32),
-                    src:          f32_src as *const f32,
-                    q1_data:      (quant_chunk_ptr as u64 + q1d as u64) as *mut u8,
-                    q1_scale:     (quant_chunk_ptr as u64 + q1s as u64) as *mut f32,
-                    r_data:       (quant_chunk_ptr as u64 + rd as u64) as *mut u8,
-                    r_scale:      (quant_chunk_ptr as u64 + rs as u64) as *mut f32,
-                    num_kv_heads: nkh as i32,
-                    head_dim:     hd as i32,
-                    chunk_tokens: CHUNK_TOKENS as i32,
-                    _pad0:        0,
-                    _pad:         [0; 10],
-                }.into_inst());
-            }
-        }
-        instructions.push(HaltInst::new().into_inst());
-
-        // Upload and execute
-        let prog_buf = upload_program(self.device, &instructions)?;
-
-        let func = self.module.get_function("megakernel_f32")?;
-        let mut prog_ptr: *const c_void = prog_buf.as_ptr().cast();
-        let mut num_inst = instructions.len() as i32;
-        let mut wd_ptr: *mut c_void = self.wd_dev_ptr;
-        // op_profile counter pointer (null = profiling disabled). See PLAN-op-profile.md.
-        let mut op_profile_ptr: *mut c_void = crate::op_profile::get_global() as *mut c_void;
-        let mut args: [*mut c_void; 4] = [
-            std::ptr::addr_of_mut!(prog_ptr).cast(),
-            std::ptr::addr_of_mut!(num_inst).cast(),
-            std::ptr::addr_of_mut!(wd_ptr).cast(),
-            std::ptr::addr_of_mut!(op_profile_ptr).cast(),
-        ];
-        func.launch_cooperative(
-            (self.num_blocks, 1, 1),
-            (256, 1, 1),
-            self.shared_mem,
-            stream,
-            &mut args,
-        )
-    }
+    // bd 9gmh Phase 2F: quantize_sealed_chunk (legacy launch_cooperative path) deleted.
+    // The mailbox-only quantize_sealed_chunk_via_worker above is the sole code path.
 
     /// Patch a cached prefill MegakernelProgram for a new chunk (tokens, start_pos).
     /// Faster than recompiling: only updates token IDs, KV write pointers, AttnPrefillInst, and position IDs.

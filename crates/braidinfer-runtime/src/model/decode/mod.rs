@@ -134,6 +134,12 @@ impl Model {
             if self.megakernel_paged.is_none() {
                 let mut mk = MegakernelProgram::compile_paged(self)?;
                 mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
+                // bd 9gmh Phase 2F: KV_QUANT now wired here (was: separate
+                // decode_step_paged_quantized entry that passed quantized=true).
+                // Multi-GPU + KV_QUANT is rejected in Model::load (model_load.rs:37).
+                if std::env::var("KV_QUANT").as_deref() == Ok("1") {
+                    mk.enable_quantized_kv(max_chunks, &self.config).map_err(ModelError::Hip)?;
+                }
                 self.megakernel_paged = Some(mk);
             }
 
@@ -285,8 +291,9 @@ impl Model {
             let seq_mut = self.paged_seq.as_mut().unwrap();
             let alloc_mut = self.page_allocator.as_mut().unwrap();
             let q_alloc = self.quant_allocator.as_mut();
-            let dispatch = self.persistent_workers.as_mut();
-            mk.post_step_paged(position, seq_mut, alloc_mut, q_alloc, &self.config, &self.stream, dispatch)
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers must be initialized in decode_step_persistent");
+            mk.post_step_paged(position, seq_mut, alloc_mut, q_alloc, &self.config, dispatch)
                 .map_err(ModelError::Hip)?;
         }
 
@@ -1528,113 +1535,9 @@ impl Model {
     }
 
 
-    /// Run a single decode step using the paged KV cache path.
-    /// Returns logits [vocab_size].
-    pub fn decode_step_paged(
-        &mut self,
-        token_id: u32,
-        position: u32,
-    ) -> Result<Vec<f32>, ModelError> {
-        self.decode_step_paged_inner(token_id, position, false)
-    }
-
-    /// Run a single decode step with quantized KV cache (4-bit residual_pc).
-    /// Sealed chunks are quantized to int4; active chunk stays f32.
-    pub fn decode_step_paged_quantized(
-        &mut self,
-        token_id: u32,
-        position: u32,
-    ) -> Result<Vec<f32>, ModelError> {
-        self.decode_step_paged_inner(token_id, position, true)
-    }
-
-    fn decode_step_paged_inner(
-        &mut self,
-        token_id: u32,
-        position: u32,
-        quantized: bool,
-    ) -> Result<Vec<f32>, ModelError> {
-        // KV quantization is single-GPU only: multi-GPU paged dispatch not yet implemented.
-        if quantized && self.multi_gpu.is_some() {
-            return Err(ModelError::InvalidConfig(
-                "KV_QUANT is not supported in multi-GPU mode".into(),
-            ));
-        }
-
-        let max_chunks = self.max_paged_chunks();
-
-        // Lazy-init: compile paged megakernel
-        if self.megakernel_paged.is_none() {
-            let mut mk = MegakernelProgram::compile_paged(self)?;
-            mk.init_paged_buffers(max_chunks)?;
-            if quantized {
-                mk.enable_quantized_kv(max_chunks, &self.config)?;
-            }
-            self.megakernel_paged = Some(mk);
-        } else {
-            let mk = self.megakernel_paged.as_ref().unwrap();
-            assert_eq!(
-                mk.quantized_kv, quantized,
-                "cannot mix decode_step_paged and decode_step_paged_quantized on the same model"
-            );
-        }
-
-        // Lazy-init: f32 PageAllocator (staging) and SequenceState
-        self.ensure_paged_decode_state(quantized)?;
-
-        // append_token
-        {
-            let seq_mut = self.paged_seq.as_mut().unwrap();
-            let alloc_mut = self.page_allocator.as_mut().unwrap();
-            seq_mut.append_token(position as i32, alloc_mut)?;
-        }
-
-        // Write position_ids to host-mapped memory before paged step (no hipMemcpy).
-        self.set_position(position).map_err(ModelError::Hip)?;
-
-        let stream = &self.stream;
-        let mk = self.megakernel_paged.as_mut().unwrap();
-        let seq = self.paged_seq.as_ref().unwrap();
-        let allocator = self.page_allocator.as_ref().unwrap();
-
-        mk.update_step_paged(token_id, position, seq, allocator, stream)?;
-        mk.execute(stream)?;
-        stream.synchronize()?;
-
-        // Post-step: handle chunk seal + quantization (non-persistent path: None dispatch).
-        {
-            let mk = self.megakernel_paged.as_mut().unwrap();
-            let seq_mut = self.paged_seq.as_mut().unwrap();
-            let alloc_mut = self.page_allocator.as_mut().unwrap();
-            let q_alloc = self.quant_allocator.as_mut();
-            mk.post_step_paged(
-                position,
-                seq_mut,
-                alloc_mut,
-                q_alloc,
-                &self.config,
-                &self.stream,
-                None,
-            )?;
-        }
-
-        // Chunk-seal mirror hook (wt1 P2-c): same as persistent path but for
-        // the non-persistent paged decode route.
-        if (position as usize + 1) % CHUNK_TOKENS == 0 {
-            if let Some(dispatch) = self.persistent_workers.as_mut() {
-                let alloc = self.page_allocator.as_ref().unwrap();
-                let seq = self.paged_seq.as_ref().unwrap();
-                if let Some(sealed) = seq.chunks.last() {
-                    let vram_ptr = alloc.slot_ptr(sealed.slot_index());
-                    dispatch.kv_mirror_chunk(0, vram_ptr).map_err(ModelError::Hip)?;
-                    dispatch.drain_kv_chunk_mirror(0, position).map_err(ModelError::Hip)?;
-                }
-            }
-        }
-
-        let mut logits = vec![0.0f32; self.config.vocab_size];
-        self.activations.logits.copy_to_host(&mut logits)?;
-        self.seq_len = position + 1;
-        Ok(logits)
-    }
+    // bd 9gmh Phase 2F (2026-05-21): decode_step_paged, decode_step_paged_quantized,
+    // and decode_step_paged_inner deleted. KV_QUANT enablement is now wired into
+    // decode_step_persistent's lazy-init (gated on KV_QUANT=1 env var). The legacy
+    // non-persistent paged path (mk.execute → launch_cooperative + None-dispatch
+    // post_step_paged) is gone; decode_step (persistent mailbox) is the sole entry.
 }

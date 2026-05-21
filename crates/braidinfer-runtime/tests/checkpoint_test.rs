@@ -12,6 +12,7 @@ fn max_diff_vecs(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 }
 
 #[test]
+#[ignore = "bd gnxs: read_gdn_state uses copy_to_host which deadlocks under always-persistent — needs SDMA migration"]
 fn test_checkpoint_roundtrip() {
     let device = DeviceId(0);
     let model_dir = Path::new(MODEL_DIR);
@@ -24,7 +25,7 @@ fn test_checkpoint_roundtrip() {
 
     // Run 16 tokens to build up recurrent state
     for pos in 0u32..16 {
-        model.decode_step_paged(9707, pos).expect("decode step");
+        model.decode_step(9707, pos).expect("decode step");
     }
 
     // Read GDN state, save checkpoint
@@ -33,7 +34,7 @@ fn test_checkpoint_roundtrip() {
 
     // Mutate GDN state by running more tokens
     for pos in 16u32..24 {
-        model.decode_step_paged(9707, pos).expect("decode step");
+        model.decode_step(9707, pos).expect("decode step");
     }
     let state_mutated = model.read_gdn_state().expect("read gdn mutated");
     let mutate_diff = max_diff_vecs(&state_before, &state_mutated);

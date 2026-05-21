@@ -56,8 +56,8 @@ impl Model {
     }
 
     /// Prefill using paged KV cache (for persistent single-GPU non-MoE models).
-    /// Populates paged chunks via sequential decode_step_paged so that
-    /// decode_step_persistent can attend to the full prefill context.
+    /// Populates paged chunks via sequential decode_step so that subsequent
+    /// decode calls can attend to the full prefill context.
     ///
     /// Note: this is O(N^2) decode steps (not batched). Batched paged prefill
     /// is tracked as a follow-up optimization (TODO: braidinfer-8gz follow-up).
@@ -65,15 +65,14 @@ impl Model {
         let start_pos = self.seq_len;
         let mut logits = vec![0.0f32; self.config.vocab_size];
 
+        // bd 9gmh Phase 2F: was decode_step_paged (legacy non-persistent path);
+        // now routes through decode_step (always-persistent), which lazy-spawns
+        // the worker on first call and uses dispatch_batch_slice via mailbox.
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = start_pos + i as u32;
-            logits = self.decode_step_paged(tok, pos)?;
+            logits = self.decode_step(tok, pos)?;
         }
 
-        // seq_len is incremented by each decode_step_paged call internally,
-        // so we don't need to increment it again here.
-        // But decode_step_paged calls set seq_len = position + 1 after each step,
-        // so after the last step it should equal start_pos + total.
         Ok(logits)
     }
 

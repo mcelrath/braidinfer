@@ -193,13 +193,13 @@ fn test_prefill_benchmark() {
     // Sequential decode baseline
     let mut model_seq = Model::load(model_dir, device).expect("load");
     for (i, &tok) in tokens[..8].iter().enumerate() {
-        model_seq.decode_step_paged(tok, i as u32).expect("warmup");
+        model_seq.decode_step(tok, i as u32).expect("warmup");
     }
     drop(model_seq);
     let mut model_seq = Model::load(model_dir, device).expect("reload");
     let start = Instant::now();
     for (i, &tok) in tokens.iter().enumerate() {
-        model_seq.decode_step_paged(tok, i as u32).expect("decode");
+        model_seq.decode_step(tok, i as u32).expect("decode");
     }
     let elapsed = start.elapsed();
     let per_token_ms = elapsed.as_secs_f64() * 1000.0 / n as f64;
