@@ -67,8 +67,6 @@ pub struct Model {
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) debug_nan: bool,
     pub(crate) has_moe: bool,          // cached at load time: any layer has FfnType::MoE
-    pub(crate) kv_quant: bool,         // cached from KV_QUANT env var at load time
-    pub(crate) sync_debug: bool,       // cached from SYNC_DEBUG env var at load time
     pub(crate) debug_p2p_hidden: bool, // cached from DEBUG_P2P_HIDDEN env var at load time
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
     // Multi-GPU expert parallel (None for single-GPU)
@@ -120,16 +118,6 @@ impl Model {
                 CHUNK_TOKENS,
                 max_chunks as u32,
             )?);
-        }
-        Ok(())
-    }
-
-    fn append_paged_decode_token(&mut self, position: u32) -> Result<(), ModelError> {
-        self.ensure_paged_decode_state(false)?;
-        let seq_mut = self.paged_seq.as_mut().unwrap();
-        if seq_mut.seq_len == position {
-            let alloc_mut = self.page_allocator.as_mut().unwrap();
-            seq_mut.append_token(position as i32, alloc_mut)?;
         }
         Ok(())
     }

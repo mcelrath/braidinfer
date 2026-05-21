@@ -117,12 +117,6 @@ impl RmsNormInst {
             _pad: [0; 10],
         }
     }
-
-    pub(crate) fn with_sentinel(mut self, sentinel_ptr: *mut u32, seq: u32) -> Self {
-        self.sentinel_ptr = sentinel_ptr as u64;
-        self.sentinel_seq = seq as u64;
-        self
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
