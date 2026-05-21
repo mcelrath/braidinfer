@@ -291,7 +291,6 @@ impl MegakernelProgram {
             embedding_inst_idx,
             _mrope_inst_indices: mrope_inst_indices,
             gqa_attn_inst_indices,
-            position_ids_dev_ptr: act.position_ids.as_ptr() as u64,
             kv: super::KvConfig {
                 max_seq_len: cfg.max_seq_len as u32,
                 num_kv_heads: cfg.num_kv_heads,
@@ -729,7 +728,6 @@ impl MegakernelProgram {
             embedding_inst_idx,
             _mrope_inst_indices: Vec::new(),
             gqa_attn_inst_indices: Vec::new(),
-            position_ids_dev_ptr: prefill_bufs.position_ids.as_ptr() as u64,
             kv: super::KvConfig {
                 max_seq_len: cfg.max_seq_len as u32,
                 num_kv_heads: cfg.num_kv_heads,
@@ -1006,7 +1004,6 @@ impl MegakernelProgram {
             embedding_inst_idx: 0,
             _mrope_inst_indices: Vec::new(),
             gqa_attn_inst_indices: Vec::new(),
-            position_ids_dev_ptr: prefill_bufs.position_ids.as_ptr() as u64,
             kv: super::KvConfig {
                 max_seq_len: cfg.max_seq_len as u32,
                 num_kv_heads: cfg.num_kv_heads,
@@ -1093,7 +1090,6 @@ impl MegakernelProgram {
             embedding_inst_idx: 0,
             _mrope_inst_indices: Vec::new(),
             gqa_attn_inst_indices: Vec::new(),
-            position_ids_dev_ptr: 0,
             kv: super::KvConfig {
                 max_seq_len: cfg.max_seq_len as u32,
                 num_kv_heads: cfg.num_kv_heads,

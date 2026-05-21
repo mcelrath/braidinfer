@@ -108,8 +108,6 @@ pub struct MegakernelProgram {
     // Indices of instructions that need per-step updates
     pub(crate) embedding_inst_idx: usize,
     pub(crate) gqa_attn_inst_indices: Vec<usize>, // seq_len changes each step
-    // mRoPE position_ids device pointer (3 i32s: temporal, height, width)
-    pub(crate) position_ids_dev_ptr: u64,
     // KV cache config (mandatory — present on all programs)
     pub(crate) kv: KvConfig,
     // Paged KV cache support (Some only when paged=true)

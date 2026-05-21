@@ -72,7 +72,7 @@ fn test_moe_gate_softmax() {
                 0.0
             };
             let val = val + (h as f32) * 0.01;
-            gate_data[e * hidden_size + h] = ((val.to_bits() >> 16) as u16); // f32→bf16 truncation
+            gate_data[e * hidden_size + h] = (val.to_bits() >> 16) as u16; // f32→bf16 truncation
         }
     }
 
