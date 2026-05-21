@@ -2,12 +2,9 @@ use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
-use braidinfer_hip::stream::Stream;
-use std::ffi::c_void;
 use std::sync::Arc;
 
 use crate::config::ModelConfig;
-use crate::tracer::TraceSink;
 use crate::watchdog::WatchdogThread;
 
 /// Tokens per paged KV chunk — must match compile_attention_layer_paged.
@@ -43,7 +40,6 @@ impl Instruction {
 /// KV cache configuration used on ALL programs (paged and non-paged, decode and prefill).
 pub(crate) struct KvConfig {
     pub max_seq_len: u32,
-    pub num_kv_heads: usize,
     pub head_dim: usize,
     pub kv_write_indices: Vec<Vec<(usize, usize)>>, // per attn layer, per kv_head: (k_copy_idx, v_copy_idx)
     pub kv_base_ptrs: Vec<(u64, u64)>,              // (k_base, v_base) per attention layer
@@ -100,10 +96,13 @@ pub(crate) struct PrefillCacheState {
 /// For packed: switches opcode to OP_LINEAR_PROJ_RNF4/PCG32, sets u8 pointer.
 pub struct MegakernelProgram {
     pub(crate) instructions: Vec<Instruction>,
-    pub(crate) device_program: DeviceBuffer<u64>,
-    pub(crate) module: Arc<Module>,
+    /// Loaded HSACO module — kept alive as the RAII anchor. The kernel
+    /// entry points are loaded by PersistentDispatch (which owns its own
+    /// Arc<Module>); this Arc only keeps the module mapped for the
+    /// program's lifetime. bd 9gmh Phase 2C: stopped being read after
+    /// execute() was deleted; retain to anchor the module Arc.
+    pub(crate) _module: Arc<Module>,
     pub(crate) num_blocks: u32,
-    pub(crate) shared_mem: u32,
     pub(crate) device: DeviceId,
     // Indices of instructions that need per-step updates
     pub(crate) embedding_inst_idx: usize,
@@ -137,9 +136,6 @@ pub struct MegakernelProgram {
     pub(crate) multi_gpu_attn_boundaries: Vec<(usize, usize)>,
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
-    /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.
-    /// Avoids a Vec allocation per decode step.
-    pub(crate) flat_program: Vec<u64>,
     /// Map from instruction index → Probe emitted at that instruction (when
     /// dump_buffer is enabled). Populated at compile time by emit_attention_layer
     /// / compile_gdn_layer / compile_ffn / compile_embedding sites. Drained by
@@ -148,8 +144,6 @@ pub struct MegakernelProgram {
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,
-    /// Device pointer to WatchdogState (host-mapped, owned by watchdog). Passed to kernel.
-    pub(crate) wd_dev_ptr: *mut c_void,
 }
 
 /// One KV-write D2dCopy pair (K and V) for prefill chunk patching.
@@ -254,7 +248,6 @@ impl PrefillBuffers {
 }
 
 pub(crate) mod instructions;
-pub(crate) use instructions::*;
 
 mod compile_common;
 mod compile_attention;
@@ -269,82 +262,6 @@ impl MegakernelProgram {
     }
     pub fn block_count(&self) -> u32 {
         self.num_blocks
-    }
-
-    /// Enable per-instruction dump mode. Allocates GPU buffer and prepends
-    /// an OP_NOP header instruction encoding dump pointers (words[1-3]).
-    /// This avoids adding kernel args which would increase register pressure
-    /// and reduce the cooperative launch block limit.
-    pub fn enable_dump(&mut self, max_slots: i32) -> HipResult<()> {
-        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
-        let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
-        self.dump_buffer = Some(DeviceBuffer::<u8>::alloc(self.device, buf_size)?);
-        let counter = MappedHostBuffer::<i32>::alloc(1)?;
-        unsafe { *counter.host_ptr() = 0i32; }
-        self.dump_counter = Some(counter);
-        self.dump_capacity = max_slots;
-
-        // Prepend OP_NOP header with dump pointers, re-upload program
-        let header = NopInst {
-            opcode_gridx: make_opcode_gridx(OP_NOP, 0),
-            dump_buf: self.dump_buffer.as_ref().unwrap().as_ptr(),
-            max_slots: max_slots as u64,
-            dump_counter: self.dump_counter.as_ref().unwrap().device_ptr(),
-            _pad: [0; 14],
-        }.into_inst();
-
-        let total_words = (1 + self.instructions.len()) * INST_SIZE;
-        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
-        flat.extend_from_slice(&header.words);
-        for inst in &self.instructions {
-            flat.extend_from_slice(&inst.words);
-        }
-        let mut new_prog = DeviceBuffer::alloc(self.device, total_words)?;
-        new_prog.copy_from_host(&flat)?;
-        self.device_program = new_prog;
-
-        Ok(())
-    }
-
-    /// Read dump results after execute. Returns Vec of (opcode, inst_idx, data).
-    pub fn read_dump(&self, stream: &Stream) -> HipResult<Vec<(u32, u32, Vec<f32>)>> {
-        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
-        let counter = self.dump_counter.as_ref().unwrap();
-        stream.synchronize()?;
-        let count_val = unsafe { *counter.host_ptr() };
-        let num_slots = count_val.min(self.dump_capacity) as usize;
-
-        let buf = self.dump_buffer.as_ref().unwrap();
-        let total_bytes = num_slots * DUMP_SLOT_BYTES;
-        let mut host = vec![0u8; total_bytes];
-        if num_slots > 0 {
-            braidinfer_hip::error::check(unsafe {
-                braidinfer_hip::ffi::hipMemcpyAsync(
-                    host.as_mut_ptr() as *mut std::ffi::c_void,
-                    buf.as_ptr() as *const std::ffi::c_void,
-                    total_bytes,
-                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
-                    stream.raw(),
-                )
-            })?;
-            stream.synchronize()?;
-        }
-
-        let mut results = Vec::with_capacity(num_slots);
-        for i in 0..num_slots {
-            let slot = &host[i * DUMP_SLOT_BYTES..];
-            let opcode = u32::from_le_bytes(slot[0..4].try_into().unwrap());
-            let inst_idx = u32::from_le_bytes(slot[4..8].try_into().unwrap());
-            let size = u32::from_le_bytes(slot[8..12].try_into().unwrap()) as usize;
-            let data: Vec<f32> = (0..size)
-                .map(|j| {
-                    let off = 16 + j * 4;
-                    f32::from_le_bytes(slot[off..off + 4].try_into().unwrap())
-                })
-                .collect();
-            results.push((opcode, inst_idx, data));
-        }
-        Ok(results)
     }
 
     /// Enable per-instruction dump mode for the persistent worker path.
@@ -370,59 +287,6 @@ impl MegakernelProgram {
 
     pub fn dump_active(&self) -> bool {
         self.dump_buffer.is_some()
-    }
-
-    pub fn disable_dump(&mut self) -> HipResult<()> {
-        self.dump_buffer = None;
-        self.dump_counter = None;
-        self.dump_capacity = 0;
-        // Rebuild device program without the NOP header
-        self.device_program = upload_program(self.device, &self.instructions)?;
-        Ok(())
-    }
-
-    /// Write dump results to a BTRC trace file compatible with compare_traces.py.
-    /// Names are derived from opcode + sequential index (e.g., "inst003_LINEAR_PROJ").
-    pub fn write_dump_btrc(&self, stream: &Stream, path: &str) -> HipResult<()> {
-        let slots = self.read_dump(stream)?;
-        let mut tw = TraceSink::open(path).expect("failed to open dump trace file");
-        for (opcode, inst_idx, data) in &slots {
-            let name = format!("inst{:03}_{}", inst_idx, opcode_name(*opcode));
-            tw.write_checkpoint(&name, data).expect("failed to write checkpoint");
-        }
-        tw.close().expect("failed to close dump trace file");
-        eprintln!(
-            "Megakernel dump: {} instructions written to {}",
-            slots.len(),
-            path
-        );
-        Ok(())
-    }
-
-    /// Execute the megakernel program.
-    pub fn execute(&self, stream: &Stream) -> HipResult<()> {
-        let func = self.module.get_function("megakernel_f32")?;
-        let mut prog_ptr: *const c_void = self.device_program.as_ptr().cast();
-        // When dump is active, device_program has an extra OP_NOP header instruction
-        let extra = if self.dump_buffer.is_some() { 1 } else { 0 };
-        let mut num_inst = (self.instructions.len() + extra) as i32;
-
-        let mut wd_ptr: *mut c_void = self.wd_dev_ptr;
-        let mut op_profile_ptr: *mut c_void = crate::op_profile::get_global() as *mut c_void;
-        let mut args: [*mut c_void; 4] = [
-            std::ptr::addr_of_mut!(prog_ptr).cast(),
-            std::ptr::addr_of_mut!(num_inst).cast(),
-            std::ptr::addr_of_mut!(wd_ptr).cast(),
-            std::ptr::addr_of_mut!(op_profile_ptr).cast(),
-        ];
-
-        func.launch_cooperative(
-            (self.num_blocks, 1, 1),
-            (256, 1, 1),
-            self.shared_mem,
-            stream,
-            &mut args,
-        )
     }
 
     /// Route this program's instruction stream through the persistent worker
@@ -454,14 +318,6 @@ impl MegakernelProgram {
         dispatch.dispatch_batch_slice(gpu_idx, &self.instructions[..halt_idx]);
         Ok(())
     }
-}
-
-/// Upload an instruction slice to a new device buffer.
-fn upload_program(device: DeviceId, instructions: &[Instruction]) -> HipResult<DeviceBuffer<u64>> {
-    let flat: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
-    let mut buf = DeviceBuffer::alloc(device, flat.len())?;
-    buf.copy_from_host(&flat)?;
-    Ok(buf)
 }
 
 pub fn opcode_name_str(op: u32) -> String {
