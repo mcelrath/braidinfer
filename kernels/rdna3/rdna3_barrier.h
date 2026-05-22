@@ -201,7 +201,8 @@ __device__ __forceinline__ void atomic_block_barrier(GridBarrierState* state) {
     //
     // The function still takes `state` to keep call sites unchanged; the
     // pointer is unused. cooperative_groups::this_grid().sync() must run
-    // on a cooperative launch, which persistent_worker is.
+    // on a cooperative launch, which both megakernel_f32 and
+    // persistent_worker entries are.
     (void)state;
     cooperative_groups::this_grid().sync();
 #else

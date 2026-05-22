@@ -275,8 +275,9 @@ impl MegakernelProgram {
 
     /// Enable per-instruction dump mode for the persistent worker path.
     ///
-    /// Allocates the VRAM dump buffer and counter. The persistent_worker reads
-    /// dump pointers from
+    /// Unlike `enable_dump` (which prepends a NOP header and rebuilds device_program
+    /// for the one-shot megakernel_f32 path), this variant ONLY allocates the VRAM
+    /// dump buffer and counter. The persistent_worker reads dump pointers from
     /// `WorkerQueue.dump_base/count/capacity` (written by
     /// `PersistentDispatch::set_trace_dump_ptrs`), not from a NOP header.
     ///
@@ -317,8 +318,7 @@ impl MegakernelProgram {
         // HALT EXCLUSION: the persistent cooperative kernel loops forever
         // waiting for the next batch; HALT would cause it to exit. Strip any
         // trailing HALT instructions (compile_prefill / compile_final_norm_lm_head
-        // historically appended OP_HALT for the now-deleted one-shot entry; the
-        // emitters still produce it for trace symmetry).
+        // append OP_HALT for the one-shot megakernel_f32 entry).
         let halt_idx = self
             .instructions
             .iter()

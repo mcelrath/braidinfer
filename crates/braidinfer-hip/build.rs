@@ -66,8 +66,8 @@ fn main() {
         "moe_gate",
         "moe_prefill",
         "dot_sigmoid_scale_add",
-        // megakernel.hsaco exports persistent_worker (kernels/megakernel.hip).
-        // bd 9gmh Phase 4: megakernel_f32 one-shot entry deleted.
+        // megakernel.hsaco contains BOTH megakernel_f32 and persistent_worker
+        // entry points (zqw merge: kernels/megakernel.hip).
         "megakernel",
         "peer_copy",
         "deinterleave",

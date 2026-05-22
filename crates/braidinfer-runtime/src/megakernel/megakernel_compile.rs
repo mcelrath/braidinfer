@@ -61,7 +61,7 @@ impl MegakernelProgram {
         // 2 blocks/CU: 2*31776 = 63552 < 65536 ✓ — no occupancy reduction.
         let base_shared = if has_moe { 1024u32 * 4 } else { 256u32 * 4 * 2 };
         let shared_mem = base_shared.max(31776u32);
-        let func = module.get_function("persistent_worker")?;
+        let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         eprintln!(
             "  megakernel: shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}"
@@ -349,7 +349,7 @@ impl MegakernelProgram {
         let shared_mem = (256u32 * 4 * 2)
             .max((cfg.hidden_size as u32) * 4)
             .max(31776u32);
-        let func = module.get_function("persistent_worker")?;
+        let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         eprintln!(
             "  megakernel(paged): shared_mem={shared_mem} blocks_per_sm={blocks_per_sm} NUM_CUS={NUM_CUS}"
@@ -801,7 +801,7 @@ impl MegakernelProgram {
         let shared_mem = (256u32 * 4 * 2)
             .max((cfg.hidden_size as u32) * 4)
             .max(31776u32);
-        let func = module.get_function("persistent_worker")?;
+        let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
         let num_blocks = blocks_per_sm_clamped * NUM_CUS;
@@ -1049,7 +1049,7 @@ impl MegakernelProgram {
         let device = model.device;
 
         let shared_mem = (256u32 * 4 * 2).max(hs as u32 * 4).max(super::SHARED_LPROJ_TOTAL);
-        let func = module.get_function("persistent_worker")?;
+        let func = module.get_function("megakernel_f32")?;
         let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
         let num_blocks = blocks_per_sm.max(1) as u32 * NUM_CUS;
 

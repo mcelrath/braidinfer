@@ -405,9 +405,11 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     //
     // The within-kernel barrier is redundant here: after op_moe_ffn_remote
     // returns, dispatch_opcode returns (no trailing barrier on the
-    // OP_MOE_FFN_REMOTE non-dump path), then persistent_worker's main loop.
-    // The next mailbox iteration's batch-boundary buffer_gl1_inv
-    // (megakernel.hip) re-invalidates the writer-side L1.
+    // OP_MOE_FFN_REMOTE non-dump path), then megakernel_f32 / persistent_worker's
+    // main loop. For Phase 0b's per-batch coop, kernel exit completes the
+    // dispatch — its AQL trailer fence handles cross-GPU visibility. For the
+    // persistent_worker path, the next mailbox iteration's batch-boundary
+    // buffer_gl1_inv (megakernel.hip:185) re-invalidates the writer-side L1.
     //
     // Strict invariant: every block must complete its writes before kernel
     // exit. The cooperative kernel only retires when all blocks return,
