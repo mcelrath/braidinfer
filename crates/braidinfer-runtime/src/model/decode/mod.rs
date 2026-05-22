@@ -165,7 +165,12 @@ impl Model {
         }
 
         // Ensure paged decode state (page_allocator + paged_seq) is initialized.
-        self.ensure_paged_decode_state(false)?;
+        // bd a2dk: pass quantized=true when KV_QUANT=1 so the quant_allocator is
+        // created. post_step_paged silently no-ops when quant_allocator is None,
+        // leaving quant_page_table[0]=0; the next decode step's OP_ATTN_PAGED_Q
+        // then reads `chunk_base + k_q1scale_off = 0 + 0x4000` and page-faults.
+        let quantized = std::env::var("KV_QUANT").as_deref() == Ok("1");
+        self.ensure_paged_decode_state(quantized)?;
 
         // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
         let shared_mem = SHARED_LPROJ_TOTAL as u32;

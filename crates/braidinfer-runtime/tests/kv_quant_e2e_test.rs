@@ -14,7 +14,7 @@ fn argmax(logits: &[f32]) -> (usize, f32) {
 }
 
 #[test]
-#[ignore = "bd a2dk: quantize_sealed_chunk_via_worker page-faults at first chunk-seal under KV_QUANT+persistent"]
+
 fn test_quantized_kv_vs_f32_paged() {
     let device = DeviceId(0);
     let model_dir = Path::new(MODEL_DIR);
@@ -68,7 +68,7 @@ fn test_quantized_kv_vs_f32_paged() {
 }
 
 #[test]
-#[ignore = "bd a2dk: quantize_sealed_chunk_via_worker page-faults at first chunk-seal under KV_QUANT+persistent"]
+
 fn test_quantized_kv_long_sequence() {
     let device = DeviceId(0);
     let model_dir = Path::new(MODEL_DIR);
