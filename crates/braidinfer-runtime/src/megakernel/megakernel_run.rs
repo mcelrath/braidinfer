@@ -701,10 +701,12 @@ impl MegakernelProgram {
         // 4. Upload updated position IDs
         prefill_bufs.write_positions(start_pos, n)?;
 
-        // 5. (bd 9gmh Phase 2B+2D) Re-upload SKIPPED: the persistent worker
-        // mailbox path reads from self.instructions directly via
-        // dispatch_batch_slice. The previous device_program copy_from_host
-        // would deadlock because the persistent worker holds all CUs.
-        Ok(())
+        // 5. Re-upload modified instructions to device
+        // Reuse pre-allocated flat_program buffer to avoid per-chunk allocation.
+        self.flat_program.clear();
+        for inst in &self.instructions {
+            self.flat_program.extend_from_slice(&inst.words);
+        }
+        self.device_program.copy_from_host(&self.flat_program)
     }
 }

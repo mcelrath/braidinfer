@@ -2,13 +2,11 @@
 //! Extracted from megakernel.rs for maintainability.
 
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use std::sync::Arc;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 
-#[allow(unused_imports)]
 use super::upload_program;
 use super::instructions::*;
 use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
@@ -277,12 +275,7 @@ impl MegakernelProgram {
         instructions.push(HaltInst::new().into_inst());
 
         // Upload program to device
-        // bd 9gmh Phase 2B+2D: mailbox path uses self.instructions directly;
-        // device_program is a vestigial 1-element placeholder (the worker
-        // does not read from VRAM). Uploading via copy_from_host here would
-        // deadlock because the persistent worker is already running and
-        // holds all CUs.
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?;
+        let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
@@ -719,12 +712,7 @@ impl MegakernelProgram {
         instructions.push(Instruction::new(OP_HALT, 0));
 
         // Upload
-        // bd 9gmh Phase 2B+2D: mailbox path uses self.instructions directly;
-        // device_program is a vestigial 1-element placeholder (the worker
-        // does not read from VRAM). Uploading via copy_from_host here would
-        // deadlock because the persistent worker is already running and
-        // holds all CUs.
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?;
+        let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
@@ -1000,12 +988,7 @@ impl MegakernelProgram {
         }
         instructions.push(Instruction::new(OP_HALT, 0));
 
-        // bd 9gmh Phase 2B+2D: mailbox path uses self.instructions directly;
-        // device_program is a vestigial 1-element placeholder (the worker
-        // does not read from VRAM). Uploading via copy_from_host here would
-        // deadlock because the persistent worker is already running and
-        // holds all CUs.
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?;
+        let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
@@ -1091,12 +1074,7 @@ impl MegakernelProgram {
             vs as i32, hs as i32, 0).into_inst());
         instructions.push(Instruction::new(OP_HALT, 0));
 
-        // bd 9gmh Phase 2B+2D: mailbox path uses self.instructions directly;
-        // device_program is a vestigial 1-element placeholder (the worker
-        // does not read from VRAM). Uploading via copy_from_host here would
-        // deadlock because the persistent worker is already running and
-        // holds all CUs.
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?;
+        let device_program = upload_program(device, &instructions)?;
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
