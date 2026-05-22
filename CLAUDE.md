@@ -272,6 +272,19 @@ The cooperative watchdog recovery test lives in `../exterior_algebra/scripts/wat
 - Cooperative variant: 100/100 PASS, mean recovery 4.7 ± 0.7 ms
 - Stubborn variant: documented as platform-limited — `hipDeviceReset` blocks indefinitely on RDNA3/gfx1100 (ROCm has no GPU TDR preemption for compute). Process abort is the correct escalation path.
 
+## Never Trust grep/rg — Read Files In Full
+
+`rg`/`grep` find string matches, not structural dependencies. Using grep as the audit mechanism for "what does this function reach" is a systematic Claude failure mode. When planning ANY migration, refactor, or deletion:
+
+1. **Read the affected file(s) in full** — entire file, not just the matching lines.
+2. **Read every upstream caller in full** — every function that calls into the affected code, recursively until you hit the public API boundary.
+3. **Read every downstream callee in full** — every function the affected code calls, recursively until you hit `std`/HIP/external. Pay specific attention to indirect calls (kernel forwards, trait methods, helper modules).
+4. Only AFTER full Read can you grep — and only to confirm the picture Read gave you, not to construct it.
+
+The bd 9gmh Phase 2 regression (bd pywl) is the canonical failure: a `rg "mk.execute"` audit found 6 sites to migrate; a full Read of `prefill_mixed_chunk` would have revealed `moe_ffn_forward_prefill_batched` calling `self.kernels.*.forward` + `memcpy_d2h` — completely outside `mk.execute` but reachable from `Model::prefill`. Single-GPU smoke + test suite passed because they don't take that branch. The grep-based plan was self-consistent but structurally blind. Migration shipped; multi-GPU MoE prefill deadlocked on the first user run.
+
+**Trigger this rule whenever**: planning a beads epic, writing a PLAN doc, dispatching an implementation agent, or making any structural call (delete a method, retire an env knob, migrate a code path). The cost of full Reads is real; the cost of a shipped regression is much higher.
+
 ## Pre-existing Issues — File First, Then Move On
 
 When you encounter a failure, bug, or stale state that pre-dates your current task (test was already failing on HEAD, doc is out of date, dead code unrelated to your change, etc.): **first run `bd list --status=open` (grep for related keywords) to see if it's tracked. If not, `bd create` immediately with a precise repro/description.** Then continue your task. Do not silently fix or silently skip — the bead is the audit trail. Applies to: pre-existing test failures, latent bugs surfaced by your build, doc drift, orphan files, dead code outside your task's scope.
