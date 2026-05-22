@@ -12,7 +12,6 @@ fn max_diff_vecs(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 }
 
 #[test]
-#[ignore = "bd gnxs: read_gdn_state uses copy_to_host which deadlocks under always-persistent — needs SDMA migration"]
 fn test_checkpoint_roundtrip() {
     let device = DeviceId(0);
     let model_dir = Path::new(MODEL_DIR);

@@ -411,18 +411,68 @@ impl Model {
         Ok(logits)
     }
 
-    /// Read all GDN recurrent state to host (for testing).
-    /// PRE-WORKER-ONLY: calls `copy_to_host` (hipMemcpy) — must NOT be called
-    /// while the persistent cooperative worker is running (CUs held → deadlock).
-    pub fn read_gdn_state(&self) -> Result<Vec<Vec<f32>>, ModelError> {
-        self.stream.synchronize()?;
+    /// Read all GDN recurrent state to host (for testing / checkpoint diagnostics).
+    ///
+    /// bd gnxs: under always-persistent mode the cooperative worker holds every
+    /// GPU CU, so the prior `copy_to_host` path (synchronous `hipMemcpy` on the
+    /// default stream) deadlocks. We now issue an async D2H copy on the
+    /// persistent dispatch's per-GPU SDMA stream (no CU contention) and then
+    /// synchronize that one stream. Mirrors the `kv_mirror_chunk` /
+    /// `drain_kv_chunk_mirror` pattern used at chunk-seal in decode_step.
+    ///
+    /// Pre-worker callers (no decode/prefill yet) take the legacy path —
+    /// `copy_to_host` is safe before the worker is spawned.
+    pub fn read_gdn_state(&mut self) -> Result<Vec<Vec<f32>>, ModelError> {
+        // Make sure the worker (and its SDMA stream) exist before we try the
+        // async path. Idempotent.
+        self.ensure_persistent_worker_spawned()?;
+
+        let gpu_idx = self.device.0 as usize;
+        let stream = self
+            .persistent_workers
+            .as_ref()
+            .map(|d| d.sdma_stream(gpu_idx))
+            .unwrap_or(std::ptr::null_mut());
+
         let mut result = Vec::with_capacity(self.gdn_states.len());
+        if stream.is_null() {
+            // Fallback: no SDMA stream available (pre-worker path). Safe to
+            // use the synchronous copy here because the worker has not been
+            // launched yet — the deadlock guard does nothing in that state.
+            self.stream.synchronize()?;
+            for state in &self.gdn_states {
+                let n = state.recurrent.len();
+                let mut buf = vec![0.0f32; n];
+                state.recurrent.copy_to_host(&mut buf)?;
+                result.push(buf);
+            }
+            return Ok(result);
+        }
+
+        // Issue async D2H copies onto the SDMA stream. Pinned-host buffering
+        // isn't strictly required for correctness here (we synchronize before
+        // returning), so we copy directly into the result Vecs.
         for state in &self.gdn_states {
             let n = state.recurrent.len();
             let mut buf = vec![0.0f32; n];
-            state.recurrent.copy_to_host(&mut buf)?;
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    buf.as_mut_ptr() as *mut std::ffi::c_void,
+                    state.recurrent.as_ptr() as *const std::ffi::c_void,
+                    n * std::mem::size_of::<f32>(),
+                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                    stream,
+                )
+            })
+            .map_err(ModelError::Hip)?;
             result.push(buf);
         }
+        // Synchronize SDMA stream — copies complete before we return.
+        braidinfer_hip::error::check(unsafe {
+            braidinfer_hip::ffi::hipStreamSynchronize(stream)
+        })
+        .map_err(ModelError::Hip)?;
+
         Ok(result)
     }
 
