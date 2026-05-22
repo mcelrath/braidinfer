@@ -166,7 +166,12 @@ pub struct PrefillBuffers {
     pub z_proj: DeviceBuffer<f32>,  // [N × num_heads * value_dim]
     pub ffn_act: DeviceBuffer<f32>, // [N × intermediate_size]
     pub residual: DeviceBuffer<f32>, // [N × hidden_size]
-    pub position_ids: DeviceBuffer<i32>, // [N × 3] — mRoPE positions per token
+    // bd pywl: host-mapped so write_positions writes via CPU MMIO instead of
+    // hipMemcpy. PrefillBuffers's write_positions runs from Model::prefill,
+    // which (under always-persistent, post bd 9gmh Phase 2) happens AFTER the
+    // worker spawn — synchronous hipMemcpy on GPU 0 deadlocks against the
+    // cooperative kernel holding all CUs.
+    pub position_ids: MappedHostBuffer<i32>, // [N × 3] — mRoPE positions per token
     // Attention layer intermediates
     pub q_gate_attn: DeviceBuffer<f32>, // [N × nqh × hd × 2]
     pub q_attn: DeviceBuffer<f32>,      // [N × nqh × hd]
@@ -190,14 +195,18 @@ impl PrefillBuffers {
     /// Without this refresh, the second run of bench_coherence reads stale
     /// positions from the previous run's last prefill (5ax root cause).
     pub fn write_positions(&mut self, start_pos: u32, n: usize) -> HipResult<()> {
-        let mut pos_data = vec![0i32; n * 3];
+        // bd pywl: host-mapped UC write — GPU reads through device_ptr without
+        // hipMemcpy. Safe under the running persistent worker.
+        let host_ptr = self.position_ids.host_ptr();
         for t in 0..n {
             let pos = (start_pos + t as u32) as i32;
-            pos_data[t * 3] = pos;
-            pos_data[t * 3 + 1] = pos;
-            pos_data[t * 3 + 2] = pos;
+            unsafe {
+                host_ptr.add(t * 3).write_volatile(pos);
+                host_ptr.add(t * 3 + 1).write_volatile(pos);
+                host_ptr.add(t * 3 + 2).write_volatile(pos);
+            }
         }
-        self.position_ids.copy_from_host(&pos_data)
+        Ok(())
     }
 }
 
@@ -228,7 +237,7 @@ impl PrefillBuffers {
             z_proj: DeviceBuffer::alloc(device, n * nvh * vd)?,
             ffn_act: DeviceBuffer::alloc(device, n * is)?,
             residual: DeviceBuffer::alloc(device, n * hs)?,
-            position_ids: DeviceBuffer::alloc(device, n * 3)?,
+            position_ids: MappedHostBuffer::<i32>::alloc(n * 3)?,
             q_gate_attn: DeviceBuffer::alloc(
                 device,
                 n * nqh * hd * if cfg.has_output_gate { 2 } else { 1 },
