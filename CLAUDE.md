@@ -2,6 +2,8 @@
 
 GPU-native LLM inference engine in Rust + HIP, targeting AMD RDNA3 (gfx1100, 7900XTX).
 
+**Why this project exists**: agentic coding fails when the agent's view of the codebase is incomplete or inconsistent — text-grep misses sibling helpers, IDE indexes go stale, partial reads ship regressions (bd pywl is the canonical example: a grep-planned migration shipped a multi-GPU MoE prefill deadlock because the relevant code used a different API than the one grepped for). BraidInfer is the inference substrate for an agent architecture that puts the entire codebase (or its API skeleton, expanded on demand via tool calls) in the KV cache. Properties: always-consistent (the KV state IS the source of truth, no re-index); mask+append on update (file changes are O(diff), not O(reindex)); complete view (attention can pattern-match across the whole code structure, not just text-matched lines). The grep-blindness failure mode that motivates the "never trust grep" discipline in `~/.claude/CLAUDE.md` is exactly the class of failure this engine aims to make architecturally impossible.
+
 ## System Software Deviates From Stock — Patch Manifest
 
 This host runs **custom-patched** kernel and ROCm. Behaviors may differ from upstream documentation. **Check this list before debugging kernel/GPU coherence anomalies.**
