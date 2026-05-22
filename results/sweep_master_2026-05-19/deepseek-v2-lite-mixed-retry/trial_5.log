@@ -1,0 +1,6 @@
+Reserved GPUs: 0,5,6,7 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24534MiB)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/deepseek-v2-lite-mixed.bqnt (5209 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:58:70:
+load model: MissingWeight("none of [\"model.layers.0.self_attn.k_proj.weight\", \"model.layers.0.mixer.k_proj.weight\"] found")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

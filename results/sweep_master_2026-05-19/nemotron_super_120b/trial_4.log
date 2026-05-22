@@ -1,0 +1,91 @@
+Waiting for GPUs: need 4, found 3. 3600s remaining...
+Reserved GPUs: 1,2,3,4 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24534MiB)
+Auto: MULTI_GPU enabled (model 79.4GB > single-GPU 25.7GB free)
+Auto: PERSISTENT enabled (required for multi-GPU)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/nemotron_super_120b.q4.bqnt (42308 tensors)
+Multi-GPU: HIP 0 = PCI 0000:47:00.0
+Multi-GPU: HIP 1 = PCI 0000:4a:00.0
+Multi-GPU: HIP 2 = PCI 0000:83:00.0
+Multi-GPU: HIP 3 = PCI 0000:86:00.0
+P2P: GPU 0→1 enabled (can_access=1)
+P2P: GPU 0→2 enabled (can_access=1)
+P2P: GPU 0→3 enabled (can_access=1)
+P2P: GPU 1→0 enabled (can_access=1)
+P2P: GPU 1→2 enabled (can_access=1)
+P2P: GPU 1→3 enabled (can_access=1)
+P2P: GPU 2→0 enabled (can_access=1)
+P2P: GPU 2→1 enabled (can_access=1)
+P2P: GPU 2→3 enabled (can_access=1)
+P2P: GPU 3→0 enabled (can_access=1)
+P2P: GPU 3→1 enabled (can_access=1)
+P2P: GPU 3→2 enabled (can_access=1)
+Multi-GPU: HWQ warm-up complete on 4 devices (order=[0, 1, 2, 3])
+Multi-GPU: allocating buffers on GPU 0 (hs=4096, eis=2688)
+Multi-GPU: allocating buffers on GPU 1 (hs=4096, eis=2688)
+Multi-GPU: allocating buffers on GPU 2 (hs=4096, eis=2688)
+Multi-GPU: allocating buffers on GPU 3 (hs=4096, eis=2688)
+Multi-GPU: 4 devices, P2P enabled
+  VRAM after init: [GPU0=17552MB, GPU1=24366MB, GPU2=24366MB, GPU3=24366MB]
+  Layer 1: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 3: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 5: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 8: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 10: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 12: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 14: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 17: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 19: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 21: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 23: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 26: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 28: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 30: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 32: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 34: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 37: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 39: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 41: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 43: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 45: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 48: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 50: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 52: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 54: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 56: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 59: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 61: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 63: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 65: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 67: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 70: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 72: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 74: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 76: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 79: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 81: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 83: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 85: 512 experts distributed (128 per GPU, 4 GPUs)
+  Layer 87: 512 experts distributed (128 per GPU, 4 GPUs)
+Multi-GPU: experts distributed across all 4 GPUs
+  VRAM after MoE distribute: [GPU0=752MB, GPU1=7564MB, GPU2=7564MB, GPU3=7564MB]
+Multi-GPU attn: 8 layers × 4 workers, local_nqh=8 local_nkh=2 q_mult=1
+  VRAM after init_attn_buffers: [GPU0=624MB, GPU1=7434MB, GPU2=7434MB, GPU3=7434MB]
+Multi-GPU: split QKV weights for 8 attn layers across 4 GPUs
+  VRAM after init_split_attn_weights: [GPU0=624MB, GPU1=7392MB, GPU2=7392MB, GPU3=7392MB]
+VRAM after load: 23936/24560 MB
+max_seq_len: 8192
+stop tokens: [11]
+  MoE worker state allocated on GPU 1 (no separate kernel — runs via persistent_worker)
+  MoE worker state allocated on GPU 2 (no separate kernel — runs via persistent_worker)
+  MoE worker state allocated on GPU 3 (no separate kernel — runs via persistent_worker)
+  megakernel: shared_mem=31776 blocks_per_sm=2 NUM_CUS=48
+  GPU 1: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+  GPU 2: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+  GPU 3: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+  MoE P2P dispatch initialized: 3 worker GPUs (prefill path)
+  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+warmup-mailbox-only attempt 1: OK — spawn=762.0ms dispatch=1.46ms [gpu0=609us,gpu1=257us,gpu2=321us,gpu3=268us]
+warmup-discard: clean after 1 attempt(s) in 0.77s
+ jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox
+20 tokens in 4.057s = 4.9 tok/s
+[braidinfer] multi-GPU fast-exit (rc=0): bypasses Stream/Module/Buffer drops that may wedge for 600s+ on the cooperative-kernel atomic_block_barrier (4fg.2). Functional output has already been printed. Not an abort.

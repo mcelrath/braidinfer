@@ -1,0 +1,75 @@
+=== 17-model matrix sweep on master (HEAD=d52aa32) — N=5 per model ===
+Tue May 19 06:55:18 PM EDT 2026
+--- model 1: devstral-small-q4 (-g auto) ---
+  1/devstral-small-q4: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 2: mistral-7b-q4 (-g auto) ---
+  2/mistral-7b-q4: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 3: mistral-nemo-q4 (-g auto) ---
+  3/mistral-nemo-q4: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 4: nemotron_cascade_30b (-g 4) ---
+  4/nemotron_cascade_30b: decode_ok=5/5 rc=0=5 hw_exc_trials=0 mes_errs_total=0
+--- model 5: nemotron_super_120b (-g 4) ---
+  5/nemotron_super_120b: decode_ok=5/5 rc=0=5 hw_exc_trials=0 mes_errs_total=0
+--- model 6: qwen35_27b (-g auto) ---
+  6/qwen35_27b: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 7: qwen35_122b_a10b (-g 4) ---
+  7/qwen35_122b_a10b: decode_ok=0/5 rc=0=0 hw_exc_trials=5 mes_errs_total=140
+--- model 8: qwen35_2b (-g auto) ---
+  8/qwen35_2b: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 9: qwen35_35b_a3b (-g 4) ---
+  9/qwen35_35b_a3b: decode_ok=5/5 rc=0=5 hw_exc_trials=0 mes_errs_total=0
+--- model 10: qwen35_08b (-g auto) ---
+  10/qwen35_08b: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 11: qwen36_27b (-g auto) ---
+  11/qwen36_27b: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 12: qwen36_35b_a3b (-g 4) ---
+  12/qwen36_35b_a3b: decode_ok=5/5 rc=0=5 hw_exc_trials=0 mes_errs_total=0
+--- model 13: qwen35-0.8b-mixed (-g auto) ---
+  13/qwen35-0.8b-mixed: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 14: qwen36_27b-q8 (-g auto) ---
+  14/qwen36_27b-q8: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 15: qwen36_35b_a3b-q8 (-g 4) ---
+--- RESUME from model 15 ---
+Tue May 19 07:22:30 PM EDT 2026
+--- model 15: qwen36_35b_a3b-q8 (-g 4) ---
+  15/qwen36_35b_a3b-q8: decode_ok=5/5 rc=0=5 hw_exc_trials=0 mes_errs_total=0
+--- model 16: deepseek-v2-lite-mixed (-g auto) ---
+  16/deepseek-v2-lite-mixed: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+--- model 17: leanstral-mixed (-g 4) ---
+  17/leanstral-mixed: decode_ok=0/5 rc=0=0 hw_exc_trials=0 mes_errs_total=0
+Tue May 19 07:24:43 PM EDT 2026
+=== RESUMED MODELS DONE ===
+--- RETRY auto-mode models with -g 4 ---
+Tue May 19 07:25:13 PM EDT 2026
+--- 1 devstral-small-q4 (-g 4, retry) ---
+  1/devstral-small-q4 retry: decode_ok=0/5 rc=0=0
+--- 2 mistral-7b-q4 (-g 4, retry) ---
+  2/mistral-7b-q4 retry: decode_ok=5/5 rc=0=5
+--- 3 mistral-nemo-q4 (-g 4, retry) ---
+  3/mistral-nemo-q4 retry: decode_ok=3/5 rc=0=3
+--- 6 qwen35_27b (-g 4, retry) ---
+  6/qwen35_27b retry: decode_ok=0/5 rc=0=0
+--- 8 qwen35_2b (-g 4, retry) ---
+  8/qwen35_2b retry: decode_ok=0/5 rc=0=0
+--- 10 qwen35_08b (-g 4, retry) ---
+  10/qwen35_08b retry: decode_ok=5/5 rc=0=5
+--- 11 qwen36_27b (-g 4, retry) ---
+  11/qwen36_27b retry: decode_ok=5/5 rc=0=5
+--- 13 qwen35-0.8b-mixed (-g 4, retry) ---
+  13/qwen35-0.8b-mixed retry: decode_ok=5/5 rc=0=5
+--- 14 qwen36_27b-q8 (-g 4, retry) ---
+  14/qwen36_27b-q8 retry: decode_ok=0/5 rc=0=0
+--- 16 deepseek-v2-lite-mixed (-g 4, retry) ---
+  16/deepseek-v2-lite-mixed retry: decode_ok=0/5 rc=0=0
+Tue May 19 07:38:42 PM EDT 2026
+=== RETRY DONE ===
+--- POST-REBOOT contamination-suspect retry (2026-05-20) ---
+Tue May 19 08:15:27 PM EDT 2026
+--- qwen35_27b (-g 4, post-reboot) ---
+  qwen35_27b post-reboot: decode_ok=5/5
+--- qwen35_2b (-g 4, post-reboot) ---
+  qwen35_2b post-reboot: decode_ok=5/5
+--- mistral-nemo-q4 (-g 4, post-reboot) ---
+  mistral-nemo-q4 post-reboot: decode_ok=5/5
+Tue May 19 08:19:15 PM EDT 2026
+=== POST-REBOOT RETRY DONE ===

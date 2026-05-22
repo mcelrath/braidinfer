@@ -1,0 +1,5 @@
+Reserved GPUs: 4,5,6,7 (free VRAM: 24533MiB, 24533MiB, 24533MiB, 24533MiB)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:48:47:
+load tokenizer: "failed to load tokenizer from \"/home/mcelrath/.cache/huggingface/hub/models--mistralai--Leanstral-2603/snapshots/2680dd278dcfc20398231b52e9396b07d3cacf4f/tokenizer.json\": No such file or directory (os error 2)"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

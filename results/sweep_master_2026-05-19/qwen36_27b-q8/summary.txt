@@ -1,0 +1,6 @@
+Tue May 19 07:17:49 PM EDT 2026
+T1 rc=2 decode_ok=0 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | 
+T2 rc=2 decode_ok=0 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | 
+T3 rc=2 decode_ok=0 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | 
+T4 rc=2 decode_ok=0 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | 
+T5 rc=2 decode_ok=0 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | 

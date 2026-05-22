@@ -1,0 +1,7 @@
+Reserved GPUs: 5,6,7,1 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24532MiB)
+Auto: MULTI_GPU enabled (model 75.7GB > single-GPU 25.7GB free)
+Auto: PERSISTENT enabled (required for multi-GPU)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/bin/generate.rs:58:70:
+load model: SafeTensors(Io(Os { code: 2, kind: NotFound, message: "No such file or directory" }))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

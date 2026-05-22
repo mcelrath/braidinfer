@@ -1,0 +1,15 @@
+Reserved GPUs: 0,2,3,4 (free VRAM: 24533MiB, 24533MiB, 24533MiB, 24533MiB)
+Auto: PERSISTENT enabled (non-MoE model)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/qwen35-0.8b-mixed.bqnt (229 tensors)
+VRAM after load: 1548/24560 MB
+max_seq_len: 8192
+stop tokens: [248046, 248044]
+warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+  megakernel: shared_mem=31776 blocks_per_sm=2 NUM_CUS=48
+  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+warmup-discard: clean after 1 attempt(s) in 0.14s
+ jumps over the lazy dog.
+The quick brown fox jumps over the lazy dog.
+The quick
+20 tokens in 0.349s = 57.3 tok/s
+persistent_worker: started, queue=0x14dfe45a0000

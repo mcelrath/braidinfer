@@ -1,0 +1,6 @@
+Reserved GPUs: 0 (free VRAM: 24534MiB)
+Model:  mistralai/Leanstral-2603
+Dir:    /home/mcelrath/.cache/huggingface/hub/models--mistralai--Leanstral-2603/snapshots/2680dd278dcfc20398231b52e9396b07d3cacf4f
+Format: mixed
+Output: models/leanstral-mixed.bqnt.new
+Found 7 safetensors shard(s)

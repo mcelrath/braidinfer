@@ -1,0 +1,6 @@
+Tue May 19 08:17:59 PM EDT 2026
+T1 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 hiperr=0 | Reserved GPUs: 1,2,3,4
+T2 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 hiperr=0 | Reserved GPUs: 1,2,3,4
+T3 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 hiperr=0 | Reserved GPUs: 1,2,3,4
+T4 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 hiperr=0 | Reserved GPUs: 1,2,3,4
+T5 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 hiperr=0 | Reserved GPUs: 1,2,3,4

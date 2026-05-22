@@ -1,0 +1,39 @@
+Waiting for GPUs: need 4, found 1. 3600s remaining...
+Waiting for GPUs: need 4, found 1. 3594s remaining...
+Waiting for GPUs: need 4, found 1. 3589s remaining...
+Waiting for GPUs: need 4, found 1. 3584s remaining...
+Waiting for GPUs: need 4, found 1. 3578s remaining...
+Waiting for GPUs: need 4, found 3. 3573s remaining...
+Reserved GPUs: 0,1,2,3 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24534MiB)
+Auto: PERSISTENT enabled (non-MoE model)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/mistral-7b-q4.bqnt (452 tensors)
+VRAM after load: 7154/24560 MB
+max_seq_len: 8192
+stop tokens: []
+warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+  megakernel: shared_mem=31776 blocks_per_sm=2 NUM_CUS=48
+  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+warmup-discard: clean after 1 attempt(s) in 0.48s
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+20 tokens in 1.764s = 11.3 tok/s
+persistent_worker: started, queue=0x151fc2380000

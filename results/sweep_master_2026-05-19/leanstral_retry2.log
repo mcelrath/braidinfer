@@ -1,0 +1,13 @@
+Waiting for GPUs: need 4, found 3. 3600s remaining...
+Waiting for GPUs: need 4, found 3. 3594s remaining...
+Waiting for GPUs: need 4, found 3. 3589s remaining...
+Reserved GPUs: 0,2,6,7 (free VRAM: 24533MiB, 24533MiB, 24533MiB, 24533MiB)
+Auto: MULTI_GPU enabled (model 75.7GB > single-GPU 25.7GB free)
+Auto: PERSISTENT enabled (required for multi-GPU)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/leanstral-mixed.bqnt (14322 tensors)
+
+thread 'main' panicked at crates/braidinfer-runtime/src/weights.rs:311:5:
+assertion `left == right` failed: weight tok_embeddings.weight: expected 508559360 bytes, got 1073741824
+  left: 1073741824
+ right: 508559360
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

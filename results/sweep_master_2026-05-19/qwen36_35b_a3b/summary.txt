@@ -1,0 +1,6 @@
+Tue May 19 07:16:11 PM EDT 2026
+T1 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: OK — spawn=302.0ms dispatch=1.82ms [gpu0=900us,gpu1=296us,gpu2=306us,gpu3=309us]
+T2 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: OK — spawn=308.9ms dispatch=1.57ms [gpu0=649us,gpu1=307us,gpu2=302us,gpu3=311us]
+T3 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: OK — spawn=405.7ms dispatch=1.44ms [gpu0=539us,gpu1=269us,gpu2=305us,gpu3=320us]
+T4 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: OK — spawn=398.1ms dispatch=1.35ms [gpu0=555us,gpu1=268us,gpu2=253us,gpu3=270us]
+T5 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: OK — spawn=311.6ms dispatch=1.61ms [gpu0=688us,gpu1=302us,gpu2=306us,gpu3=304us]

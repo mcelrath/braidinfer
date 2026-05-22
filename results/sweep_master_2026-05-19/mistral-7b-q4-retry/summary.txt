@@ -1,0 +1,6 @@
+Tue May 19 07:25:32 PM EDT 2026
+T1 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+T2 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+T3 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=6 | warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+T4 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+T5 rc=0 decode_ok=1 warn_nan=0 bang_tail=0 hw_exc=0 mes_errs=0 | warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup

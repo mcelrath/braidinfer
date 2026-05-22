@@ -1,0 +1,10 @@
+Reserved GPUs: 2,3,4,5 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24534MiB)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/nemotron_cascade_30b.q4.bqnt (6029 tensors)
+VRAM after load: 20296/24560 MB
+max_seq_len: 8192
+stop tokens: [11]
+warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+  megakernel: shared_mem=31776 blocks_per_sm=2 NUM_CUS=48
+warmup-discard: clean after 1 attempt(s) in 0.23s
+ jumps over the lazy dog. I'm a dog. I'm a dog. I'm a dog
+20 tokens in 0.648s = 30.9 tok/s

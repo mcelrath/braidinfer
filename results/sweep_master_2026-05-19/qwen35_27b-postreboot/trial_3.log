@@ -1,0 +1,14 @@
+Reserved GPUs: 1,2,3,4 (free VRAM: 24534MiB, 24534MiB, 24534MiB, 24534MiB)
+Auto: PERSISTENT enabled (non-MoE model)
+Loaded pre-quantized weights from /home/mcelrath/Projects/ai/braidinfer/models/qwen35_27b.q4.bqnt (570 tensors)
+VRAM after load: 21278/24560 MB
+max_seq_len: 8192
+stop tokens: [248046, 248044]
+warmup-mailbox-only attempt 1: single-GPU mode — falling back to full-decode warmup
+  megakernel: shared_mem=31776 blocks_per_sm=2 NUM_CUS=48
+  GPU 0: persistent worker launched (96 blocks, 31776B shared, bpsm_raw=2 bpsm=2 num_cus=48)
+warmup-discard: clean after 1 attempt(s) in 1.13s
+ jumps over the lazy dog.
+What is the first letter of the first word in the sentence?
+20 tokens in 4.627s = 4.3 tok/s
+persistent_worker: started, queue=0x15482a430000

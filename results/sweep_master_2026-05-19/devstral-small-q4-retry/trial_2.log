@@ -1,0 +1,2 @@
+Reserved GPUs: 4,5,6,7 (free VRAM: 24533MiB, 24533MiB, 24533MiB, 24533MiB)
+Could not resolve HF cache dir for /home/mcelrath/Projects/ai/braidinfer/models/devstral-small-q4.bqnt

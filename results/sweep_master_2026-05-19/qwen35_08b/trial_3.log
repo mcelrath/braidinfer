@@ -1,0 +1,4 @@
+usage: launch-gpu.py [-h] [--gpus GPUS] [--min-vram MIN_VRAM]
+                     [--gpu-timeout GPU_TIMEOUT] [--timeout TIMEOUT]
+                     [--status] [--cleanup] [--kill]
+launch-gpu.py: error: argument --gpus/-g: invalid int value: 'auto'

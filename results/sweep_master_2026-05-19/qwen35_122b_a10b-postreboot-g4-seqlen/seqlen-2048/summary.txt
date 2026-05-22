@@ -1,0 +1,5 @@
+T1 rc=0 decode_ok=1 hw_exc=0 warn_nan=0 | = 5.9 tok/s
+T2 rc=0 decode_ok=1 hw_exc=0 warn_nan=0 | = 6.1 tok/s
+T3 rc=0 decode_ok=1 hw_exc=0 warn_nan=0 | = 6.2 tok/s
+T4 rc=0 decode_ok=1 hw_exc=0 warn_nan=0 | = 6.0 tok/s
+T5 rc=0 decode_ok=1 hw_exc=0 warn_nan=0 | = 5.9 tok/s

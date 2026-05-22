@@ -1,0 +1,4 @@
+--- MAX_SEQ_LEN=2048 ---
+  seqlen=2048: decode_ok=5/5
+--- MAX_SEQ_LEN=4096 ---
+  seqlen=4096: decode_ok=5/5
