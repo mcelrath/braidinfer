@@ -2,7 +2,14 @@
 
 GPU-native LLM inference engine in Rust + HIP, targeting AMD RDNA3 (gfx1100, 7900XTX).
 
-**Why this project exists**: agentic coding fails when the agent's view of the codebase is incomplete or inconsistent — text-grep misses sibling helpers, IDE indexes go stale, partial reads ship regressions (bd pywl is the canonical example: a grep-planned migration shipped a multi-GPU MoE prefill deadlock because the relevant code used a different API than the one grepped for). BraidInfer is the inference substrate for an agent architecture that puts the entire codebase (or its API skeleton, expanded on demand via tool calls) in the KV cache. Properties: always-consistent (the KV state IS the source of truth, no re-index); mask+append on update (file changes are O(diff), not O(reindex)); complete view (attention can pattern-match across the whole code structure, not just text-matched lines). The grep-blindness failure mode that motivates the "never trust grep" discipline in `~/.claude/CLAUDE.md` is exactly the class of failure this engine aims to make architecturally impossible.
+**Why this project exists**: agentic coding fails when the agent's view of the codebase is incomplete or inconsistent — text-grep misses sibling helpers, IDE indexes go stale, partial reads ship regressions (bd pywl is the canonical example: a grep-planned migration shipped a multi-GPU MoE prefill deadlock because the relevant code used a different API than the one grepped for). BraidInfer is the inference substrate for an agent architecture that puts the entire codebase (or its API skeleton, expanded on demand via tool calls) in the KV cache.
+
+The KV API contract is the one implemented in llama.cpp at `../llama.cpp/docs/kv-cache-api.md` (mask+append updates, always-consistent state, no re-index on file change). BraidInfer reimplements that API but goes farther:
+1. **Lower-latency dispatch via megakernel** — single persistent cooperative kernel polls a host-mapped mailbox, eliminating per-step `hipModuleLaunchKernel` overhead and CU spin-up latency. llama.cpp dispatches per-op; we batch a whole step.
+2. **Paged / tree / radix KV cache with vLLM-style memory management** — fixed-size chunk pool, per-sequence page tables, copy-on-write for branching. llama.cpp uses a flat per-sequence cache, which fragments and limits batching.
+3. **Near-linear prefill scaling with GPU count** — head-parallel attention + expert-parallel MoE + GART-host-mapped P2P handoffs. llama.cpp's multi-GPU prefill is serial across devices and bottlenecks on H2H copies; the `bd 9gmh` epic + the pywl regression are both about getting this right.
+
+The grep-blindness failure mode that motivates the "never trust grep" discipline in `~/.claude/CLAUDE.md` is exactly the class of failure this engine aims to make architecturally impossible.
 
 ## System Software Deviates From Stock — Patch Manifest
 
