@@ -333,7 +333,11 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     float* out_p2p = i->output_slot_p2p;
     const int* eids = i->expert_ids;
     const float* ews = i->expert_weights;
-    const MoeWorkerConfig* cfg = (const MoeWorkerConfig*)i->config;
+    // bd 0hu3-b: resolve per-context config via array[layer_idx]. config_array
+    // is in this consumer's own VA; entries are MoeWorkerConfig* valid in the
+    // same VA. Prevents cross-context VA bake-in (the bd 0hu3-b regression).
+    const MoeWorkerConfig* cfg =
+        (const MoeWorkerConfig*)i->config_array[i->layer_idx];
     float* la = i->local_activation;
     float* lo = i->local_output;
     float* sg = i->scratch_gate;

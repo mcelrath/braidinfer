@@ -1120,9 +1120,6 @@ impl MegakernelProgram {
                 } => (*num_active, *expert_intermediate_size),
                 _ => unreachable!(),
             };
-            let has_gate = if moe.has_gate_proj { 1u64 } else { 0u64 };
-            let num_workers = p2p.workers.len();
-            let num_gpus = p2p.num_gpus;
             // gate_up_in_dim: expert input dimension (hs for standard MoE, moe_latent_size for Nemotron-H)
             let gupd = dist.map(|d| d.gate_up_in_dim).unwrap_or(hs);
             let has_latent = moe.fc1_latent_proj.is_some();
@@ -1166,47 +1163,44 @@ impl MegakernelProgram {
                 }
             }
 
-            // Build OP_MOE_DISPATCH instruction
+            // bd 0hu3-b: replace OP_MOE_DISPATCH with OP_MOE_FFN_REMOTE for GPU 0.
+            // Every GPU now runs the same op for MoE expert compute in decode.
+            // activation_p2p self-points at GPU 0's own VRAM (no peer P2P).
+            // output_slot_p2p = output_slots[0] (same UC destination as old PRE).
+            // local_activation/local_output/scratch_* use the gpu0_* buffers
+            // (parallel to the worker's `workers[w].*` buffers).
+            //
             // For Nemotron-H (has_latent): activation = moe_latent (gupd elements)
-            //                              final_output = moe_latent (gupd; fc2 projects to hs after)
             // For standard MoE:           activation = normed (hs)
-            //                              final_output = ffn_down_stage (hs)
+            // The PRE-step does NOT write `final_output` (the moe_latent /
+            // ffn_down_stage); only OP_MOE_DISPATCH_POST does, and that
+            // emission below is unchanged.
             let activation_ptr = if has_latent {
-                act.moe_latent.as_ptr() as u64
+                act.moe_latent.as_ptr() as *const f32
             } else {
-                act.normed.as_ptr() as u64
+                act.normed.as_ptr() as *const f32
             };
-            let final_output_ptr = if moe.fc2_latent_proj.is_some() {
-                act.moe_latent.as_ptr() as u64  // experts write latent; fc2 projects to ffn_down_stage
-            } else {
-                act.ffn_down_stage.as_ptr() as u64
-            };
+            let relu_sq = !moe.has_gate_proj;
 
-            prog.instructions[barrier_idx] = MoeDispatchInst {
-                opcode_gridx: OP_MOE_DISPATCH as u64,
-                work_queue: p2p.work_queue.device_ptr() as u64,
-                output_slots: p2p.output_slots_dev_ptrs[0] as u64,
-                final_output: final_output_ptr,
-                expert_ids: act.moe_expert_ids.as_ptr() as u64,
-                expert_weights: act.moe_expert_weights.as_ptr() as u64,
-                seq_counter: p2p.seq_counter.device_ptr() as u64,
-                num_workers_hs: ((num_workers as u64) << 32) | (hs as u64),
-                layer_k: ((layer_idx as u64) << 32) | (k as u64),
-                eis_gate: ((eis as u64) << 32) | has_gate,
-                activation: activation_ptr,
-                layer_config_ptrs: p2p.gpu0_layer_config_ptrs.as_ptr() as u64,
-                scratch_gate: p2p.gpu0_scratch_gate.as_ptr() as u64,
-                scratch_up: p2p.gpu0_scratch_up.as_ptr() as u64,
-                scratch_act: p2p.gpu0_scratch_act.as_ptr() as u64,
-                num_gpus: num_gpus as u64,
-                gate_up_in_dim: gupd as u64,
-                gpu0_acc: p2p.gpu0_acc.as_ptr() as u64,
-            }.into_inst();
+            prog.instructions[barrier_idx] = p2p.build_ffn_remote_inst_gpu0(
+                layer_idx,
+                activation_ptr,
+                p2p.output_slots_dev_ptrs[0] as *mut f32,
+                act.moe_expert_ids.as_ptr() as *const i32,
+                act.moe_expert_weights.as_ptr() as *const f32,
+                k,
+                eis,
+                hs,
+                gupd,
+                moe.has_gate_proj,
+                relu_sq,
+                std::ptr::null(),
+                0,
+            );
 
-            // bd 1hik: also populate the per-layer params table consumed by
-            // `dispatch_moe_workers_decode_async`. Same source of truth used
-            // above to emit MoeDispatchInst; the CPU worker-dispatch path
-            // no longer needs to read raw instruction words to recover these.
+            // bd 1hik: populate the per-layer params table consumed by
+            // `dispatch_moe_workers_decode_async`. CPU worker-dispatch path
+            // no longer reads raw instruction words to recover these.
             let has_gate_bool = moe.has_gate_proj;
             p2p.decode_params[layer_idx] = Some(crate::moe_p2p::DecodeMoeParams {
                 output_slots: p2p.output_slots_dev_ptrs[0],

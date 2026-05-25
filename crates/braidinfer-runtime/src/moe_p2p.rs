@@ -621,7 +621,11 @@ impl MoeP2pContext {
         wait_seq: u64,
     ) -> crate::megakernel::Instruction {
         let w = &self.workers[worker_idx];
-        let cfg_ptr = w.layer_config_ptrs_host[layer_idx] as *const std::ffi::c_void;
+        // bd 0hu3-b: pass the worker-local config_array (worker VRAM, worker
+        // VA) and let the kernel index into it. Each worker's array contains
+        // VAs valid in its own context.
+        let config_array =
+            w.layer_config_ptrs.as_ptr() as *const *const std::ffi::c_void;
         // grid_x is unused inside op_moe_ffn_remote (which uses the full grid).
         crate::megakernel::instructions::MoeFfnRemoteInst::new(
             1, // grid_x — kernel uses cooperative full grid; value irrelevant
@@ -629,7 +633,8 @@ impl MoeP2pContext {
             output_slot_p2p_dev_ptr,
             expert_ids_p2p,
             expert_weights_p2p,
-            cfg_ptr,
+            config_array,
+            layer_idx as u64,
             w.local_activation.as_ptr() as *mut f32,
             w.local_output.as_ptr() as *mut f32,
             w.scratch_gate.as_ptr() as *mut f32,
@@ -669,14 +674,20 @@ impl MoeP2pContext {
         wait_ptr: *const u32,
         wait_seq: u64,
     ) -> crate::megakernel::Instruction {
-        let cfg_ptr = self.gpu0_layer_config_ptrs_host[layer_idx] as *const std::ffi::c_void;
+        // bd 0hu3-b: pass GPU 0's config_array (GPU 0 VRAM, GPU 0 VA), kernel
+        // dereferences at config_array[layer_idx]. The entries are VAs valid
+        // in GPU 0's own context — and this instruction is consumed exclusively
+        // by GPU 0 (compile_inner_p2p megakernel + persistent_worker).
+        let config_array =
+            self.gpu0_layer_config_ptrs.as_ptr() as *const *const std::ffi::c_void;
         crate::megakernel::instructions::MoeFfnRemoteInst::new(
             1, // grid_x — kernel uses cooperative full grid; irrelevant
             activation_p2p_dev_ptr,
             output_slot_p2p_dev_ptr,
             expert_ids_p2p,
             expert_weights_p2p,
-            cfg_ptr,
+            config_array,
+            layer_idx as u64,
             self.gpu0_local_activation.as_ptr() as *mut f32,
             self.gpu0_acc.as_ptr() as *mut f32,
             self.gpu0_scratch_gate.as_ptr() as *mut f32,

@@ -1349,7 +1349,14 @@ pub(crate) struct MoeFfnRemoteInst {
     pub output_slot_p2p: *mut f32,
     pub expert_ids: *const i32,
     pub expert_weights: *const f32,
-    pub config: *const std::ffi::c_void,
+    // bd 0hu3-b: per-context array of MoeWorkerConfig*, indexed by layer_idx
+    // INSIDE the kernel. Each consumer (GPU 0's compiled megakernel, each
+    // worker's mailbox-dispatch) sees its OWN VA pointing at its OWN array
+    // (whose entries are also valid VAs in that consumer's context).
+    // Mirrors the OP_MOE_DISPATCH layer_config_ptrs-as-array pattern. Replaces
+    // the prior `config: *const c_void` which baked a single producer-side VA
+    // into the shared instruction bytes (faulted when consumed cross-context).
+    pub config_array: *const *const std::ffi::c_void,
     pub local_activation: *mut f32,
     pub local_output: *mut f32,
     pub scratch_gate: *mut f32,
@@ -1364,7 +1371,11 @@ pub(crate) struct MoeFfnRemoteInst {
     // wait_ptr=null disables the acquire (used for non-prefill dispatches).
     pub wait_ptr: *const u32,
     pub wait_seq: u64,
-    pub _pad: [u64; 2],
+    // bd 0hu3-b: layer index into config_array (above). Resolved inside the
+    // kernel via config_array[layer_idx] so each consumer dereferences a VA
+    // that is valid in its own context.
+    pub layer_idx: u64,
+    pub _pad: [u64; 1],
 }
 assert_inst_size!(MoeFfnRemoteInst);
 impl_inst!(MoeFfnRemoteInst);
@@ -1378,7 +1389,8 @@ impl MoeFfnRemoteInst {
         output_slot_p2p: *mut f32,
         expert_ids: *const i32,
         expert_weights: *const f32,
-        config: *const std::ffi::c_void,
+        config_array: *const *const std::ffi::c_void,
+        layer_idx: u64,
         local_activation: *mut f32,
         local_output: *mut f32,
         scratch_gate: *mut f32,
@@ -1398,7 +1410,7 @@ impl MoeFfnRemoteInst {
             output_slot_p2p,
             expert_ids,
             expert_weights,
-            config,
+            config_array,
             local_activation,
             local_output,
             scratch_gate,
@@ -1409,7 +1421,8 @@ impl MoeFfnRemoteInst {
             flags,
             wait_ptr: std::ptr::null(),
             wait_seq: 0,
-            _pad: [0; 2],
+            layer_idx,
+            _pad: [0; 1],
         }
     }
 

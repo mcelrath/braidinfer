@@ -76,13 +76,9 @@ __device__ __forceinline__ void dispatch_opcode(
         return;
     }
 
-    // OP_MOE_DISPATCH PRE: zero GPU 0 output slot + run GPU 0 local experts.
-    // Manages its own grid.sync() internally.
-    if (opcode == OP_MOE_DISPATCH) {
-        op_moe_dispatch(inst, grid, gbs, watchdog);
-        OP_PROFILE_END(opcode, op_profile);
-        return;
-    }
+    // bd 0hu3-b: OP_MOE_DISPATCH retired. compile_inner_p2p now emits
+    // OP_MOE_FFN_REMOTE for GPU 0 (handled above), unifying the per-GPU
+    // MoE expert compute path. OP_MOE_DISPATCH_POST (sum step) is kept.
 
     // OP_MOE_DISPATCH_POST: sum output_slots across GPUs into final_output.
     if (opcode == OP_MOE_DISPATCH_POST) {

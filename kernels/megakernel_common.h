@@ -612,7 +612,11 @@ typedef struct {
     float* output_slot_p2p;          // GPU 0 VRAM, [hs] floats — this worker's slot in output_slots
     const int32_t* expert_ids;       // [k] global expert IDs (host-mapped or VRAM)
     const float* expert_weights;     // [k]
-    const void* config;              // worker-local VRAM, MoeWorkerConfig*
+    // bd 0hu3-b: per-context array of MoeWorkerConfig* indexed by layer_idx
+    // INSIDE the kernel. Each consumer dereferences config_array[layer_idx]
+    // through its own VA. Prior single-config-pointer design baked a producer-
+    // side VA into shared instruction bytes and faulted on cross-context use.
+    const void* const* config_array; // [num_layers] pointers to MoeWorkerConfig
     float* local_activation;         // worker VRAM, [gupd] — staging buffer for P2P-read
     float* local_output;             // worker VRAM, [gupd] — accumulator (sized hs since gupd<=hs)
     float* scratch_gate;             // worker VRAM, [max(eis, gupd)] — also reused for down output
@@ -626,7 +630,10 @@ typedef struct {
     // wait_ptr=0 disables (decode path).
     const uint32_t* wait_ptr;
     uint64_t wait_seq;
-    uint64_t _pad[2];
+    // bd 0hu3-b: index into config_array (above). Kernel reads
+    // config_array[layer_idx] to obtain its own per-context MoeWorkerConfig*.
+    uint64_t layer_idx;
+    uint64_t _pad[1];
 } MoeFfnRemoteInst;
 static_assert(sizeof(MoeFfnRemoteInst) == INST_SIZE_WORDS * 8, "MoeFfnRemoteInst size mismatch");
 static_assert(offsetof(MoeFfnRemoteInst, activation_p2p) == 8, "MoeFfnRemoteInst.activation_p2p offset");
