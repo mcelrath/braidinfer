@@ -349,19 +349,6 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     bool is_rnf4 = (cfg->weight_format == MOE_WEIGHT_FORMAT_RNF4G128);
     long long gate_up_row_stride = (long long)cfg->gate_up_row_stride;
 
-#ifdef BRAIDINFER_MOE_WORKER_DIAG
-    // bd 9gmh Phase 1 (udi msg #3456): print first 8 floats of act_p2p at kernel
-    // entry. If values are sane (match GPU 0's CPU-readable staging[t][0..8]):
-    // workers ARE reading correctly, bug is downstream in worker compute path.
-    // If zeros/NaN/stale: read IS stale, need different drain mechanism.
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        printf("WORKER_DIAG cfg=%u gupd=%d act[0..8]=%f %f %f %f %f %f %f %f\n",
-               cfg->my_gpu_id, gupd,
-               act_p2p[0], act_p2p[1], act_p2p[2], act_p2p[3],
-               act_p2p[4], act_p2p[5], act_p2p[6], act_p2p[7]);
-    }
-#endif
-
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
     coop_copy(la, act_p2p, gupd, grid, gbs);
 
@@ -406,50 +393,21 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
         coop_weighted_acc(lo, sg, w, gupd, grid, gbs);
     }
 
-    // 4. P2P-write accumulated output to GPU 0's output_slot.
+    // 4. Write accumulated output to local-VRAM out_p2p.
     //
-    // §11.4 HAZARD avoidance (Phase 0b braidinfer-pky.2 fix, 2026-05-12):
-    // coop_copy's trailing atomic_block_barrier would stall on
-    // s_waitcnt_vscnt here because the destination is GPU 0's output_slots
-    // (UC memory) — cross-GPU PCIe writes under multi-GPU pressure don't
-    // drain before the barrier's leading vscnt wait. Diagnosed via
-    // BRAIDINFER_P0B_DIAG=1: per-batch coop launches wedge at the next
-    // try_wait_acks_many after this barrier.
-    //
-    // The within-kernel barrier is redundant here: after op_moe_ffn_remote
-    // returns, dispatch_opcode returns (no trailing barrier on the
-    // OP_MOE_FFN_REMOTE non-dump path), then megakernel_f32 / persistent_worker's
-    // main loop. For Phase 0b's per-batch coop, kernel exit completes the
-    // dispatch — its AQL trailer fence handles cross-GPU visibility. For the
-    // persistent_worker path, the next mailbox iteration's batch-boundary
-    // buffer_gl1_inv (megakernel.hip:185) re-invalidates the writer-side L1.
-    //
-    // Strict invariant: every block must complete its writes before kernel
-    // exit. The cooperative kernel only retires when all blocks return,
-    // which guarantees the loop below has completed in every block. The
-    // __threadfence forces local VRAM stores (`lo`) to be visible at agent
-    // scope before any thread starts the cross-GPU copy.
+    // bd 9gmh Phase 1 fix (2026-05-24): the dispatch site (moe_forward.rs)
+    // passes worker-local local_output VRAM here, NOT a cross-GPU peer
+    // pointer. Host issues hipMemcpyAsync(D2H) on the worker's SDMA stream
+    // after ack to copy this into host-mapped output_slots. SDMA traffic
+    // class avoids the gfx11 MMHUB hazard that compute-engine cross-fabric
+    // writes triggered. __threadfence makes local stores visible at agent
+    // scope before the cooperative kernel retires; ack ordering downstream
+    // is handled by the SDMA copy on the worker's dedicated stream.
     __threadfence();
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;
          idx += gridDim.x * blockDim.x) {
         out_p2p[idx] = lo[idx];
     }
     __threadfence();
-#ifdef BRAIDINFER_MOE_WORKER_READBACK_FENCE
-    // Option (C) per udi #199/#236: PCIe non-posted read from GPU 0
-    // forces worker's prior posted writes to same target to complete
-    // before the read returns (PCIe §2.4 producer-consumer rule).
-    // bd 9gmh Phase 1 (2026-05-24): readback from EVERY block thread 0
-    // (not just block 0) — single-block readback didn't fix multi-token
-    // NaN. Broader coverage rules out per-block ordering issues.
-    if (threadIdx.x == 0) {
-        volatile float probe = out_p2p[0];
-        // Force the load to not be optimized out.
-        if (probe == 0.123456789f) {
-            // Impossible value; just anchors the compiler.
-            ((volatile float*)out_p2p)[0] = probe;
-        }
-    }
-#endif
 }
 

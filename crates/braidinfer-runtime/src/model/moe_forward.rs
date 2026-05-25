@@ -410,13 +410,6 @@ impl Model {
         prefill_hidden: &mut DeviceBuffer<f32>, // [n × hs]
         n: usize,
     ) -> HipResult<()> {
-        // DIAGNOSTIC bisection: if BRAIDINFER_MOE_NOOP=1, skip all MoE compute and return.
-        // If logits become non-NaN (just wrong-numbers), MoE function is the culprit.
-        // If logits still NaN, bug is upstream (attention/chunk).
-        if std::env::var("BRAIDINFER_MOE_NOOP").is_ok() {
-            let _ = (layer_idx, prefill_hidden, n);
-            return Ok(());
-        }
         use crate::megakernel::compile_common::{linear_proj_opcode_ptr, rmsnorm_opcode, div_ceil};
         use crate::megakernel::instructions::{
             D2dCopyInst, DotSigmoidScaleAddInst, LinearProjInst, MoeGateInst, NopInst,
@@ -530,18 +523,13 @@ impl Model {
             per_token_wts_dev,
             gpu0_zero_dev,
             gpu0_out_dev,
-            shared_scratch_dev,
             num_workers,
             num_gpus,
             worker_act_bases,
-            worker_out_bases,
         ) = {
             let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
-            // bd 9gmh Phase 1 (udi msg #3451): host-mapped portable_coherent staging
-            // (back to decode's working allocator class). Workers read via per-worker
-            // per-context device_ptr (activation_staging_dev_ptr_for(w)). Ordering
-            // between Step 1's D2D-copy producer and Step 2.5's worker consumer is
-            // forced by .with_signal() on the D2D-copy.
+            // Host-mapped portable_coherent staging. Workers read via per-worker
+            // per-context device_ptr (activation_staging_dev_ptr_for(w)).
             let act_staging_dev = p2p.activation_staging.as_ptr() as *mut f32;
             let per_token_ids_host = p2p.per_token_expert_ids.host_ptr();
             let per_token_wts_host = p2p.per_token_expert_weights.host_ptr();
@@ -549,20 +537,17 @@ impl Model {
             let per_token_wts_dev = p2p.per_token_expert_weights.as_mut_ptr();
             let gpu0_zero_dev = p2p.gpu0_zero_buffer.as_ptr();
             let gpu0_out_dev = p2p.output_slots_dev_ptrs[0];
-            let shared_scratch_dev = p2p.shared_expert_gate_scratch.as_mut_ptr();
             let num_workers = p2p.workers.len();
             let num_gpus = p2p.num_gpus;
             let worker_act_bases: Vec<*mut f32> = (0..num_workers)
                 .map(|w| p2p.activation_staging_dev_ptr_for(w)).collect();
-            let worker_out_bases: Vec<*mut f32> = (0..num_workers)
-                .map(|w| p2p.output_slots_dev_ptrs[w + 1]).collect();
             (
                 act_staging_dev,
                 per_token_ids_host, per_token_wts_host,
                 per_token_ids_dev, per_token_wts_dev,
-                gpu0_zero_dev, gpu0_out_dev, shared_scratch_dev,
+                gpu0_zero_dev, gpu0_out_dev,
                 num_workers, num_gpus,
-                worker_act_bases, worker_out_bases,
+                worker_act_bases,
             )
         };
 
@@ -659,25 +644,6 @@ impl Model {
         // (write a known constant to staging+output_slots tail end and check kernel-side
         // for corruption) and a single giant dispatch (vs per-token batches).
 
-        // DIAGNOSTIC: BRAIDINFER_MOE_NO_WORKERS=1 skips Step 2.5 worker dispatch,
-        // CPU-zeros worker output_slots (host-mapped UC) so Step 5 sum is just GPU 0's
-        // local expert output. If non-NaN, bug is in worker dispatch/output. If NaN,
-        // bug is in Step 3 or Step 5.
-        if std::env::var("BRAIDINFER_MOE_NO_WORKERS").is_ok() {
-            unsafe {
-                let p2p = self.moe_p2p.as_ref().unwrap();
-                let host = p2p.output_slots.host_ptr();
-                for t in 0..n {
-                    for g in 1..num_gpus {
-                        let off = (t * num_gpus + g) * hs;
-                        for i in 0..hs {
-                            std::ptr::write_volatile(host.add(off + i), 0.0f32);
-                        }
-                    }
-                }
-            }
-        } else {
-
         // === STEP 2.5: per-token worker dispatch via OP_MOE_FFN_REMOTE ===
         // Workers P2P-read from activation_staging via their per-context device pointers.
         // Routing IDs/weights are passed via the per-token activations.moe_expert_ids/_weights
@@ -757,76 +723,6 @@ impl Model {
                 }
             }
 
-            // bd 9gmh: cross-fabric drain via CPU read. Workers write to host-mapped
-            // UC output_slots[t,g] via PCIe; their persistent_worker ack writes are
-            // posted and may reach the host mailbox BEFORE the data writes commit to
-            // host DRAM. gfx11 has no producer-side drain primitive that reliably
-            // forces this. A CPU read from each worker-written slot pulls from the
-            // memory controller, which blocks until all in-flight posted writes to
-            // that DRAM page have committed (PCIe ordering: completer's response
-            // must reflect all prior accepted posted writes). Workers' next-step
-            // accesses (and GPU 0's Step 5 read) then see fresh data.
-            unsafe {
-                let outs = self.moe_p2p.as_ref().unwrap().output_slots.host_ptr();
-                for g in 1..num_gpus {
-                    let off = (t * num_gpus + g) * hs;
-                    // Read first f32 from each worker's slot. The volatile read
-                    // is what forces the drain, not the value — std::hint::black_box
-                    // anchors it against optimisation.
-                    let v = std::ptr::read_volatile(outs.add(off));
-                    std::hint::black_box(v);
-                }
-            }
-
-            // bd 9gmh probe: BRAIDINFER_MOE_ZERO_WORKER_OUT=1 — workers run as usual
-            // (dispatch + PCIe traffic happens), but after their writes commit we
-            // CPU-zero output_slots[t, 1..num_gpus]. Step 5 then reads zeros from
-            // the worker slots. Distinguishes "worker outputs corrupt" vs
-            // "side-effect of worker dispatch corrupts other state".
-            if std::env::var("BRAIDINFER_MOE_ZERO_WORKER_OUT").is_ok() {
-                unsafe {
-                    let outs = self.moe_p2p.as_ref().unwrap().output_slots.host_ptr();
-                    for g in 1..num_gpus {
-                        let off = (t * num_gpus + g) * hs;
-                        for i in 0..hs {
-                            std::ptr::write_volatile(outs.add(off + i), 0.0f32);
-                        }
-                    }
-                }
-            }
-
-            // bd 9gmh diagnostic (BRAIDINFER_MOE_CPU_DIAG=1, first 2 layers only):
-            // after workers ack for this token, read output_slots from host. Localizes:
-            // worker output is NaN → worker compute / staging read is broken; or
-            // worker output sane → worker dataflow OK, bug is Step 5's read.
-            // Also reads staging[t][0..8] for cross-check vs Step 1's DIAG.
-            if t < 2 && layer_idx < 2 && std::env::var("BRAIDINFER_MOE_CPU_DIAG").is_ok() {
-                unsafe {
-                    let p2p = self.moe_p2p.as_ref().unwrap();
-                    let stg = p2p.activation_staging.host_ptr().add(t * latent_size);
-                    let sv: Vec<f32> = (0..8).map(|i| std::ptr::read_volatile(stg.add(i))).collect();
-                    eprintln!("  CPU L{layer_idx} t={t} staging[0..8]={:.3?}", sv);
-                    let outs = p2p.output_slots.host_ptr();
-                    for g in 0..num_gpus {
-                        let off = (t * num_gpus + g) * hs;
-                        let ov: Vec<f32> = (0..8).map(|i| std::ptr::read_volatile(outs.add(off + i))).collect();
-                        let any_nan = ov.iter().any(|x| x.is_nan());
-                        eprintln!("  CPU L{layer_idx} t={t} out_slot[g={g}][0..8]={:.3?} nan={any_nan}", ov);
-                    }
-                }
-            }
-        }
-        } // end else { Step 2.5 }
-
-        // bd 9gmh Phase 1 timing-targeted experiment: sleep after Step 2.5 worker acks
-        // to test whether workers' output_slots PCIe writes need more time to drain
-        // through HDP. If this fixes 5/5 NaN, the bug is purely worker-side write drain.
-        if let Ok(us_str) = std::env::var("BRAIDINFER_MOE_SLEEP_US") {
-            if let Ok(us) = us_str.parse::<u64>() {
-                if us > 0 {
-                    std::thread::sleep(std::time::Duration::from_micros(us));
-                }
-            }
         }
 
         // === STEP 3: GPU 0 local expert compute via mailbox ===
@@ -899,29 +795,7 @@ impl Model {
             dispatch.dispatch_batch_slice(device_idx, &insts);
         }
 
-        // DIAGNOSTIC: BRAIDINFER_MOE_NO_STEP5=1 skips Step 5, leaves prefill_hidden unchanged.
-        if std::env::var("BRAIDINFER_MOE_NO_STEP5").is_ok() {
-            return Ok(());
-        }
         // === STEP 5: per-token sum + fc2 + shared expert + residual ===
-        // bd 9gmh diagnostic: read output_slots from host BEFORE Step 5 enters
-        // GPU 0 kernel. If values match Step 2.5 post-ack reads → Step 5 corrupts.
-        // If different → race between Step 3's GPU 0 writes / worker writes and
-        // Step 5's GPU 0 kernel reads.
-        if layer_idx < 2 && std::env::var("BRAIDINFER_MOE_CPU_DIAG").is_ok() {
-            unsafe {
-                let p2p = self.moe_p2p.as_ref().unwrap();
-                let outs = p2p.output_slots.host_ptr();
-                for tt in 0..n.min(2) {
-                    for g in 0..num_gpus {
-                        let off = (tt * num_gpus + g) * hs;
-                        let ov: Vec<f32> = (0..8).map(|i| std::ptr::read_volatile(outs.add(off + i))).collect();
-                        let any_nan = ov.iter().any(|x| x.is_nan());
-                        eprintln!("  PRE-S5 L{layer_idx} t={tt} out_slot[g={g}][0..8]={:.3?} nan={any_nan}", ov);
-                    }
-                }
-            }
-        }
         for t in 0..n {
             let mut insts: Vec<Instruction> = Vec::new();
             let token_input = unsafe { prefill_hidden.as_ptr().add(t * hs) };
@@ -942,9 +816,7 @@ impl Model {
                 ffn_down_dev, gpu0_zero_dev, hs as i32,
             ).into_inst());
             // Sum num_gpus output slots via expert_out as scratch + scale_add.
-            // bd 9gmh probe: BRAIDINFER_MOE_SUM_G0_ONLY=1 only sums g=0 (skip worker slots).
-            let sum_g_max = if std::env::var("BRAIDINFER_MOE_SUM_G0_ONLY").is_ok() { 1 } else { num_gpus };
-            for g in 0..sum_g_max {
+            for g in 0..num_gpus {
                 let slot_offset = (t * num_gpus + g) * hs;
                 let slot_src = unsafe { gpu0_out_dev.add(slot_offset) as *const f32 };
                 insts.push(D2dCopyInst::new(
@@ -968,8 +840,7 @@ impl Model {
                 ).into_inst());
             }
             // Shared expert (recompute normed from hidden).
-            let skip_shared = std::env::var("BRAIDINFER_MOE_NO_SHARED").is_ok();
-            if let Some(se_ptr) = shared_expert_ptr.filter(|_| !skip_shared) {
+            if let Some(se_ptr) = shared_expert_ptr {
                 let se = unsafe { &*se_ptr };
                 let (se_up_op, se_up_data) = linear_proj_opcode_ptr(&se.up_proj);
                 let (se_down_op, se_down_data) = linear_proj_opcode_ptr(&se.down_proj);
@@ -1005,8 +876,7 @@ impl Model {
                     hs as i32, se_is as i32, 0,
                 ).into_inst());
 
-                let skip_seg = std::env::var("BRAIDINFER_MOE_NO_SEG").is_ok();
-                if let Some(seg_ptr) = shared_expert_gate_ptr.filter(|_| !skip_seg) {
+                if let Some(seg_ptr) = shared_expert_gate_ptr {
                     // Fused OP_DOT_SIGMOID_SCALE_ADD: single-block kernel does
                     // dot + sigmoid + scale_add in one instruction with LDS broadcast
                     // of the sigmoid scale to all threads in the block. Replaces

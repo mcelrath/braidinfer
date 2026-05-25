@@ -32,17 +32,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BRAIDINFER_OP_PROFILE");
     let op_profile = env::var("BRAIDINFER_OP_PROFILE").is_ok();
 
-    // braidinfer-snl candidate fix (udi bridge #236): worker performs a volatile
-    // non-posted PCIe read from out_p2p[0] before returning from
-    // op_moe_ffn_remote. The PCIe §2.4 producer-consumer rule forces same-
-    // requester same-target writes to drain before the read returns, so the
-    // subsequent ack=seq is only visible to the host after output_slots have
-    // landed in HBM. DO NOT REMOVE until braidinfer-snl is closed.
-    println!("cargo:rerun-if-env-changed=BRAIDINFER_MOE_WORKER_READBACK_FENCE");
-    let moe_worker_readback_fence = env::var("BRAIDINFER_MOE_WORKER_READBACK_FENCE").is_ok();
-    println!("cargo:rerun-if-env-changed=BRAIDINFER_MOE_WORKER_DIAG");
-    let moe_worker_diag = env::var("BRAIDINFER_MOE_WORKER_DIAG").is_ok();
-
     // Compile each .hip kernel to a code object (.hsaco) for runtime loading.
     let kernels = [
         "rmsnorm",
@@ -98,12 +87,6 @@ fn main() {
         }
         if op_profile {
             hipcc_args.push("-DBRAIDINFER_OP_PROFILE".to_string());
-        }
-        if moe_worker_readback_fence {
-            hipcc_args.push("-DBRAIDINFER_MOE_WORKER_READBACK_FENCE".to_string());
-        }
-        if moe_worker_diag {
-            hipcc_args.push("-DBRAIDINFER_MOE_WORKER_DIAG".to_string());
         }
         hipcc_args.push("-o".to_string());
 
