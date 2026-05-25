@@ -481,8 +481,6 @@ impl Model {
 
         // Tracer: lazy-init from env vars. Borrows SDMA streams from PersistentDispatch
         // (owned there; destroyed in PersistentDispatch::Drop after workers exit).
-        // BRAIDINFER_DECODE_MIRROR=1 is a deprecated compat shim: if BRAIDINFER_TRACE is
-        // unset, construct with ProbeFilter::All. TODO Phase 5: consolidate env vars.
         if !self.tracer.enabled() {
             let dispatch = self
                 .persistent_workers
@@ -494,16 +492,7 @@ impl Model {
             for &dev in &worker_devices {
                 streams.push(dispatch.sdma_stream(dev.0 as usize));
             }
-            let tracer = if std::env::var("BRAIDINFER_TRACE").is_err()
-                && std::env::var("BRAIDINFER_DECODE_MIRROR").is_ok()
-            {
-                // Deprecated compat: BRAIDINFER_DECODE_MIRROR=1, BRAIDINFER_TRACE unset.
-                eprintln!("  tracer: BRAIDINFER_DECODE_MIRROR compat — ProbeFilter::All ({} streams)", streams.len());
-                crate::tracer::Tracer::with_filter_and_streams(streams, crate::tracer::ProbeFilter::All)
-            } else {
-                crate::tracer::Tracer::from_env(streams).map_err(ModelError::Hip)?
-            };
-            self.tracer = tracer;
+            self.tracer = crate::tracer::Tracer::from_env(streams).map_err(ModelError::Hip)?;
         }
         Ok(())
     }
