@@ -424,7 +424,7 @@ impl Model {
         let dist_refs: Vec<Option<&crate::weights::DistributedMoeWeights>> =
             self.distributed_moe.iter().map(|d| d.as_ref()).collect();
         let gate_up_in_dim = self.config.moe_latent_size.unwrap_or(hs);
-        let p2p = crate::moe_p2p::MoeP2pContext::init(
+        let mut p2p = crate::moe_p2p::MoeP2pContext::init(
             self.device,
             &worker_devices,
             hs,
@@ -441,7 +441,7 @@ impl Model {
         // P2P compile for num_gpus=1 to leave megakernel_multi_gpu_p2p
         // None.
         if !is_single_gpu {
-            let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
+            let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &mut p2p)
                 .map_err(ModelError::Hip)?;
             self.megakernel_multi_gpu_p2p = Some(mk_p2p);
         }
@@ -1467,38 +1467,25 @@ impl Model {
     /// starting with OP_MOE_DISPATCH_POST (sum), which runs only after this
     /// wait completes — guaranteeing all output_slots are populated and visible.
     fn dispatch_moe_workers_decode_async(&mut self, layer_idx: usize, gpu0_seq: Option<u32>) -> Result<(), ModelError> {
-        // Find the OP_MOE_DISPATCH instruction for this layer.
-        let mk = self.megakernel_multi_gpu_p2p.as_ref().unwrap();
-        let moe_inst_idx = mk.barrier_layer_map.iter()
-            .find(|&&(_, l)| l == layer_idx)
-            .map(|&(i, _)| i)
-            .expect("layer_idx not in barrier_layer_map");
-        let inst = &mk.instructions[moe_inst_idx];
-
-        // Decode MoeDispatchInst layout (see kernels/megakernel_moe_dispatch.hip header).
-        // words[2]=output_slots, [4]=expert_ids, [5]=expert_weights, [7]=(num_workers<<32)|hs,
-        // [8]=(layer_idx<<32)|k, [9]=(eis<<32)|has_gate, [10]=activation, [16]=gate_up_in_dim
-        let output_slots = inst.words[2] as *mut f32;
-        let expert_ids = inst.words[4] as *const i32;
-        let expert_weights = inst.words[5] as *const f32;
-        let hs = (inst.words[7] & 0xFFFFFFFF) as usize;
-        let k = (inst.words[8] & 0xFFFFFFFF) as usize;
-        let eis = (inst.words[9] >> 32) as usize;
-        let has_gate = (inst.words[9] & 0xFFFFFFFF) != 0;
-        // inst.words[10] holds act.normed.as_ptr() — cached GPU 0 VRAM.
-        // Workers previously P2P-read from there (cross-GPU peer-VRAM read
-        // of cached memory) which pressures GPU 0's L2 + PCIe non-posted
-        // path at 4+ GPUs (snl follow-up: ea bridge #242 mechanism).
-        // Workers now read from a per-worker device pointer to the
-        // host-mapped UC handoff buffer; the megakernel program stages
-        // `act.normed → moe_act_uc_handoff` via OP_D2D_COPY at MoE entry.
-        let _activation_cached = inst.words[10] as *const f32;
-        let mut gupd = inst.words[16] as usize;
-        if gupd == 0 { gupd = hs; }
-        // Standard MoE has gate→silu_mul; non-gated path uses relu_squared.
-        let relu_sq = !has_gate;
-
+        // bd 1hik: per-layer routing parameters are populated by
+        // `compile_multi_gpu_p2p` into `MoeP2pContext::decode_params[layer_idx]`
+        // from the same source of truth used to emit OP_MOE_DISPATCH. The
+        // CPU worker-dispatch path no longer reads raw `MoeDispatchInst`
+        // words — decoupling worker dispatch from the GPU-0 PRE opcode's
+        // wire layout (unblocks bd 0hu.3 option (b)).
         let p2p = self.moe_p2p.as_ref().expect("moe_p2p must be initialized for MoE decode");
+        let params = p2p.decode_params[layer_idx]
+            .as_ref()
+            .expect("decode_params not populated for MoE layer (compile_multi_gpu_p2p must run first)");
+        let output_slots = params.output_slots;
+        let expert_ids = params.expert_ids;
+        let expert_weights = params.expert_weights;
+        let hs = params.hs as usize;
+        let k = params.k as usize;
+        let eis = params.eis as usize;
+        let has_gate = params.has_gate_proj;
+        let gupd = if params.gupd == 0 { hs } else { params.gupd as usize };
+        let relu_sq = params.relu_sq;
         let num_gpus = p2p.num_gpus;
         let num_workers = p2p.workers.len();
         // Token index 0 for decode (single-token); per-worker output slot:

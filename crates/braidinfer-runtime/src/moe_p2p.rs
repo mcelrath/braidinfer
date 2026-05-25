@@ -71,6 +71,39 @@ pub struct MoeWorkerGpu {
     pub local_output: DeviceBuffer<f32>,
 }
 
+/// Per-MoE-layer routing parameters needed by the CPU worker-dispatch path
+/// (`dispatch_moe_workers_decode_async`). Populated at megakernel compile time
+/// from the same source-of-truth values (model config + DistributedMoeWeights +
+/// MoeP2pContext pointers) used to emit OP_MOE_DISPATCH — never read back from
+/// compiled instruction words, so the worker-dispatch path is decoupled from
+/// the GPU-0 PRE opcode's wire layout (bd 1hik).
+///
+/// All pointers reference activation buffers / shared P2P buffers whose device
+/// addresses are stable for the model's lifetime (allocated once at init).
+#[derive(Clone, Copy)]
+pub(crate) struct DecodeMoeParams {
+    /// `p2p.output_slots_dev_ptrs[0]` — base of [batch × num_gpus × hs] expert
+    /// output slot grid. Workers write per-(token, gpu) slots; POST sums them.
+    pub output_slots: *mut f32,
+    /// `act.moe_expert_ids` device pointer (populated each step by OP_MOE_GATE).
+    pub expert_ids: *const i32,
+    /// `act.moe_expert_weights` device pointer (populated each step by OP_MOE_GATE).
+    pub expert_weights: *const f32,
+    /// hidden_size (slot stride: output_slots[gpu_id * hs..gpu_id * hs + hs]).
+    pub hs: u32,
+    /// gate_up_in_dim (expert input dimension; equals hs for standard MoE,
+    /// `moe_latent_size` for Nemotron-H latent MoE).
+    pub gupd: u32,
+    /// num_active experts per token.
+    pub k: u32,
+    /// expert_intermediate_size.
+    pub eis: u32,
+    /// True for gated MoE (gate→silu_mul), false for non-gated (relu²).
+    pub has_gate_proj: bool,
+    /// Convenience: `!has_gate_proj` — non-gated path uses relu_squared.
+    pub relu_sq: bool,
+}
+
 /// GPU-native P2P MoE dispatch context.
 pub struct MoeP2pContext {
     /// Shared work queue in GART memory (MoeWorkItem fixed fields + activation_cache[gate_up_in_dim]).
@@ -187,6 +220,11 @@ pub struct MoeP2pContext {
     pub workers: Vec<MoeWorkerGpu>,
     pub num_gpus: usize,
     pub hidden_size: usize,
+    /// Per-layer MoE routing parameters consumed by the CPU worker-dispatch
+    /// path (`dispatch_moe_workers_decode_async`). `None` for non-MoE layers;
+    /// `Some(...)` populated by `compile_multi_gpu_p2p` from the same source
+    /// of truth used to emit OP_MOE_DISPATCH. Lookup is by `layer_idx`.
+    pub(crate) decode_params: Vec<Option<DecodeMoeParams>>,
 }
 
 /// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache[] tail.
@@ -536,6 +574,8 @@ impl MoeP2pContext {
             workers,
             num_gpus,
             hidden_size,
+            // bd 1hik: populated by compile_multi_gpu_p2p; None until then.
+            decode_params: vec![None; num_total_layers],
         })
     }
 

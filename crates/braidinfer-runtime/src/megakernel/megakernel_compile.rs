@@ -32,7 +32,7 @@ impl MegakernelProgram {
     /// No CPU involvement in the hot path; workers on GPUs 1-3 run moe_worker_kernel.
     pub fn compile_multi_gpu_p2p(
         model: &Model,
-        p2p: &crate::moe_p2p::MoeP2pContext,
+        p2p: &mut crate::moe_p2p::MoeP2pContext,
     ) -> HipResult<Self> {
         Self::compile_inner_p2p(model, p2p)
     }
@@ -1094,7 +1094,7 @@ impl MegakernelProgram {
     ///   - fc1_latent_proj (normed→moe_latent) is emitted before OP_MOE_DISPATCH
     ///   - OP_MOE_DISPATCH uses moe_latent as activation and writes to moe_latent
     ///   - fc2_latent_proj (moe_latent→ffn_down_stage) + residual_add are emitted after
-    fn compile_inner_p2p(model: &Model, p2p: &crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
+    fn compile_inner_p2p(model: &Model, p2p: &mut crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
         let mut prog = Self::compile_inner(model, false, true)?;
 
         let cfg = &model.config;
@@ -1202,6 +1202,23 @@ impl MegakernelProgram {
                 gate_up_in_dim: gupd as u64,
                 gpu0_acc: p2p.gpu0_acc.as_ptr() as u64,
             }.into_inst();
+
+            // bd 1hik: also populate the per-layer params table consumed by
+            // `dispatch_moe_workers_decode_async`. Same source of truth used
+            // above to emit MoeDispatchInst; the CPU worker-dispatch path
+            // no longer needs to read raw instruction words to recover these.
+            let has_gate_bool = moe.has_gate_proj;
+            p2p.decode_params[layer_idx] = Some(crate::moe_p2p::DecodeMoeParams {
+                output_slots: p2p.output_slots_dev_ptrs[0],
+                expert_ids: act.moe_expert_ids.as_ptr() as *const i32,
+                expert_weights: act.moe_expert_weights.as_ptr() as *const f32,
+                hs: hs as u32,
+                gupd: gupd as u32,
+                k: k as u32,
+                eis: eis as u32,
+                has_gate_proj: has_gate_bool,
+                relu_sq: !has_gate_bool,
+            });
         }
 
         // Pass 2: rebuild instruction stream to insert OP_MOE_DISPATCH_POST after every
