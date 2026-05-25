@@ -4,12 +4,10 @@ pub(crate) fn kernel_dir() -> PathBuf {
     PathBuf::from(env!("BRAIDINFER_KERNEL_DIR"))
 }
 
-mod kernel_dot_sigmoid;
 mod kernel_fused;
 mod kernel_matmul;
 mod kernel_norm;
 
-pub use kernel_dot_sigmoid::*;
 pub use kernel_fused::*;
 pub use kernel_matmul::*;
 pub use kernel_norm::*;
@@ -512,9 +510,6 @@ pub struct AllKernels {
     pub ffn_fused: FfnFusedKernel,
     pub ssm_update: SelectiveStateUpdateKernel,
     pub argmax: ArgmaxKernel,
-    pub moe_gate: MoeGateKernel,
-    pub moe_prefill: MoePrefillKernel,
-    pub dot_sigmoid_scale_add: DotSigmoidScaleAddKernel,
 }
 
 impl AllKernels {
@@ -538,9 +533,6 @@ impl AllKernels {
             ffn_fused: FfnFusedKernel::load(device)?,
             ssm_update: SelectiveStateUpdateKernel::load(device)?,
             argmax: ArgmaxKernel::load(device)?,
-            moe_gate: MoeGateKernel::load(device)?,
-            moe_prefill: MoePrefillKernel::load(device)?,
-            dot_sigmoid_scale_add: DotSigmoidScaleAddKernel::load(device)?,
         })
     }
 }

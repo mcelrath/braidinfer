@@ -54,11 +54,10 @@ fn main() {
         "gdn_recurrent_step_v2",
         "selective_state_update",
         "argmax",
-        "moe_gate",
-        "moe_prefill",
-        "dot_sigmoid_scale_add",
-        // megakernel.hsaco contains BOTH megakernel_f32 and persistent_worker
-        // entry points (zqw merge: kernels/megakernel.hip).
+        // megakernel.hsaco contains both unified opcode-dispatch entry points
+        // (kernels/megakernel.hip). Includes OP_MOE_GATE / OP_MOE_FFN /
+        // OP_DOT_SIGMOID_SCALE_ADD — the standalone one-shot kernels for these
+        // ops were retired by bd 174k (zero callers after MoE unification).
         "megakernel",
         "peer_copy",
         "deinterleave",
