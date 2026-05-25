@@ -593,19 +593,6 @@ impl Model {
         Ok(buf)
     }
 
-    /// Enable per-instruction activation dump on the paged megakernel.
-    /// Call BEFORE the first decode_step_paged of each run. Capacity = max number of
-    /// dump slots (one per OP per kernel-launch). For a 24-layer hybrid running 2 steps,
-    /// ~50-100 ops per launch × 2 launches → 200 slots is generous.
-    pub fn enable_paged_dump(&mut self, max_slots: i32) -> Result<(), ModelError> {
-        let Some(mk) = self.megakernel_paged.as_mut() else {
-            return Err(ModelError::MissingWeight(
-                "megakernel_paged not initialized — call decode_step_paged once first".into(),
-            ));
-        };
-        mk.enable_dump(max_slots).map_err(ModelError::Hip)
-    }
-
     /// Read the per-instruction dump from the paged megakernel.
     /// Returns Vec<(opcode, inst_idx, output_data)> in the order they were dumped.
     pub fn read_paged_dump(&self) -> Result<Vec<(u32, u32, Vec<f32>)>, ModelError> {

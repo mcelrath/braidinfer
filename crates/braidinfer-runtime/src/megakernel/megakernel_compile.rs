@@ -2,13 +2,11 @@
 //! Extracted from megakernel.rs for maintainability.
 
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use std::sync::Arc;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 
-// bd 9gmh Phase 1D: upload_program no longer called (placeholder allocs above)
 use super::instructions::*;
 use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
@@ -276,19 +274,13 @@ impl MegakernelProgram {
         instructions.push(HaltInst::new().into_inst());
 
         // Upload program to device
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
-        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
         let wd_state_dev = watchdog.register(device)?;
-        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
 
         Ok(MegakernelProgram {
             instructions,
-            device_program,
-            module: Arc::new(module),
             num_blocks,
-            shared_mem,
             device,
             embedding_inst_idx,
             _mrope_inst_indices: mrope_inst_indices,
@@ -322,9 +314,7 @@ impl MegakernelProgram {
             trace_probe_map,
             barrier_layer_map,
             multi_gpu_attn_boundaries,
-            flat_program,
             _watchdog: watchdog,
-            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -713,19 +703,13 @@ impl MegakernelProgram {
         instructions.push(Instruction::new(OP_HALT, 0));
 
         // Upload
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
-        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
         let wd_state_dev = watchdog.register(device)?;
-        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
 
         Ok(MegakernelProgram {
             instructions,
-            device_program,
-            module: Arc::new(module),
             num_blocks,
-            shared_mem,
             device,
             embedding_inst_idx,
             _mrope_inst_indices: Vec::new(),
@@ -753,9 +737,7 @@ impl MegakernelProgram {
             trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
-            flat_program,
             _watchdog: watchdog,
-            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -989,19 +971,13 @@ impl MegakernelProgram {
         }
         instructions.push(Instruction::new(OP_HALT, 0));
 
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
-        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
         let wd_state_dev = watchdog.register(device)?;
-        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
 
         Ok(MegakernelProgram {
             instructions,
-            device_program,
-            module,
             num_blocks,
-            shared_mem,
             device,
             embedding_inst_idx: 0,
             _mrope_inst_indices: Vec::new(),
@@ -1029,9 +1005,7 @@ impl MegakernelProgram {
             trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
-            flat_program,
             _watchdog: watchdog,
-            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }
@@ -1075,19 +1049,13 @@ impl MegakernelProgram {
             vs as i32, hs as i32, 0).into_inst());
         instructions.push(Instruction::new(OP_HALT, 0));
 
-        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
-        let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
         let wd_state_dev = watchdog.register(device)?;
-        let wd_dev_ptr = wd_state_dev as *mut std::ffi::c_void;
 
         Ok(MegakernelProgram {
             instructions,
-            device_program,
-            module,
             num_blocks,
-            shared_mem,
             device,
             embedding_inst_idx: 0,
             _mrope_inst_indices: Vec::new(),
@@ -1110,9 +1078,7 @@ impl MegakernelProgram {
             trace_probe_map: Vec::new(),
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
-            flat_program,
             _watchdog: watchdog,
-            wd_dev_ptr,
             _not_send: std::marker::PhantomData,
         })
     }

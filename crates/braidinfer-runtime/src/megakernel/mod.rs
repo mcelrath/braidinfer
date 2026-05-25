@@ -100,10 +100,7 @@ pub(crate) struct PrefillCacheState {
 /// For packed: switches opcode to OP_LINEAR_PROJ_RNF4/PCG32, sets u8 pointer.
 pub struct MegakernelProgram {
     pub(crate) instructions: Vec<Instruction>,
-    pub(crate) device_program: DeviceBuffer<u64>,
-    pub(crate) module: Arc<Module>,
     pub(crate) num_blocks: u32,
-    pub(crate) shared_mem: u32,
     pub(crate) device: DeviceId,
     // Indices of instructions that need per-step updates
     pub(crate) embedding_inst_idx: usize,
@@ -137,9 +134,6 @@ pub struct MegakernelProgram {
     pub(crate) multi_gpu_attn_boundaries: Vec<(usize, usize)>,
     // Prevent Send — contains raw GPU device pointers as u64
     pub(crate) _not_send: std::marker::PhantomData<*mut ()>,
-    /// Pre-allocated flat buffer for GPU uploads: instructions.len() * INST_SIZE u64s.
-    /// Avoids a Vec allocation per decode step.
-    pub(crate) flat_program: Vec<u64>,
     /// Map from instruction index → Probe emitted at that instruction (when
     /// dump_buffer is enabled). Populated at compile time by emit_attention_layer
     /// / compile_gdn_layer / compile_ffn / compile_embedding sites. Drained by
@@ -148,8 +142,6 @@ pub struct MegakernelProgram {
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,
-    /// Device pointer to WatchdogState (host-mapped, owned by watchdog). Passed to kernel.
-    pub(crate) wd_dev_ptr: *mut c_void,
 }
 
 /// One KV-write D2dCopy pair (K and V) for prefill chunk patching.
@@ -280,41 +272,6 @@ impl MegakernelProgram {
         self.num_blocks
     }
 
-    /// Enable per-instruction dump mode. Allocates GPU buffer and prepends
-    /// an OP_NOP header instruction encoding dump pointers (words[1-3]).
-    /// This avoids adding kernel args which would increase register pressure
-    /// and reduce the cooperative launch block limit.
-    pub fn enable_dump(&mut self, max_slots: i32) -> HipResult<()> {
-        const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
-        let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
-        self.dump_buffer = Some(DeviceBuffer::<u8>::alloc(self.device, buf_size)?);
-        let counter = MappedHostBuffer::<i32>::alloc(1)?;
-        unsafe { *counter.host_ptr() = 0i32; }
-        self.dump_counter = Some(counter);
-        self.dump_capacity = max_slots;
-
-        // Prepend OP_NOP header with dump pointers, re-upload program
-        let header = NopInst {
-            opcode_gridx: make_opcode_gridx(OP_NOP, 0),
-            dump_buf: self.dump_buffer.as_ref().unwrap().as_ptr(),
-            max_slots: max_slots as u64,
-            dump_counter: self.dump_counter.as_ref().unwrap().device_ptr(),
-            _pad: [0; 14],
-        }.into_inst();
-
-        let total_words = (1 + self.instructions.len()) * INST_SIZE;
-        let mut flat: Vec<u64> = Vec::with_capacity(total_words);
-        flat.extend_from_slice(&header.words);
-        for inst in &self.instructions {
-            flat.extend_from_slice(&inst.words);
-        }
-        let mut new_prog = DeviceBuffer::alloc(self.device, total_words)?;
-        new_prog.copy_from_host(&flat)?;
-        self.device_program = new_prog;
-
-        Ok(())
-    }
-
     /// Read dump results after execute. Returns Vec of (opcode, inst_idx, data).
     pub fn read_dump(&self, stream: &Stream) -> HipResult<Vec<(u32, u32, Vec<f32>)>> {
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
@@ -357,15 +314,12 @@ impl MegakernelProgram {
     }
 
     /// Enable per-instruction dump mode for the persistent worker path.
-    ///
-    /// Unlike `enable_dump` (which prepends a NOP header and rebuilds device_program
-    /// for the one-shot megakernel_f32 path), this variant ONLY allocates the VRAM
-    /// dump buffer and counter. The persistent_worker reads dump pointers from
-    /// `WorkerQueue.dump_base/count/capacity` (written by
+    /// Allocates the VRAM dump buffer + host-mapped counter. The persistent_worker
+    /// reads dump pointers from `WorkerQueue.dump_base/count/capacity` (written by
     /// `PersistentDispatch::set_trace_dump_ptrs`), not from a NOP header.
     ///
     /// Safe to call while the persistent worker is running because it does not
-    /// touch device_program or issue any HIP API that requires free CUs.
+    /// issue any HIP API that requires free CUs.
     pub fn enable_dump_persistent(&mut self, max_slots: i32) -> HipResult<()> {
         const DUMP_SLOT_BYTES: usize = 16 + 8192 * 4;
         let buf_size = max_slots as usize * DUMP_SLOT_BYTES;
@@ -379,15 +333,6 @@ impl MegakernelProgram {
 
     pub fn dump_active(&self) -> bool {
         self.dump_buffer.is_some()
-    }
-
-    pub fn disable_dump(&mut self) -> HipResult<()> {
-        self.dump_buffer = None;
-        self.dump_counter = None;
-        self.dump_capacity = 0;
-        // Rebuild device program without the NOP header
-        self.device_program = upload_program(self.device, &self.instructions)?;
-        Ok(())
     }
 
     /// Write dump results to a BTRC trace file compatible with compare_traces.py.
@@ -408,34 +353,8 @@ impl MegakernelProgram {
         Ok(())
     }
 
-    /// Execute the megakernel program.
-    pub fn execute(&self, stream: &Stream) -> HipResult<()> {
-        let func = self.module.get_function("megakernel_f32")?;
-        let mut prog_ptr: *const c_void = self.device_program.as_ptr().cast();
-        // When dump is active, device_program has an extra OP_NOP header instruction
-        let extra = if self.dump_buffer.is_some() { 1 } else { 0 };
-        let mut num_inst = (self.instructions.len() + extra) as i32;
-
-        let mut wd_ptr: *mut c_void = self.wd_dev_ptr;
-        let mut op_profile_ptr: *mut c_void = crate::op_profile::get_global() as *mut c_void;
-        let mut args: [*mut c_void; 4] = [
-            std::ptr::addr_of_mut!(prog_ptr).cast(),
-            std::ptr::addr_of_mut!(num_inst).cast(),
-            std::ptr::addr_of_mut!(wd_ptr).cast(),
-            std::ptr::addr_of_mut!(op_profile_ptr).cast(),
-        ];
-
-        func.launch_cooperative(
-            (self.num_blocks, 1, 1),
-            (256, 1, 1),
-            self.shared_mem,
-            stream,
-            &mut args,
-        )
-    }
-
     /// Route this program's instruction stream through the persistent worker
-    /// mailbox. Replaces execute(stream) under always-persistent.
+    /// mailbox.
     ///
     /// Worker must already be spawned on this program's device — caller
     /// (Model::prefill / decode_step_persistent) handles spawn ordering.
@@ -443,31 +362,21 @@ impl MegakernelProgram {
     /// and wait_acks each slice synchronously (no separate stream sync needed).
     ///
     /// Dump-buffer note: worker reads dump_base / dump_count from
-    /// WorkerQueueLayout (populated by PersistentDispatch::set_trace_dump_ptrs),
-    /// NOT from the instruction stream. No OP_NOP header is required even
-    /// when self.dump_buffer.is_some().
+    /// WorkerQueueLayout (populated by PersistentDispatch::set_trace_dump_ptrs).
     pub fn dispatch_via_worker(
         &mut self,
         dispatch: &mut crate::persistent_dispatch::PersistentDispatch,
         gpu_idx: usize,
     ) -> HipResult<()> {
         // persistent_worker exits on OP_HALT (kernels/megakernel.hip:231-237).
-        // Compiled prefill programs append OP_HALT for the legacy megakernel_f32
-        // entry; strip it so the worker stays alive for subsequent batches.
+        // Compiled prefill programs append OP_HALT historically; strip it so
+        // the worker stays alive for subsequent batches.
         let halt_idx = self.instructions.iter()
             .position(|inst| (inst.words[0] as u32) == OP_HALT)
             .unwrap_or(self.instructions.len());
         dispatch.dispatch_batch_slice(gpu_idx, &self.instructions[..halt_idx]);
         Ok(())
     }
-}
-
-/// Upload an instruction slice to a new device buffer.
-fn upload_program(device: DeviceId, instructions: &[Instruction]) -> HipResult<DeviceBuffer<u64>> {
-    let flat: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
-    let mut buf = DeviceBuffer::alloc(device, flat.len())?;
-    buf.copy_from_host(&flat)?;
-    Ok(buf)
 }
 
 pub fn opcode_name_str(op: u32) -> String {
