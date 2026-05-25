@@ -89,35 +89,11 @@ impl Model {
             .map(|p| linear_proj_opcode_ptr(unsafe { &*p }))
             .unwrap_or((0, std::ptr::null()));
 
-        // GPU 0 local expert routing (distributed MoE weights, per-format opcode).
-        let (
-            dist_weight_format,
-            gate_up_expert_stride,
-            down_expert_stride,
-            gate_up_row_stride,
-            gpu0_gate_up_base,
-            gpu0_down_base,
-            slot_map_owned,
-        ) = {
-            let dist = self.distributed_moe[layer_idx]
-                .as_ref()
-                .expect("distributed_moe not initialized for MoE prefill");
-            let slot_map: Vec<Option<usize>> = dist.expert_buffers[0].slot_map.clone();
-            (
-                dist.weight_format,
-                dist.gate_up_expert_stride,
-                dist.down_expert_stride,
-                dist.gate_up_row_stride,
-                dist.gpu0_gate_up_base,
-                dist.gpu0_down_base,
-                slot_map,
-            )
-        };
-        let expert_proj_op = match dist_weight_format {
-            crate::weights::WeightFormat::Rnf4G128 => crate::megakernel::OP_LINEAR_PROJ_RNF4,
-            crate::weights::WeightFormat::PcG32Q4 => crate::megakernel::OP_LINEAR_PROJ_PCG32,
-            crate::weights::WeightFormat::Bf16 => OP_LINEAR_PROJ,
-        };
+        // bd i7gl: GPU 0 expert iteration (gate_up_base, down_base, slot_map,
+        // expert_proj_op, weight_format, strides) is no longer destructured here
+        // — Step 3 dispatches OP_MOE_FFN_REMOTE which reads the per-layer
+        // MoeWorkerConfig from VRAM (built at MoeP2pContext::init from the same
+        // DistributedMoeWeights). Single source of truth, no Rust-side mirror.
 
         // Shared expert + shared-expert gate.
         let shared_expert_ptr: Option<*const crate::weights::DenseFfnWeights> =
@@ -376,74 +352,31 @@ impl Model {
 
         }
 
-        // === STEP 3: GPU 0 local expert compute via mailbox ===
-        // Per-token program: zero ffn_down (via D2D copy from pre-zeroed buffer),
-        // for each routed expert on GPU 0: gate/up projections + activation + down
-        // projection + weighted accumulate, then D2D ffn_down → output_slots[(t*num_gpus+0)*hs].
+        // === STEP 3: GPU 0 local expert compute via OP_MOE_FFN_REMOTE ===
+        // bd i7gl: unified with the peer-worker compute path. GPU 0 dispatches
+        // OP_MOE_FFN_REMOTE on its own persistent_worker with self-pointing
+        // activation_p2p (prefill_normed_dev) and output_slot_p2p (host-mapped
+        // output_slots[t,0]). The kernel (op_moe_ffn_remote, megakernel_moe.hip)
+        // iterates the k routed experts internally and skips any whose
+        // MoeWorkerConfig.entries[eid].gate_up_ptr is null (= not local to this
+        // GPU). On GPU 0 the layer's MoeWorkerConfig has all experts marked
+        // local (populated by bd 174k's distribute_moe_weights_from_ref with
+        // num_devices=1), so the in-kernel skip is a no-op.
         for t in 0..n {
-            let mut insts: Vec<Instruction> = Vec::new();
-            // Zero ffn_down (latent_size floats) via D2D copy from gpu0_zero_buffer.
-            insts.push(D2dCopyInst::new(
-                div_ceil(latent_size as u32, 256),
-                ffn_down_dev, gpu0_zero_dev, latent_size as i32,
-            ).into_inst());
-            // bd 9gmh Phase 1: Step 3 reads from VRAM prefill_moe_normed (same-GPU,
-            // local cached) instead of host-mapped activation_staging. Reading via
-            // host-mapped UC went through GART/PCIe → potential L0 staleness across
-            // layers; reading local VRAM uses standard same-GPU cache coherence which
-            // works correctly. The host-mapped staging is still needed for workers
-            // (Step 2.5 P2P read).
             let expert_input = unsafe { prefill_normed_dev.add(t * latent_size) as *const f32 };
-            for j in 0..k {
-                let eid = unsafe { *per_token_ids_host.add(t * MAX_ACTIVE_EXPERTS + j) } as usize;
-                let ew = unsafe { *per_token_wts_host.add(t * MAX_ACTIVE_EXPERTS + j) };
-                let slot = match slot_map_owned[eid] { Some(s) => s, None => continue };
-                let gu_ptr = unsafe { gpu0_gate_up_base.add(slot * gate_up_expert_stride) };
-                let dn_ptr = unsafe { gpu0_down_base.add(slot * down_expert_stride) };
-                if has_gate {
-                    let up_ptr = unsafe { gu_ptr.add(eis * gate_up_row_stride) };
-                    insts.push(LinearProjInst::new(
-                        expert_proj_op, eis as u32, expert_gate_dev, gu_ptr, expert_input,
-                        eis as i32, latent_size as i32, 0,
-                    ).into_inst());
-                    insts.push(LinearProjInst::new(
-                        expert_proj_op, eis as u32, expert_up_dev, up_ptr, expert_input,
-                        eis as i32, latent_size as i32, 0,
-                    ).into_inst());
-                    insts.push(SiluMulInst::new(
-                        div_ceil(eis as u32, 256),
-                        expert_act_dev, expert_gate_dev as *const f32,
-                        expert_up_dev as *const f32, eis as i32,
-                    ).into_inst());
-                } else {
-                    insts.push(LinearProjInst::new(
-                        expert_proj_op, eis as u32, expert_up_dev, gu_ptr, expert_input,
-                        eis as i32, latent_size as i32, 0,
-                    ).into_inst());
-                    insts.push(ReluSqInst::new(
-                        div_ceil(eis as u32, 256),
-                        expert_act_dev, expert_up_dev as *const f32, eis as i32,
-                    ).into_inst());
-                }
-                insts.push(LinearProjInst::new(
-                    expert_proj_op, latent_size as u32, expert_out_dev, dn_ptr,
-                    expert_act_dev as *const f32,
-                    latent_size as i32, eis as i32, 0,
-                ).into_inst());
-                insts.push(ScaleAddInst::new(
-                    div_ceil(latent_size as u32, 256),
-                    ffn_down_dev, expert_out_dev as *const f32, ew, latent_size as i32,
-                ).into_inst());
-            }
-            // D2D ffn_down → output_slots[(t * num_gpus + 0) * hs].
             let gpu0_out_slot = unsafe { gpu0_out_dev.add(t * num_gpus * hs) };
-            insts.push(D2dCopyInst::new(
-                div_ceil(latent_size as u32, 256),
-                gpu0_out_slot, ffn_down_dev as *const f32, latent_size as i32,
-            ).into_inst());
-
+            let ids = unsafe { per_token_ids_dev.add(t * MAX_ACTIVE_EXPERTS) as *const i32 };
+            let wts = unsafe { per_token_wts_dev.add(t * MAX_ACTIVE_EXPERTS) as *const f32 };
+            let p2p = self.moe_p2p.as_ref().unwrap();
+            let inst = p2p.build_ffn_remote_inst_gpu0(
+                layer_idx, expert_input, gpu0_out_slot, ids, wts,
+                k, eis, hs, latent_size, has_gate, !has_gate,
+                std::ptr::null(),
+                0,
+            );
+            let insts = std::slice::from_ref(&inst);
             let dispatch = self.persistent_workers.as_mut().unwrap();
-            dispatch.dispatch_batch_slice(device_idx, &insts);
+            dispatch.dispatch_batch_slice(device_idx, insts);
         }
 
         // === STEP 5: per-token sum + fc2 + shared expert + residual ===

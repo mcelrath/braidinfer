@@ -149,6 +149,16 @@ pub struct MoeP2pContext {
     /// per-expert coop_weighted_acc sites. Size = hidden_size (the slot
     /// stride; gupd ≤ hs).
     pub gpu0_acc: DeviceBuffer<f32>,
+    /// bd i7gl: GPU 0 local-activation buffer for self-dispatched OP_MOE_FFN_REMOTE.
+    /// Mirrors MoeWorkerGpu.local_activation but on GPU 0. Sized gate_up_in_dim
+    /// (= gupd). op_moe_ffn_remote's leading coop_copy stages the activation
+    /// from activation_p2p (which on GPU 0 self-points to prefill_normed_dev)
+    /// into this buffer before the per-expert GEMV loop.
+    pub gpu0_local_activation: DeviceBuffer<f32>,
+    /// bd i7gl: host-side copy of gpu0_layer_config_ptrs device values, so
+    /// CPU can read per-layer MoeWorkerConfig* without device→host copy
+    /// during per-token dispatch. Same pattern as MoeWorkerGpu.layer_config_ptrs_host.
+    pub gpu0_layer_config_ptrs_host: Vec<u64>,
     /// bd 9gmh Phase 1: host-mapped per-token expert routing populated by
     /// OP_MOE_GATE in moe_ffn_forward_prefill_batched Step 1. CPU reads
     /// directly to drive Step 2.5 worker dispatches and Step 3 GPU 0 local
@@ -331,6 +341,12 @@ impl MoeP2pContext {
         let mut gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
         // §11.4 HAZARD avoidance for op_moe_dispatch — see field doc.
         let mut gpu0_acc = DeviceBuffer::<f32>::alloc(gpu0, hidden_size)?;
+        // bd i7gl: GPU 0 local_activation for self-dispatched OP_MOE_FFN_REMOTE.
+        let mut gpu0_local_activation = DeviceBuffer::<f32>::alloc(gpu0, gate_up_in_dim)?;
+        // bd i7gl: host-side mirror of gpu0_layer_config_ptrs values for
+        // per-token dispatch (avoids device→host copy in hot path).
+        let mut gpu0_layer_config_ptrs_host = vec![0u64; num_total_layers];
+        gpu0_layer_config_ptrs.copy_to_host(&mut gpu0_layer_config_ptrs_host)?;
 
         // bd 9gmh Phase 1: per-token routing host-mapped buffers (CPU reads
         // directly to drive worker dispatch). MAX_ACTIVE_EXPERTS = 32 (per
@@ -510,6 +526,8 @@ impl MoeP2pContext {
             gpu0_scratch_up,
             gpu0_scratch_act,
             gpu0_acc,
+            gpu0_local_activation,
+            gpu0_layer_config_ptrs_host,
             per_token_expert_ids,
             per_token_expert_weights,
             step1_drain_sentinel,
@@ -577,6 +595,53 @@ impl MoeP2pContext {
             w.scratch_gate.as_ptr() as *mut f32,
             w.scratch_up.as_ptr() as *mut f32,
             w.scratch_act.as_ptr() as *mut f32,
+            k as u32,
+            eis as u32,
+            hs as u32,
+            gupd as u32,
+            has_gate_proj,
+            relu_sq,
+        )
+        .with_wait(wait_ptr, wait_seq)
+        .into_inst()
+    }
+
+    /// bd i7gl: build an OP_MOE_FFN_REMOTE instruction for self-dispatch on
+    /// GPU 0. Mirrors `build_ffn_remote_inst` but reads GPU-0-side scratch
+    /// buffers (gpu0_*) instead of a `workers[w]` entry. Used by prefill
+    /// Step 3 to unify GPU 0's expert compute with the peer-worker code path.
+    /// activation_p2p / output_slot_p2p self-point at GPU 0's own buffers
+    /// (prefill_normed_dev / output_slots[0]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_ffn_remote_inst_gpu0(
+        &self,
+        layer_idx: usize,
+        activation_p2p_dev_ptr: *const f32,
+        output_slot_p2p_dev_ptr: *mut f32,
+        expert_ids_p2p: *const i32,
+        expert_weights_p2p: *const f32,
+        k: usize,
+        eis: usize,
+        hs: usize,
+        gupd: usize,
+        has_gate_proj: bool,
+        relu_sq: bool,
+        wait_ptr: *const u32,
+        wait_seq: u64,
+    ) -> crate::megakernel::Instruction {
+        let cfg_ptr = self.gpu0_layer_config_ptrs_host[layer_idx] as *const std::ffi::c_void;
+        crate::megakernel::instructions::MoeFfnRemoteInst::new(
+            1, // grid_x — kernel uses cooperative full grid; irrelevant
+            activation_p2p_dev_ptr,
+            output_slot_p2p_dev_ptr,
+            expert_ids_p2p,
+            expert_weights_p2p,
+            cfg_ptr,
+            self.gpu0_local_activation.as_ptr() as *mut f32,
+            self.gpu0_acc.as_ptr() as *mut f32,
+            self.gpu0_scratch_gate.as_ptr() as *mut f32,
+            self.gpu0_scratch_up.as_ptr() as *mut f32,
+            self.gpu0_scratch_act.as_ptr() as *mut f32,
             k as u32,
             eis as u32,
             hs as u32,
