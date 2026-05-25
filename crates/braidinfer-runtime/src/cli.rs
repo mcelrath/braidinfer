@@ -1,7 +1,7 @@
 //! Shared CLI helpers used by the `generate` and `chat` binaries.
 //!
 //! Resolves model paths from the HuggingFace cache, queries VRAM, and applies
-//! the auto-detection rules for `MULTI_GPU` and `PERSISTENT`.
+//! the auto-detection rule for `MULTI_GPU`.
 
 use std::path::{Path, PathBuf};
 
@@ -197,13 +197,12 @@ pub fn bqnt_size_bytes(model_dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// Apply auto-detection for `MULTI_GPU` and `PERSISTENT` env vars based on
-/// model size vs single-GPU VRAM and MoE presence. Idempotent — only sets a
-/// var if the user did not. Emits a one-line stderr notice when it does.
+/// Apply auto-detection for `MULTI_GPU` based on model size vs single-GPU
+/// VRAM and MoE presence. Idempotent — only sets the var if the user did
+/// not. Emits a one-line stderr notice when it does.
 ///
-/// Returns `(multi_gpu, persistent)` so callers can branch without re-reading
-/// the env afterwards.
-pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
+/// Returns `multi_gpu` so callers can branch without re-reading the env.
+pub fn apply_auto_modes(model_dir: &Path) -> bool {
     let bqnt_size = bqnt_size_bytes(model_dir);
     let free_per_gpu = vram_free_per_gpu();
     let single_gpu_vram = free_per_gpu.first().copied().unwrap_or(0);
@@ -255,29 +254,18 @@ pub fn apply_auto_modes(model_dir: &Path) -> (bool, bool) {
         unsafe { std::env::set_var("MULTI_GPU", "1") };
     }
 
-    // PERSISTENT: always enabled (bd 9gmh Phase 3 retired PERSISTENT=0 path).
-    // All configurations — single-GPU dense, single-GPU MoE, multi-GPU,
-    // KV_QUANT=1, WEIGHT_QUANT=rnf4/mixed — are validated on the persistent
-    // cooperative megakernel path. Setting PERSISTENT=0 is now a no-op.
-    if std::env::var("PERSISTENT").as_deref() == Ok("0") {
-        eprintln!("Warning: PERSISTENT=0 is deprecated and has no effect. The persistent cooperative megakernel path is always used.");
-    } else if std::env::var("PERSISTENT").is_err() {
-        unsafe { std::env::set_var("PERSISTENT", "1") };
-    }
-    let persistent = true;
-
-    validate_env_combos(multi_gpu, persistent);
-    (multi_gpu, persistent)
+    validate_env_combos(multi_gpu);
+    multi_gpu
 }
 
 /// Reject combinations of env vars that are guaranteed to crash at runtime
 /// or load time. Surfacing these at startup (after MULTI_GPU is resolved)
 /// gives the user an immediate, actionable error instead of a panic or
 /// InvalidConfig after several seconds of model load.
-fn validate_env_combos(multi_gpu: bool, _persistent: bool) {
-    // KV_QUANT under PERSISTENT is supported (bd 9gmh: chunk-seal quantization
-    // routed via persistent worker mailbox in quantize_sealed_chunk_via_worker).
-    // Multi-GPU paged KV dispatch is still not implemented.
+fn validate_env_combos(multi_gpu: bool) {
+    // KV_QUANT chunk-seal quantization is routed via the persistent worker
+    // mailbox in quantize_sealed_chunk_via_worker. Multi-GPU paged KV dispatch
+    // is still not implemented.
     let kv_quant = std::env::var("KV_QUANT").as_deref() == Ok("1");
     if kv_quant && multi_gpu {
         eprintln!("Error: KV_QUANT=1 is not supported with MULTI_GPU=1");

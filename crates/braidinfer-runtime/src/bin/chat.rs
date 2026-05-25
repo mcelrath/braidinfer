@@ -41,7 +41,7 @@ async fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    let (multi_gpu, _persistent) = apply_auto_modes(model_dir);
+    let multi_gpu = apply_auto_modes(model_dir);
 
     if std::env::var("KV_QUANT").as_deref() == Ok("1") {
         eprintln!("KV_QUANT enabled (residual_pc int4)");

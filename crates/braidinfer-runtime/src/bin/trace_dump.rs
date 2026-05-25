@@ -65,7 +65,7 @@ fn main() {
         .unwrap_or(3);
 
     let resolved = resolve_model_arg(model_arg);
-    let (_multi_gpu, _persistent) = apply_auto_modes(&resolved.model_dir);
+    let _multi_gpu = apply_auto_modes(&resolved.model_dir);
 
     println!("trace_dump: model_dir={:?}", resolved.model_dir);
     println!("trace_dump: prompt={prompt:?} steps={num_steps}");

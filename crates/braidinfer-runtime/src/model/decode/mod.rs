@@ -396,16 +396,10 @@ impl Model {
         }
 
         // P2P megakernel is always initialized when has_moe && num_gpus > 1.
-        // For non-MoE multi-GPU models, this fallthrough would route to
-        // decode_step_paged → mk.execute(stream) → launch_cooperative on GPU 0,
-        // which deadlocks against the persistent_worker spawned at L330.
-        //
-        // This path was historically unreachable in production because
-        // enable_multi_gpu() at model_load.rs:1149 silently no-ops on !has_moe
-        // (the dense multi-GPU split path was never implemented). The cli.rs
-        // auto-rule now hard-errors on dense-too-big-for-one-GPU before reaching
-        // here. Belt-and-suspenders InvalidConfig in case a future load-rule
-        // change ever lets a non-MoE multi-GPU Model construct successfully.
+        // enable_multi_gpu() in model_load.rs silently no-ops on !has_moe;
+        // the cli.rs auto-rule hard-errors on dense-too-big-for-one-GPU before
+        // reaching here. Belt-and-suspenders InvalidConfig in case a future
+        // load-rule change ever lets a non-MoE multi-GPU Model construct.
         if self.megakernel_multi_gpu_p2p.is_none() {
             return Err(ModelError::InvalidConfig(
                 "decode_step_persistent_multi_gpu reached without an MoE-P2P \
@@ -1593,9 +1587,4 @@ impl Model {
     }
 
 
-    // bd 9gmh Phase 2F (2026-05-21): decode_step_paged, decode_step_paged_quantized,
-    // and decode_step_paged_inner deleted. KV_QUANT enablement is now wired into
-    // decode_step_persistent's lazy-init (gated on KV_QUANT=1 env var). The legacy
-    // non-persistent paged path (mk.execute → launch_cooperative + None-dispatch
-    // post_step_paged) is gone; decode_step (persistent mailbox) is the sole entry.
 }

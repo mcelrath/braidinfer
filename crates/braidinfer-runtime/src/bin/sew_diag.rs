@@ -53,8 +53,6 @@ fn main() {
         Path::new(&model_path).to_path_buf()
     };
 
-    // Set persistent BEFORE Model::load (it caches the env var at load time).
-    unsafe { std::env::set_var("PERSISTENT", "1") };
     let device = braidinfer_core::types::DeviceId(0);
     let mut model = Model::load(&p, device).expect("load model");
     let (nkh, hd, max_sl, has_moe) = {
@@ -64,7 +62,6 @@ fn main() {
     };
     if has_moe {
         unsafe { std::env::set_var("MULTI_GPU", "1") };
-        unsafe { std::env::set_var("PERSISTENT", "1") };
         model.enable_multi_gpu().expect("enable multi-gpu");
     }
 

@@ -38,7 +38,6 @@ fn test_persistent_paged_decode_smoke() {
         return;
     }
 
-    unsafe { std::env::set_var("PERSISTENT", "1") };
     unsafe { std::env::remove_var("KV_QUANT") };
 
     let mut model = Model::load(model_dir, device).expect("load model in persistent mode");

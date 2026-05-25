@@ -56,7 +56,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    let (multi_gpu, _persistent) = apply_auto_modes(model_dir);
+    let multi_gpu = apply_auto_modes(model_dir);
 
     let mut model =
         Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
