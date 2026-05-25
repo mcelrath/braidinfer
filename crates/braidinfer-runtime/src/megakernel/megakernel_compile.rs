@@ -1154,7 +1154,7 @@ impl MegakernelProgram {
                         // were copied.
                         prog.instructions[barrier_idx - 2] = D2dCopyInst::new(
                             div_ceil(hs as u32, 256),
-                            p2p.moe_act_uc_handoff_dev_ptrs[0],
+                            p2p.moe_act_uc_handoff.dev_ptr(0),
                             act.normed.as_ptr(),
                             hs as i32,
                         )
@@ -1185,7 +1185,7 @@ impl MegakernelProgram {
             prog.instructions[barrier_idx] = p2p.build_ffn_remote_inst_gpu0(
                 layer_idx,
                 activation_ptr,
-                p2p.output_slots_dev_ptrs[0] as *mut f32,
+                p2p.output_slots.dev_ptr(0) as *mut f32,
                 act.moe_expert_ids.as_ptr() as *const i32,
                 act.moe_expert_weights.as_ptr() as *const f32,
                 k,
@@ -1203,7 +1203,7 @@ impl MegakernelProgram {
             // no longer reads raw instruction words to recover these.
             let has_gate_bool = moe.has_gate_proj;
             p2p.decode_params[layer_idx] = Some(crate::moe_p2p::DecodeMoeParams {
-                output_slots: p2p.output_slots_dev_ptrs[0],
+                output_slots: p2p.output_slots.dev_ptr(0),
                 expert_ids: act.moe_expert_ids.as_ptr() as *const i32,
                 expert_weights: act.moe_expert_weights.as_ptr() as *const f32,
                 hs: hs as u32,
@@ -1252,7 +1252,7 @@ impl MegakernelProgram {
                         new_instructions.push(
                             D2dCopyInst::new(
                                 div_ceil(gupd_stage as u32, 256),
-                                p2p.moe_act_uc_handoff_dev_ptrs[0],
+                                p2p.moe_act_uc_handoff.dev_ptr(0),
                                 act.moe_latent.as_ptr(),
                                 gupd_stage as i32,
                             )
@@ -1295,7 +1295,7 @@ impl MegakernelProgram {
                     new_instructions.push(MoeDispatchInst {
                         opcode_gridx: OP_MOE_DISPATCH_POST as u64,
                         work_queue: p2p.work_queue.device_ptr() as u64,
-                        output_slots: p2p.output_slots_dev_ptrs[0] as u64,
+                        output_slots: p2p.output_slots.dev_ptr(0) as u64,
                         final_output: final_output_ptr,
                         expert_ids: act.moe_expert_ids.as_ptr() as u64,
                         expert_weights: act.moe_expert_weights.as_ptr() as u64,

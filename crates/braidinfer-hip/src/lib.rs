@@ -4,6 +4,7 @@ pub mod error;
 pub mod ffi;
 pub mod memory;
 pub mod module;
+pub mod staging;
 pub mod stream;
 
 pub use dev_ptr::{DevPtr, tags};
@@ -12,6 +13,7 @@ pub use error::{HipError, HipResult};
 pub use memory::{
     DeviceBuffer, MappedHostBuffer, PinnedBuffer, memcpy_d2d, memcpy_d2h, memcpy_h2d,
 };
+pub use staging::CrossGpuStaging;
 pub use stream::Stream;
 
 use braidinfer_core::types::DeviceId;

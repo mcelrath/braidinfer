@@ -23,6 +23,7 @@ use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
 use braidinfer_hip::device::DeviceGuard;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
+use braidinfer_hip::staging::CrossGpuStaging;
 
 use crate::quant::WeightFormat;
 use crate::weights::DistributedMoeWeights;
@@ -122,12 +123,13 @@ pub struct MoeP2pContext {
     /// reproduced the wedge across V0/V5 n=10 4-GPU trials. Workers still
     /// write cross-PCIe (now to host memory instead of peer VRAM); GPU 0's
     /// POST reads back through hipHostGetDevicePointer.
-    pub output_slots: MappedHostBuffer<f32>,
-    /// Per-GPU device pointer to `output_slots` (one per device, including
-    /// GPU 0). hipHostGetDevicePointer returns a device-context-specific
-    /// pointer; even with `hipHostMallocPortable` the address is valid
-    /// only for the GPU context that was current at the time of the call.
-    pub output_slots_dev_ptrs: Vec<*mut f32>,
+    ///
+    /// Owned as a [`CrossGpuStaging<f32>`]: the per-GPU device pointers are
+    /// resolved at construction and accessed via `.dev_ptr(gpu_idx)`. Indexing
+    /// convention: `gpu_idx == gpu_id` (slice order `[gpu0, worker0, worker1,
+    /// ...]` passed to `CrossGpuStaging::alloc`). `.host_ptr()` is the CPU
+    /// view used for CPU-side zero init and post-step readback.
+    pub output_slots: CrossGpuStaging<f32>,
     /// Host-mapped UC staging buffer for the MoE activation input
     /// (`act.normed` for standard MoE, `act.moe_latent` for Nemotron-H).
     ///
@@ -141,11 +143,11 @@ pub struct MoeP2pContext {
     /// cross-GPU peer path entirely.
     ///
     /// Sized `MAX_PREFILL_BATCH × hidden_size`. Decode uses only first hs.
-    pub moe_act_uc_handoff: MappedHostBuffer<f32>,
-    /// Per-GPU device pointer to `moe_act_uc_handoff`. Index 0 = GPU 0,
-    /// 1.. = workers in worker-index order. Same pattern as
-    /// `output_slots_dev_ptrs`.
-    pub moe_act_uc_handoff_dev_ptrs: Vec<*mut f32>,
+    ///
+    /// Owned as a [`CrossGpuStaging<f32>`]: indexing convention `gpu_idx ==
+    /// gpu_id` (slice order `[gpu0, worker0, worker1, ...]`), same as
+    /// [`Self::output_slots`].
+    pub moe_act_uc_handoff: CrossGpuStaging<f32>,
     /// GPU 0 per-layer config pointer array on GPU 0 VRAM: `MoeWorkerConfig*[num_layers]`.
     pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
     /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
@@ -155,13 +157,13 @@ pub struct MoeP2pContext {
     /// Workers P2P-read via per-worker device pointers in `activation_staging_dev_ptrs`.
     /// Replaces a former `DeviceBuffer<f32>::alloc_uncached(gpu0, ...)` which deadlocked
     /// when GPU 0's persistent_worker held all CUs (eh2).
-    pub activation_staging: MappedHostBuffer<f32>,
-    /// Per-worker device pointer to `activation_staging`. Indexed by worker_idx
-    /// (0 = first worker = GPU 1). Even with `hipHostMallocPortable`, the device
-    /// address returned by `hipHostGetDevicePointer` is valid only for the GPU
-    /// context that was current at the time of the call. We therefore retrieve
-    /// one device pointer per worker GPU at init time.
-    pub activation_staging_dev_ptrs: Vec<*mut f32>,
+    ///
+    /// Owned as a [`CrossGpuStaging<f32>`]: same `gpu_idx == gpu_id`
+    /// indexing as [`Self::output_slots`]. GPU 0's view is needed because
+    /// Step 1's D2D-copy stages prefill_normed into this buffer. Workers
+    /// use the [`Self::activation_staging_dev_ptr_for`] accessor (which
+    /// remaps worker_idx → gpu_id = worker_idx + 1).
+    pub activation_staging: CrossGpuStaging<f32>,
     /// bd 9gmh Phase 1 (udi msg #3440): GPU 0 VRAM UC staging — workers P2P-read this
     /// via the patched MTYPE_UC peer-VRAM mapping (kernel patch 0001 active in
     /// linux-p2p 7.0.9). Host-mapped portable_coherent is asymmetric on gfx1100
@@ -295,38 +297,24 @@ impl MoeP2pContext {
         // alloc_coherent (hipHostMallocCoherent) forces fine-grained UC on
         // BOTH CPU and GPU sides; alloc_portable may use MTYPE_NC (cached)
         // and would defeat the no-L2-staleness intent.
-        let output_slots = MappedHostBuffer::<f32>::alloc_portable_coherent(
+        // §11.4 cross-GPU staging buffers. Indexing convention `gpu_idx ==
+        // gpu_id`: slice order is `[gpu0, worker0, worker1, ...]`.
+        let mut gpu_id_devices: Vec<DeviceId> = Vec::with_capacity(num_gpus);
+        gpu_id_devices.push(gpu0);
+        gpu_id_devices.extend_from_slice(worker_devices);
+        let mut output_slots = CrossGpuStaging::<f32>::alloc(
             MAX_PREFILL_BATCH * num_gpus * hidden_size,
+            &gpu_id_devices,
         )?;
-        let mut output_slots_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_gpus);
-        // GPU 0 first.
-        let mut gpu0_output_slots_dev: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                &mut gpu0_output_slots_dev,
-                output_slots.host_ptr() as *mut std::ffi::c_void,
-                0,
-            ))?;
-        }
-        output_slots_dev_ptrs.push(gpu0_output_slots_dev as *mut f32);
 
         // Input-side companion (snl 2026-05-15): host-mapped UC for the
         // MoE activation handoff. Sized for max prefill batch × hidden_size
         // (decode uses first hs only). Same allocator + per-GPU dev-ptr
         // pattern as output_slots.
-        let moe_act_uc_handoff = MappedHostBuffer::<f32>::alloc_portable_coherent(
+        let mut moe_act_uc_handoff = CrossGpuStaging::<f32>::alloc(
             MAX_PREFILL_BATCH * hidden_size,
+            &gpu_id_devices,
         )?;
-        let mut moe_act_uc_handoff_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_gpus);
-        let mut gpu0_handoff_dev: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                &mut gpu0_handoff_dev,
-                moe_act_uc_handoff.host_ptr() as *mut std::ffi::c_void,
-                0,
-            ))?;
-        }
-        moe_act_uc_handoff_dev_ptrs.push(gpu0_handoff_dev as *mut f32);
 
 
         let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
@@ -365,7 +353,14 @@ impl MoeP2pContext {
         // leave worker writes stuck in GPU 0's L2 (per udi 2026-05-22). Replaces
         // a prior SDMA-D2H-from-VRAM design that was non-deterministically reading
         // stale VRAM dirtied at L2.
-        let activation_staging = MappedHostBuffer::<f32>::alloc_portable_coherent(MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // Indexing convention `gpu_idx == gpu_id`: GPU 0 D2D-copies into
+        // `.dev_ptr(0)`, worker `w` P2P-reads via `.dev_ptr(w + 1)`. The
+        // worker-side accessor `activation_staging_dev_ptr_for(worker_idx)`
+        // returns `.dev_ptr(worker_idx + 1)`.
+        let mut activation_staging = CrossGpuStaging::<f32>::alloc(
+            MAX_PREFILL_BATCH * gate_up_in_dim,
+            &gpu_id_devices,
+        )?;
         // bd 9gmh Phase 1: GPU 0 VRAM staging — destination for Step 1's final D2D-copy.
         // Workers P2P-read; kernel patch 0001 forces MTYPE_UC for the peer-VRAM mapping
         // so worker reads bypass GPU 0's L2. Local alloc is cached (default) — fast
@@ -425,11 +420,11 @@ impl MoeP2pContext {
         gpu0_scratch_act.copy_from_host(&zeros_big[..expert_intermediate_size])?;
         gpu0_acc.copy_from_host(&zeros_big[..hidden_size])?;
         shared_expert_gate_scratch.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * 32])?;
-        // Also zero host-mapped UC buffers via CPU writes (host_ptr is direct VA).
+        // Zero host-mapped UC buffers via CPU writes.
+        output_slots.zero();
+        moe_act_uc_handoff.zero();
+        activation_staging.zero();
         unsafe {
-            std::ptr::write_bytes(output_slots.host_ptr(), 0, MAX_PREFILL_BATCH * num_gpus * hidden_size);
-            std::ptr::write_bytes(activation_staging.host_ptr(), 0, MAX_PREFILL_BATCH * gate_up_in_dim);
-            std::ptr::write_bytes(moe_act_uc_handoff.host_ptr(), 0, MAX_PREFILL_BATCH * hidden_size);
             std::ptr::write_bytes(per_token_expert_ids.host_ptr(), 0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS);
             std::ptr::write_bytes(per_token_expert_weights.host_ptr(), 0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS);
         }
@@ -441,48 +436,19 @@ impl MoeP2pContext {
         let _ = shared_mem;
         let _ = kernel_dir;
         let mut workers = Vec::with_capacity(num_workers);
-        let mut activation_staging_dev_ptrs: Vec<*mut f32> = Vec::with_capacity(num_workers);
         for (w_idx, &device) in worker_devices.iter().enumerate() {
             let gpu_id = (w_idx + 1) as u32;
             let _worker_guard = DeviceGuard::switch_to(device)?;
-            // Get a worker-specific device pointer to the portable host-mapped
-            // activation_staging. Even with `hipHostMallocPortable`, AMD ROCm
-            // requires this call from each GPU's context to obtain a valid
-            // device address for that GPU; the device pointer from a different
-            // context can page-fault on access.
-            let mut act_dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            unsafe {
-                braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                    &mut act_dev_ptr,
-                    activation_staging.host_ptr() as *mut std::ffi::c_void,
-                    0,
-                ))?;
-            }
-            activation_staging_dev_ptrs.push(act_dev_ptr as *mut f32);
-            // Per-worker device pointer to output_slots (snl §11.4 fix).
-            let mut out_dev_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            unsafe {
-                braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                    &mut out_dev_ptr,
-                    output_slots.host_ptr() as *mut std::ffi::c_void,
-                    0,
-                ))?;
-            }
-            output_slots_dev_ptrs.push(out_dev_ptr as *mut f32);
-            // Per-worker device pointer to the MoE activation handoff buffer
-            // (snl input-side fix, follow-up to output_slots).
-            let mut handoff_dev: *mut std::ffi::c_void = std::ptr::null_mut();
-            unsafe {
-                braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                    &mut handoff_dev,
-                    moe_act_uc_handoff.host_ptr() as *mut std::ffi::c_void,
-                    0,
-                ))?;
-            }
-            moe_act_uc_handoff_dev_ptrs.push(handoff_dev as *mut f32);
+            // Per-worker peer-views resolved by CrossGpuStaging::alloc above.
+            // gpu_id indexing: output_slots/moe_act_uc_handoff use slice
+            // `[gpu0, worker0, ...]` (so `gpu_id` directly). activation_staging
+            // uses `worker_devices` only (so `w_idx`).
+            let act_dev_ptr = activation_staging.dev_ptr(gpu_id as usize) as *mut std::ffi::c_void;
+            let out_dev_ptr = output_slots.dev_ptr(gpu_id as usize) as *mut std::ffi::c_void;
+            let handoff_dev = moe_act_uc_handoff.dev_ptr(gpu_id as usize) as *mut std::ffi::c_void;
 
             // §11.18 (d-buffers) per udi #2619: peer-side UTCL2 TLB warm-up.
-            // hipHostGetDevicePointer above only resolves the peer's virtual
+            // hipHostGetDevicePointer only resolves the peer's virtual
             // address for the GART page; per §11.18 L1900-1904 the GPU VA TLB
             // entry is committed in this peer's UTCL2 ONLY on first touch. A
             // 4-byte D2H read via hipMemcpy from each peer-view dev_ptr forces
@@ -549,16 +515,13 @@ impl MoeP2pContext {
         }
 
         Ok(MoeP2pContext {
-            output_slots_dev_ptrs,
             moe_act_uc_handoff,
-            moe_act_uc_handoff_dev_ptrs,
             work_queue,
             seq_counter,
             output_slots,
             gpu0_layer_config_ptrs,
             _gpu0_config_storage: gpu0_config_storage,
             activation_staging,
-            activation_staging_dev_ptrs,
             activation_staging_vram,
             gpu0_scratch_gate,
             gpu0_scratch_up,
@@ -583,7 +546,8 @@ impl MoeP2pContext {
     /// Use this when building OP_MOE_FFN_REMOTE for `worker_idx` (0-based —
     /// 0 = GPU 1). See field doc on `activation_staging_dev_ptrs`.
     pub fn activation_staging_dev_ptr_for(&self, worker_idx: usize) -> *mut f32 {
-        self.activation_staging_dev_ptrs[worker_idx]
+        // worker_idx 0 = GPU 1 (gpu_id 1) under gpu_idx == gpu_id convention.
+        self.activation_staging.dev_ptr(worker_idx + 1)
     }
 
     /// Worker's local_output VRAM pointer (worker-local addressable).

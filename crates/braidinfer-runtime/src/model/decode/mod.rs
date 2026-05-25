@@ -546,7 +546,7 @@ impl Model {
                 if let Some(b) = w.attn_k.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_k")); }
                 if let Some(b) = w.attn_v.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_v")); }
                 if let Some(b) = w.attn_gate.as_ref()   { dev(b, &format!("workers[{gpu_i}].attn_gate")); }
-                if let Some(b) = w.attn_out.as_ref()    { host(b, &format!("workers[{gpu_i}].attn_out")); }
+                if let Some(b) = w.attn_out.as_ref()    { host(b.host(), &format!("workers[{gpu_i}].attn_out")); }
                 for (i, kv) in w.attn_kv_caches.iter().enumerate() {
                     if i < 2 {
                         dev(&kv.k, &format!("workers[{gpu_i}].attn_kv_caches[{i}].k"));
@@ -561,8 +561,8 @@ impl Model {
 
         if let Some(p2p) = self.moe_p2p.as_ref() {
             eprintln!("-- moe_p2p --");
-            host(&p2p.output_slots, "moe_p2p.output_slots");
-            host(&p2p.activation_staging, "moe_p2p.activation_staging");
+            host(p2p.output_slots.host(), "moe_p2p.output_slots");
+            host(p2p.activation_staging.host(), "moe_p2p.activation_staging");
         }
         eprintln!("=== end MTYPE audit ===");
     }
@@ -1498,7 +1498,7 @@ impl Model {
             let gpu_id = w + 1;
             let out_slot = unsafe { output_slots.add(gpu_id * hs) };
             // Per-worker device pointer to the host-mapped activation handoff.
-            let activation = p2p.moe_act_uc_handoff_dev_ptrs[gpu_id] as *const f32;
+            let activation = p2p.moe_act_uc_handoff.dev_ptr(gpu_id) as *const f32;
             // bd el1f: decode is single-token; the multi-token Step 1 drain
             // race doesn't apply, so wait_ptr=null (no acquire). The decode
             // path uses OP_MOE_DISPATCH (megakernel-internal) which handles

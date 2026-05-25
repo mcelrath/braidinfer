@@ -124,13 +124,13 @@ impl Model {
             let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
             // Host-mapped portable_coherent staging. Workers read via per-worker
             // per-context device_ptr (activation_staging_dev_ptr_for(w)).
-            let act_staging_dev = p2p.activation_staging.as_ptr() as *mut f32;
+            let act_staging_dev = p2p.activation_staging.dev_ptr(0);
             let per_token_ids_host = p2p.per_token_expert_ids.host_ptr();
             let per_token_wts_host = p2p.per_token_expert_weights.host_ptr();
             let per_token_ids_dev = p2p.per_token_expert_ids.as_mut_ptr();
             let per_token_wts_dev = p2p.per_token_expert_weights.as_mut_ptr();
             let gpu0_zero_dev = p2p.gpu0_zero_buffer.as_ptr();
-            let gpu0_out_dev = p2p.output_slots_dev_ptrs[0];
+            let gpu0_out_dev = p2p.output_slots.dev_ptr(0);
             let num_workers = p2p.workers.len();
             let num_gpus = p2p.num_gpus;
             let worker_act_bases: Vec<*mut f32> = (0..num_workers)

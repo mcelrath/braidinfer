@@ -4,6 +4,7 @@ use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::{Device, DeviceGuard};
 use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
+use braidinfer_hip::staging::CrossGpuStaging;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{HipResult, ffi};
 
@@ -69,7 +70,13 @@ pub struct GpuWorker {
     // these into local VRAM UC and GPU 0 peer-read via D2D_COPY, which on
     // gfx1100 under PCIe pressure at 4+ GPU wedges MES. Routing through
     // host-mapped portable+coherent eliminates the cross-GPU peer-read.
-    pub attn_out: Option<braidinfer_hip::memory::MappedHostBuffer<f32>>, // [local_nqh * head_dim]
+    /// Owned as a [`CrossGpuStaging<f32>`]: per-iteration `devices` slice is
+    /// `[worker.device, DeviceId(0)]`, so `.dev_ptr(0)` = worker self-view,
+    /// `.dev_ptr(1)` = GPU 0 gather-side view. The cached `attn_out_dev_self`
+    /// / `attn_out_dev_gpu0` raw-pointer fields are kept as hot-path
+    /// pre-resolved aliases so downstream consumers don't need to revisit the
+    /// staging object per decode step.
+    pub attn_out: Option<CrossGpuStaging<f32>>, // [local_nqh * head_dim]
     pub attn_out_dev_self: Option<*mut f32>,
     pub attn_out_dev_gpu0: Option<*mut f32>,
     // Distributed QKV projection buffers (allocated by init_split_attn_weights)
@@ -244,35 +251,19 @@ impl MultiGpuContext {
             // the prior worker-VRAM UC peer-read which triggered the §11.4
             // class wedge under PCIe pressure at 4+ GPU.
             {
-                let buf = braidinfer_hip::memory::MappedHostBuffer::<f32>::alloc_portable_coherent(
+                // Per-iteration staging: `[worker.device, GPU 0]`. Indexing is
+                // local to this slice — `.dev_ptr(0)` is the worker self-view,
+                // `.dev_ptr(1)` is the GPU 0 gather-side view. The hot-path
+                // pre-resolved aliases below mirror the original API.
+                let buf = CrossGpuStaging::<f32>::alloc(
                     local_nqh * head_dim,
+                    &[worker.device, DeviceId(0)],
                 )?;
-                // Worker-side dev pointer (current context is worker.device).
-                let mut self_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-                unsafe {
-                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                        &mut self_ptr,
-                        buf.host_ptr() as *mut std::ffi::c_void,
-                        0,
-                    ))?;
-                }
-                // GPU 0-side dev pointer. Inner DeviceGuard switches to GPU 0
-                // and restores back to worker.device when it drops at end of
-                // this block.
-                let mut gpu0_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-                {
-                    let _g0 = DeviceGuard::switch_to(DeviceId(0))?;
-                    unsafe {
-                        braidinfer_hip::error::check(braidinfer_hip::ffi::hipHostGetDevicePointer(
-                            &mut gpu0_ptr,
-                            buf.host_ptr() as *mut std::ffi::c_void,
-                            0,
-                        ))?;
-                    }
-                }
+                let self_ptr = buf.dev_ptr(0);
+                let gpu0_ptr = buf.dev_ptr(1);
                 worker.attn_out = Some(buf);
-                worker.attn_out_dev_self = Some(self_ptr as *mut f32);
-                worker.attn_out_dev_gpu0 = Some(gpu0_ptr as *mut f32);
+                worker.attn_out_dev_self = Some(self_ptr);
+                worker.attn_out_dev_gpu0 = Some(gpu0_ptr);
             }
             // Distributed QKV projection activation buffers
             worker.attn_normed = Some(DeviceBuffer::<f32>::alloc(worker.device, hidden_size)?);
