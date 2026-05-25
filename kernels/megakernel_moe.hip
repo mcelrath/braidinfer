@@ -349,6 +349,22 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     bool is_rnf4 = (cfg->weight_format == MOE_WEIGHT_FORMAT_RNF4G128);
     long long gate_up_row_stride = (long long)cfg->gate_up_row_stride;
 
+    // bd el1f: acquire-load Step 1 drain sentinel before any P2P read of
+    // act_p2p. Pair with Rust dispatch's with_signal(seq=layer_idx+1) on
+    // the multi-block D2D-copy that ends Step 1. Same pattern as op_d2d_copy
+    // wait_ptr at megakernel_ops.hip:1736-1745. wait_ptr=null disables (decode
+    // path, where the multi-token race doesn't apply).
+    if (i->wait_ptr != nullptr) {
+        if (threadIdx.x == 0) {
+            while (__atomic_load_n(
+                       (volatile unsigned int*)i->wait_ptr,
+                       __ATOMIC_ACQUIRE) != (unsigned int)i->wait_seq) {
+                /* spin */
+            }
+        }
+        __syncthreads();
+    }
+
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
     coop_copy(la, act_p2p, gupd, grid, gbs);
 

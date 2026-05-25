@@ -621,7 +621,12 @@ typedef struct {
     int64_t k_eis;                   // low 32: k, high 32: eis
     int64_t hs_gupd;                 // low 32: hs, high 32: gupd
     int64_t flags;                   // bit0=has_gate, bit1=relu_sq (else silu*up)
-    uint64_t _pad[4];
+    // bd el1f: acquire-side of Step 1 → Step 2.5 drain barrier. Worker
+    // acquire-spins on *wait_ptr == wait_seq before reading activation_p2p.
+    // wait_ptr=0 disables (decode path).
+    const uint32_t* wait_ptr;
+    uint64_t wait_seq;
+    uint64_t _pad[2];
 } MoeFfnRemoteInst;
 static_assert(sizeof(MoeFfnRemoteInst) == INST_SIZE_WORDS * 8, "MoeFfnRemoteInst size mismatch");
 static_assert(offsetof(MoeFfnRemoteInst, activation_p2p) == 8, "MoeFfnRemoteInst.activation_p2p offset");

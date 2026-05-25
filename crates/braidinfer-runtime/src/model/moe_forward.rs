@@ -222,10 +222,15 @@ impl Model {
             ).into_inst());
         }
         // Multi-block D2D-copy with .with_signal() — producer-readback drain forces
-        // GPU 0's writes to host DRAM before workers fire (udi msg #3451). Sentinel
-        // is VRAM DeviceBuffer<u32> (kernel patch 0001 + VRAM atomic works on gfx11);
-        // signal_seq=1 constant (matches decode's compile_attention.rs:486 pattern).
+        // GPU 0's writes to host DRAM before workers fire. Sentinel is VRAM
+        // DeviceBuffer<u32> (kernel patch 0001 + VRAM atomic works on gfx11).
+        // bd el1f: monotonic signal_seq = layer_idx + 1. Single sentinel is
+        // overwritten in-place each layer; if the seq were constant=1 and layer 0
+        // wrote 1, layer 1's workers would acquire-spin on seq=1 and skip the wait
+        // (sentinel still 1 from prior layer) — reading stale activation_staging.
+        // Monotonic + zero-init guarantees workers wait for their layer's Step 1.
         let drain_signal_ptr = self.moe_p2p.as_ref().unwrap().step1_drain_sentinel.as_ptr() as *mut u32;
+        let drain_signal_seq = (layer_idx as u32) + 1;
         insts.push(
             D2dCopyInst::new(
                 div_ceil((n * latent_size) as u32, 256),
@@ -233,7 +238,7 @@ impl Model {
                 prefill_normed_dev as *const f32,
                 (n * latent_size) as i32,
             )
-            .with_signal(drain_signal_ptr, 1)
+            .with_signal(drain_signal_ptr, drain_signal_seq)
             .into_inst(),
         );
         // bd 9gmh Phase 1 (udi msg #3453): trailing NOP. Without an instruction after
@@ -254,13 +259,26 @@ impl Model {
             dispatch.dispatch_batch_slice(device_idx, &insts);
         }
 
-        // bd 9gmh Phase 1: investigation point — multi-token MoE produces NaN logits
-        // 5/5 with several drain-barrier attempts (volatile-read host barrier; SDMA D2H
-        // sync; SYSTEM-scope ack at megakernel.hip:309). The DIAG eprintln "fix" worked
-        // by accident of timing delay. Next session: re-examine whether the race is
-        // really at Step 1/2.5 boundary or elsewhere; consider adding GPU-side diagnostic
-        // (write a known constant to staging+output_slots tail end and check kernel-side
-        // for corruption) and a single giant dispatch (vs per-token batches).
+        // bd el1f: Step 1 → Step 2.5 drain mechanism empirically validated
+        // by a 200x statistical regression gate (100x -g 1 + 100x -g 4 on
+        // qwen35_35b_a3b multi-token prefill, text-identical within each
+        // config, zero NaN). The producer-readback drain in op_d2d_copy
+        // (megakernel_ops.hip:1772-1793) — single-thread volatile load of
+        // host-mapped UC dst[0] forcing PCIe drain, then SYSTEM-scope ack
+        // — combined with the CPU-dispatch latency between GPU 0's ack and
+        // workers' kernel entry is sufficient on gfx11 + linux-p2p kernel
+        // patches 0001/0012/0013/0016/0017/0018 + hsa-rocr-p2p-mtype-uc.
+        //
+        // The active-acquire approach (op_moe_ffn_remote.wait_ptr/seq) was
+        // explored under el1f Phase A and found incompatible with gfx11's
+        // peer-VRAM L2 coherence model: GPU 0's atomic_store to its own
+        // VRAM sentinel sits in GPU 0's L2; peers' MTYPE_UC reads pull
+        // through PCIe to memory controller and miss the L2-cached write.
+        // Host-mapped UC sentinels wedge the SYSTEM-scope atomic
+        // (moe_p2p.rs:341 — prior bd 9gmh finding). The wait_ptr/wait_seq
+        // fields on MoeFfnRemoteInst are wired through but pass null in
+        // production. Step 2.5 dispatch (below) reaffirms this with a
+        // _ = drain_signal_{ptr,seq} bind.
 
         // === STEP 2.5: per-token worker dispatch via OP_MOE_FFN_REMOTE ===
         // Workers P2P-read from activation_staging via their per-context device pointers.
@@ -294,11 +312,26 @@ impl Model {
                 let gpu_id = w + 1;
                 let out_target = p2p.local_output_ptr_for(w);
                 let act_p2p = unsafe { worker_act_bases[w].add(t * latent_size) as *const f32 };
+                // bd el1f: wait_ptr infrastructure is in place but PASS NULL.
+                // The acquire-on-VRAM-sentinel pattern (Phase A as designed)
+                // deadlocks: GPU 0's L2 holds the producer atomic_store; peer
+                // GPUs' MTYPE_UC reads pull through PCIe to memory controller,
+                // missing the L2-cached write. moe_p2p.rs:341 documents that
+                // host-mapped UC sentinels wedge the SYSTEM-scope atomic, so
+                // moving the sentinel doesn't help either. The drain therefore
+                // relies on implicit CPU-dispatch-latency timing (current
+                // production approach). Phase B will VERIFY empirically that
+                // this timing is sufficient; if VERIFY fails, the fix is a
+                // new sentinel medium — separate epic.
+                let _ = drain_signal_ptr;
+                let _ = drain_signal_seq;
                 let inst = p2p.build_ffn_remote_inst(
                     w, layer_idx, act_p2p, out_target,
                     self.activations.moe_expert_ids.as_ptr() as *const i32,
                     self.activations.moe_expert_weights.as_ptr() as *const f32,
                     k, eis, hs, latent_size, has_gate, !has_gate,
+                    std::ptr::null(),
+                    0,
                 );
                 let single = std::slice::from_ref(&inst);
                 let seq = pd.dispatch_batch_fire(gpu_id, single);

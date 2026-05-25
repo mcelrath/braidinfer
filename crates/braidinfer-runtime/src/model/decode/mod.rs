@@ -1512,6 +1512,10 @@ impl Model {
             let out_slot = unsafe { output_slots.add(gpu_id * hs) };
             // Per-worker device pointer to the host-mapped activation handoff.
             let activation = p2p.moe_act_uc_handoff_dev_ptrs[gpu_id] as *const f32;
+            // bd el1f: decode is single-token; the multi-token Step 1 drain
+            // race doesn't apply, so wait_ptr=null (no acquire). The decode
+            // path uses OP_MOE_DISPATCH (megakernel-internal) which handles
+            // its own ordering.
             let inst = p2p.build_ffn_remote_inst(
                 w,
                 layer_idx,
@@ -1520,6 +1524,8 @@ impl Model {
                 expert_ids,
                 expert_weights,
                 k, eis, hs, gupd, has_gate, relu_sq,
+                std::ptr::null(),
+                0,
             );
             (gpu_id, inst)
         }).collect();

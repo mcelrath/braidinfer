@@ -1358,7 +1358,13 @@ pub(crate) struct MoeFfnRemoteInst {
     pub k_eis: u64,    // low 32: k, high 32: eis
     pub hs_gupd: u64,  // low 32: hs, high 32: gupd
     pub flags: u64,    // bit0=has_gate, bit1=relu_sq
-    pub _pad: [u64; 4],
+    // bd el1f Phase A: acquire-side of Step 1 → Step 2.5 drain barrier.
+    // Worker acquire-spins on *wait_ptr == wait_seq before reading
+    // activation_p2p. Pair with Step 1's D2dCopyInst::with_signal(sentinel, seq).
+    // wait_ptr=null disables the acquire (used for non-prefill dispatches).
+    pub wait_ptr: *const u32,
+    pub wait_seq: u64,
+    pub _pad: [u64; 2],
 }
 assert_inst_size!(MoeFfnRemoteInst);
 impl_inst!(MoeFfnRemoteInst);
@@ -1401,8 +1407,20 @@ impl MoeFfnRemoteInst {
             k_eis: (k as u64) | ((eis as u64) << 32),
             hs_gupd: (hs as u64) | ((gupd as u64) << 32),
             flags,
-            _pad: [0; 4],
+            wait_ptr: std::ptr::null(),
+            wait_seq: 0,
+            _pad: [0; 2],
         }
+    }
+
+    /// bd el1f: attach acquire-load on the Step 1 drain sentinel.
+    /// `seq` should be `layer_idx + 1` to match the producer's monotonic
+    /// `with_signal((layer_idx as u64) + 1)` on the Step 1 D2D-copy.
+    #[allow(dead_code)]
+    pub(crate) fn with_wait(mut self, ptr: *const u32, seq: u64) -> Self {
+        self.wait_ptr = ptr;
+        self.wait_seq = seq;
+        self
     }
 }
 

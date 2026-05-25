@@ -556,6 +556,11 @@ impl MoeP2pContext {
         gupd: usize,
         has_gate_proj: bool,
         relu_sq: bool,
+        // bd el1f Phase A: pair with Step 1's D2dCopyInst::with_signal.
+        // wait_ptr=null disables (e.g. decode path); wait_seq should be
+        // (layer_idx + 1) for prefill to match the producer's monotonic seq.
+        wait_ptr: *const u32,
+        wait_seq: u64,
     ) -> crate::megakernel::Instruction {
         let w = &self.workers[worker_idx];
         let cfg_ptr = w.layer_config_ptrs_host[layer_idx] as *const std::ffi::c_void;
@@ -578,7 +583,9 @@ impl MoeP2pContext {
             gupd as u32,
             has_gate_proj,
             relu_sq,
-        ).into_inst()
+        )
+        .with_wait(wait_ptr, wait_seq)
+        .into_inst()
     }
 }
 
