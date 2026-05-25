@@ -349,6 +349,19 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     bool is_rnf4 = (cfg->weight_format == MOE_WEIGHT_FORMAT_RNF4G128);
     long long gate_up_row_stride = (long long)cfg->gate_up_row_stride;
 
+#ifdef BRAIDINFER_MOE_WORKER_DIAG
+    // bd 9gmh Phase 1 (udi msg #3456): print first 8 floats of act_p2p at kernel
+    // entry. If values are sane (match GPU 0's CPU-readable staging[t][0..8]):
+    // workers ARE reading correctly, bug is downstream in worker compute path.
+    // If zeros/NaN/stale: read IS stale, need different drain mechanism.
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("WORKER_DIAG cfg=%u gupd=%d act[0..8]=%f %f %f %f %f %f %f %f\n",
+               cfg->my_gpu_id, gupd,
+               act_p2p[0], act_p2p[1], act_p2p[2], act_p2p[3],
+               act_p2p[4], act_p2p[5], act_p2p[6], act_p2p[7]);
+    }
+#endif
+
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
     coop_copy(la, act_p2p, gupd, grid, gbs);
 
@@ -426,15 +439,16 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     // Option (C) per udi #199/#236: PCIe non-posted read from GPU 0
     // forces worker's prior posted writes to same target to complete
     // before the read returns (PCIe §2.4 producer-consumer rule).
-    // Anchor = out_p2p[0]: same GPU 0 UC buffer we just wrote to;
-    // reading our own writes back forces same-requester same-target
-    // ordering. Earlier `act_p2p[0]` anchor page-faulted on gfx1100
-    // (HSA agent fault) despite the bulk copy reading act_p2p
-    // successfully — switching to out_p2p[0] (UC, written by us this
-    // call) avoids the fault while preserving §2.4 semantics.
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+    // bd 9gmh Phase 1 (2026-05-24): readback from EVERY block thread 0
+    // (not just block 0) — single-block readback didn't fix multi-token
+    // NaN. Broader coverage rules out per-block ordering issues.
+    if (threadIdx.x == 0) {
         volatile float probe = out_p2p[0];
-        (void)probe;
+        // Force the load to not be optimized out.
+        if (probe == 0.123456789f) {
+            // Impossible value; just anchors the compiler.
+            ((volatile float*)out_p2p)[0] = probe;
+        }
     }
 #endif
 }

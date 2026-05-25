@@ -1,5 +1,8 @@
 dolt:
   shared-server: true
+  host: tardis
+  port: 3308
+  auto-start: false
 no-git-ops: true
 
 # Beads Configuration File

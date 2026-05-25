@@ -698,15 +698,14 @@ impl MegakernelProgram {
             }
         }
 
-        // 4. Upload updated position IDs
+        // 4. Update position IDs (host-mapped, no hipMemcpy — bd pywl partial fix a33685b).
         prefill_bufs.write_positions(start_pos, n)?;
 
-        // 5. Re-upload modified instructions to device
-        // Reuse pre-allocated flat_program buffer to avoid per-chunk allocation.
-        self.flat_program.clear();
-        for inst in &self.instructions {
-            self.flat_program.extend_from_slice(&inst.words);
-        }
-        self.device_program.copy_from_host(&self.flat_program)
+        // bd 9gmh Phase 1D: no Step 5 re-upload. The mailbox path (dispatch_via_worker
+        // → dispatch_batch_slice) reads instructions directly from self.instructions in
+        // CPU memory; device_program is a 1-element placeholder allocated at compile
+        // time, never read. Patched fields above (token IDs, KV write dsts, attn
+        // start_pos, position IDs) are already in self.instructions before dispatch.
+        Ok(())
     }
 }

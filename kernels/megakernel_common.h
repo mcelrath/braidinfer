@@ -437,6 +437,19 @@ typedef struct {
 static_assert(sizeof(SigmoidWeightedAddInst) == INST_SIZE_WORDS * 8, "SigmoidWeightedAddInst size mismatch");
 static_assert(offsetof(SigmoidWeightedAddInst, output) == 8, "SigmoidWeightedAddInst.output offset");
 
+// OP_DOT_SIGMOID_SCALE_ADD (opcode 46) — bd 9gmh fused replacement
+typedef struct {
+    uint64_t opcode_gridx;
+    float* output;
+    const float* src;
+    const float* input;
+    const unsigned short* weight;
+    int64_t size;
+    uint64_t _pad[12];
+} DotSigmoidScaleAddInst;
+static_assert(sizeof(DotSigmoidScaleAddInst) == INST_SIZE_WORDS * 8, "DotSigmoidScaleAddInst size mismatch");
+static_assert(offsetof(DotSigmoidScaleAddInst, output) == 8, "DotSigmoidScaleAddInst.output offset");
+
 // OP_SCALE_ADD (opcode 36)
 typedef struct {
     uint64_t opcode_gridx;

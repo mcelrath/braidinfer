@@ -395,16 +395,41 @@ impl Model {
     /// Input: prefill_hidden[0..n*hs] — current layer's input.
     /// Output: prefill_hidden[0..n*hs] updated with MoE FFN output + residual.
     ///
-    /// Dispatches all n tokens to worker GPUs in a single round-trip, while GPU 0
-    /// computes its own local experts in parallel. Replaces n sequential round-trips.
+    /// bd 9gmh Phase 1 F+G+H: migrated from host-launched .forward kernels +
+    /// memcpy_d2h to mailbox-dispatched megakernel programs. Safe to run
+    /// while GPU 0's persistent_worker holds all CUs (the mailbox path uses
+    /// only host-mapped WorkerQueue::inst[] writes — no compute on
+    /// self.stream, no synchronous hipMemcpy). Per-token sequential dispatch
+    /// (rmsnorm + fc1 + gate + moe_gate) — each token waits for the previous
+    /// before reading its expert IDs. Step 3 (GPU 0 local expert compute)
+    /// and Step 5 (sum + shared expert + residual) likewise emit per-token
+    /// megakernel programs.
     pub(crate) fn moe_ffn_forward_prefill_batched(
         &mut self,
         layer_idx: usize,
         prefill_hidden: &mut DeviceBuffer<f32>, // [n × hs]
         n: usize,
     ) -> HipResult<()> {
+        // DIAGNOSTIC bisection: if BRAIDINFER_MOE_NOOP=1, skip all MoE compute and return.
+        // If logits become non-NaN (just wrong-numbers), MoE function is the culprit.
+        // If logits still NaN, bug is upstream (attention/chunk).
+        if std::env::var("BRAIDINFER_MOE_NOOP").is_ok() {
+            let _ = (layer_idx, prefill_hidden, n);
+            return Ok(());
+        }
+        use crate::megakernel::compile_common::{linear_proj_opcode_ptr, rmsnorm_opcode, div_ceil};
+        use crate::megakernel::instructions::{
+            D2dCopyInst, DotSigmoidScaleAddInst, LinearProjInst, MoeGateInst, NopInst,
+            ReluSqInst, ResidualAddInst, RmsNormInst, ScaleAddInst, SiluMulInst,
+        };
+        use crate::megakernel::{Instruction, OP_LINEAR_PROJ, OP_NOP};
+        #[allow(unused_imports)]
+        use crate::persistent_dispatch::BatchDispatcher;
+
         assert!(n <= MAX_PREFILL_BATCH, "n={n} exceeds MAX_PREFILL_BATCH={MAX_PREFILL_BATCH}");
-        // SAFETY: raw pointer breaks borrow on moe_weights to allow mutable self.activations access.
+        // SAFETY: raw pointers break borrow on moe_weights / layers / distributed_moe
+        // to allow mutable self.activations + persistent_workers access during the
+        // per-token instruction-stream construction.
         let moe_ptr = self.moe_weights[layer_idx]
             .as_ref()
             .expect("moe_ffn_forward_prefill_batched called on non-MoE layer")
@@ -414,16 +439,21 @@ impl Model {
         let eis = moe.expert_intermediate_size;
         let latent_size = moe.gate_up_in_dim;
         let has_gate = moe.has_gate_proj;
+        let eps = self.config.rms_norm_eps;
+        let rms_one_plus_w = self.config.rms_norm_one_plus_w;
+        let ne = moe.num_experts;
+
         let fc1_ptr: Option<*const crate::quant::LinearWeight> =
             moe.fc1_latent_proj.as_ref().map(|w| w as *const _);
         let fc2_ptr: Option<*const crate::quant::LinearWeight> =
             moe.fc2_latent_proj.as_ref().map(|w| w as *const _);
-        let norm_weight = match &self.layers[layer_idx] {
+        let norm_weight_buf_ptr = match &self.layers[layer_idx] {
             LayerWeights::MoeFfn(w) => &w.input_norm as *const DeviceBuffer<u16>,
             LayerWeights::Attention(w) => &w.post_norm as *const DeviceBuffer<u16>,
             LayerWeights::Gdn(w) => &w.post_norm as *const DeviceBuffer<u16>,
             _ => panic!("layer {} is not MoeFfn, Attention, or Gdn", layer_idx),
         };
+        let norm_weight = unsafe { &*norm_weight_buf_ptr }.as_ptr();
         let (k, gate_type) = match &self.config.layers[layer_idx].ffn_type {
             FfnType::MoE { num_active, gate_type, .. } => (*num_active, gate_type.clone()),
             _ => unreachable!(),
@@ -434,394 +464,583 @@ impl Model {
             GateType::NormTopK { routed_scaling_factor } => (1, *routed_scaling_factor),
             GateType::Sigmoid { routed_scaling_factor } => (2, *routed_scaling_factor),
         };
-        let bias_ptr = moe.score_correction_bias_gpu.as_ref()
-            .map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        let bias_ptr: *const u8 = moe.score_correction_bias_gpu.as_ref()
+            .map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
 
-        let mut all_activations = vec![0.0f32; n * latent_size];
-        let mut all_expert_ids = vec![0i32; n * k];
-        let mut all_expert_weights = vec![0.0f32; n * k];
+        let rmsnorm_op = rmsnorm_opcode(rms_one_plus_w);
+        // moe.gate is DeviceBuffer<u16> (always bf16, see weights.rs:85).
+        let gate_proj_op = OP_LINEAR_PROJ;
+        let gate_proj_data: *const u8 = moe.gate.as_ptr() as *const u8;
+        let (fc1_op, fc1_data) = fc1_ptr
+            .map(|p| linear_proj_opcode_ptr(unsafe { &*p }))
+            .unwrap_or((0, std::ptr::null()));
+        let (fc2_op, fc2_data) = fc2_ptr
+            .map(|p| linear_proj_opcode_ptr(unsafe { &*p }))
+            .unwrap_or((0, std::ptr::null()));
 
-        // Step 1: Per-token norm + gate + topk + collect activation to host staging
-        for t in 0..n {
-            unsafe {
-                d2d_copy_f32(&mut self.activations.hidden, 0, prefill_hidden, t * hs, hs, &self.stream)?;
-            }
-            unsafe {
-                self.kernels.rmsnorm.forward(
-                    &mut self.activations.normed,
-                    &self.activations.hidden,
-                    &*norm_weight,
-                    1, hs as u32, self.config.rms_norm_eps, self.config.rms_norm_one_plus_w,
-                    &self.stream,
-                )?;
-            }
-            if let Some(fc1) = fc1_ptr {
-                unsafe { &*fc1 }.forward(
-                    &self.kernels.linear_proj, &mut self.activations.moe_latent,
-                    &self.activations.normed, latent_size as u32, hs as u32, &self.stream,
-                )?;
-            }
-            self.kernels.linear_proj.forward(
-                &mut self.activations.moe_scores, &moe.gate, &self.activations.normed,
-                moe.num_experts as u32, hs as u32, &self.stream,
-            )?;
-            self.kernels.moe_gate.forward(
-                &self.activations.moe_scores,
-                self.activations.moe_expert_ids.as_mut_ptr(),
-                self.activations.moe_expert_weights.as_mut_ptr(),
-                bias_ptr, moe.num_experts as u32, k as u32, gate_mode, rsf, &self.stream,
-            )?;
-            self.stream.synchronize()?;
-
-            let act_src = if fc1_ptr.is_some() {
-                self.activations.moe_latent.as_ptr()
-            } else {
-                self.activations.normed.as_ptr()
-            };
-            let dst_bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    all_activations[t * latent_size..].as_mut_ptr() as *mut u8,
-                    latent_size * 4,
-                )
-            };
-            braidinfer_hip::memory::memcpy_d2h(dst_bytes, act_src as *const u8, latent_size * 4)?;
-
-            let ids_src = unsafe {
-                std::slice::from_raw_parts(self.activations.moe_expert_ids.host_ptr() as *const i32, k)
-            };
-            let wts_src = unsafe {
-                std::slice::from_raw_parts(self.activations.moe_expert_weights.host_ptr() as *const f32, k)
-            };
-            all_expert_ids[t * k..(t + 1) * k].copy_from_slice(ids_src);
-            all_expert_weights[t * k..(t + 1) * k].copy_from_slice(wts_src);
-        }
-
-        // Step 2: Stage activations + per-token routing into GPU 0 VRAM (UC) so
-        // workers can P2P-read them. Workers will be dispatched per-token via
-        // OP_MOE_FFN_REMOTE on their persistent_worker mailbox.
-        // We need the routing on the GPU side (P2P-readable). The activation
-        // staging buffer is already UC; expert ids/weights live in
-        // host-mapped GPU 0 buffers (act.moe_expert_ids/_weights) but those
-        // hold only one token. For prefill we keep them on the host side and
-        // pass the host pointer via hipHostGetDevicePointer (single-GPU model
-        // path uses host-mapped expert_ids/weights too — see model_load).
-        // Simpler approach: write per-token id/weight into act.moe_expert_ids
-        // and dispatch immediately, since the worker reads them once.
-        let (output_slots_raw, num_gpus, num_workers, worker_act_bases) = {
-            let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
-            // Per-worker device pointers to the portable host-mapped
-            // activation_staging. Even with `hipHostMallocPortable`, ROCm
-            // requires the device pointer to be retrieved from each GPU's
-            // context (done at init time, see moe_p2p::MoeP2pContext::init).
-            // Pilot site for typed-pointer epic braidinfer-77r.5.
-            let bases: Vec<*mut f32> = (0..p2p.workers.len())
-                .map(|w| p2p.activation_staging_dev_ptr_for(w))
-                .collect();
-            // Per-worker device pointer to output_slots. Each worker reads
-            // through ITS GPU's context-resolved device pointer (snl §11.4
-            // fix). output_slots_dev_ptrs[0] = GPU 0, [1..] = workers in
-            // worker-index order.
-            let out_bases: Vec<*mut f32> = (0..p2p.workers.len())
-                .map(|w| p2p.output_slots_dev_ptrs[w + 1])
-                .collect();
-            (out_bases, p2p.num_gpus, p2p.workers.len(), bases)
+        // GPU 0 local expert routing (distributed MoE weights, per-format opcode).
+        let (
+            dist_weight_format,
+            gate_up_expert_stride,
+            down_expert_stride,
+            gate_up_row_stride,
+            gpu0_gate_up_base,
+            gpu0_down_base,
+            slot_map_owned,
+        ) = {
+            let dist = self.distributed_moe[layer_idx]
+                .as_ref()
+                .expect("distributed_moe not initialized for MoE prefill");
+            let slot_map: Vec<Option<usize>> = dist.expert_buffers[0].slot_map.clone();
+            (
+                dist.weight_format,
+                dist.gate_up_expert_stride,
+                dist.down_expert_stride,
+                dist.gate_up_row_stride,
+                dist.gpu0_gate_up_base,
+                dist.gpu0_down_base,
+                slot_map,
+            )
         };
-        // Write all_activations directly to the host-mapped staging buffer.
-        // No DMA, no kernel launch — CPU stores land in pinned host RAM and
-        // are immediately visible to worker GPUs via the portable device_ptr.
-        // Replaces a former copy_from_host() that deadlocked under GPU 0's
-        // persistent_worker (eh2). Empirical bandwidth: ~10 GB/s per worker
-        // × 4 workers concurrent = ~40 GB/s aggregate (vs ~6 GB/s for UC P2P).
-        {
-            let p2p = self.moe_p2p.as_mut().unwrap();
-            let host_ptr = p2p.activation_staging.host_ptr();
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    all_activations.as_ptr(),
-                    host_ptr,
-                    n * latent_size,
-                );
+        let expert_proj_op = match dist_weight_format {
+            crate::weights::WeightFormat::Rnf4G128 => crate::megakernel::OP_LINEAR_PROJ_RNF4,
+            crate::weights::WeightFormat::PcG32Q4 => crate::megakernel::OP_LINEAR_PROJ_PCG32,
+            crate::weights::WeightFormat::Bf16 => OP_LINEAR_PROJ,
+        };
+
+        // Shared expert + shared-expert gate.
+        let shared_expert_ptr: Option<*const crate::weights::DenseFfnWeights> =
+            moe.shared_expert.as_ref().map(|se| se as *const _);
+        let shared_expert_gate_ptr: Option<*const DeviceBuffer<u16>> =
+            moe.shared_expert_gate.as_ref().map(|g| g as *const _);
+        let se_is = match &self.config.layers[layer_idx].ffn_type {
+            FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
+                if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
             }
+            _ => eis,
+        };
+
+        // Snapshot all p2p raw pointers up front to release the borrow before
+        // re-borrowing persistent_workers (mailbox dispatcher) below.
+        let (
+            act_staging_dev,
+            per_token_ids_host,
+            per_token_wts_host,
+            per_token_ids_dev,
+            per_token_wts_dev,
+            gpu0_zero_dev,
+            gpu0_out_dev,
+            shared_scratch_dev,
+            num_workers,
+            num_gpus,
+            worker_act_bases,
+            worker_out_bases,
+        ) = {
+            let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
+            // bd 9gmh Phase 1 (udi msg #3451): host-mapped portable_coherent staging
+            // (back to decode's working allocator class). Workers read via per-worker
+            // per-context device_ptr (activation_staging_dev_ptr_for(w)). Ordering
+            // between Step 1's D2D-copy producer and Step 2.5's worker consumer is
+            // forced by .with_signal() on the D2D-copy.
+            let act_staging_dev = p2p.activation_staging.as_ptr() as *mut f32;
+            let per_token_ids_host = p2p.per_token_expert_ids.host_ptr();
+            let per_token_wts_host = p2p.per_token_expert_weights.host_ptr();
+            let per_token_ids_dev = p2p.per_token_expert_ids.as_mut_ptr();
+            let per_token_wts_dev = p2p.per_token_expert_weights.as_mut_ptr();
+            let gpu0_zero_dev = p2p.gpu0_zero_buffer.as_ptr();
+            let gpu0_out_dev = p2p.output_slots_dev_ptrs[0];
+            let shared_scratch_dev = p2p.shared_expert_gate_scratch.as_mut_ptr();
+            let num_workers = p2p.workers.len();
+            let num_gpus = p2p.num_gpus;
+            let worker_act_bases: Vec<*mut f32> = (0..num_workers)
+                .map(|w| p2p.activation_staging_dev_ptr_for(w)).collect();
+            let worker_out_bases: Vec<*mut f32> = (0..num_workers)
+                .map(|w| p2p.output_slots_dev_ptrs[w + 1]).collect();
+            (
+                act_staging_dev,
+                per_token_ids_host, per_token_wts_host,
+                per_token_ids_dev, per_token_wts_dev,
+                gpu0_zero_dev, gpu0_out_dev, shared_scratch_dev,
+                num_workers, num_gpus,
+                worker_act_bases, worker_out_bases,
+            )
+        };
+
+        // VRAM scratch + activation pointers (single-token slots, reused per token).
+        let hidden_dev = self.activations.hidden.as_mut_ptr();
+        let normed_dev = self.activations.normed.as_mut_ptr();
+        let scores_dev = self.activations.moe_scores.as_mut_ptr();
+        let expert_gate_dev = self.activations.moe_expert_gate.as_mut_ptr();
+        let expert_up_dev = self.activations.moe_expert_up.as_mut_ptr();
+        let expert_act_dev = self.activations.moe_expert_act.as_mut_ptr();
+        let expert_out_dev = self.activations.moe_expert_out.as_mut_ptr();
+        let ffn_down_dev = self.activations.ffn_down.as_mut_ptr();
+        let residual_dev = self.activations.residual.as_mut_ptr();
+
+        let device_idx = self.device.0 as usize;
+
+        // === STEP 1: ALL tokens' rmsnorm + (fc1?) + gate_proj + moe_gate in ONE batch ===
+        // bd 9gmh Phase 1 (udi msg #3414): writes go to VRAM scratch (prefill_moe_normed),
+        // then a final multi-block D2D-copy stages to host-mapped UC activation_staging
+        // with signal_ptr set so op_d2d_copy's producer-readback (megakernel_ops.hip:1747-1755)
+        // drains GPU 0's PCIe-posted writes before workers P2P-read in Step 2.5.
+        // Matches decode_step's working pattern: single D2D-copy of moe_act_uc_handoff
+        // across all 96 blocks with implicit drain. The earlier rmsnorm-direct-to-staging
+        // path (grid_x=1, single-block) didn't drain reliably for peer GPUs.
+        let prefill_normed_dev = self.activations.prefill_moe_normed.as_mut_ptr();
+        let mut insts: Vec<Instruction> = Vec::with_capacity(n * 5 + 1);
+        for t in 0..n {
+            let token_input = unsafe { prefill_hidden.as_ptr().add(t * hs) };
+            let normed_slot = unsafe { prefill_normed_dev.add(t * latent_size) };
+            let ids_slot = unsafe { per_token_ids_dev.add(t * MAX_ACTIVE_EXPERTS) };
+            let wts_slot = unsafe { per_token_wts_dev.add(t * MAX_ACTIVE_EXPERTS) };
+
+            if fc1_ptr.is_some() {
+                insts.push(RmsNormInst::new(
+                    rmsnorm_op, 1, normed_dev, token_input, norm_weight, hs as i32, eps,
+                ).into_inst());
+                insts.push(LinearProjInst::new(
+                    fc1_op, latent_size as u32, normed_slot, fc1_data, normed_dev,
+                    latent_size as i32, hs as i32, 0,
+                ).into_inst());
+            } else {
+                insts.push(RmsNormInst::new(
+                    rmsnorm_op, 1, normed_slot, token_input, norm_weight, hs as i32, eps,
+                ).into_inst());
+            }
+            // gate_proj reads from VRAM scratch (same-GPU cached, fast).
+            insts.push(LinearProjInst::new(
+                gate_proj_op, ne as u32, scores_dev, gate_proj_data, normed_slot as *const f32,
+                ne as i32, hs as i32, 0,
+            ).into_inst());
+            insts.push(MoeGateInst::new(
+                scores_dev as *const f32, ids_slot, wts_slot,
+                ne as i32, k as i32, gate_mode, rsf, bias_ptr,
+            ).into_inst());
+        }
+        // Multi-block D2D-copy with .with_signal() — producer-readback drain forces
+        // GPU 0's writes to host DRAM before workers fire (udi msg #3451). Sentinel
+        // is VRAM DeviceBuffer<u32> (kernel patch 0001 + VRAM atomic works on gfx11);
+        // signal_seq=1 constant (matches decode's compile_attention.rs:486 pattern).
+        let drain_signal_ptr = self.moe_p2p.as_ref().unwrap().step1_drain_sentinel.as_ptr() as *mut u32;
+        insts.push(
+            D2dCopyInst::new(
+                div_ceil((n * latent_size) as u32, 256),
+                act_staging_dev,
+                prefill_normed_dev as *const f32,
+                (n * latent_size) as i32,
+            )
+            .with_signal(drain_signal_ptr, 1)
+            .into_inst(),
+        );
+        // bd 9gmh Phase 1 (udi msg #3453): trailing NOP. Without an instruction after
+        // the D2D-copy, dispatch_batch_slice's ack only proves the kernel returned, NOT
+        // that the D2D's PCIe-bound writes have drained. The MES per-block barrier
+        // between D2D and NOP forces the producer-readback drain to complete before
+        // the kernel exits the batch.
+        insts.push(NopInst {
+            opcode_gridx: ((OP_NOP as u64) | (1u64 << 32)),
+            dump_buf: std::ptr::null(),
+            max_slots: 0,
+            dump_counter: std::ptr::null(),
+            _pad: [0; 14],
+        }.into_inst());
+        {
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers not initialized");
+            dispatch.dispatch_batch_slice(device_idx, &insts);
         }
 
-        // Step 2.5: Dispatch OP_MOE_FFN_REMOTE for all (token, worker) pairs.
-        // Fire all workers concurrently per token; sequencing across tokens is
-        // handled by per-worker FIFO. We collect (gpu_idx, seq) and wait at end.
-        let mut all_seqs: Vec<(usize, u32)> = Vec::with_capacity(n * num_workers);
+        // bd 9gmh Phase 1: investigation point — multi-token MoE produces NaN logits
+        // 5/5 with several drain-barrier attempts (volatile-read host barrier; SDMA D2H
+        // sync; SYSTEM-scope ack at megakernel.hip:309). The DIAG eprintln "fix" worked
+        // by accident of timing delay. Next session: re-examine whether the race is
+        // really at Step 1/2.5 boundary or elsewhere; consider adding GPU-side diagnostic
+        // (write a known constant to staging+output_slots tail end and check kernel-side
+        // for corruption) and a single giant dispatch (vs per-token batches).
+
+        // DIAGNOSTIC: BRAIDINFER_MOE_NO_WORKERS=1 skips Step 2.5 worker dispatch,
+        // CPU-zeros worker output_slots (host-mapped UC) so Step 5 sum is just GPU 0's
+        // local expert output. If non-NaN, bug is in worker dispatch/output. If NaN,
+        // bug is in Step 3 or Step 5.
+        if std::env::var("BRAIDINFER_MOE_NO_WORKERS").is_ok() {
+            unsafe {
+                let p2p = self.moe_p2p.as_ref().unwrap();
+                let host = p2p.output_slots.host_ptr();
+                for t in 0..n {
+                    for g in 1..num_gpus {
+                        let off = (t * num_gpus + g) * hs;
+                        for i in 0..hs {
+                            std::ptr::write_volatile(host.add(off + i), 0.0f32);
+                        }
+                    }
+                }
+            }
+        } else {
+
+        // === STEP 2.5: per-token worker dispatch via OP_MOE_FFN_REMOTE ===
+        // Workers P2P-read from activation_staging via their per-context device pointers.
+        // Routing IDs/weights are passed via the per-token activations.moe_expert_ids/_weights
+        // single-slot buffers (worker-readable; we copy this token's slice from the
+        // per_token_* host-mapped buffers before each dispatch).
+        let mut all_seqs: Vec<(usize, u32)> = Vec::with_capacity(num_workers);
         for t in 0..n {
-            // Routing pointers for token t: host-mapped expert_ids/_weights are
-            // single-token buffers; copy this token's slice to them so the
-            // worker can read after we trigger the dispatch.
             unsafe {
                 let ids_dst = self.activations.moe_expert_ids.host_ptr() as *mut i32;
                 let wts_dst = self.activations.moe_expert_weights.host_ptr() as *mut f32;
+                let ids_src = per_token_ids_host.add(t * MAX_ACTIVE_EXPERTS);
+                let wts_src = per_token_wts_host.add(t * MAX_ACTIVE_EXPERTS);
                 for j in 0..k {
-                    std::ptr::write_volatile(ids_dst.add(j), all_expert_ids[t * k + j]);
-                    std::ptr::write_volatile(wts_dst.add(j), all_expert_weights[t * k + j]);
+                    std::ptr::write_volatile(ids_dst.add(j), *ids_src.add(j));
+                    std::ptr::write_volatile(wts_dst.add(j), *wts_src.add(j));
                 }
             }
-            // Build instruction per worker. Dispatch through persistent_worker mailbox.
             let p2p = self.moe_p2p.as_ref().unwrap();
-            let dispatch: &mut dyn crate::persistent_dispatch::BatchDispatcher =
-                self.persistent_workers.as_mut().unwrap();
+            let pd = self.persistent_workers.as_mut().unwrap();
+            // bd 9gmh fix (2026-05-24): workers write to their own local_output
+            // VRAM, NOT cross-fabric to GPU 0's output_slots. Worker kernel-
+            // issued PCIe writes to GPU 0 trigger a gfx11 MMHUB/HDP hazard that
+            // corrupts unrelated GPU 0 L2 lines (prefill_normed_dev,
+            // expert_*_dev), causing NaN cascades even when GPU 0 never reads
+            // the worker slots (per mes-researcher diagnosis + bd 9gmh probes
+            // SUM_G0_ONLY=NaN, NO_STEP5+workers=NaN, NO_P2P_WRITE=coherent).
+            // Host SDMA-async D2H below moves the data via a different traffic
+            // class (SDMA, not compute-engine PCIe), avoiding the hazard.
             for w in 0..num_workers {
                 let gpu_id = w + 1;
-                let out_slot = unsafe { output_slots_raw[w].add((t * num_gpus + gpu_id) * hs) };
-                // Per-worker device pointer (portable host-mapped requires
-                // per-context device pointers on AMD ROCm).
-                let act_p2p = unsafe {
-                    worker_act_bases[w].add(t * latent_size) as *const f32
-                };
+                let out_target = p2p.local_output_ptr_for(w);
+                let act_p2p = unsafe { worker_act_bases[w].add(t * latent_size) as *const f32 };
                 let inst = p2p.build_ffn_remote_inst(
-                    w, layer_idx, act_p2p, out_slot,
+                    w, layer_idx, act_p2p, out_target,
                     self.activations.moe_expert_ids.as_ptr() as *const i32,
                     self.activations.moe_expert_weights.as_ptr() as *const f32,
                     k, eis, hs, latent_size, has_gate, !has_gate,
                 );
                 let single = std::slice::from_ref(&inst);
-                let seq = dispatch.dispatch_batch_fire(gpu_id, single);
+                let seq = pd.dispatch_batch_fire(gpu_id, single);
                 all_seqs.push((gpu_id, seq));
             }
-            // Wait for THIS token's worker dispatches before reusing the
-            // single-slot moe_expert_ids/_weights buffers for the next token.
-            // braidinfer-wks Phase 1: parallel-poll all workers in one shared
-            // loop instead of sequential wait_ack.
-            if let Err(e) = dispatch.try_wait_acks_many(&all_seqs) {
+            if let Err(e) = pd.try_wait_acks_many(&all_seqs) {
                 panic!("{e}");
             }
             all_seqs.clear();
-        }
 
-        // Step 3: GPU 0 computes its local expert subset for all tokens.
-        // Accumulate into ffn_down, then D2D copy to output_slots[(t * num_gpus + 0) * hs].
-        for t in 0..n {
-            // Load token t's activation into GPU buffer for expert computation
-            let act_dst_ptr = if fc1_ptr.is_some() {
-                self.activations.moe_latent.as_mut_ptr() as *mut u8
-            } else {
-                self.activations.normed.as_mut_ptr() as *mut u8
-            };
-            let src_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    all_activations[t * latent_size..].as_ptr() as *const u8,
-                    latent_size * 4,
-                )
-            };
-            braidinfer_hip::memory::memcpy_h2d(act_dst_ptr, src_bytes, latent_size * 4)?;
-
-            // Zero ffn_down for accumulation
+            // SDMA-async D2H: worker local_output (worker VRAM) → host-mapped
+            // output_slots[t, w+1, ..]. Uses worker's SDMA stream (independent
+            // of compute CUs held by worker's persistent_worker). Per-worker
+            // stream sync blocks CPU only; doesn't need GPU 0 CUs.
             unsafe {
-                let rc = braidinfer_hip::ffi::hipMemsetAsync(
-                    self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
-                    0, hs * 4, self.stream.raw(),
-                );
-                if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
-            }
-
-            let expert_in: *const f32 = if fc1_ptr.is_some() {
-                self.activations.moe_latent.as_ptr()
-            } else {
-                self.activations.normed.as_ptr()
-            };
-
-            // Run experts assigned to GPU 0 (slot_map[eid] is Some iff on GPU 0).
-            // Use dist.gpu0_gate_up_base/gpu0_down_base with slot-based strides:
-            // moe.expert_gate_up is lite-loaded (hipMalloc(0)) for MULTI_GPU models and
-            // must not be dereferenced.
-            if let Some(dist) = &self.distributed_moe[layer_idx] {
-                let buf0 = &dist.expert_buffers[0];
-                let func_name = match dist.weight_format {
-                    crate::weights::WeightFormat::Bf16 => "linear_proj_f32",
-                    crate::weights::WeightFormat::Rnf4G128 => "linear_proj_rnf4_g128",
-                    crate::weights::WeightFormat::PcG32Q4 => "linear_proj_pcg32_q4",
-                };
-                for j in 0..k {
-                    let eid = all_expert_ids[t * k + j] as usize;
-                    let ew = all_expert_weights[t * k + j];
-                    let slot = match buf0.slot_map[eid] { Some(s) => s, None => continue };
-                    let gu_ptr = unsafe { dist.gpu0_gate_up_base.add(slot * dist.gate_up_expert_stride) };
-                    let dn_ptr = unsafe { dist.gpu0_down_base.add(slot * dist.down_expert_stride) };
-                    if has_gate {
-                        // gate rows [0..eis), up rows [eis..2*eis) packed consecutively
-                        let up_ptr = unsafe { gu_ptr.add(eis * dist.gate_up_row_stride) };
-                        self.kernels.linear_proj.forward_packed_ptr(
-                            self.activations.moe_expert_gate.as_mut_ptr(),
-                            gu_ptr, expert_in, eis as u32, latent_size as u32, func_name, &self.stream,
-                        )?;
-                        self.kernels.linear_proj.forward_packed_ptr(
-                            self.activations.moe_expert_up.as_mut_ptr(),
-                            up_ptr, expert_in, eis as u32, latent_size as u32, func_name, &self.stream,
-                        )?;
-                        self.kernels.silu_mul.forward(
-                            &mut self.activations.moe_expert_act,
-                            &self.activations.moe_expert_gate,
-                            &self.activations.moe_expert_up,
-                            eis as u32, &self.stream,
-                        )?;
-                    } else {
-                        self.kernels.linear_proj.forward_packed_ptr(
-                            self.activations.moe_expert_up.as_mut_ptr(),
-                            gu_ptr, expert_in, eis as u32, latent_size as u32, func_name, &self.stream,
-                        )?;
-                        self.kernels.silu_mul.relu_squared(
-                            &mut self.activations.moe_expert_act,
-                            &self.activations.moe_expert_up,
-                            eis as u32, &self.stream,
-                        )?;
-                    }
-                    self.kernels.linear_proj.forward_packed_ptr(
-                        self.activations.moe_expert_out.as_mut_ptr(),
-                        dn_ptr, self.activations.moe_expert_act.as_ptr(),
-                        latent_size as u32, eis as u32, func_name, &self.stream,
-                    )?;
-                    self.kernels.residual_add.weighted_accumulate(
-                        &mut self.activations.ffn_down,
-                        &self.activations.moe_expert_out,
-                        ew, latent_size as u32, &self.stream,
-                    )?;
+                let host_outs = p2p.output_slots.host_ptr();
+                let bytes = hs * std::mem::size_of::<f32>();
+                let mut streams: Vec<braidinfer_hip::ffi::hipStream_t> =
+                    Vec::with_capacity(num_workers);
+                for w in 0..num_workers {
+                    let gpu_id = w + 1;
+                    let device = p2p.workers[w].device;
+                    pd.ensure_sdma_stream(device).expect("ensure_sdma_stream");
+                    let stream = pd.sdma_stream(gpu_id);
+                    let off = (t * num_gpus + gpu_id) * hs;
+                    let dst = host_outs.add(off) as *mut std::ffi::c_void;
+                    let src = p2p.local_output_ptr_for(w) as *const std::ffi::c_void;
+                    let _guard = braidinfer_hip::device::DeviceGuard::switch_to(device)
+                        .expect("DeviceGuard");
+                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpyAsync(
+                        dst, src, bytes,
+                        braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                        stream,
+                    )).expect("hipMemcpyAsync D2H");
+                    streams.push(stream);
+                }
+                for s in streams {
+                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipStreamSynchronize(s))
+                        .expect("hipStreamSynchronize");
                 }
             }
 
-            // D2D copy ffn_down → output_slots[(t * num_gpus + 0) * hs].
-            // GPU 0 is the source context; use its host-mapped device
-            // pointer (the moe_p2p::output_slots_dev_ptrs[0] entry).
-            let gpu0_out = self.moe_p2p.as_ref().unwrap().output_slots_dev_ptrs[0];
+            // bd 9gmh: cross-fabric drain via CPU read. Workers write to host-mapped
+            // UC output_slots[t,g] via PCIe; their persistent_worker ack writes are
+            // posted and may reach the host mailbox BEFORE the data writes commit to
+            // host DRAM. gfx11 has no producer-side drain primitive that reliably
+            // forces this. A CPU read from each worker-written slot pulls from the
+            // memory controller, which blocks until all in-flight posted writes to
+            // that DRAM page have committed (PCIe ordering: completer's response
+            // must reflect all prior accepted posted writes). Workers' next-step
+            // accesses (and GPU 0's Step 5 read) then see fresh data.
             unsafe {
-                let rc = braidinfer_hip::ffi::hipMemcpyAsync(
-                    gpu0_out.add(t * num_gpus * hs) as *mut std::ffi::c_void,
-                    self.activations.ffn_down.as_ptr() as *const std::ffi::c_void,
-                    latent_size * 4,
-                    braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                    self.stream.raw(),
-                );
-                if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+                let outs = self.moe_p2p.as_ref().unwrap().output_slots.host_ptr();
+                for g in 1..num_gpus {
+                    let off = (t * num_gpus + g) * hs;
+                    // Read first f32 from each worker's slot. The volatile read
+                    // is what forces the drain, not the value — std::hint::black_box
+                    // anchors it against optimisation.
+                    let v = std::ptr::read_volatile(outs.add(off));
+                    std::hint::black_box(v);
+                }
+            }
+
+            // bd 9gmh probe: BRAIDINFER_MOE_ZERO_WORKER_OUT=1 — workers run as usual
+            // (dispatch + PCIe traffic happens), but after their writes commit we
+            // CPU-zero output_slots[t, 1..num_gpus]. Step 5 then reads zeros from
+            // the worker slots. Distinguishes "worker outputs corrupt" vs
+            // "side-effect of worker dispatch corrupts other state".
+            if std::env::var("BRAIDINFER_MOE_ZERO_WORKER_OUT").is_ok() {
+                unsafe {
+                    let outs = self.moe_p2p.as_ref().unwrap().output_slots.host_ptr();
+                    for g in 1..num_gpus {
+                        let off = (t * num_gpus + g) * hs;
+                        for i in 0..hs {
+                            std::ptr::write_volatile(outs.add(off + i), 0.0f32);
+                        }
+                    }
+                }
+            }
+
+            // bd 9gmh diagnostic (BRAIDINFER_MOE_CPU_DIAG=1, first 2 layers only):
+            // after workers ack for this token, read output_slots from host. Localizes:
+            // worker output is NaN → worker compute / staging read is broken; or
+            // worker output sane → worker dataflow OK, bug is Step 5's read.
+            // Also reads staging[t][0..8] for cross-check vs Step 1's DIAG.
+            if t < 2 && layer_idx < 2 && std::env::var("BRAIDINFER_MOE_CPU_DIAG").is_ok() {
+                unsafe {
+                    let p2p = self.moe_p2p.as_ref().unwrap();
+                    let stg = p2p.activation_staging.host_ptr().add(t * latent_size);
+                    let sv: Vec<f32> = (0..8).map(|i| std::ptr::read_volatile(stg.add(i))).collect();
+                    eprintln!("  CPU L{layer_idx} t={t} staging[0..8]={:.3?}", sv);
+                    let outs = p2p.output_slots.host_ptr();
+                    for g in 0..num_gpus {
+                        let off = (t * num_gpus + g) * hs;
+                        let ov: Vec<f32> = (0..8).map(|i| std::ptr::read_volatile(outs.add(off + i))).collect();
+                        let any_nan = ov.iter().any(|x| x.is_nan());
+                        eprintln!("  CPU L{layer_idx} t={t} out_slot[g={g}][0..8]={:.3?} nan={any_nan}", ov);
+                    }
+                }
+            }
+        }
+        } // end else { Step 2.5 }
+
+        // bd 9gmh Phase 1 timing-targeted experiment: sleep after Step 2.5 worker acks
+        // to test whether workers' output_slots PCIe writes need more time to drain
+        // through HDP. If this fixes 5/5 NaN, the bug is purely worker-side write drain.
+        if let Ok(us_str) = std::env::var("BRAIDINFER_MOE_SLEEP_US") {
+            if let Ok(us) = us_str.parse::<u64>() {
+                if us > 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(us));
+                }
             }
         }
 
-        // Step 4: Wait for GPU 0's stream to finish (its expert compute already
-        // wrote to output_slots[t * num_gpus * hs]). Worker dispatches are
-        // already ack'd above (see Step 2.5).
-        self.stream.synchronize()?;
-
-        // Step 5: Sum output_slots + shared expert + residual per token
-        let output_slots_raw = self.moe_p2p.as_ref().unwrap().output_slots.as_ptr();
+        // === STEP 3: GPU 0 local expert compute via mailbox ===
+        // Per-token program: zero ffn_down (via D2D copy from pre-zeroed buffer),
+        // for each routed expert on GPU 0: gate/up projections + activation + down
+        // projection + weighted accumulate, then D2D ffn_down → output_slots[(t*num_gpus+0)*hs].
         for t in 0..n {
-            unsafe {
-                d2d_copy_f32(&mut self.activations.hidden, 0, prefill_hidden, t * hs, hs, &self.stream)?;
-                d2d_copy_f32(&mut self.activations.residual, 0, &self.activations.hidden, 0, hs, &self.stream)?;
+            let mut insts: Vec<Instruction> = Vec::new();
+            // Zero ffn_down (latent_size floats) via D2D copy from gpu0_zero_buffer.
+            insts.push(D2dCopyInst::new(
+                div_ceil(latent_size as u32, 256),
+                ffn_down_dev, gpu0_zero_dev, latent_size as i32,
+            ).into_inst());
+            // bd 9gmh Phase 1: Step 3 reads from VRAM prefill_moe_normed (same-GPU,
+            // local cached) instead of host-mapped activation_staging. Reading via
+            // host-mapped UC went through GART/PCIe → potential L0 staleness across
+            // layers; reading local VRAM uses standard same-GPU cache coherence which
+            // works correctly. The host-mapped staging is still needed for workers
+            // (Step 2.5 P2P read).
+            let expert_input = unsafe { prefill_normed_dev.add(t * latent_size) as *const f32 };
+            for j in 0..k {
+                let eid = unsafe { *per_token_ids_host.add(t * MAX_ACTIVE_EXPERTS + j) } as usize;
+                let ew = unsafe { *per_token_wts_host.add(t * MAX_ACTIVE_EXPERTS + j) };
+                let slot = match slot_map_owned[eid] { Some(s) => s, None => continue };
+                let gu_ptr = unsafe { gpu0_gate_up_base.add(slot * gate_up_expert_stride) };
+                let dn_ptr = unsafe { gpu0_down_base.add(slot * down_expert_stride) };
+                if has_gate {
+                    let up_ptr = unsafe { gu_ptr.add(eis * gate_up_row_stride) };
+                    insts.push(LinearProjInst::new(
+                        expert_proj_op, eis as u32, expert_gate_dev, gu_ptr, expert_input,
+                        eis as i32, latent_size as i32, 0,
+                    ).into_inst());
+                    insts.push(LinearProjInst::new(
+                        expert_proj_op, eis as u32, expert_up_dev, up_ptr, expert_input,
+                        eis as i32, latent_size as i32, 0,
+                    ).into_inst());
+                    insts.push(SiluMulInst::new(
+                        div_ceil(eis as u32, 256),
+                        expert_act_dev, expert_gate_dev as *const f32,
+                        expert_up_dev as *const f32, eis as i32,
+                    ).into_inst());
+                } else {
+                    insts.push(LinearProjInst::new(
+                        expert_proj_op, eis as u32, expert_up_dev, gu_ptr, expert_input,
+                        eis as i32, latent_size as i32, 0,
+                    ).into_inst());
+                    insts.push(ReluSqInst::new(
+                        div_ceil(eis as u32, 256),
+                        expert_act_dev, expert_up_dev as *const f32, eis as i32,
+                    ).into_inst());
+                }
+                insts.push(LinearProjInst::new(
+                    expert_proj_op, latent_size as u32, expert_out_dev, dn_ptr,
+                    expert_act_dev as *const f32,
+                    latent_size as i32, eis as i32, 0,
+                ).into_inst());
+                insts.push(ScaleAddInst::new(
+                    div_ceil(latent_size as u32, 256),
+                    ffn_down_dev, expert_out_dev as *const f32, ew, latent_size as i32,
+                ).into_inst());
             }
-            // Zero ffn_down; sum all GPU slots into it via moe_expert_out as temp
+            // D2D ffn_down → output_slots[(t * num_gpus + 0) * hs].
+            let gpu0_out_slot = unsafe { gpu0_out_dev.add(t * num_gpus * hs) };
+            insts.push(D2dCopyInst::new(
+                div_ceil(latent_size as u32, 256),
+                gpu0_out_slot, ffn_down_dev as *const f32, latent_size as i32,
+            ).into_inst());
+
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            dispatch.dispatch_batch_slice(device_idx, &insts);
+        }
+
+        // DIAGNOSTIC: BRAIDINFER_MOE_NO_STEP5=1 skips Step 5, leaves prefill_hidden unchanged.
+        if std::env::var("BRAIDINFER_MOE_NO_STEP5").is_ok() {
+            return Ok(());
+        }
+        // === STEP 5: per-token sum + fc2 + shared expert + residual ===
+        // bd 9gmh diagnostic: read output_slots from host BEFORE Step 5 enters
+        // GPU 0 kernel. If values match Step 2.5 post-ack reads → Step 5 corrupts.
+        // If different → race between Step 3's GPU 0 writes / worker writes and
+        // Step 5's GPU 0 kernel reads.
+        if layer_idx < 2 && std::env::var("BRAIDINFER_MOE_CPU_DIAG").is_ok() {
             unsafe {
-                let rc = braidinfer_hip::ffi::hipMemsetAsync(
-                    self.activations.ffn_down.as_mut_ptr() as *mut std::ffi::c_void,
-                    0, hs * 4, self.stream.raw(),
-                );
-                if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
+                let p2p = self.moe_p2p.as_ref().unwrap();
+                let outs = p2p.output_slots.host_ptr();
+                for tt in 0..n.min(2) {
+                    for g in 0..num_gpus {
+                        let off = (tt * num_gpus + g) * hs;
+                        let ov: Vec<f32> = (0..8).map(|i| std::ptr::read_volatile(outs.add(off + i))).collect();
+                        let any_nan = ov.iter().any(|x| x.is_nan());
+                        eprintln!("  PRE-S5 L{layer_idx} t={tt} out_slot[g={g}][0..8]={:.3?} nan={any_nan}", ov);
+                    }
+                }
             }
-            for g in 0..num_gpus {
+        }
+        for t in 0..n {
+            let mut insts: Vec<Instruction> = Vec::new();
+            let token_input = unsafe { prefill_hidden.as_ptr().add(t * hs) };
+            let token_output = unsafe { prefill_hidden.as_mut_ptr().add(t * hs) };
+
+            // D2D hidden ← prefill_hidden[t*hs..]; D2D residual ← hidden.
+            insts.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                hidden_dev, token_input, hs as i32,
+            ).into_inst());
+            insts.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                residual_dev, hidden_dev as *const f32, hs as i32,
+            ).into_inst());
+            // Zero ffn_down (hs floats).
+            insts.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                ffn_down_dev, gpu0_zero_dev, hs as i32,
+            ).into_inst());
+            // Sum num_gpus output slots via expert_out as scratch + scale_add.
+            // bd 9gmh probe: BRAIDINFER_MOE_SUM_G0_ONLY=1 only sums g=0 (skip worker slots).
+            let sum_g_max = if std::env::var("BRAIDINFER_MOE_SUM_G0_ONLY").is_ok() { 1 } else { num_gpus };
+            for g in 0..sum_g_max {
                 let slot_offset = (t * num_gpus + g) * hs;
-                unsafe {
-                    let rc = braidinfer_hip::ffi::hipMemcpyAsync(
-                        self.activations.moe_expert_out.as_mut_ptr() as *mut std::ffi::c_void,
-                        output_slots_raw.add(slot_offset) as *const std::ffi::c_void,
-                        latent_size * 4,
-                        braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                        self.stream.raw(),
-                    );
-                    if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
-                }
-                self.kernels.residual_add.weighted_accumulate(
-                    &mut self.activations.ffn_down,
-                    &self.activations.moe_expert_out,
-                    1.0, latent_size as u32, &self.stream,
-                )?;
+                let slot_src = unsafe { gpu0_out_dev.add(slot_offset) as *const f32 };
+                insts.push(D2dCopyInst::new(
+                    div_ceil(latent_size as u32, 256),
+                    expert_out_dev, slot_src, latent_size as i32,
+                ).into_inst());
+                insts.push(ScaleAddInst::new(
+                    div_ceil(latent_size as u32, 256),
+                    ffn_down_dev, expert_out_dev as *const f32, 1.0, latent_size as i32,
+                ).into_inst());
             }
-
-            // fc2_latent_proj if present: ffn_down has latent-space sum, project → hs
-            if let Some(fc2) = fc2_ptr {
-                // Copy ffn_down (latent) → moe_expert_out as input to fc2
-                unsafe {
-                    let rc = braidinfer_hip::ffi::hipMemcpyAsync(
-                        self.activations.moe_expert_out.as_mut_ptr() as *mut std::ffi::c_void,
-                        self.activations.ffn_down.as_ptr() as *const std::ffi::c_void,
-                        latent_size * 4,
-                        braidinfer_hip::ffi::hipMemcpyDeviceToDevice,
-                        self.stream.raw(),
-                    );
-                    if rc != 0 { return Err(braidinfer_hip::HipError(rc)); }
-                }
-                unsafe { &*fc2 }.forward(
-                    &self.kernels.linear_proj,
-                    &mut self.activations.ffn_down,
-                    &self.activations.moe_expert_out,
-                    hs as u32, latent_size as u32, &self.stream,
-                )?;
+            // fc2_latent_proj if present: ffn_down latent-sum → expert_out (D2D) → fc2 → ffn_down.
+            if fc2_ptr.is_some() {
+                insts.push(D2dCopyInst::new(
+                    div_ceil(latent_size as u32, 256),
+                    expert_out_dev, ffn_down_dev as *const f32, latent_size as i32,
+                ).into_inst());
+                insts.push(LinearProjInst::new(
+                    fc2_op, hs as u32, ffn_down_dev, fc2_data, expert_out_dev as *const f32,
+                    hs as i32, latent_size as i32, 0,
+                ).into_inst());
             }
+            // Shared expert (recompute normed from hidden).
+            let skip_shared = std::env::var("BRAIDINFER_MOE_NO_SHARED").is_ok();
+            if let Some(se_ptr) = shared_expert_ptr.filter(|_| !skip_shared) {
+                let se = unsafe { &*se_ptr };
+                let (se_up_op, se_up_data) = linear_proj_opcode_ptr(&se.up_proj);
+                let (se_down_op, se_down_data) = linear_proj_opcode_ptr(&se.down_proj);
 
-            // Shared expert (re-compute normed for this token)
-            let moe = self.moe_weights[layer_idx].as_ref().unwrap();
-            if let Some(ref se) = moe.shared_expert {
-                let se_is = match &self.config.layers[layer_idx].ffn_type {
-                    FfnType::MoE { shared_intermediate_size, expert_intermediate_size, .. } => {
-                        if *shared_intermediate_size > 0 { *shared_intermediate_size } else { *expert_intermediate_size }
-                    }
-                    _ => eis,
-                };
-                unsafe {
-                    self.kernels.rmsnorm.forward(
-                        &mut self.activations.normed, &self.activations.hidden, &*norm_weight,
-                        1, hs as u32, self.config.rms_norm_eps, self.config.rms_norm_one_plus_w,
-                        &self.stream,
-                    )?;
-                }
-                se.up_proj.forward(
-                    &self.kernels.linear_proj, &mut self.activations.moe_expert_up,
-                    &self.activations.normed, se_is as u32, hs as u32, &self.stream,
-                )?;
-                if moe.has_gate_proj {
-                    se.gate_proj.forward(
-                        &self.kernels.linear_proj, &mut self.activations.moe_expert_gate,
-                        &self.activations.normed, se_is as u32, hs as u32, &self.stream,
-                    )?;
-                    self.kernels.silu_mul.forward(
-                        &mut self.activations.moe_expert_act,
-                        &self.activations.moe_expert_gate, &self.activations.moe_expert_up,
-                        se_is as u32, &self.stream,
-                    )?;
+                insts.push(RmsNormInst::new(
+                    rmsnorm_op, 1, normed_dev, hidden_dev as *const f32, norm_weight, hs as i32, eps,
+                ).into_inst());
+                insts.push(LinearProjInst::new(
+                    se_up_op, se_is as u32, expert_up_dev, se_up_data, normed_dev as *const f32,
+                    se_is as i32, hs as i32, 0,
+                ).into_inst());
+                if has_gate {
+                    let (se_gate_op, se_gate_data) = linear_proj_opcode_ptr(&se.gate_proj);
+                    insts.push(LinearProjInst::new(
+                        se_gate_op, se_is as u32, expert_gate_dev, se_gate_data,
+                        normed_dev as *const f32,
+                        se_is as i32, hs as i32, 0,
+                    ).into_inst());
+                    insts.push(SiluMulInst::new(
+                        div_ceil(se_is as u32, 256),
+                        expert_act_dev, expert_gate_dev as *const f32,
+                        expert_up_dev as *const f32, se_is as i32,
+                    ).into_inst());
                 } else {
-                    self.kernels.silu_mul.relu_squared(
-                        &mut self.activations.moe_expert_act, &self.activations.moe_expert_up,
-                        se_is as u32, &self.stream,
-                    )?;
+                    insts.push(ReluSqInst::new(
+                        div_ceil(se_is as u32, 256),
+                        expert_act_dev, expert_up_dev as *const f32, se_is as i32,
+                    ).into_inst());
                 }
-                se.down_proj.forward(
-                    &self.kernels.linear_proj, &mut self.activations.moe_expert_out,
-                    &self.activations.moe_expert_act, hs as u32, se_is as u32, &self.stream,
-                )?;
-                if let Some(ref gate_buf) = moe.shared_expert_gate {
-                    self.kernels.dot_sigmoid_scale_add.forward(
-                        &mut self.activations.ffn_down, &self.activations.moe_expert_out,
-                        &self.activations.normed, gate_buf, hs as u32, &self.stream,
-                    )?;
-                } else {
-                    self.kernels.residual_add.weighted_accumulate(
-                        &mut self.activations.ffn_down, &self.activations.moe_expert_out,
-                        1.0, hs as u32, &self.stream,
-                    )?;
-                }
-            }
+                insts.push(LinearProjInst::new(
+                    se_down_op, hs as u32, expert_out_dev, se_down_data,
+                    expert_act_dev as *const f32,
+                    hs as i32, se_is as i32, 0,
+                ).into_inst());
 
-            // Residual add → write back to prefill_hidden[t * hs]
-            self.kernels.residual_add.forward(
-                &mut self.activations.hidden, &self.activations.residual,
-                &self.activations.ffn_down, hs as u32, &self.stream,
-            )?;
-            unsafe {
-                d2d_copy_f32(prefill_hidden, t * hs, &self.activations.hidden, 0, hs, &self.stream)?;
+                let skip_seg = std::env::var("BRAIDINFER_MOE_NO_SEG").is_ok();
+                if let Some(seg_ptr) = shared_expert_gate_ptr.filter(|_| !skip_seg) {
+                    // Fused OP_DOT_SIGMOID_SCALE_ADD: single-block kernel does
+                    // dot + sigmoid + scale_add in one instruction with LDS broadcast
+                    // of the sigmoid scale to all threads in the block. Replaces
+                    // OP_LINEAR_PROJ(1×hs)+OP_SIGMOID_WEIGHTED_ADD pair which had
+                    // cross-block L0 staleness on intermediate scratch[0].
+                    let seg_data = unsafe { &*seg_ptr }.as_ptr();
+                    insts.push(DotSigmoidScaleAddInst::new(
+                        ffn_down_dev,
+                        expert_out_dev as *const f32,
+                        normed_dev as *const f32,
+                        seg_data,
+                        hs as i32,
+                    ).into_inst());
+                } else {
+                    insts.push(ScaleAddInst::new(
+                        div_ceil(hs as u32, 256),
+                        ffn_down_dev, expert_out_dev as *const f32, 1.0, hs as i32,
+                    ).into_inst());
+                }
             }
+            // Final residual add: hidden = residual + ffn_down; D2D back to prefill_hidden.
+            insts.push(ResidualAddInst::new(
+                div_ceil(hs as u32, 256),
+                hidden_dev, residual_dev as *const f32, ffn_down_dev as *const f32, hs as i32,
+            ).into_inst());
+            insts.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                token_output, hidden_dev as *const f32, hs as i32,
+            ).into_inst());
+
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            dispatch.dispatch_batch_slice(device_idx, &insts);
         }
 
-        self.stream.synchronize()?;
         Ok(())
     }
 

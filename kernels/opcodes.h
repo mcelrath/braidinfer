@@ -49,3 +49,4 @@
 #define OP_LINEAR_PROJ_2X    43 // bf16 fused two linear projections (e.g. GDN w_a + w_b: same input, same in_dim, same out_dim); see LinearProj2xInst
 #define OP_MOE_FFN_REMOTE    44 // MoE expert FFN dispatched on worker GPUs: P2P-read activation from GPU 0, compute experts (per-config skip if not local), P2P-write to per-worker output_slot. See MoeFfnRemoteInst.
 #define OP_MOE_DISPATCH_POST 45 // GPU 0 sums output_slots[0..num_gpus * hs] into final_output. Uses MoeDispatchInst layout (only output_slots, final_output, num_workers_hs, num_gpus, gate_up_in_dim are read).
+#define OP_DOT_SIGMOID_SCALE_ADD 46 // FUSED: output[i] += sigmoid(dot(weight, input)) * src[i]. Single-block. bd 9gmh: replaces OP_LINEAR_PROJ(1×hs) + OP_SIGMOID_WEIGHTED_ADD which had cross-block L0 staleness on intermediate scratch.

@@ -78,6 +78,7 @@ TOC entries below are tagged with status flags:
 | 11.17 | Warmup-to-active transition stream/event state | [CURRENT] | Any change to Model::load or worker startup sequence |
 | 11.18 | host-mapped portable-coherent + multi-GPU GART — producer L2 staleness — Rule 10 producer-fence hypothesis | [FALSIFIED-by-§11.19] (MERGED-to-§11.19) | Rule 10 producer-fence hypothesis tested and refuted by Exp 3 (10/30 PASS = baseline). Do not re-propose. Content merged into §11.19 (w)-(aa); §11.18 header is a stub |
 | 11.19 | Cold-start mailbox visibility race + production cure | [CURRENT] | The canonical account of bd 4e2m; read before any multi-GPU warmup work |
+| 11.20 | op_d2d_copy `signal_ptr` on host-mapped UC wedges — mechanism uncertain | [PARTIALLY-FALSIFIED, rule survives] | Empirical: signal_ptr to host-UC wedges 5/5; to VRAM works. Mechanism narrative in original write-up FALSIFIED by disassembly; new candidates listed. Rule: signal target must be VRAM, never host-mapped UC. |
 
 **For agents**: if you are debugging a `"deterministic for N steps, then divergent"` bug or writing any new cross-agent buffer, jump directly to **§5.5 Rule 4** (diagnostic) and **§5.5 Rule 1** (allocation method decision tree). Those two are the highest-yield entry points.
 
@@ -2075,6 +2076,131 @@ This bracket-from-above on the §11.19 (f) "MES μC private cache / memory-hub-l
 **Production state (final).** Empty-packet warmup (`BRAIDINFER_WARMUP_MODE=empty-packet`) is the minimum correct cure at 10/10 PASS. ~1.5ms overhead on top of the unavoidable ~300ms spawn. No in-kernel substitute exists. bd `yuby` closed as not-actionable.
 
 **Cross-refs.** bd 4e2m, bd yuby (principled-fix CLOSED 2026-05-20), bridge thread 2026-05-20 #3321–#3336 (udi Angle B falsification, Probe A withdrawal, Probe (a) variant 10/10 PASS, in-shader barrier 7/10 partial+new-failure-class, refined PCIe-write-load-bearing narrative), commit 2ce674b — empty-packet default + this subsection.
+
+### 11.20 op_d2d_copy `signal_ptr` on host-mapped UC wedges the process — mechanism uncertain (2026-05-24, partially-falsified)
+
+**STATUS.** Empirical wedge confirmed. Mechanism narrative in the original
+2026-05-24 write-up was FALSIFIED by direct disassembly of the gfx1100
+megakernel (same day, see below). Working rule survives; explanation does
+not. Section preserved as a debugging trail; pending further investigation.
+
+**Empirical finding (CONFIRMED).** braidinfer's `op_d2d_copy`
+(`megakernel_ops.hip:1747-1758`) optionally writes a sentinel via
+`__atomic_store_n(i->signal_ptr, i->signal_seq, __ATOMIC_RELEASE)` after a
+producer-readback `volatile float drain_probe = dst[0]` and a
+`__threadfence()`. The existing caller at `compile_attention.rs:486` passes
+`act.normed_seq.device_ptr()` — a `DeviceBuffer<u32>` (VRAM). When a new
+caller (Phase 1 9gmh fix attempt 3, commit `fd350a9`) passed
+`step1_drain_sentinel.as_ptr()` from a `MappedHostBuffer<u32>` (host-mapped
+UC), the process wedged 5/5 trials in uninterruptible D-state with no
+progress past the first op_d2d_copy invocation. Reverting to a VRAM-backed
+`DeviceBuffer<u32>` sentinel (commit `16aeb25`) restored correctness. The
+host-mapped UC *memory class* is empirically the trigger.
+
+**ORIGINAL MECHANISM HYPOTHESIS — FALSIFIED.** The first version of this
+section attributed the wedge to `__atomic_store_n` emitting
+`buffer_atomic_swap_b32 glc=1` (return-value variant) with the wave
+`vmcnt`-pending on a swap-response that PCIe-bound host UC has no agent to
+generate. Direct disassembly of
+`target/release/build/braidinfer-hip-*/out/megakernel.hsaco` (gfx1100 slice,
+op_d2d_copy symbol `_Z11op_d2d_copyPKyj`) shows the atomic_store_n actually
+lowers to **plain `flat_store_b32 v[0:1], v2`** — no `glc`, no `dlc`, no
+atomic-swap variant. No return-ack is requested at the ISA level. The
+`vmcnt`-forever-pending narrative is therefore wrong. The source also uses
+the 3-arg GCC builtin `__atomic_store_n(ptr, val, memorder)` — NOT the
+4-arg `__hip_atomic_store_n` with an explicit
+`__HIP_MEMORY_SCOPE_SYSTEM` argument — so the "SYSTEM scope on host UC"
+framing was a misread of the source.
+
+Full instruction sequence at function tail (signal_ptr branch):
+```
+buffer_gl1_inv ; buffer_gl0_inv          // __threadfence() lowering
+flat_load_b32  v4, v[3:4]                 // load dst[0] (drain_probe)
+flat_store_b32 v[2:3], v4 dlc             // stash on stack (private)
+s_waitcnt_vscnt null, 0x0
+flat_load_b32  v2, v[2:3] glc dlc         // reload from stack — volatile read ordering
+flat_load_b128 v[0:3], v[0:1] offset:48   // reload signal_ptr (got clobbered)
+s_waitcnt vmcnt(0) lgkmcnt(0)
+flat_store_b32 v[0:1], v2                 // ★ the atomic_store_n RELEASE store
+```
+
+**WHERE THE WEDGE ACTUALLY COMES FROM — open.** Plausible candidates:
+
+1. **`volatile dst[0]` drain_probe** (line 1750). The `flat_load_b32 v4, v[3:4]`
+   reads from `dst`, which in the failing configuration may resolve to a
+   different memory class than the signal_ptr does. If `dst` and signal_ptr
+   are both host-mapped UC and the compiler-emitted volatile-read sequence
+   (stack-roundtrip with `glc dlc` reload) interacts badly with that class,
+   the wedge could originate at the drain_probe load rather than the final
+   store. Untested.
+
+2. **Posted-write visibility on host UC.** `flat_store_b32` to host-mapped
+   UC is a *posted* write — no completion semantics. Nothing downstream in
+   this kernel waits for the write to land. The host's `try_wait_ack`
+   poll then never sees the value because the write is sitting in a PCIe
+   write-combining buffer with no drain trigger. If the cooperative kernel
+   then proceeds to spin on a dependent signal, the system as a whole
+   wedges even though no individual wave is hung. This would manifest as
+   D-state on the host process (uninterruptible wait on the missing ack),
+   not on the GPU. Plausible; needs verification by attaching gdb to the
+   wedged process and inspecting the wait site.
+
+3. **Something off-path.** The wedge fingerprint (5/5 D-state on the very
+   first dispatch) is consistent with #1 or #2 but neither is confirmed.
+
+**WORKING RULE (mechanism-independent).** `signal_ptr` arguments to
+`op_d2d_copy` (and analogous in-kernel atomic-store-on-completion paths)
+**must point to VRAM**, backed by `DeviceBuffer<T>` not
+`MappedHostBuffer<T>`. Empirically observed across the broken commit
+(host-UC signal_ptr → 5/5 wedge) and the fix (VRAM signal_ptr → working).
+Workers reading the VRAM sentinel via P2P go through the patched MTYPE_UC
+peer mapping (linux-p2p `0001` + `hsa-rocr-p2p-mtype-uc-gfx11.patch`) and
+observe the sentinel after PCIe arbitration without caching issues.
+
+**Why this rule survives the mechanism falsification.** The empirical
+data — host-UC wedges, VRAM works — is independent of *which* line of the
+op_d2d_copy tail causes the hang. Whether the failure point is the
+drain_probe load, the posted-store visibility, or somewhere else, the
+working configuration is the same: VRAM-backed signal_ptr. The rule is
+prescriptive; the mechanism narrative was descriptive and turned out
+incorrect.
+
+**Alternatives** (in order of effort):
+
+1. **Use a VRAM sentinel** — recommended; what `16aeb25` does. 1-line change.
+2. **Don't use op_d2d_copy's signal_ptr for host-UC targets** — restructure
+   to signal from the host (CPU) after the D2D copy completes.
+3. **Investigate op_d2d_copy's tail under host-UC** — needed to actually
+   close the mechanism question; would unblock more permissive use of the
+   primitive. Not done yet.
+
+**Lessons.**
+
+- Compiler lowering of GCC atomic builtins on gfx11 is not what "you would
+  expect" from x86 / spec. The 3-arg `__atomic_store_n` with `__ATOMIC_RELEASE`
+  emits a plain store with a preceding fence — not an atomic-swap, not a
+  memory-scope-aware special. The 4-arg `__hip_atomic_store_n` may behave
+  differently; this section does NOT characterize it.
+- "Mechanism by analogy" was wrong here. A confident-sounding ISA-level
+  mechanism narrative that fits the symptoms is not the same as a
+  disassembly-verified mechanism. The original §11.20 narrative read
+  plausibly and was used by a peer agent (braidinfer) to act on the rule,
+  which worked because the *rule* was right — but the *mechanism* was
+  wrong. Next time, disassemble before publishing.
+- §11.14's "host-mapped UC is the gfx11 trapdoor" pattern is the larger
+  truth here even if the specific instruction-level mechanism for §11.20
+  differs. Host-mapped UC + in-kernel synchronization-pattern interactions
+  on gfx11 are a class of footguns; multiple distinct mechanisms exist
+  (§11.14 reader-side no-op, §11.15 SYSTEM-scope-on-ack `s_waitcnt_vscnt`
+  wedge under PCIe pressure, §11.20 op_d2d_copy signal_ptr wedge of
+  unknown mechanism).
+
+**Cross-refs.** §11.14 (sister reader-side ISA gap on host-UC), §11.15
+(adjacent persistent-worker-ack AGENT-vs-SYSTEM rule), §5.5 Rule 2
+(device-UC atomics undefined — adjacent rule, different class), braidinfer
+commits `fd350a9` (broken signal_ptr attempt) → `16aeb25` (VRAM sentinel
+fix), bridge thread 2026-05-24 #3420 (braidinfer report), #3421 (udi
+incorrect mechanism narrative), #3422+ (disassembly correction).
 
 ---
 

@@ -1117,6 +1117,42 @@ __device__ __attribute__((noinline)) void op_sigmoid_weighted_add(const u64* ins
     }
 }
 
+// OP_DOT_SIGMOID_SCALE_ADD (fused, bd 9gmh): output[i] += sigmoid(dot(weight, input)) * src[i].
+// Single-block (grid_x=1, vblock=0). Replaces the OP_LINEAR_PROJ(1×hs) +
+// OP_SIGMOID_WEIGHTED_ADD pair which had cross-block L0 staleness on the
+// intermediate scratch (atomic_block_barrier is agent-scope; doesn't invalidate
+// per-CU L0 → reader blocks 1..N see undefined/stale scalar).
+// args: [1]=output(w), [2]=src, [3]=input(f32), [4]=weight(bf16/u16), [5]=size
+__device__ __attribute__((noinline)) void op_dot_sigmoid_scale_add(const u64* inst, u32 vblock) {
+    (void)vblock;
+    const DotSigmoidScaleAddInst* i = (const DotSigmoidScaleAddInst*)inst;
+    float* output = i->output;
+    const float* src = i->src;
+    const float* input = i->input;
+    const unsigned short* weight = (const unsigned short*)i->weight;
+    int size = (int)i->size;
+
+    extern __shared__ float shared[];
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+
+    // Parallel partial dot product (block 0 only).
+    float partial = 0.0f;
+    for (int j = tid; j < size; j += bs) {
+        partial += input[j] * bf16_to_f32(weight[j]);
+    }
+    // Block-level reduction via the existing helper (shared LDS, lane-stable).
+    float total = block_reduce_sum(partial, shared);
+    if (tid == 0) {
+        shared[0] = 1.0f / (1.0f + expf(-total));
+    }
+    __syncthreads();
+    const float scale = shared[0];
+    for (int j = tid; j < size; j += bs) {
+        output[j] += scale * src[j];
+    }
+}
+
 // OP_SCALE_ADD: output[i] += scale * src[i]
 // args: [1]=output (float*), [2]=src (float*), [3]=scale (f32 bits packed as u32), [4]=size
 __device__ __attribute__((noinline)) void op_scale_add(const u64* inst, u32 vblock) {

@@ -2,12 +2,13 @@
 //! Extracted from megakernel.rs for maintainability.
 
 use braidinfer_hip::HipResult;
+use braidinfer_hip::memory::DeviceBuffer;
 use braidinfer_hip::module::Module;
 use std::sync::Arc;
 
 use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj, linear_proj_opcode_ptr, rmsnorm_opcode};
 
-use super::upload_program;
+// bd 9gmh Phase 1D: upload_program no longer called (placeholder allocs above)
 use super::instructions::*;
 use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, NUM_CUS, PrefillBuffers};
 #[allow(unused_imports)]
@@ -275,7 +276,7 @@ impl MegakernelProgram {
         instructions.push(HaltInst::new().into_inst());
 
         // Upload program to device
-        let device_program = upload_program(device, &instructions)?;
+        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
@@ -712,7 +713,7 @@ impl MegakernelProgram {
         instructions.push(Instruction::new(OP_HALT, 0));
 
         // Upload
-        let device_program = upload_program(device, &instructions)?;
+        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
@@ -988,7 +989,7 @@ impl MegakernelProgram {
         }
         instructions.push(Instruction::new(OP_HALT, 0));
 
-        let device_program = upload_program(device, &instructions)?;
+        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();
@@ -1074,7 +1075,7 @@ impl MegakernelProgram {
             vs as i32, hs as i32, 0).into_inst());
         instructions.push(Instruction::new(OP_HALT, 0));
 
-        let device_program = upload_program(device, &instructions)?;
+        let device_program = DeviceBuffer::<u64>::alloc(device, 1)?; // bd 9gmh Phase 1D: placeholder — mailbox path reads from self.instructions directly
         let flat_program: Vec<u64> = instructions.iter().flat_map(|i| i.words).collect();
 
         let watchdog = model.watchdog.clone();

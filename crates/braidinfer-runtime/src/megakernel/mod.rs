@@ -265,7 +265,7 @@ impl PrefillBuffers {
 pub(crate) mod instructions;
 pub(crate) use instructions::*;
 
-mod compile_common;
+pub(crate) mod compile_common;
 mod compile_attention;
 mod compile_layers;
 mod compile_moe;
@@ -451,7 +451,13 @@ impl MegakernelProgram {
         dispatch: &mut crate::persistent_dispatch::PersistentDispatch,
         gpu_idx: usize,
     ) -> HipResult<()> {
-        dispatch.dispatch_batch_slice(gpu_idx, &self.instructions);
+        // persistent_worker exits on OP_HALT (kernels/megakernel.hip:231-237).
+        // Compiled prefill programs append OP_HALT for the legacy megakernel_f32
+        // entry; strip it so the worker stays alive for subsequent batches.
+        let halt_idx = self.instructions.iter()
+            .position(|inst| (inst.words[0] as u32) == OP_HALT)
+            .unwrap_or(self.instructions.len());
+        dispatch.dispatch_batch_slice(gpu_idx, &self.instructions[..halt_idx]);
         Ok(())
     }
 }

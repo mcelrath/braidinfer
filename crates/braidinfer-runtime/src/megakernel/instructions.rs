@@ -15,6 +15,7 @@ use super::{
     OP_MOE_FFN_REMOTE, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM,
     OP_RELU_SQ, OP_CONV1D_3X, OP_LINEAR_PROJ_2X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE,
     OP_SCALE_ADD, OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
+    OP_DOT_SIGMOID_SCALE_ADD,
 };
 
 // Compile-time size assertions: each struct must be exactly INST_SIZE * 8 bytes.
@@ -949,6 +950,37 @@ impl SigmoidWeightedAddInst {
             output, scalar, input,
             n: n as u64,
             _pad: [0; 13],
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_DOT_SIGMOID_SCALE_ADD (opcode 46) — bd 9gmh: fused replacement for
+// OP_LINEAR_PROJ(1×hs)+OP_SIGMOID_WEIGHTED_ADD which had cross-block L0 stale
+// reads on intermediate scratch[0].
+// Single-block: grid_x=1, vblock=0. Block-local LDS broadcast of sigmoid scale.
+// words[1]=output(w), [2]=src, [3]=input(f32), [4]=weight(bf16/u16), [5]=size
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub(crate) struct DotSigmoidScaleAddInst {
+    pub opcode_gridx: u64,
+    pub output: *mut f32,
+    pub src: *const f32,
+    pub input: *const f32,
+    pub weight: *const u16,
+    pub size: u64,
+    pub _pad: [u64; 12],
+}
+assert_inst_size!(DotSigmoidScaleAddInst);
+impl_inst!(DotSigmoidScaleAddInst);
+
+impl DotSigmoidScaleAddInst {
+    pub(crate) fn new(output: *mut f32, src: *const f32, input: *const f32, weight: *const u16, size: i32) -> Self {
+        DotSigmoidScaleAddInst {
+            opcode_gridx: make_opcode_gridx(OP_DOT_SIGMOID_SCALE_ADD, 1),
+            output, src, input, weight,
+            size: size as u64,
+            _pad: [0; 12],
         }
     }
 }

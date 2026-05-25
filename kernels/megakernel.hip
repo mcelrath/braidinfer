@@ -306,7 +306,15 @@ void simple_persistent_worker(
         braidinfer::rdna3::atomic_block_barrier(&g_gbs);
         if (threadIdx.x == 0 && blockIdx.x == 0) {
             uint32_t seq = queue->seq_num;
-            queue->ack = seq;
+            // bd 9gmh Phase 1 (udi 2026-05-22): SYSTEM-scope release fence so
+            // data writes drain past PCIe BEFORE the ack becomes host-visible.
+            // atomic_block_barrier above is AGENT-scope (L2 only) — ack writes
+            // to host-mapped UC race ahead of data writes still in L2, leaving
+            // CPU / peer GPUs seeing stale staging on the next step. RELEASE
+            // SYSTEM-scope atomic store binds the ack to all prior writes at
+            // system memory ordering.
+            __hip_atomic_store(&queue->ack, seq, __ATOMIC_RELEASE,
+                               __HIP_MEMORY_SCOPE_SYSTEM);
             last_seq = seq;
         }
         braidinfer::rdna3::atomic_block_barrier(&g_gbs);

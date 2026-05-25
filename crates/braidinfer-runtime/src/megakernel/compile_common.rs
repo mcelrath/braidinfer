@@ -25,7 +25,7 @@ pub(super) fn emit_batched_linear_proj(
 }
 
 /// Return (opcode, weight_data_ptr) for a LinearWeight.
-pub(super) fn linear_proj_opcode_ptr(weight: &LinearWeight) -> (u32, *const u8) {
+pub(crate) fn linear_proj_opcode_ptr(weight: &LinearWeight) -> (u32, *const u8) {
     match weight {
         LinearWeight::Bf16(buf) => (OP_LINEAR_PROJ, buf.as_ptr() as *const u8),
         LinearWeight::Packed(pw) => {
@@ -40,7 +40,7 @@ pub(super) fn linear_proj_opcode_ptr(weight: &LinearWeight) -> (u32, *const u8) 
 }
 
 /// Choose RMSNorm opcode based on model config.
-pub(super) fn rmsnorm_opcode(one_plus_w: bool) -> u32 {
+pub(crate) fn rmsnorm_opcode(one_plus_w: bool) -> u32 {
     if one_plus_w { OP_RMSNORM } else { OP_RMSNORM_WX }
 }
 
@@ -54,7 +54,7 @@ pub(super) fn ffn_gate_up_opcode(rnf4: bool, one_plus_w: bool) -> u32 {
     }
 }
 
-pub(super) fn div_ceil(a: u32, b: u32) -> u32 {
+pub(crate) fn div_ceil(a: u32, b: u32) -> u32 {
     (a + b - 1) / b
 }
 

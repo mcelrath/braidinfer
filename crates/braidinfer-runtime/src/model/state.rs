@@ -29,30 +29,24 @@ impl Model {
     }
 
     /// Process a sequence of tokens (prefill). Returns logits for the last token.
-    /// In persistent mode (before worker starts): uses batched megakernel compile_prefill.
-    /// Otherwise: sequential decode_step fallback.
+    ///
+    /// bd 9gmh Phase 1: spawns the persistent worker at entry; all prefill paths
+    /// route through the worker mailbox (compile_prefill* upload is a 1-element
+    /// placeholder, mk.dispatch_via_worker reads instructions from CPU memory
+    /// directly into WorkerQueue::inst[]). No hipMemcpy on GPU 0 once the worker
+    /// is up — moe_forward.rs's three host-launched functions are migrated to
+    /// mailbox-dispatched megakernel programs in this same commit.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
         if tokens.is_empty() {
             return Err(ModelError::MissingWeight("empty token sequence".into()));
         }
-        // Persistent + paged (non-MoE): use paged prefill so decode sees KV in paged chunks.
-        // Worker not yet started so hipMemcpy is still allowed.
-        // bd 9gmh Phase 3: persistent is always true, so condition reduces to:
-        // !has_moe && persistent_workers not yet launched.
-        if !self.has_moe && self.persistent_workers.is_none() {
-            return self.prefill_paged(tokens);
+        // Spawn the persistent worker before any prefill work.
+        self.ensure_persistent_worker_spawned()?;
+        if self.has_moe {
+            self.prefill_batched(tokens)
+        } else {
+            self.prefill_paged(tokens)
         }
-        // MoE: mixed batched path (compile_prefill_segment + moe_ffn_forward).
-        if self.has_moe && self.persistent_workers.is_none() {
-            return self.prefill_batched(tokens);
-        }
-        // Sequential fallback: persistent worker already running — route through decode_step.
-        let mut logits = vec![];
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = self.seq_len + i as u32;
-            logits = self.decode_step(tok, pos)?;
-        }
-        Ok(logits)
     }
 
     /// Prefill using paged KV cache (for persistent single-GPU non-MoE models).
@@ -116,18 +110,14 @@ impl Model {
         // Then for each span of non-MoE layers, compile_prefill_segment handles them.
         // For MoE layers, use moe_ffn_forward with d2d handoff.
 
-        // Step 1: Embed all tokens into prefill_bufs.hidden via a tiny megakernel
+        // Step 1: Embed all tokens into prefill_bufs.hidden via the persistent
+        // worker mailbox (bd 9gmh Phase 1E). No OP_HALT — mailbox path must
+        // never send HALT (would terminate the worker).
         {
             use crate::megakernel::instructions::*;
-            use crate::megakernel::{Instruction, NUM_CUS, OP_HALT};
+            use crate::megakernel::Instruction;
 
             let grid_x = (hs as u32 + 255) / 256;
-            let module = std::sync::Arc::clone(&megakernel_module);
-            let shared_mem = (256u32 * 4 * 2).max(hs as u32 * 4).max(31776u32);
-            let func = module.get_function("megakernel_f32").map_err(ModelError::Hip)?;
-            let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize).map_err(ModelError::Hip)?;
-            let num_blocks = blocks_per_sm.max(1) as u32 * NUM_CUS;
-
             let mut insts: Vec<Instruction> = Vec::new();
             let bufs = self.prefill_bufs.as_ref().unwrap();
             for t in 0..n {
@@ -139,35 +129,9 @@ impl Model {
                     hs as i32,
                 ).into_inst());
             }
-            insts.push(Instruction::new(OP_HALT, 0));
-
-            let flat: Vec<u64> = insts.iter().flat_map(|i| i.words).collect();
-            let mut dev_prog = braidinfer_hip::memory::DeviceBuffer::alloc(self.device, flat.len()).map_err(ModelError::Hip)?;
-            dev_prog.copy_from_host(&flat).map_err(ModelError::Hip)?;
-
-            let mut prog_ptr: *const std::ffi::c_void = dev_prog.as_ptr().cast();
-            let mut num_inst = insts.len() as i32;
-            let wd = self.watchdog.clone();
-            let wd_state_dev = wd.register(self.device).map_err(ModelError::Hip)?;
-            let mut wd_ptr: *mut std::ffi::c_void = wd_state_dev as *mut std::ffi::c_void;
-            // megakernel_f32 signature: (program, num_inst, watchdog, op_profile).
-            // op_profile may be null when profiling is disabled.
-            let mut op_profile_ptr: *mut std::ffi::c_void =
-                crate::op_profile::get_global() as *mut std::ffi::c_void;
-            let mut args: [*mut std::ffi::c_void; 4] = [
-                std::ptr::addr_of_mut!(prog_ptr).cast(),
-                std::ptr::addr_of_mut!(num_inst).cast(),
-                std::ptr::addr_of_mut!(wd_ptr).cast(),
-                std::ptr::addr_of_mut!(op_profile_ptr).cast(),
-            ];
-            func.launch_cooperative(
-                (num_blocks, 1, 1),
-                (256, 1, 1),
-                shared_mem,
-                &self.stream,
-                &mut args,
-            ).map_err(ModelError::Hip)?;
-            self.stream.synchronize().map_err(ModelError::Hip)?;
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers must be initialized in Model::prefill");
+            dispatch.dispatch_batch_slice(self.device.0 as usize, &insts);
         }
 
         // Step 2: Walk layers, identify contiguous non-MoE spans vs MoE layers.
@@ -225,9 +189,13 @@ impl Model {
                 // subsequent runs — manifests as MROPE reading wrong pos at token 0).
                 bufs.write_positions(start_pos, n).map_err(ModelError::Hip)?;
                 self.prefill_bufs = Some(bufs);
-                let mk = self.megakernel_prefill_segments.get(&key).unwrap();
-                mk.execute(&self.stream).map_err(ModelError::Hip)?;
-                self.stream.synchronize().map_err(ModelError::Hip)?;
+                {
+                    let mk = self.megakernel_prefill_segments.get_mut(&key).unwrap();
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
+                }
 
                 // Dispatch MoE FFN for this layer
                 if self.moe_p2p.is_some() {
@@ -245,12 +213,14 @@ impl Model {
                 // If this is the last layer, emit final norm + LM head now (post-MoE).
                 if is_truly_last {
                     let bufs = self.prefill_bufs.take().unwrap();
-                    let mk = MegakernelProgram::compile_final_norm_lm_head(
+                    let mut mk = MegakernelProgram::compile_final_norm_lm_head(
                         self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
                     ).map_err(ModelError::Hip)?;
                     self.prefill_bufs = Some(bufs);
-                    mk.execute(&self.stream).map_err(ModelError::Hip)?;
-                    self.stream.synchronize().map_err(ModelError::Hip)?;
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
                 }
                 layer_i += 1;
             } else {
@@ -281,9 +251,13 @@ impl Model {
                 // share the prefill_bufs.position_ids buffer).
                 bufs.write_positions(start_pos, n).map_err(ModelError::Hip)?;
                 self.prefill_bufs = Some(bufs);
-                let mk = self.megakernel_prefill_segments.get(&key).unwrap();
-                mk.execute(&self.stream).map_err(ModelError::Hip)?;
-                self.stream.synchronize().map_err(ModelError::Hip)?;
+                {
+                    let mk = self.megakernel_prefill_segments.get_mut(&key).unwrap();
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
+                }
             }
         }
 
@@ -291,12 +265,14 @@ impl Model {
         // so the final norm + LM head was never emitted. Compute it now.
         if self.config.layers[num_layers - 1].layer_type == LayerType::MoeFfn {
             let bufs = self.prefill_bufs.take().unwrap();
-            let mk = MegakernelProgram::compile_final_norm_lm_head(
+            let mut mk = MegakernelProgram::compile_final_norm_lm_head(
                 self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
             ).map_err(ModelError::Hip)?;
             self.prefill_bufs = Some(bufs);
-            mk.execute(&self.stream).map_err(ModelError::Hip)?;
-            self.stream.synchronize().map_err(ModelError::Hip)?;
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers must be initialized in Model::prefill");
+            mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                .map_err(ModelError::Hip)?;
         }
 
         Ok(())
@@ -347,8 +323,11 @@ impl Model {
                         mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
                     }
                     self.prefill_bufs = Some(bufs);
-                    let mk = self.megakernel_prefill.as_ref().unwrap();
-                    mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                    let mk = self.megakernel_prefill.as_mut().unwrap();
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
                 } else {
                     // Partial last chunk: cache by token count to avoid recompile on repeated prompts.
                     let n = chunk.len();
@@ -364,11 +343,13 @@ impl Model {
                         self.megakernel_prefill_partial_n = n;
                     }
                     self.prefill_bufs = Some(bufs);
-                    let mk = self.megakernel_prefill_partial.as_ref().unwrap();
-                    mk.execute(&self.stream).map_err(ModelError::Hip)?;
+                    let mk = self.megakernel_prefill_partial.as_mut().unwrap();
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
                 }
 
-                self.stream.synchronize().map_err(ModelError::Hip)?;
                 offset = end;
             }
         }
@@ -428,7 +409,32 @@ impl Model {
                 }
             }
         }
-        self.activations.logits.copy_to_host(&mut logits)?;
+        // Persistent worker holds GPU 0 CUs — synchronous copy_to_host would
+        // deadlock. Use the dispatch's SDMA stream (no CU contention).
+        let gpu_idx = self.device.0 as usize;
+        let stream = self
+            .persistent_workers
+            .as_ref()
+            .map(|d| d.sdma_stream(gpu_idx))
+            .unwrap_or(std::ptr::null_mut());
+        if stream.is_null() {
+            self.activations.logits.copy_to_host(&mut logits)?;
+        } else {
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    logits.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.activations.logits.as_ptr() as *const std::ffi::c_void,
+                    logits.len() * std::mem::size_of::<f32>(),
+                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                    stream,
+                )
+            })
+            .map_err(ModelError::Hip)?;
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipStreamSynchronize(stream)
+            })
+            .map_err(ModelError::Hip)?;
+        }
         Ok(logits)
     }
 

@@ -129,6 +129,13 @@ pub struct MoeP2pContext {
     /// context that was current at the time of the call. We therefore retrieve
     /// one device pointer per worker GPU at init time.
     pub activation_staging_dev_ptrs: Vec<*mut f32>,
+    /// bd 9gmh Phase 1 (udi msg #3440): GPU 0 VRAM UC staging — workers P2P-read this
+    /// via the patched MTYPE_UC peer-VRAM mapping (kernel patch 0001 active in
+    /// linux-p2p 7.0.9). Host-mapped portable_coherent is asymmetric on gfx1100
+    /// multi-GPU: non-allocator-GPU reads of an allocator-GPU's host-mapped UC
+    /// see stale data even after CPU/allocator-GPU reads succeed. GPU 0 VRAM with
+    /// peer-VRAM-UC mapping fixes this. Sized [MAX_PREFILL_BATCH × gate_up_in_dim].
+    pub activation_staging_vram: DeviceBuffer<f32>,
     /// GPU 0 scratch buffers for expert computation.
     pub gpu0_scratch_gate: DeviceBuffer<f32>,
     pub gpu0_scratch_up: DeviceBuffer<f32>,
@@ -142,6 +149,29 @@ pub struct MoeP2pContext {
     /// per-expert coop_weighted_acc sites. Size = hidden_size (the slot
     /// stride; gupd ≤ hs).
     pub gpu0_acc: DeviceBuffer<f32>,
+    /// bd 9gmh Phase 1: host-mapped per-token expert routing populated by
+    /// OP_MOE_GATE in moe_ffn_forward_prefill_batched Step 1. CPU reads
+    /// directly to drive Step 2.5 worker dispatches and Step 3 GPU 0 local
+    /// expert compute. Sized [MAX_PREFILL_BATCH × MAX_ACTIVE_EXPERTS].
+    pub per_token_expert_ids: MappedHostBuffer<i32>,
+    pub per_token_expert_weights: MappedHostBuffer<f32>,
+    /// bd 9gmh Phase 1 drain sentinel (udi msg #3421): GPU 0 VRAM u32 used as
+    /// op_d2d_copy's signal_ptr at end of Step 1. MUST be VRAM, not host-mapped UC —
+    /// the kernel's __atomic_store_n(SYSTEM) compiles to buffer_atomic_swap_b32 with
+    /// glc=1 expecting a memory-controller return-ack; host UC has no ack generator
+    /// → wave wedges in vmcnt-pending → process D-state.
+    pub step1_drain_sentinel: DeviceBuffer<u32>,
+    /// bd 9gmh Phase 1H: shared-expert dot-product scratch. Used between
+    /// OP_LINEAR_PROJ(out_dim=1, in_dim=hs) (computes scratch[0] =
+    /// dot(shared_expert_gate, normed)) and OP_SIGMOID_WEIGHTED_ADD
+    /// (reads scratch[0]). Single f32 per program; safe to share across
+    /// per-token programs since each token waits for its program to
+    /// complete before the next dispatches.
+    pub shared_expert_gate_scratch: DeviceBuffer<f32>,
+    /// bd 9gmh Phase 1G: pre-zeroed f32 buffer used as source for OP_D2D_COPY
+    /// when we need to zero ffn_down (replaces hipMemsetAsync on self.stream
+    /// which can't run while persistent_worker holds CUs). Size = hidden_size.
+    pub gpu0_zero_buffer: DeviceBuffer<f32>,
     /// Per-worker MoE state for GPUs 1..N-1. No kernel modules — workers run
     /// `persistent_worker.hsaco` via `PersistentDispatch`.
     pub workers: Vec<MoeWorkerGpu>,
@@ -281,15 +311,75 @@ impl MoeP2pContext {
         // see latest CPU writes both with and without explicit gl1_inv.
         // Required for braidinfer-eh2: copy_from_host deadlocks under GPU 0's
         // persistent_worker; direct CPU writes to host RAM bypass that hazard.
-        let activation_staging = MappedHostBuffer::<f32>::alloc_portable(MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // bd 9gmh Phase 1F: GPU 0's persistent_worker writes rmsnorm output here;
+        // peer GPUs P2P-read in Step 2.5. Must be portable_coherent (MTYPE_UC) —
+        // gfx11 has no L2 writeback, so a cached host-mapped allocation would
+        // leave worker writes stuck in GPU 0's L2 (per udi 2026-05-22). Replaces
+        // a prior SDMA-D2H-from-VRAM design that was non-deterministically reading
+        // stale VRAM dirtied at L2.
+        let activation_staging = MappedHostBuffer::<f32>::alloc_portable_coherent(MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // bd 9gmh Phase 1: GPU 0 VRAM staging — destination for Step 1's final D2D-copy.
+        // Workers P2P-read; kernel patch 0001 forces MTYPE_UC for the peer-VRAM mapping
+        // so worker reads bypass GPU 0's L2. Local alloc is cached (default) — fast
+        // for GPU 0's own writes in Step 1 + reads in Step 3.
+        let mut activation_staging_vram = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim).
         let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
-        let gpu0_scratch_gate = DeviceBuffer::<f32>::alloc(gpu0, scratch_gate_size)?;
-        let gpu0_scratch_up = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
-        let gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
+        let mut gpu0_scratch_gate = DeviceBuffer::<f32>::alloc(gpu0, scratch_gate_size)?;
+        let mut gpu0_scratch_up = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
+        let mut gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
         // §11.4 HAZARD avoidance for op_moe_dispatch — see field doc.
-        let gpu0_acc = DeviceBuffer::<f32>::alloc(gpu0, hidden_size)?;
+        let mut gpu0_acc = DeviceBuffer::<f32>::alloc(gpu0, hidden_size)?;
+
+        // bd 9gmh Phase 1: per-token routing host-mapped buffers (CPU reads
+        // directly to drive worker dispatch). MAX_ACTIVE_EXPERTS = 32 (per
+        // moe_p2p constant). 64 * 32 * 4 bytes = 8 KiB each — negligible.
+        let per_token_expert_ids = MappedHostBuffer::<i32>::alloc(MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS)?;
+        let per_token_expert_weights = MappedHostBuffer::<f32>::alloc(MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS)?;
+        // bd 9gmh Phase 1: VRAM sentinel for Step 1's D2D-copy producer-readback drain
+        // (per udi msg #3421 — MUST be VRAM, host-mapped UC wedges the SYSTEM-scope atomic).
+        let step1_drain_sentinel = DeviceBuffer::<u32>::alloc(gpu0, 1)?;
+
+        // bd 9gmh Phase 1H: 1-element scratch for shared-expert dot product
+        // (OP_LINEAR_PROJ(1×hs) writes, OP_SIGMOID_WEIGHTED_ADD reads).
+        // bd 9gmh Phase 1: per-token slot, padded to 128-byte L0 cache line stride.
+        // Single-element scratch broke: OP_LINEAR_PROJ(grid_x=1) only block 0 writes
+        // scratch[0]; OP_SIGMOID_WEIGHTED_ADD (grid_x=8) blocks 1-7 read scratch[0]
+        // — their L0 has stale (or uninit garbage = NaN) cached entries. Per-token
+        // separate cache lines = each token's read sees its own producer's writes.
+        let mut shared_expert_gate_scratch = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * 32)?;
+
+        // bd 9gmh Phase 1G: pre-zeroed VRAM buffer for OP_D2D_COPY-based
+        // zeroing (replaces hipMemsetAsync which can't run while persistent
+        // worker holds CUs). Initialize once at startup via copy_from_host
+        // (safe — runs before any worker spawn).
+        let mut gpu0_zero_buffer = DeviceBuffer::<f32>::alloc(gpu0, hidden_size)?;
+        let zeros = vec![0.0f32; hidden_size];
+        gpu0_zero_buffer.copy_from_host(&zeros)?;
+
+        // bd 9gmh: zero-init all VRAM scratch buffers at allocation. RDNA3 L0
+        // caches indexed by VA; cold-miss reads of uninitialized VRAM pages can
+        // return arbitrary bit patterns (often NaN-encoded leftovers from prior
+        // workloads). For any buffer that a kernel might READ before its first
+        // WRITE within a token, the read sees garbage. Zero init makes cold reads
+        // return 0.0 deterministically — finite, safe.
+        let zeros_big = vec![0.0f32; MAX_PREFILL_BATCH * gate_up_in_dim];
+        activation_staging_vram.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * gate_up_in_dim])?;
+        gpu0_scratch_gate.copy_from_host(&zeros_big[..scratch_gate_size])?;
+        gpu0_scratch_up.copy_from_host(&zeros_big[..expert_intermediate_size])?;
+        gpu0_scratch_act.copy_from_host(&zeros_big[..expert_intermediate_size])?;
+        gpu0_acc.copy_from_host(&zeros_big[..hidden_size])?;
+        shared_expert_gate_scratch.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * 32])?;
+        // Also zero host-mapped UC buffers via CPU writes (host_ptr is direct VA).
+        unsafe {
+            std::ptr::write_bytes(output_slots.host_ptr(), 0, MAX_PREFILL_BATCH * num_gpus * hidden_size);
+            std::ptr::write_bytes(activation_staging.host_ptr(), 0, MAX_PREFILL_BATCH * gate_up_in_dim);
+            std::ptr::write_bytes(moe_act_uc_handoff.host_ptr(), 0, MAX_PREFILL_BATCH * hidden_size);
+            std::ptr::write_bytes(per_token_expert_ids.host_ptr(), 0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS);
+            std::ptr::write_bytes(per_token_expert_weights.host_ptr(), 0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS);
+        }
+        // step1_drain_sentinel: signal-only, no reads of stale → skip.
 
         // Allocate per-worker MoE state on each worker GPU. No kernel launch —
         // workers run `persistent_worker.hsaco` via `PersistentDispatch`, dispatched
@@ -415,10 +505,16 @@ impl MoeP2pContext {
             _gpu0_config_storage: gpu0_config_storage,
             activation_staging,
             activation_staging_dev_ptrs,
+            activation_staging_vram,
             gpu0_scratch_gate,
             gpu0_scratch_up,
             gpu0_scratch_act,
             gpu0_acc,
+            per_token_expert_ids,
+            per_token_expert_weights,
+            step1_drain_sentinel,
+            shared_expert_gate_scratch,
+            gpu0_zero_buffer,
             workers,
             num_gpus,
             hidden_size,
@@ -430,6 +526,12 @@ impl MoeP2pContext {
     /// 0 = GPU 1). See field doc on `activation_staging_dev_ptrs`.
     pub fn activation_staging_dev_ptr_for(&self, worker_idx: usize) -> *mut f32 {
         self.activation_staging_dev_ptrs[worker_idx]
+    }
+
+    /// Worker's local_output VRAM pointer (worker-local addressable).
+    /// Used by the BRAIDINFER_MOE_NO_P2P_WRITE diagnostic probe.
+    pub fn local_output_ptr_for(&self, worker_idx: usize) -> *mut f32 {
+        self.workers[worker_idx].local_output.as_ptr() as *mut f32
     }
 
     /// Build an OP_MOE_FFN_REMOTE instruction for one token on `worker_idx`

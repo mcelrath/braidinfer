@@ -157,6 +157,7 @@ __device__ __forceinline__ void dispatch_opcode(
             case OP_FFN_GATE_UP_RNF4:    op_ffn_gate_up_rnf4(inst, vb); break;
             case OP_FFN_DOWN_RES_RNF4:   op_ffn_down_res_rnf4(inst, vb); break;
             case OP_SIGMOID_WEIGHTED_ADD: op_sigmoid_weighted_add(inst, vb); break;
+            case OP_DOT_SIGMOID_SCALE_ADD: op_dot_sigmoid_scale_add(inst, vb); break;
             case OP_SCALE_ADD:    op_scale_add(inst, vb); break;
             case OP_RELU_SQ:      op_relu_sq(inst, vb); break;
             case OP_MAMBA2_CONV1D:        op_mamba2_conv1d(inst, vb); break;
