@@ -129,13 +129,19 @@ impl Model {
     /// `chunk_base + k_q1scale_off = 0 + 0x4000` and page-fault.
     pub(crate) fn ensure_persistent_worker_spawned(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
-        if self.persistent_workers.is_some() {
+        // bd 174k Phase C: single-GPU MoE may have already initialized
+        // persistent_workers (and moe_p2p) via ensure_moe_workers_started
+        // during enable_multi_gpu. In that case megakernel_paged still
+        // needs lazy-init; only the dispatch creation is skipped.
+        let need_megakernel_paged = self.megakernel_paged.is_none();
+        let need_dispatch = self.persistent_workers.is_none();
+        if !need_megakernel_paged && !need_dispatch {
             return Ok(());
         }
 
         let max_chunks = self.max_paged_chunks();
 
-        if self.megakernel_paged.is_none() {
+        if need_megakernel_paged {
             let mut mk = MegakernelProgram::compile_paged(self)?;
             mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
             if std::env::var("KV_QUANT").as_deref() == Ok("1") {
@@ -160,11 +166,24 @@ impl Model {
         let quantized = std::env::var("KV_QUANT").as_deref() == Ok("1");
         self.ensure_paged_decode_state(quantized)?;
 
-        let shared_mem = SHARED_LPROJ_TOTAL as u32;
-        let mut dispatch =
-            PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
-        dispatch.ensure_sdma_stream(self.device).map_err(ModelError::Hip)?;
-        self.persistent_workers = Some(dispatch);
+        if need_dispatch {
+            let shared_mem = SHARED_LPROJ_TOTAL as u32;
+            let mut dispatch =
+                PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
+            dispatch.ensure_sdma_stream(self.device).map_err(ModelError::Hip)?;
+            self.persistent_workers = Some(dispatch);
+        } else {
+            // bd 174k Phase C: single-GPU MoE path created the dispatch in
+            // ensure_moe_workers_started (with empty worker_devices, so GPU 0
+            // wasn't launched). Add GPU 0 now — first decode step is when the
+            // persistent_worker is allowed to hold CUs.
+            let shared_mem = SHARED_LPROJ_TOTAL as u32;
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            if !dispatch.has_worker(self.device.0 as usize) {
+                dispatch.add_device(self.device, shared_mem)
+                    .map_err(ModelError::Hip)?;
+            }
+        }
 
         if !self.tracer.enabled() {
             let sdma = self.persistent_workers.as_ref().unwrap()
@@ -186,50 +205,56 @@ impl Model {
 
         // Lazy-init: compile PAGED megakernel FIRST (needs GPU queries),
         // then launch persistent worker (occupies all SMs).
-        if self.persistent_workers.is_none() {
+        // bd 174k Phase C: split init into megakernel_paged + dispatch — for
+        // single-GPU MoE the dispatch is already up (ensure_moe_workers_started
+        // ran during enable_multi_gpu), but megakernel_paged still needs lazy
+        // compile. The two were coupled by a single is_none() gate.
+        let need_megakernel_paged = self.megakernel_paged.is_none();
+        let need_dispatch = self.persistent_workers.is_none();
+        if need_megakernel_paged {
             let max_chunks = self.max_paged_chunks();
-
-            if self.megakernel_paged.is_none() {
-                let mut mk = MegakernelProgram::compile_paged(self)?;
-                mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
-                // bd 9gmh Phase 2F: KV_QUANT now wired here (was: separate
-                // decode_step_paged_quantized entry that passed quantized=true).
-                // Multi-GPU + KV_QUANT is rejected in Model::load (model_load.rs:37).
-                if std::env::var("KV_QUANT").as_deref() == Ok("1") {
-                    mk.enable_quantized_kv(max_chunks, &self.config).map_err(ModelError::Hip)?;
-                }
-                self.megakernel_paged = Some(mk);
+            let mut mk = MegakernelProgram::compile_paged(self)?;
+            mk.init_paged_buffers(max_chunks).map_err(ModelError::Hip)?;
+            if std::env::var("KV_QUANT").as_deref() == Ok("1") {
+                mk.enable_quantized_kv(max_chunks, &self.config).map_err(ModelError::Hip)?;
             }
+            self.megakernel_paged = Some(mk);
 
             // Patch LM head instruction to write to logits_mapped (host-mapped)
             // so CPU can read without hipMemcpy (which deadlocks the cooperative kernel).
-            // This must be done whether megakernel_paged was just compiled or
-            // pre-compiled by prefill_paged (which doesn't patch logits_mapped).
             {
                 let mk = self.megakernel_paged.as_mut().unwrap();
-                // Search for OP_LM_HEAD by opcode rather than using a hardcoded
-                // offset (n_inst-2). words[0] encodes opcode in the low 32 bits.
                 let lm_head_idx = mk
                     .instructions
                     .iter()
                     .rposition(|inst| (inst.words[0] as u32) == OP_LM_HEAD)
                     .expect("lm_head not found in paged megakernel");
-                // words[1] = output pointer (LinearProjInst layout; see instructions.rs:556).
                 mk.instructions[lm_head_idx].words[1] =
                     self.activations.logits_mapped.as_write_ptr() as u64;
             }
 
             // Ensure paged decode state (page_allocator + paged_seq) is initialized.
             self.ensure_paged_decode_state(false)?;
-
-            // PCG32 full kernel requires SHARED_LPROJ_TOTAL (31776B) for its LDS tile.
+        }
+        if need_dispatch {
             let shared_mem = SHARED_LPROJ_TOTAL as u32;
             let mut dispatch =
                 PersistentDispatch::init(&[self.device], shared_mem, self.config.hidden_size, self.watchdog.clone()).map_err(ModelError::Hip)?;
-            // Ensure SDMA stream for GPU 0 so tracer can issue async D2H copies.
             dispatch.ensure_sdma_stream(self.device).map_err(ModelError::Hip)?;
             self.persistent_workers = Some(dispatch);
-
+        } else {
+            // bd 174k Phase C: single-GPU MoE path created the dispatch in
+            // ensure_moe_workers_started (with empty worker_devices, so GPU 0
+            // wasn't launched). Add GPU 0 now — first decode step is when the
+            // persistent_worker is allowed to hold CUs.
+            let shared_mem = SHARED_LPROJ_TOTAL as u32;
+            let dispatch = self.persistent_workers.as_mut().unwrap();
+            if !dispatch.has_worker(self.device.0 as usize) {
+                dispatch.add_device(self.device, shared_mem)
+                    .map_err(ModelError::Hip)?;
+            }
+        }
+        if need_megakernel_paged || need_dispatch {
             // Lazy-init tracer from env vars now that SDMA stream is available.
             if !self.tracer.enabled() {
                 let sdma = self.persistent_workers.as_ref().unwrap()
@@ -413,9 +438,15 @@ impl Model {
         self.decode_step_p2p(token_id, position)
     }
 
-    /// Lazily start MoE expert workers (GPUs 1-3) without launching the GPU 0 decode
-    /// persistent cooperative kernel. Safe to call during prefill (no cooperative kernel
-    /// running on GPU 0 yet, so hipMalloc is allowed).
+    /// Lazily initialize the MoE mailbox dispatch context. On multi-GPU this
+    /// launches peer-GPU persistent workers and compiles the P2P decode
+    /// megakernel. On single-GPU MoE (bd 174k Phase C) it only initializes
+    /// the moe_p2p host-mapped UC routing buffers and skips both worker
+    /// launches and compile_multi_gpu_p2p — single-GPU decode keeps using
+    /// megakernel_paged.
+    ///
+    /// Safe to call during prefill (no cooperative kernel running on GPU 0 yet,
+    /// so hipMalloc is allowed).
     pub(crate) fn ensure_moe_workers_started(&mut self) -> Result<(), ModelError> {
         use crate::persistent_dispatch::PersistentDispatch;
         if self.moe_p2p.is_some() {
@@ -424,13 +455,11 @@ impl Model {
         if !self.has_moe {
             return Ok(());
         }
-        let num_gpus = match self.multi_gpu.as_ref() {
-            Some(m) => m.num_devices,
-            None => return Ok(()),
-        };
-        if num_gpus <= 1 {
-            return Ok(());
-        }
+        // bd 174k Phase C: lift the multi_gpu==None and num_gpus<=1 early-returns.
+        // Single-GPU MoE still initializes moe_p2p (with num_workers=0) so the
+        // unified mailbox-routed prefill path works.
+        let num_gpus = self.multi_gpu.as_ref().map_or(1, |m| m.num_devices);
+        let is_single_gpu = num_gpus <= 1;
         // bd ntz6: the moe_gemv_worker.hip kernel was orphaned (never compiled,
         // OP_EXPERT_FFN had no producer/consumer). Workers run persistent_worker.hsaco
         // via OP_MOE_FFN_REMOTE. shared_mem floor is just SHARED_LPROJ_TOTAL.
@@ -466,10 +495,17 @@ impl Model {
             shared_mem_persistent,
         )
         .map_err(ModelError::Hip)?;
-        let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
-            .map_err(ModelError::Hip)?;
+        // bd 174k Phase C: compile_multi_gpu_p2p produces the P2P decode
+        // megakernel (patches OP_BARRIER -> OP_MOE_DISPATCH). Single-GPU
+        // decode keeps using megakernel_paged via decode_step — skip the
+        // P2P compile for num_gpus=1 to leave megakernel_multi_gpu_p2p
+        // None.
+        if !is_single_gpu {
+            let mk_p2p = MegakernelProgram::compile_multi_gpu_p2p(self, &p2p)
+                .map_err(ModelError::Hip)?;
+            self.megakernel_multi_gpu_p2p = Some(mk_p2p);
+        }
         self.moe_p2p = Some(p2p);
-        self.megakernel_multi_gpu_p2p = Some(mk_p2p);
 
         // wt1 P2-a: PersistentDispatch now owns SDMA streams (one per GPU,
         // indexed by DeviceId.0). Stream allocation for worker GPUs (1..N-1)

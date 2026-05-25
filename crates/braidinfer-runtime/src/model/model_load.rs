@@ -1165,12 +1165,16 @@ impl Model {
             .unwrap_or(1);
 
         let ctx = crate::multi_gpu::MultiGpuContext::init(self.config.hidden_size, max_eis)?;
-        let mut ctx = match ctx {
-            Some(c) => c,
+        // bd 174k Phase A: when only 1 GPU is available we still populate
+        // distributed_moe (with num_devices=1, all experts on GPU 0). The
+        // unified MoE prefill path (moe_ffn_forward_prefill_batched) reads
+        // per-GPU expert config from distributed_moe regardless of GPU count.
+        // distribute_moe_weights_from_ref handles num_devices=1 cleanly: it
+        // aliases the existing moe.expert_gate_up buffer on GPU 0 (no VRAM
+        // duplication), uses identity slot_map, and skips memcpy on gpu==0.
+        let mut ctx_opt: Option<crate::multi_gpu::MultiGpuContext> = match ctx {
+            Some(c) => Some(c),
             None => {
-                // Only 1 GPU available. If expert weights were loaded lite (skipped because
-                // MULTI_GPU was set), inference will silently produce wrong output or fault.
-                // Callers should check GPU count BEFORE setting MULTI_GPU to avoid this.
                 let experts_missing = self.moe_weights.iter().any(|m| {
                     m.as_ref().map_or(false, |moe| {
                         moe.expert_gate_up.raw_data_ptr() == std::ptr::null()
@@ -1183,8 +1187,8 @@ impl Model {
                             .into(),
                     ));
                 }
-                eprintln!("Multi-GPU: only 1 device, skipping");
-                return Ok(());
+                eprintln!("Single-GPU MoE: populating distributed_moe[layer] with GPU-0-only layout (no VRAM duplication)");
+                None
             }
         };
 
@@ -1192,8 +1196,8 @@ impl Model {
         // the caller's device when this guard drops at function return.
         let _gpu0_guard = braidinfer_hip::device::DeviceGuard::switch_to(DeviceId(0))?;
 
-        // Distribute MoE weights across GPUs
-        let num_devices = ctx.num_devices;
+        // Distribute MoE weights across GPUs (or onto GPU 0 only when single-GPU).
+        let num_devices = ctx_opt.as_ref().map_or(1, |c| c.num_devices);
         let hs = self.config.hidden_size;
 
         // Check if expert weights were loaded (single-GPU) or skipped (multi-GPU lite load)
@@ -1279,25 +1283,42 @@ impl Model {
                     self.config.num_q_heads
                 )));
             }
-            let local_nqh = self.config.num_q_heads / num_devices;
-            let local_nkh = self.config.num_kv_heads; // replicated on every GPU
-            let q_mult = if self.config.has_output_gate { 2 } else { 1 };
-            ctx.init_attn_buffers(
-                num_attn_layers,
-                local_nqh,
-                local_nkh,
-                self.config.head_dim,
-                self.config.max_seq_len,
-                self.config.hidden_size,
-                q_mult,
-            )?;
-            print_vram("init_attn_buffers");
-            // Split Q/K/V projection weights onto each GPU
-            self.init_split_attn_weights(&mut ctx, local_nqh, local_nkh, q_mult)?;
-            print_vram("init_split_attn_weights");
+            // bd 174k Phase A: head-parallel attention split only applies to
+            // true multi-GPU. Single-GPU (ctx_opt == None) skips this block.
+            if let Some(ctx) = ctx_opt.as_mut() {
+                let local_nqh = self.config.num_q_heads / num_devices;
+                let local_nkh = self.config.num_kv_heads; // replicated on every GPU
+                let q_mult = if self.config.has_output_gate { 2 } else { 1 };
+                ctx.init_attn_buffers(
+                    num_attn_layers,
+                    local_nqh,
+                    local_nkh,
+                    self.config.head_dim,
+                    self.config.max_seq_len,
+                    self.config.hidden_size,
+                    q_mult,
+                )?;
+                print_vram("init_attn_buffers");
+                // Split Q/K/V projection weights onto each GPU
+                self.init_split_attn_weights(ctx, local_nqh, local_nkh, q_mult)?;
+                print_vram("init_split_attn_weights");
+            }
         }
 
-        self.multi_gpu = Some(ctx);
+        // multi_gpu is set only when there's a real multi-GPU context.
+        // Single-GPU MoE populates distributed_moe (above) but leaves
+        // self.multi_gpu = None — the unified prefill path handles this.
+        self.multi_gpu = ctx_opt;
+
+        // bd 174k Phase C: initialize moe_p2p NOW (at model setup time, before
+        // any persistent_worker is launched). MoeP2pContext::init calls
+        // DeviceBuffer::copy_from_host which trips the persistent-worker
+        // guard if deferred until first prefill (after warmup spawned the
+        // GPU 0 worker). This is safe here because enable_multi_gpu runs
+        // immediately after Model::load on the binary side.
+        if self.has_moe {
+            self.ensure_moe_workers_started()?;
+        }
         Ok(())
     }
 

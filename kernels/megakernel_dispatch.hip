@@ -126,6 +126,15 @@ __device__ __forceinline__ void dispatch_opcode(
         return;
     }
 
+    // bd 174k diag: OP_NOP at end of a batch is a drain primitive (Step 1
+    // trailing NOP for producer-readback). Acknowledge it explicitly so the
+    // default-case "unknown opcode" printf doesn't fire on every batch.
+    if (opcode == OP_NOP) {
+        braidinfer::rdna3::atomic_block_barrier(gbs);
+        OP_PROFILE_END(opcode, op_profile);
+        return;
+    }
+
     // Virtual block loop: each physical block handles multiple virtual blocks.
     for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
         switch (opcode) {

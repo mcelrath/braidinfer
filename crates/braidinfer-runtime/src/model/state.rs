@@ -145,19 +145,14 @@ impl Model {
             let lt = self.config.layers[layer_i].layer_type.clone();
             if lt == LayerType::MoeFfn {
                 // Nemotron standalone MoE FFN layer (no attention part).
-                if self.moe_p2p.is_some() {
-                    // Multi-GPU batched path: dispatch all n tokens in one round-trip
-                    let mut bufs = self.prefill_bufs.take().unwrap();
-                    self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
-                        .map_err(ModelError::Hip)?;
-                    self.prefill_bufs = Some(bufs);
-                } else {
-                    // Single-GPU batched path: one sync for all n gate computations
-                    let mut bufs = self.prefill_bufs.take().unwrap();
-                    self.moe_ffn_forward_prefill_single_gpu_batched(layer_i, &mut bufs.hidden, n)
-                        .map_err(ModelError::Hip)?;
-                    self.prefill_bufs = Some(bufs);
-                }
+                // bd 174k Phase D: single-GPU and multi-GPU share the same
+                // mailbox-routed MoE prefill path. ensure_moe_workers_started
+                // (called above) initializes moe_p2p for both (num_workers=0
+                // when single-GPU).
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
+                    .map_err(ModelError::Hip)?;
+                self.prefill_bufs = Some(bufs);
                 layer_i += 1;
             } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
                 && (lt == LayerType::Attention || lt == LayerType::Gdn) {
@@ -197,18 +192,12 @@ impl Model {
                         .map_err(ModelError::Hip)?;
                 }
 
-                // Dispatch MoE FFN for this layer
-                if self.moe_p2p.is_some() {
-                    let mut bufs = self.prefill_bufs.take().unwrap();
-                    self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
-                        .map_err(ModelError::Hip)?;
-                    self.prefill_bufs = Some(bufs);
-                } else {
-                    let mut bufs = self.prefill_bufs.take().unwrap();
-                    self.moe_ffn_forward_prefill_single_gpu_batched(layer_i, &mut bufs.hidden, n)
-                        .map_err(ModelError::Hip)?;
-                    self.prefill_bufs = Some(bufs);
-                }
+                // Dispatch MoE FFN for this layer via unified mailbox path
+                // (bd 174k Phase D: single-GPU also uses moe_p2p with num_workers=0).
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
+                    .map_err(ModelError::Hip)?;
+                self.prefill_bufs = Some(bufs);
 
                 // If this is the last layer, emit final norm + LM head now (post-MoE).
                 if is_truly_last {

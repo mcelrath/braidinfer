@@ -89,6 +89,11 @@ pub struct Model {
 // ---- Model impl ----
 
 impl Model {
+    /// True if any layer's FfnType is MoE. Cached at load time.
+    pub fn has_moe(&self) -> bool {
+        self.has_moe
+    }
+
     fn max_paged_chunks(&self) -> usize {
         (self.config.max_seq_len + CHUNK_TOKENS - 1) / CHUNK_TOKENS
     }
