@@ -1141,12 +1141,15 @@ impl Model {
         })
     }
 
-    /// Enable multi-GPU expert parallel dispatch.
-    /// Distributes MoE expert weights across available GPUs (round-robin).
-    /// Must be called after load, before first decode_step.
-    pub fn enable_multi_gpu(&mut self) -> Result<(), ModelError> {
+    /// Initialize distributed MoE expert dispatch. Populates `distributed_moe`
+    /// per layer. On multi-GPU, also distributes expert weights across GPUs
+    /// (round-robin) and sets up head-parallel attention buffers. On single-GPU
+    /// (bd 174k), populates a 1-entry layout that aliases moe.expert_gate_up
+    /// on GPU 0 with no VRAM duplication — needed by the unified mailbox-routed
+    /// prefill path. Must be called after load, before first decode_step.
+    pub fn enable_distributed_moe(&mut self) -> Result<(), ModelError> {
         if !self.has_moe {
-            eprintln!("Multi-GPU: model has no MoE layers, skipping");
+            eprintln!("enable_distributed_moe: model has no MoE layers, skipping");
             return Ok(());
         }
 

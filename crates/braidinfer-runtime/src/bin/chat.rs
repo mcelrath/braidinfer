@@ -51,7 +51,7 @@ async fn main() {
         Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
 
     if multi_gpu || model.has_moe() {
-        if let Err(e) = model.enable_multi_gpu() {
+        if let Err(e) = model.enable_distributed_moe() {
             let per_gpu_free_mb: Vec<f64> =
                 braidinfer_runtime::cli::vram_free_per_gpu()
                     .iter()

@@ -62,7 +62,7 @@ fn main() {
     };
     if has_moe {
         unsafe { std::env::set_var("MULTI_GPU", "1") };
-        model.enable_multi_gpu().expect("enable multi-gpu");
+        model.enable_distributed_moe().expect("enable multi-gpu");
     }
 
     let n_prompt = prompt_tokens.len();

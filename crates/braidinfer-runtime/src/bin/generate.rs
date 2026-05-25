@@ -65,7 +65,7 @@ fn main() {
     // single-GPU MoE this populates distributed_moe with a 1-device layout
     // (no VRAM duplication) so the unified mailbox prefill path can read it.
     if multi_gpu || model.has_moe() {
-        if let Err(e) = model.enable_multi_gpu() {
+        if let Err(e) = model.enable_distributed_moe() {
             let per_gpu_free_mb: Vec<f64> =
                 braidinfer_runtime::cli::vram_free_per_gpu()
                     .iter()
@@ -211,7 +211,7 @@ fn main() {
             model = Model::load_with_max_seq_len(model_dir, device, max_seq_len)
                 .expect("reload model after warmup-discard");
             if multi_gpu || model.has_moe() {
-                if let Err(e) = model.enable_multi_gpu() {
+                if let Err(e) = model.enable_distributed_moe() {
                     eprintln!("ERROR: enable_multi_gpu failed on warmup-discard reload: {e:?}");
                     std::process::exit(1);
                 }
