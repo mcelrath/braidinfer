@@ -1977,8 +1977,14 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
     int mrope_section0_pairs = (int)(i->mrope_sections & 0xFFFFFFFFu);
     int mrope_section1_pairs = (int)(i->mrope_sections >> 32);
 
-    int q_head = vblock;
-    if (q_head >= num_q_heads) return;
+    // bd srg6.2: head-slice unpacking. Single-GPU: local_q_head_start=0, local_nqh=nqh
+    // (folds to vblock < nqh). Multi-GPU (Phase 4): per-worker slice of q-heads.
+    uint32_t hs = (uint32_t)(i->head_slice & 0xFFFFFFFFu);
+    int local_nqh = (int)(hs & 0xFFFFu);
+    int local_q_head_start = (int)((hs >> 16) & 0xFFFFu);
+    int q_head_local = (int)vblock;
+    if (q_head_local >= local_nqh) return;
+    int q_head = local_q_head_start + q_head_local;  // absolute head index
 
     int gqa_group = num_q_heads / num_kv_heads;
     int kv_head = q_head / gqa_group;
@@ -2167,8 +2173,13 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
     long long v_rdata_off   = k_rdata_off + per_kv;
     long long v_rscale_off  = k_rscale_off + per_kv;
 
-    int q_head = vblock;
-    if (q_head >= num_q_heads) return;
+    // bd srg6.2: head-slice unpacking (mirror of op_attn_paged).
+    uint32_t hs = (uint32_t)(i->head_slice & 0xFFFFFFFFu);
+    int local_nqh = (int)(hs & 0xFFFFu);
+    int local_q_head_start = (int)((hs >> 16) & 0xFFFFu);
+    int q_head_local = (int)vblock;
+    if (q_head_local >= local_nqh) return;
+    int q_head = local_q_head_start + q_head_local;
 
     int gqa_group = num_q_heads / num_kv_heads;
     int kv_head = q_head / gqa_group;

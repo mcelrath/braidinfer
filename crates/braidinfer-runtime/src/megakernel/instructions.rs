@@ -76,7 +76,7 @@ pub(crate) struct NopInst {
     pub dump_buf: *const u8,
     pub max_slots: u64,
     pub dump_counter: *const i32,
-    pub _pad: [u64; 14],
+    pub _pad: [u64; 15],
 }
 assert_inst_size!(NopInst);
 impl_inst!(NopInst);
@@ -99,7 +99,7 @@ pub(crate) struct RmsNormInst {
     // fields) spin-waits on this value.
     pub sentinel_ptr: u64,
     pub sentinel_seq: u64,
-    pub _pad: [u64; 10],
+    pub _pad: [u64; 11],
 }
 assert_inst_size!(RmsNormInst);
 impl_inst!(RmsNormInst);
@@ -115,7 +115,7 @@ impl RmsNormInst {
             eps_bits: eps.to_bits() as u64,
             sentinel_ptr: 0,
             sentinel_seq: 0,
-            _pad: [0; 10],
+            _pad: [0; 11],
         }
     }
 }
@@ -134,7 +134,7 @@ pub(crate) struct LinearProjInst {
     pub out_dim: u64,      // i32 zero-extended
     pub in_dim: u64,       // i32 zero-extended
     pub batch: u64,        // i32, 0 = single token
-    pub _pad: [u64; 11],
+    pub _pad: [u64; 12],
 }
 assert_inst_size!(LinearProjInst);
 impl_inst!(LinearProjInst);
@@ -149,7 +149,7 @@ impl LinearProjInst {
             out_dim: out_dim as u64,
             in_dim: in_dim as u64,
             batch: batch as u64,
-            _pad: [0; 11],
+            _pad: [0; 12],
         }
     }
 }
@@ -167,7 +167,7 @@ pub(crate) struct Conv1dInst {
     pub output: *mut f32,
     pub dim: u64,
     pub kernel_size: u64,
-    pub _pad: [u64; 11],
+    pub _pad: [u64; 12],
 }
 assert_inst_size!(Conv1dInst);
 impl_inst!(Conv1dInst);
@@ -182,7 +182,7 @@ impl Conv1dInst {
             output,
             dim: dim as u64,
             kernel_size: kernel_size as u64,
-            _pad: [0; 11],
+            _pad: [0; 12],
         }
     }
 }
@@ -199,7 +199,7 @@ pub(crate) struct GdnGateInst {
     pub a_log: *const f32,
     pub dt_bias: *const u16, // bf16
     pub num_heads: u64,
-    pub _pad: [u64; 12],
+    pub _pad: [u64; 13],
 }
 assert_inst_size!(GdnGateInst);
 impl_inst!(GdnGateInst);
@@ -213,7 +213,7 @@ impl GdnGateInst {
             a_log,
             dt_bias,
             num_heads: num_heads as u64,
-            _pad: [0; 12],
+            _pad: [0; 13],
         }
     }
 }
@@ -237,7 +237,7 @@ pub(crate) struct GdnRecurInst {
     pub vd: u64,
     pub gqa_group: u64,
     pub num_heads: u64,
-    pub _pad: [u64; 6],
+    pub _pad: [u64; 7],
 }
 assert_inst_size!(GdnRecurInst);
 impl_inst!(GdnRecurInst);
@@ -251,7 +251,7 @@ impl GdnRecurInst {
             vd: vd as u64,
             gqa_group: gqa_group as u64,
             num_heads: num_heads as u64,
-            _pad: [0; 6],
+            _pad: [0; 7],
         }
     }
 }
@@ -270,7 +270,7 @@ pub(crate) struct RmsNormGateInst {
     pub num_heads: u64,
     pub vd: u64,
     pub eps_bits: u64,
-    pub _pad: [u64; 10],
+    pub _pad: [u64; 11],
 }
 assert_inst_size!(RmsNormGateInst);
 impl_inst!(RmsNormGateInst);
@@ -283,7 +283,7 @@ impl RmsNormGateInst {
             num_heads: num_heads as u64,
             vd: vd as u64,
             eps_bits: eps.to_bits() as u64,
-            _pad: [0; 10],
+            _pad: [0; 11],
         }
     }
 }
@@ -299,7 +299,7 @@ pub(crate) struct ResidualAddInst {
     pub src: *const f32,
     pub residual: *const f32,
     pub n: u64,
-    pub _pad: [u64; 13],
+    pub _pad: [u64; 14],
 }
 assert_inst_size!(ResidualAddInst);
 impl_inst!(ResidualAddInst);
@@ -310,7 +310,7 @@ impl ResidualAddInst {
             opcode_gridx: make_opcode_gridx(OP_RESIDUAL_ADD, grid_x),
             output, src, residual,
             n: n as u64,
-            _pad: [0; 13],
+            _pad: [0; 14],
         }
     }
 }
@@ -331,7 +331,7 @@ pub(crate) struct QkNormInst {
     pub hd: u64,
     pub eps_bits: u64,
     pub batch: u64, // only set for n>1; 0 for single-token
-    pub _pad: [u64; 8],
+    pub _pad: [u64; 9],
 }
 assert_inst_size!(QkNormInst);
 impl_inst!(QkNormInst);
@@ -346,7 +346,7 @@ impl QkNormInst {
             hd: hd as u64,
             eps_bits: eps.to_bits() as u64,
             batch: batch as u64,
-            _pad: [0; 8],
+            _pad: [0; 9],
         }
     }
 }
@@ -372,7 +372,7 @@ pub(crate) struct MropeInst {
     pub s2: u64,
     pub batch: u64,
     pub dump: *mut u32, // 5ax diag: optional u32 dump buffer (null disables)
-    pub _pad: [u64; 4],
+    pub _pad: [u64; 5],
 }
 assert_inst_size!(MropeInst);
 impl_inst!(MropeInst);
@@ -391,7 +391,7 @@ impl MropeInst {
             s2: s2 as u64,
             batch: batch as u64,
             dump: std::ptr::null_mut(),
-            _pad: [0; 4],
+            _pad: [0; 5],
         }
     }
 
@@ -416,7 +416,7 @@ pub(crate) struct GqaAttnInst {
     pub seq_len: u64,
     pub max_seq_len: u64,
     pub q_head_start: u64,
-    pub _pad: [u64; 7],
+    pub _pad: [u64; 8],
 }
 assert_inst_size!(GqaAttnInst);
 impl_inst!(GqaAttnInst);
@@ -432,7 +432,7 @@ impl GqaAttnInst {
             seq_len: seq_len as u64,
             max_seq_len: max_seq_len as u64,
             q_head_start: 0,
-            _pad: [0; 7],
+            _pad: [0; 8],
         }
     }
 }
@@ -448,7 +448,7 @@ pub(crate) struct OutputGateInst {
     pub attn_out: *const f32,
     pub gate: *const f32,
     pub size: u64,
-    pub _pad: [u64; 13],
+    pub _pad: [u64; 14],
 }
 assert_inst_size!(OutputGateInst);
 impl_inst!(OutputGateInst);
@@ -459,7 +459,7 @@ impl OutputGateInst {
             opcode_gridx: make_opcode_gridx(OP_OUTPUT_GATE, grid_x),
             output, attn_out, gate,
             size: size as u64,
-            _pad: [0; 13],
+            _pad: [0; 14],
         }
     }
 }
@@ -481,7 +481,7 @@ pub(crate) struct FfnGateUpInst {
     pub intermediate: u64,
     pub eps_bits: u64,
     pub batch: u64,
-    pub _pad: [u64; 8],
+    pub _pad: [u64; 9],
 }
 assert_inst_size!(FfnGateUpInst);
 impl_inst!(FfnGateUpInst);
@@ -495,7 +495,7 @@ impl FfnGateUpInst {
             intermediate: intermediate as u64,
             eps_bits: eps.to_bits() as u64,
             batch: batch as u64,
-            _pad: [0; 8],
+            _pad: [0; 9],
         }
     }
 }
@@ -514,7 +514,7 @@ pub(crate) struct FfnDownResInst {
     pub hs: u64,
     pub intermediate: u64,
     pub batch: u64,
-    pub _pad: [u64; 10],
+    pub _pad: [u64; 11],
 }
 assert_inst_size!(FfnDownResInst);
 impl_inst!(FfnDownResInst);
@@ -527,7 +527,7 @@ impl FfnDownResInst {
             hs: hs as u64,
             intermediate: intermediate as u64,
             batch: batch as u64,
-            _pad: [0; 10],
+            _pad: [0; 11],
         }
     }
 }
@@ -543,7 +543,7 @@ pub(crate) struct EmbeddingInst {
     pub embed_weight: *const u16, // bf16
     pub token_id: u64,
     pub hs: u64,
-    pub _pad: [u64; 13],
+    pub _pad: [u64; 14],
 }
 assert_inst_size!(EmbeddingInst);
 impl_inst!(EmbeddingInst);
@@ -556,7 +556,7 @@ impl EmbeddingInst {
             embed_weight,
             token_id: token_id as u64,
             hs: hs as u64,
-            _pad: [0; 13],
+            _pad: [0; 14],
         }
     }
 }
@@ -571,7 +571,7 @@ impl EmbeddingInst {
 #[repr(C)]
 pub(crate) struct HaltInst {
     pub opcode_gridx: u64,
-    pub _pad: [u64; 17],
+    pub _pad: [u64; 18],
 }
 assert_inst_size!(HaltInst);
 impl_inst!(HaltInst);
@@ -580,7 +580,7 @@ impl HaltInst {
     pub(crate) fn new() -> Self {
         HaltInst {
             opcode_gridx: make_opcode_gridx(OP_HALT, 0),
-            _pad: [0; 17],
+            _pad: [0; 18],
         }
     }
 }
@@ -603,7 +603,7 @@ pub(crate) struct D2dCopyInst {
     // write signal_seq to *(u32*)signal_ptr after the copy completes (release).
     pub signal_ptr: u64,
     pub signal_seq: u64,
-    pub _pad: [u64; 10],
+    pub _pad: [u64; 11],
 }
 assert_inst_size!(D2dCopyInst);
 impl_inst!(D2dCopyInst);
@@ -618,7 +618,7 @@ impl D2dCopyInst {
             wait_seq: 0,
             signal_ptr: 0,
             signal_seq: 0,
-            _pad: [0; 10],
+            _pad: [0; 11],
         }
     }
 
@@ -662,6 +662,10 @@ pub(crate) struct AttnPagedInst {
     pub mrope_sections: u64, // packed: low 32 = section0_pairs, high 32 = section1_pairs
     pub k_norm: *const u16, // null if no QK-norm
     pub eps_bits: u64,       // f32 rms_norm_eps as u64 (low 32 bits)
+    // bd srg6.2: head-slice for head-parallel paged read.
+    // Encoding: bits 0-15 = local_nqh, bits 16-31 = local_q_head_start, bits 32-63 = reserved (0).
+    // Single-GPU: (0 << 16) | nqh. Multi-GPU (Phase 4): per-worker slice.
+    pub head_slice: u64,
 }
 assert_inst_size!(AttnPagedInst);
 impl_inst!(AttnPagedInst);
@@ -685,8 +689,11 @@ impl AttnPagedInst {
         eps: f32,
         mrope_section0_pairs: i32,
         mrope_section1_pairs: i32,
+        local_q_head_start: u16,
+        local_nqh: u16,
     ) -> Self {
         let mrope_sections = (mrope_section0_pairs as u64) | ((mrope_section1_pairs as u64) << 32);
+        let head_slice = (local_nqh as u64) | ((local_q_head_start as u64) << 16);
         AttnPagedInst {
             opcode_gridx: make_opcode_gridx(OP_ATTN_PAGED, grid_x),
             output,
@@ -706,6 +713,7 @@ impl AttnPagedInst {
             mrope_sections,
             k_norm,
             eps_bits: eps.to_bits() as u64,
+            head_slice,
         }
     }
 }
@@ -728,7 +736,7 @@ pub(crate) struct AttnPrefillInst {
     pub start_pos: u64,
     pub n: u64,
     pub max_seq_len: u64,
-    pub _pad: [u64; 7],
+    pub _pad: [u64; 8],
 }
 assert_inst_size!(AttnPrefillInst);
 impl_inst!(AttnPrefillInst);
@@ -744,7 +752,7 @@ impl AttnPrefillInst {
             start_pos: start_pos as u64,
             n: n as u64,
             max_seq_len: max_seq_len as u64,
-            _pad: [0; 7],
+            _pad: [0; 8],
         }
     }
 }
@@ -762,7 +770,7 @@ pub(crate) struct DeinterleaveInst {
     pub num_heads: u64,
     pub head_dim: u64,
     pub batch: u64,
-    pub _pad: [u64; 11],
+    pub _pad: [u64; 12],
 }
 assert_inst_size!(DeinterleaveInst);
 impl_inst!(DeinterleaveInst);
@@ -775,7 +783,7 @@ impl DeinterleaveInst {
             num_heads: num_heads as u64,
             head_dim: head_dim as u64,
             batch: batch as u64,
-            _pad: [0; 11],
+            _pad: [0; 12],
         }
     }
 }
@@ -798,7 +806,7 @@ pub(crate) struct KvQuantizeInst {
     pub head_dim:     i32,
     pub chunk_tokens: i32,
     pub _pad0:        i32,
-    pub _pad:         [u64; 10],
+    pub _pad:         [u64; 11],
 }
 assert_inst_size!(KvQuantizeInst);
 impl_inst!(KvQuantizeInst);
@@ -829,13 +837,17 @@ pub(crate) struct AttnPagedQInst {
     pub rd_off: u64,
     pub rs: u64,
     pub k_norm: *const u16, // null if no QK-norm
+    // bd srg6.2: head-slice (same encoding as AttnPagedInst.head_slice).
+    pub head_slice: u64,
     pub _pad: u64,
 }
 assert_inst_size!(AttnPagedQInst);
 impl_inst!(AttnPagedQInst);
 
 impl AttnPagedQInst {
-    pub(crate) fn new(q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, chunk_tokens: i32, rd: i32, q1d: u64, q1s: u64, rd_off: u64, rs: u64, k_norm: *const u16) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(q: *const f32, inv_freq: *const f32, nqh: i32, nkh: i32, hd: i32, chunk_tokens: i32, rd: i32, q1d: u64, q1s: u64, rd_off: u64, rs: u64, k_norm: *const u16, local_q_head_start: u16, local_nqh: u16) -> Self {
+        let head_slice = (local_nqh as u64) | ((local_q_head_start as u64) << 16);
         AttnPagedQInst {
             opcode_gridx: make_opcode_gridx(OP_ATTN_PAGED_Q, 0),
             scratch: 0,
@@ -854,6 +866,7 @@ impl AttnPagedQInst {
             rd_off,
             rs,
             k_norm,
+            head_slice,
             _pad: 0,
         }
     }
@@ -875,7 +888,7 @@ pub(crate) struct MoeGateInst {
     pub gate_mode: u64,
     pub rsf_bits: u64, // routed_scaling_factor as f32 bits
     pub bias: *const u8,
-    pub _pad: [u64; 9],
+    pub _pad: [u64; 10],
 }
 assert_inst_size!(MoeGateInst);
 impl_inst!(MoeGateInst);
@@ -890,7 +903,7 @@ impl MoeGateInst {
             gate_mode: gate_mode as u64,
             rsf_bits: rsf.to_bits() as u64,
             bias,
-            _pad: [0; 9],
+            _pad: [0; 10],
         }
     }
 }
@@ -922,7 +935,7 @@ pub(crate) struct MoeFfnInst {
     pub expert_act: *const f32,
     pub expert_out: *const f32,
     pub gate_up_row_stride: u64,
-    pub _pad: u64,
+    pub _pad: [u64; 2],
 }
 assert_inst_size!(MoeFfnInst);
 impl_inst!(MoeFfnInst);
@@ -938,7 +951,7 @@ pub(crate) struct SigmoidWeightedAddInst {
     pub scalar: *const f32,
     pub input: *const f32,
     pub n: u64,
-    pub _pad: [u64; 13],
+    pub _pad: [u64; 14],
 }
 assert_inst_size!(SigmoidWeightedAddInst);
 impl_inst!(SigmoidWeightedAddInst);
@@ -949,7 +962,7 @@ impl SigmoidWeightedAddInst {
             opcode_gridx: make_opcode_gridx(OP_SIGMOID_WEIGHTED_ADD, grid_x),
             output, scalar, input,
             n: n as u64,
-            _pad: [0; 13],
+            _pad: [0; 14],
         }
     }
 }
@@ -969,7 +982,7 @@ pub(crate) struct DotSigmoidScaleAddInst {
     pub input: *const f32,
     pub weight: *const u16,
     pub size: u64,
-    pub _pad: [u64; 12],
+    pub _pad: [u64; 13],
 }
 assert_inst_size!(DotSigmoidScaleAddInst);
 impl_inst!(DotSigmoidScaleAddInst);
@@ -980,7 +993,7 @@ impl DotSigmoidScaleAddInst {
             opcode_gridx: make_opcode_gridx(OP_DOT_SIGMOID_SCALE_ADD, 1),
             output, src, input, weight,
             size: size as u64,
-            _pad: [0; 12],
+            _pad: [0; 13],
         }
     }
 }
@@ -1029,6 +1042,7 @@ pub(crate) struct MoeDispatchInst {
     /// to UC `output_slots[0..gupd]`. See moe_p2p.rs `MoeP2pContext::gpu0_acc`.
     /// Unused by OP_MOE_DISPATCH_POST (it only reads output_slots).
     pub gpu0_acc: u64,
+    pub _pad: u64,
 }
 assert_inst_size!(MoeDispatchInst);
 impl_inst!(MoeDispatchInst);
@@ -1044,7 +1058,7 @@ pub(crate) struct ScaleAddInst {
     pub src: *const f32,
     pub scale_bits: u64,
     pub size: u64,
-    pub _pad: [u64; 13],
+    pub _pad: [u64; 14],
 }
 assert_inst_size!(ScaleAddInst);
 impl_inst!(ScaleAddInst);
@@ -1056,7 +1070,7 @@ impl ScaleAddInst {
             opcode_gridx: make_opcode_gridx(OP_SCALE_ADD, grid_x),
             output, src, scale_bits,
             size: size as u64,
-            _pad: [0; 13],
+            _pad: [0; 14],
         }
     }
 }
@@ -1071,7 +1085,7 @@ pub(crate) struct ReluSqInst {
     pub output: *mut f32,
     pub input: *const f32,
     pub size: u64,
-    pub _pad: [u64; 14],
+    pub _pad: [u64; 15],
 }
 assert_inst_size!(ReluSqInst);
 impl_inst!(ReluSqInst);
@@ -1082,7 +1096,7 @@ impl ReluSqInst {
             opcode_gridx: make_opcode_gridx(OP_RELU_SQ, grid_x),
             output, input,
             size: size as u64,
-            _pad: [0; 14],
+            _pad: [0; 15],
         }
     }
 }
@@ -1102,7 +1116,7 @@ pub(crate) struct Mamba2Conv1dInst {
     pub output: *mut f32,
     pub conv_dim: u64,
     pub kernel_size: u64,
-    pub _pad: [u64; 10],
+    pub _pad: [u64; 11],
 }
 assert_inst_size!(Mamba2Conv1dInst);
 impl_inst!(Mamba2Conv1dInst);
@@ -1114,7 +1128,7 @@ impl Mamba2Conv1dInst {
             state, input, weight, bias, output,
             conv_dim: conv_dim as u64,
             kernel_size: kernel_size as u64,
-            _pad: [0; 10],
+            _pad: [0; 11],
         }
     }
 }
@@ -1134,7 +1148,7 @@ pub(crate) struct Mamba2NormGatedInst {
     pub num_heads: u64,
     pub value_dim: u64,
     pub eps_bits: u64,
-    pub _pad: [u64; 10],
+    pub _pad: [u64; 11],
 }
 assert_inst_size!(Mamba2NormGatedInst);
 impl_inst!(Mamba2NormGatedInst);
@@ -1147,7 +1161,7 @@ impl Mamba2NormGatedInst {
             num_heads: num_heads as u64,
             value_dim: value_dim as u64,
             eps_bits: eps.to_bits() as u64,
-            _pad: [0; 10],
+            _pad: [0; 11],
         }
     }
 }
@@ -1173,7 +1187,7 @@ pub(crate) struct SsmUpdateInst {
     pub hd: u64,
     pub sd: u64,
     pub ng: u64,
-    pub _pad: [u64; 4],
+    pub _pad: [u64; 5],
 }
 assert_inst_size!(SsmUpdateInst);
 impl_inst!(SsmUpdateInst);
@@ -1187,7 +1201,7 @@ impl SsmUpdateInst {
             hd: hd as u64,
             sd: sd as u64,
             ng: ng as u64,
-            _pad: [0; 4],
+            _pad: [0; 5],
         }
     }
 }
@@ -1203,7 +1217,7 @@ pub(crate) struct SiluMulInst {
     pub gate: *const f32,
     pub up: *const f32,
     pub size: u64,
-    pub _pad: [u64; 13],
+    pub _pad: [u64; 14],
 }
 assert_inst_size!(SiluMulInst);
 impl_inst!(SiluMulInst);
@@ -1214,7 +1228,7 @@ impl SiluMulInst {
             opcode_gridx: make_opcode_gridx(OP_SILU_MUL, grid_x),
             output, gate, up,
             size: size as u64,
-            _pad: [0; 13],
+            _pad: [0; 14],
         }
     }
 }
@@ -1229,7 +1243,7 @@ pub(crate) struct BarrierInst {
     pub barrier_flag: *const u32,
     pub resume_flag: *const u32,
     pub layer_idx: u64,
-    pub _pad: [u64; 14],
+    pub _pad: [u64; 15],
 }
 assert_inst_size!(BarrierInst);
 impl_inst!(BarrierInst);
@@ -1241,7 +1255,7 @@ impl BarrierInst {
             barrier_flag: std::ptr::null(),
             resume_flag: std::ptr::null(),
             layer_idx: layer_idx as u64,
-            _pad: [0; 14],
+            _pad: [0; 15],
         }
     }
 }
@@ -1270,7 +1284,7 @@ pub(crate) struct Conv1d3xInst {
     pub v_dim:      i64,
     pub kernel_size: i64,
     pub blocks_qk_v: u64, // low32=blocks_qk, high32=blocks_v
-    pub _pad: u64,
+    pub _pad: [u64; 2],
 }
 assert_inst_size!(Conv1d3xInst);
 impl_inst!(Conv1d3xInst);
@@ -1295,7 +1309,7 @@ impl Conv1d3xInst {
             v_dim: v_dim as i64,
             kernel_size: kernel_size as i64,
             blocks_qk_v: (blocks_qk as u64) | ((blocks_v as u64) << 32),
-            _pad: 0,
+            _pad: [0; 2],
         }
     }
 }
@@ -1316,7 +1330,7 @@ pub(crate) struct LinearProj2xInst {
     pub out_dim: i64, // same for A and B
     pub in_dim: i64,
     pub batch: i64, // 0 or 1 → single token
-    pub _pad: [u64; 9],
+    pub _pad: [u64; 10],
 }
 assert_inst_size!(LinearProj2xInst);
 impl_inst!(LinearProj2xInst);
@@ -1344,7 +1358,7 @@ impl LinearProj2xInst {
             out_dim: out_dim as i64,
             in_dim: in_dim as i64,
             batch: batch as i64,
-            _pad: [0; 9],
+            _pad: [0; 10],
         }
     }
 }
@@ -1390,7 +1404,7 @@ pub(crate) struct MoeFfnRemoteInst {
     // kernel via config_array[layer_idx] so each consumer dereferences a VA
     // that is valid in its own context.
     pub layer_idx: u64,
-    pub _pad: [u64; 1],
+    pub _pad: [u64; 2],
 }
 assert_inst_size!(MoeFfnRemoteInst);
 impl_inst!(MoeFfnRemoteInst);
@@ -1437,7 +1451,7 @@ impl MoeFfnRemoteInst {
             wait_ptr: std::ptr::null(),
             wait_seq: 0,
             layer_idx,
-            _pad: [0; 1],
+            _pad: [0; 2],
         }
     }
 

@@ -331,7 +331,7 @@ impl MegakernelProgram {
                     head_dim:     hd as i32,
                     chunk_tokens: CHUNK_TOKENS as i32,
                     _pad0:        0,
-                    _pad:         [0; 10],
+                    _pad:         [0; 11],
                 }.into_inst());
             }
         }

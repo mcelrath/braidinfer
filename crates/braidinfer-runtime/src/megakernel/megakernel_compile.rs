@@ -1313,6 +1313,7 @@ impl MegakernelProgram {
                         // OP_MOE_DISPATCH_POST doesn't use gpu0_acc, but
                         // the field is non-optional in the struct layout.
                         gpu0_acc: 0,
+                        _pad: 0,
                     }.into_inst());
 
                     // The rest of the post-MoE insertions only apply to Nemotron-H

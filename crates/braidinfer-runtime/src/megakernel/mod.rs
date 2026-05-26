@@ -20,7 +20,7 @@ include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 /// Must match SHARED_LPROJ_TOTAL in kernels/megakernel_ops.hip.
 pub(crate) const SHARED_LPROJ_TOTAL: u32 = 31776;
 
-pub(crate) const INST_SIZE: usize = 18; // 18 u64s per instruction = 144 bytes
+pub(crate) const INST_SIZE: usize = 19; // 19 u64s per instruction = 152 bytes (bd srg6.2)
 // RDNA3 7900XTX: 96 CUs grouped into 48 WGPs. hipDeviceAttributeMultiprocessorCount=48 (WGPs).
 // Cooperative kernel max blocks = blocks_per_sm * WGPs = blocks_per_sm * 48.
 pub(crate) const NUM_CUS: u32 = 48;

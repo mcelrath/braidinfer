@@ -230,6 +230,9 @@ impl MegakernelProgram {
                     let (q1d, q1s, rd_off, rs) =
                         quantized_kv_offsets(cfg, chunk_tokens, *attn_layer_index, false);
                     let k_norm_ptr = if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() };
+                    // bd srg6.2: single-GPU head-slice = full range (start=0, nqh).
+                    let local_q_head_start: u16 = 0;
+                    let local_nqh: u16 = nqh as u16;
                     instructions.push(AttnPagedQInst::new(
                         q_attn_ptr as *const f32,
                         act.inv_freq.as_ptr(),
@@ -238,6 +241,8 @@ impl MegakernelProgram {
                         rd as i32,
                         q1d as u64, q1s as u64, rd_off as u64, rs as u64,
                         k_norm_ptr,
+                        local_q_head_start,
+                        local_nqh,
                     ).into_inst()); // no sync between quant and f32 attention
                 }
 
@@ -247,8 +252,12 @@ impl MegakernelProgram {
                 {
                     let k_norm_ptr = if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() };
                     let mrope = cfg.mrope_sections();
+                    // bd srg6.2: single-GPU head-slice = full range.
+                    // grid_x = local_nqh (= nqh on single-GPU). Phase 4 will scale grid_x for worker slices.
+                    let local_q_head_start: u16 = 0;
+                    let local_nqh: u16 = nqh as u16;
                     instructions.push(AttnPagedInst::new(
-                        nqh as u32,
+                        local_nqh as u32,
                         attn_out_ptr,
                         q_attn_ptr as *const f32,
                         act.inv_freq.as_ptr(),
@@ -262,6 +271,8 @@ impl MegakernelProgram {
                         eps,
                         mrope[0] as i32,
                         mrope[1] as i32,
+                        local_q_head_start,
+                        local_nqh,
                     ).into_inst());
                 }
             }

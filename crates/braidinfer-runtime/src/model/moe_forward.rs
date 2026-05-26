@@ -227,7 +227,7 @@ impl Model {
             dump_buf: std::ptr::null(),
             max_slots: 0,
             dump_counter: std::ptr::null(),
-            _pad: [0; 14],
+            _pad: [0; 15],
         }.into_inst());
         {
             let dispatch = self.persistent_workers.as_mut()
