@@ -109,8 +109,6 @@ pub(crate) struct DecodeMoeParams {
 pub struct MoeP2pContext {
     /// Shared work queue in GART memory (MoeWorkItem fixed fields + activation_cache[gate_up_in_dim]).
     pub work_queue: MappedHostBuffer<u8>,
-    /// Monotonic dispatch sequence counter (GART, host-mapped u32).
-    pub seq_counter: MappedHostBuffer<u32>,
     /// Expert output accumulation buffer. Workers P2P-write expert outputs
     /// here; GPU 0's POST op reads them.
     ///
@@ -283,7 +281,6 @@ impl MoeP2pContext {
         // The flexible activation_cache tail holds batch_size * gate_up_in_dim floats.
         let wq_size = MOE_WORK_QUEUE_FIXED + MAX_PREFILL_BATCH * gate_up_in_dim * std::mem::size_of::<f32>();
         let work_queue = MappedHostBuffer::<u8>::alloc(wq_size)?;
-        let seq_counter = MappedHostBuffer::<u32>::alloc(1)?;
         // Output slots sized for MAX_PREFILL_BATCH × num_gpus × hidden_size.
         // Decode uses only the first (0 * num_gpus + gpu) * hs slot (batch_size=1).
         //
@@ -517,7 +514,6 @@ impl MoeP2pContext {
         Ok(MoeP2pContext {
             moe_act_uc_handoff,
             work_queue,
-            seq_counter,
             output_slots,
             gpu0_layer_config_ptrs,
             _gpu0_config_storage: gpu0_config_storage,

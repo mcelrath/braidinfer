@@ -36,7 +36,7 @@
 #define OP_FFN_DOWN_RES_RNF4 31  // Fused down_proj + residual add (rnf4 weights)
 #define OP_SIGMOID_WEIGHTED_ADD 32  // output[i] += sigmoid(scalar[0]) * input[i]
 #define OP_BARRIER      33  // explicit grid.sync() barrier instruction
-#define OP_MOE_DISPATCH 34  // GPU-initiated MoE: write work queue, poll ack flags, sum output slots
+#define OP_MOE_DISPATCH 34  // RETIRED bd 0hu.3-b (commit b406640): GPU 0's MoE PRE-compute now uses OP_MOE_FFN_REMOTE self-dispatch. Slot kept for ABI history.
 // 35 reserved (was OP_EXPERT_FFN — removed per bd ntz6 2026-05-21:
 //   defined but no producer/consumer, moe_gemv_worker.hip orphan not in build).
 #define OP_SCALE_ADD    36  // output[i] += scale * src[i]; args: [1]=output, [2]=src, [3]=scale(f32 bits), [4]=size

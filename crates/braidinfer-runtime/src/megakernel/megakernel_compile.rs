@@ -1299,7 +1299,7 @@ impl MegakernelProgram {
                         final_output: final_output_ptr,
                         expert_ids: act.moe_expert_ids.as_ptr() as u64,
                         expert_weights: act.moe_expert_weights.as_ptr() as u64,
-                        seq_counter: p2p.seq_counter.device_ptr() as u64,
+                        seq_counter: 0, // unused by OP_MOE_DISPATCH_POST; field retained for layout compat
                         num_workers_hs: ((num_workers as u64) << 32) | (hs as u64),
                         layer_k: ((layer_idx as u64) << 32) | (k as u64),
                         eis_gate: ((eis as u64) << 32) | has_gate,

@@ -185,38 +185,35 @@ Single persistent cooperative kernel (384 blocks × 256 threads) replacing ~345 
 128-byte instructions, virtual block loop, grid.sync() between instructions.
 2.1x speedup over naive dispatch (6.4ms vs 13.4ms per token).
 
-`kernels/megakernel.hip` defines TWO `__global__` entry points that share
-one opcode dispatch table:
+`kernels/megakernel.hip` defines a single `__global__` entry point:
 
-- `megakernel_f32(program, num_inst, watchdog, op_profile)` — one-shot
-  driver: iterates a VRAM `program` array, exits on `OP_HALT`. Used by
-  prefill and one-shot megakernel dispatch paths.
 - `persistent_worker(queue, watchdog)` — persistent driver: polls a
   host-mapped `WorkerQueue` mailbox forever, acks each batch. Used by
-  the steady-state decode hot path. Holds CUs for the model's lifetime.
+  both prefill and decode. Holds CUs for the model's lifetime.
 
-Both call the same `dispatch_opcode(...)` helper in
+`persistent_worker` calls `dispatch_opcode(...)` in
 `kernels/megakernel_dispatch.hip` — the unified routing table for every
-opcode the megakernel handles. Adding a new opcode (or promoting an
-existing one to a top-level case bypassing the virtual-block loop)
-requires editing exactly one file. Trace dump infrastructure is wired
-through both entries via `WorkerQueue::dump_*` fields populated by the
-Rust runtime when `Model::trace` is active.
+opcode the megakernel handles. Adding a new opcode requires editing
+exactly one file. Trace dump infrastructure is wired through
+`WorkerQueue::dump_*` fields populated by the Rust runtime when
+`Model::trace` is active.
 
-`kernels/megakernel.hsaco` carries both symbols. The Rust runtime loads
-the same hsaco from two call sites — `MegakernelProgram` for the
-megakernel_f32 entry and `PersistentDispatch` for the persistent_worker
-entry — via `Module::get_function(name)`.
+`kernels/megakernel.hsaco` exposes `persistent_worker` (loaded by
+`PersistentDispatch` via `Module::get_function`).
 
-History: prior to the braidinfer-zqw merge, `persistent_worker` lived in
-its own `kernels/persistent_worker.hip` with a parallel (and drifting)
-opcode-dispatch chain. That drift caused the OP_LM_HEAD regression
-(commit 9c21cf6: 250× slowdown on persistent decode). The merge
-(commits b1cb2de…9deeb50) collapsed both chains into one helper.
+History:
+- The one-shot `megakernel_f32` entry was deleted in bd 9gmh Phase 4
+  (commit 5953598) once persistent dispatch covered both prefill and
+  decode.
+- Prior to the braidinfer-zqw merge, `persistent_worker` lived in
+  its own `kernels/persistent_worker.hip` with a parallel (drifting)
+  opcode-dispatch chain. That drift caused the OP_LM_HEAD regression
+  (commit 9c21cf6: 250× slowdown on persistent decode). The merge
+  (commits b1cb2de…9deeb50) collapsed both chains into one helper.
 
 ## Watchdog for Persistent Kernels
 
-Persistent cooperative kernels (moe_worker, moe_gemv_worker, megakernel.hip's `persistent_worker` and `megakernel_f32` entries, megakernel_moe_dispatch) include a host-side watchdog that detects wedged kernels.
+Persistent cooperative kernels (moe_worker, moe_gemv_worker, megakernel.hip's `persistent_worker`) include a host-side watchdog that detects wedged kernels.
 
 ### How it works
 

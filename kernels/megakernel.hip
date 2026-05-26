@@ -42,13 +42,16 @@ __device__ static uint32_t g_shutdown_seen;
 // operations. CPU-scheduled via memory writes (no HIP API calls in hot path).
 // One instance per GPU, launched once at init, runs for model lifetime.
 //
-// Same op-dispatch chain as megakernel_f32 above (via dispatch_opcode helper).
-// Differences from megakernel_f32 are confined to the driver loop:
+// Calls dispatch_opcode (kernels/megakernel_dispatch.hip) for per-opcode work.
+// Driver loop responsibilities:
 //   - mailbox-poll lifecycle (wait for seq_num, ack on completion)
 //   - per-batch L1 invalidation
 //   - per-pc instruction copy to LDS
 //   - shutdown-flag handling
-//   - __launch_bounds__(256, 2) instead of (256) for cooperative occupancy
+//   - __launch_bounds__(256, 2) for cooperative occupancy
+// (Prior to bd 9gmh Phase 4 / commit 5953598, a sibling `megakernel_f32`
+// one-shot entry existed; it was deleted once persistent dispatch covered
+// both prefill and decode.)
 extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     volatile WorkerQueue* queue,
     WatchdogState* watchdog  // host-mapped watchdog state; NULL to disable

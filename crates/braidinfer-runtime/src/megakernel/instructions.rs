@@ -986,9 +986,24 @@ impl DotSigmoidScaleAddInst {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OP_MOE_DISPATCH (opcode 34)
-// words[1..17] are raw u64s set directly (see compile_inner_p2p).
-// Provide a raw-words struct for clarity.
+// MoeDispatchInst — POST-ONLY CARRIER (post bd 0hu.3-b, commit b406640).
+//
+// OP_MOE_DISPATCH (opcode 34) is RETIRED — GPU 0's MoE PRE-compute now uses
+// OP_MOE_FFN_REMOTE (MoeFfnRemoteInst) emitted by compile_inner_p2p via
+// `build_ffn_remote_inst_gpu0`. The only remaining consumer of this layout
+// is OP_MOE_DISPATCH_POST (opcode 45), which reads exactly four slots:
+//   output_slots [word 2], final_output [3], num_workers_hs [7], num_gpus [15],
+//   gate_up_in_dim [16].
+// All other fields below (work_queue, expert_ids/weights, seq_counter,
+// layer_k, eis_gate, activation, layer_config_ptrs, scratch_*, gpu0_acc)
+// are VESTIGIAL — preserved only for layout compatibility with the
+// kernel-side C struct in `kernels/megakernel_common.h`. Emission sites
+// set them to zero or arbitrary values; POST never dereferences them.
+//
+// TODO: bd to rename to MoeDispatchPostInst and shrink to {opcode_gridx,
+// _pad1, output_slots, final_output, _pad2[3], num_workers_hs, _pad3[7],
+// num_gpus, gate_up_in_dim, _pad4} — requires coordinating C struct in
+// megakernel_common.h.
 // ─────────────────────────────────────────────────────────────────────────────
 #[repr(C)]
 pub(crate) struct MoeDispatchInst {
