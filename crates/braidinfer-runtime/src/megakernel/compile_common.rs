@@ -69,4 +69,16 @@ pub(super) enum AttentionVariant<'a> {
         kv_cache: &'a KvCache,
         start_pos: u32,
     },
+    /// bd srg6.5 Phase 3c: Prefill (N tokens) into paged KV chunks.
+    /// Batched OP_KV_WRITE_PAGED_BATCH (one K + one V) after mRoPE, then
+    /// per-token OP_ATTN_PAGED loop with seq_len = start_pos + t + 1.
+    /// page_table_ptr / position_table_ptr are host-mapped buffer device
+    /// pointers (caller writes chunk-base entries before dispatch).
+    PrefillPagedKv {
+        attn_layer_index: usize,
+        start_pos: u32,
+        n: usize,
+        page_table_ptr: u64,
+        position_table_ptr: u64,
+    },
 }

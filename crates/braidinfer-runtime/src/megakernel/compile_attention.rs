@@ -340,6 +340,102 @@ impl MegakernelProgram {
                     cfg.max_seq_len as i32,
                 ).into_inst());
             }
+
+            AttentionVariant::PrefillPagedKv {
+                attn_layer_index,
+                start_pos,
+                n: _n_variant, // identical to outer n (asserted by caller); kept for symmetry
+                page_table_ptr,
+                position_table_ptr,
+            } => {
+                // bd srg6.5 Phase 3c: paged-KV prefill.
+                // 1. mRoPE batched (n*(nqh+nkh)) — same as Prefill variant.
+                let mrope_idx = instructions.len();
+                mrope_indices.push(mrope_idx);
+                instructions.push(MropeInst::new(
+                    (n * (nqh + nkh)) as u32,
+                    q_attn_ptr, k_attn_ptr,
+                    act.inv_freq.as_ptr(), position_ids_ptr,
+                    nqh as i32, nkh as i32, hd as i32, rd as i32,
+                    cfg.mrope_sections()[0] as i32,
+                    cfg.mrope_sections()[1] as i32,
+                    cfg.mrope_sections()[2] as i32,
+                    n as i32,
+                ).into_inst());
+
+                // 2. Paged KV layer offsets (matches PagedKv decode arm at line 107-111).
+                let kv_stride = nkh * hd;
+                let chunk_tokens: usize = CHUNK_TOKENS;
+                let layer_k_off = (*attn_layer_index * 2 * chunk_tokens * kv_stride
+                                    * std::mem::size_of::<f32>()) as u64;
+                let layer_v_off = layer_k_off
+                    + (chunk_tokens * kv_stride * std::mem::size_of::<f32>()) as u64;
+
+                // 3. 2× OP_KV_WRITE_PAGED_BATCH (K, V). Replaces N*nkh*2 D2D_COPYs.
+                // src layout [N, nkh, hd] matches prefill_bufs.k_attn / v_attn.
+                instructions.push(KvWritePagedBatchInst::new(
+                    k_attn_ptr as *const f32,
+                    *page_table_ptr as *const u64,
+                    layer_k_off,
+                    *start_pos,
+                    n as u32,
+                    0u16,
+                    nkh as u16,
+                    hd as u16,
+                    chunk_tokens as u16,
+                ).into_inst());
+                instructions.push(KvWritePagedBatchInst::new(
+                    v_attn_ptr as *const f32,
+                    *page_table_ptr as *const u64,
+                    layer_v_off,
+                    *start_pos,
+                    n as u32,
+                    0u16,
+                    nkh as u16,
+                    hd as u16,
+                    chunk_tokens as u16,
+                ).into_inst());
+
+                // 4. Per-token OP_ATTN_PAGED. Each token attends over positions
+                //    [0..(start_pos + t + 1)] (causal). seq_len_t is baked at
+                //    compile time — no per-step patching needed (one-shot prefill).
+                let k_norm_ptr = if cfg.has_qk_norm { w.k_norm.as_ptr() } else { std::ptr::null() };
+                let mrope = cfg.mrope_sections();
+                for t in 0..n {
+                    let q_t = unsafe { q_attn_ptr.add(t * nqh * hd) as *const f32 };
+                    let attn_out_t = unsafe { attn_out_ptr.add(t * nqh * hd) };
+                    let paged_idx = instructions.len();
+                    attn_paged_indices.push(paged_idx);
+                    let seq_len_t = (*start_pos as usize + t + 1) as i32;
+                    instructions.push(AttnPagedInst::new(
+                        nqh as u32,
+                        attn_out_t,
+                        q_t,
+                        act.inv_freq.as_ptr(),
+                        nqh as i32, nkh as i32, hd as i32,
+                        seq_len_t,
+                        chunk_tokens as i32,
+                        rd as i32,
+                        layer_k_off,
+                        layer_v_off,
+                        k_norm_ptr,
+                        eps,
+                        mrope[0] as i32,
+                        mrope[1] as i32,
+                        0u16,
+                        nqh as u16,
+                    ).into_inst());
+                    // Patch page_table + pos_table + partial_state (per recovered
+                    // compile_prefill_paged@7caac79:1027-1034 pattern).
+                    let last = instructions.len() - 1;
+                    unsafe {
+                        let inst_ptr = instructions[last].words.as_mut_ptr() as *mut AttnPagedInst;
+                        (*inst_ptr).page_table = *page_table_ptr;
+                        (*inst_ptr).pos_table = *position_table_ptr;
+                        (*inst_ptr).partial_state = 0;
+                    }
+                }
+            }
         }
 
         // 10. Output gate (Qwen3.5 only) or pass-through
