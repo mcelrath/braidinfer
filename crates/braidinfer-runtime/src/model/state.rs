@@ -49,24 +49,145 @@ impl Model {
         }
     }
 
-    /// Prefill using paged KV cache (for persistent single-GPU non-MoE models).
-    /// Populates paged chunks via sequential decode_step so that subsequent
-    /// decode calls can attend to the full prefill context.
+    /// Prefill using paged KV cache (single-GPU dense / non-MoE).
     ///
-    /// Note: this is O(N^2) decode steps (not batched). Batched paged prefill
-    /// is tracked as a follow-up optimization (TODO: braidinfer-8gz follow-up).
+    /// bd srg6.7 (Phase 3e): batched paged-prefill via
+    /// `compile_prefill_paged_persistent`. Replaces the previous per-token
+    /// decode_step loop (bd 0hp1, O(N) mailbox round-trips) with a single
+    /// compiled paged-prefill program per CHUNK_TOKENS slab.
     fn prefill_paged(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
-        let start_pos = self.seq_len;
-        let mut logits = vec![0.0f32; self.config.vocab_size];
+        use crate::megakernel::instructions::*;
+        use crate::megakernel::{CHUNK_TOKENS, Instruction, MegakernelProgram, PrefillBuffers};
+        use braidinfer_hip::memory::MappedHostBuffer;
+        use std::sync::Arc;
 
-        // bd 9gmh Phase 2F: was decode_step_paged (legacy non-persistent path);
-        // now routes through decode_step (always-persistent), which lazy-spawns
-        // the worker on first call and uses dispatch_batch_slice via mailbox.
-        for (i, &tok) in tokens.iter().enumerate() {
-            let pos = start_pos + i as u32;
-            logits = self.decode_step(tok, pos)?;
+        let start_pos_full = self.seq_len;
+
+        // Lazy-init paged page/position tables (DeviceBuffer ones, currently
+        // dead — braidinfer-c7w2) and page_allocator/paged_seq.
+        self.ensure_paged_decode_state(false)?;
+
+        // Lazy-alloc prefill scratch (hidden / qkv / etc.).
+        if self.prefill_bufs.is_none() {
+            self.prefill_bufs = Some(
+                PrefillBuffers::alloc(self.device, &self.config, CHUNK_TOKENS)
+                    .map_err(ModelError::Hip)?,
+            );
         }
 
+        // Lazy-alloc host-mapped page/position tables for the paged-prefill writer.
+        let max_chunks = self.max_paged_chunks();
+        if self.prefill_paged_page_table.is_none() {
+            self.prefill_paged_page_table = Some(
+                MappedHostBuffer::<u64>::alloc(max_chunks).map_err(ModelError::Hip)?,
+            );
+        }
+        if self.prefill_paged_position_table.is_none() {
+            self.prefill_paged_position_table = Some(
+                MappedHostBuffer::<i32>::alloc(3 * self.config.max_seq_len).map_err(ModelError::Hip)?,
+            );
+        }
+
+        let megakernel_module = Arc::new(
+            braidinfer_hip::module::Module::load(
+                self.device,
+                &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+            )
+            .map_err(ModelError::Hip)?,
+        );
+
+        let hs = self.config.hidden_size;
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let end = (offset + CHUNK_TOKENS).min(tokens.len());
+            let chunk = &tokens[offset..end];
+            let chunk_start_pos = start_pos_full + offset as u32;
+            let n = chunk.len();
+
+            // Step 1: emit embeddings into prefill_bufs.hidden via mailbox
+            // (mirror prefill_mixed_chunk:116-135 pattern).
+            {
+                let grid_x = (hs as u32 + 255) / 256;
+                let mut insts: Vec<Instruction> = Vec::with_capacity(n);
+                let bufs = self.prefill_bufs.as_ref().unwrap();
+                for t in 0..n {
+                    insts.push(EmbeddingInst::new(
+                        grid_x,
+                        unsafe { bufs.hidden.as_write_ptr().add(t * hs) },
+                        self.embed_weight.as_ptr(),
+                        chunk[t] as i32,
+                        hs as i32,
+                    ).into_inst());
+                }
+                let dispatch = self.persistent_workers.as_mut()
+                    .expect("persistent_workers must be initialized in Model::prefill");
+                dispatch.dispatch_batch_slice(self.device.0 as usize, &insts);
+            }
+
+            // Step 2: compile + dispatch the paged-prefill program for this chunk.
+            let mut bufs = self.prefill_bufs.take().unwrap();
+            let mut seq = self.paged_seq.take().unwrap();
+            let mut allocator = self.page_allocator.take().unwrap();
+
+            let mut mk = {
+                let page_table = self.prefill_paged_page_table.as_ref().unwrap();
+                let pos_table = self.prefill_paged_position_table.as_ref().unwrap();
+                MegakernelProgram::compile_prefill_paged_persistent(
+                    self,
+                    Arc::clone(&megakernel_module),
+                    chunk,
+                    chunk_start_pos,
+                    &mut seq,
+                    &mut allocator,
+                    page_table,
+                    pos_table,
+                    &mut bufs,
+                )
+                .map_err(ModelError::Hip)?
+            };
+
+            self.prefill_bufs = Some(bufs);
+            self.paged_seq = Some(seq);
+            self.page_allocator = Some(allocator);
+
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers must be initialized in Model::prefill");
+            mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                .map_err(ModelError::Hip)?;
+
+            offset = end;
+        }
+
+        self.seq_len += tokens.len() as u32;
+
+        // Read last-token logits from act.logits via the persistent dispatch's
+        // SDMA stream (CU-free; the persistent worker still holds compute CUs).
+        // Mirror of prefill_batched:402-426.
+        let mut logits = vec![0.0f32; self.config.vocab_size];
+        let gpu_idx = self.device.0 as usize;
+        let stream = self
+            .persistent_workers
+            .as_ref()
+            .map(|d| d.sdma_stream(gpu_idx))
+            .unwrap_or(std::ptr::null_mut());
+        if stream.is_null() {
+            self.activations.logits.copy_to_host(&mut logits)?;
+        } else {
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipMemcpyAsync(
+                    logits.as_mut_ptr() as *mut std::ffi::c_void,
+                    self.activations.logits.as_ptr() as *const std::ffi::c_void,
+                    logits.len() * std::mem::size_of::<f32>(),
+                    braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                    stream,
+                )
+            })
+            .map_err(ModelError::Hip)?;
+            braidinfer_hip::error::check(unsafe {
+                braidinfer_hip::ffi::hipStreamSynchronize(stream)
+            })
+            .map_err(ModelError::Hip)?;
+        }
         Ok(logits)
     }
 

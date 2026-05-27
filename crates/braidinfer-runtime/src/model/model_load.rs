@@ -1125,6 +1125,8 @@ impl Model {
             paged_seq: None,
             paged_page_table: None,
             paged_position_table: None,
+            prefill_paged_page_table: None,
+            prefill_paged_position_table: None,
             checkpoint_pool: None,
             last_checkpoint_slot: None,
             debug_nan: std::env::var("DEBUG_NAN").is_ok(),

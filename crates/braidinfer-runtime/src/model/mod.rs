@@ -1,6 +1,6 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
 
 use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram};
@@ -65,6 +65,12 @@ pub struct Model {
     pub(crate) paged_seq: Option<SequenceState>,
     pub(crate) paged_page_table: Option<DeviceBuffer<u64>>,
     pub(crate) paged_position_table: Option<DeviceBuffer<i32>>,
+    // bd srg6.7: host-mapped page/position tables for paged-prefill writer.
+    // MappedHostBuffer (not DeviceBuffer) because writes happen while persistent
+    // worker holds GPU CUs — copy_from_host would panic; host_ptr.write_volatile
+    // is safe. Sized for max prompt: max_chunks u64s + 3*max_seq_len i32s.
+    pub(crate) prefill_paged_page_table: Option<MappedHostBuffer<u64>>,
+    pub(crate) prefill_paged_position_table: Option<MappedHostBuffer<i32>>,
     pub(crate) checkpoint_pool: Option<RecurrentCheckpointPool>,
     pub(crate) last_checkpoint_slot: Option<u32>,
     pub(crate) debug_nan: bool,
