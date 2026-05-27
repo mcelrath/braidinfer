@@ -1,6 +1,6 @@
 //! Per-opcode instruction structs for the megakernel.
 //!
-//! Each struct is `#[repr(C)]` with exactly `INST_SIZE` (18) u64-equivalent fields.
+//! Each struct is `#[repr(C)]` with exactly `INST_SIZE` (19) u64-equivalent fields.
 //! `words[0]` = `opcode_gridx: u64` encoding `opcode | (grid_x << 32)`.
 //! All structs transmute to/from `Instruction` via `into_inst()`.
 //!
