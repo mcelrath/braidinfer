@@ -644,3 +644,18 @@ typedef struct {
 } MoeFfnRemoteInst;
 static_assert(sizeof(MoeFfnRemoteInst) == INST_SIZE_WORDS * 8, "MoeFfnRemoteInst size mismatch");
 static_assert(offsetof(MoeFfnRemoteInst, activation_p2p) == 8, "MoeFfnRemoteInst.activation_p2p offset");
+
+// OP_KV_WRITE_PAGED_BATCH (opcode 47) — bd srg6.4 Phase 3b.
+// See KvWritePagedBatchInst in instructions.rs for field semantics.
+typedef struct {
+    uint64_t opcode_gridx;
+    const float* src;
+    const uint64_t* page_table;
+    uint64_t layer_kv_offset;
+    uint64_t start_pos;    // low 32: start_pos, high 32: n_tokens
+    uint64_t head_slice;   // 0-15: local_nkh, 16-31: local_kv_head_start,
+                           // 32-47: head_dim, 48-63: chunk_tokens
+    uint64_t _pad[13];
+} KvWritePagedBatchInst;
+static_assert(sizeof(KvWritePagedBatchInst) == INST_SIZE_WORDS * 8, "KvWritePagedBatchInst size mismatch");
+static_assert(offsetof(KvWritePagedBatchInst, src) == 8, "KvWritePagedBatchInst.src offset");

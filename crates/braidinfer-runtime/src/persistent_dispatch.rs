@@ -968,6 +968,14 @@ impl PersistentDispatch {
         }
     }
 
+    /// bd srg6.4 Phase 3b: thin public passthrough for the integration test.
+    /// Equivalent to dispatch_batch_slice on the trait. Not intended for
+    /// production use.
+    #[doc(hidden)]
+    pub fn test_dispatch_batch_slice(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        <Self as BatchDispatcher>::dispatch_batch_slice(self, gpu_idx, instructions);
+    }
+
     /// Fire a batch of instructions to a GPU WITHOUT waiting for ack. Returns seq for wait_ack.
     /// Caller must call wait_ack(gpu_idx, seq) before reading GPU 0 output.
     /// Used to overlap GPU 0 OP_EXPERT_FFN with kbk dispatch on GPUs 1+.

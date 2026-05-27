@@ -15,7 +15,7 @@ use super::{
     OP_MOE_FFN_REMOTE, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM,
     OP_RELU_SQ, OP_CONV1D_3X, OP_LINEAR_PROJ_2X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE,
     OP_SCALE_ADD, OP_SIGMOID_WEIGHTED_ADD, OP_SILU_MUL, OP_SSM_UPDATE,
-    OP_DOT_SIGMOID_SCALE_ADD,
+    OP_DOT_SIGMOID_SCALE_ADD, OP_KV_WRITE_PAGED_BATCH,
 };
 
 // Compile-time size assertions: each struct must be exactly INST_SIZE * 8 bytes.
@@ -40,7 +40,7 @@ macro_rules! impl_inst {
     ($t:ty) => {
         impl $t {
             #[allow(dead_code)]
-            pub(crate) fn into_inst(self) -> Instruction {
+            pub fn into_inst(self) -> Instruction {
                 unsafe { std::mem::transmute(self) }
             }
         }
@@ -590,7 +590,7 @@ impl HaltInst {
 // words[1]=dst(w), [2]=src, [3]=n_elems(i32)
 // ─────────────────────────────────────────────────────────────────────────────
 #[repr(C)]
-pub(crate) struct D2dCopyInst {
+pub struct D2dCopyInst {
     pub opcode_gridx: u64,
     pub dst: *mut f32,
     pub src: *const f32,
@@ -1466,3 +1466,69 @@ impl MoeFfnRemoteInst {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OP_KV_WRITE_PAGED_BATCH (opcode 47) — bd srg6.4 Phase 3b.
+// Paged K-or-V batched writer. Replaces N × OP_D2D_COPY emitted per
+// (token, head) by the per-token paged write path. One instruction walks
+// the page_table internally to locate the destination chunk + in-chunk
+// offset for each (token, head) virtual block.
+//
+// Layout:
+//   src              — contiguous deinterleaved K (or V) source,
+//                      [n_tokens, local_nkh, head_dim]
+//   page_table       — *const u64; chunk base pointers indexed by chunk_idx
+//   layer_kv_offset  — byte offset within a chunk for this layer's K (or V)
+//                      sub-region; caller picks K vs V offset
+//   start_pos        — bits 0-31: first token's absolute position
+//                      bits 32-63: n_tokens
+//   head_slice       — bits 0-15:  local_nkh
+//                      bits 16-31: local_kv_head_start
+//                      bits 32-47: head_dim
+//                      bits 48-63: chunk_tokens
+// grid_x = n_tokens * local_nkh. Each virtual block writes head_dim
+// floats to a distinct (token, head) destination — no intra-op sync.
+// ─────────────────────────────────────────────────────────────────────────────
+#[repr(C)]
+pub struct KvWritePagedBatchInst {
+    pub opcode_gridx: u64,
+    pub src: *const f32,
+    pub page_table: *const u64,
+    pub layer_kv_offset: u64,
+    pub start_pos: u64,    // low 32: start_pos, high 32: n_tokens
+    pub head_slice: u64,
+    pub _pad: [u64; 13],
+}
+assert_inst_size!(KvWritePagedBatchInst);
+impl_inst!(KvWritePagedBatchInst);
+
+impl KvWritePagedBatchInst {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // bd srg6.4 Phase 3b: emission lands in Phase 3c (srg6.5)
+    pub(crate) fn new(
+        src: *const f32,
+        page_table: *const u64,
+        layer_kv_offset: u64,
+        start_pos: u32,
+        n_tokens: u32,
+        local_kv_head_start: u16,
+        local_nkh: u16,
+        head_dim: u16,
+        chunk_tokens: u16,
+    ) -> Self {
+        let grid_x = n_tokens * (local_nkh as u32);
+        let start_pos_packed = (start_pos as u64) | ((n_tokens as u64) << 32);
+        let head_slice = (local_nkh as u64)
+            | ((local_kv_head_start as u64) << 16)
+            | ((head_dim as u64) << 32)
+            | ((chunk_tokens as u64) << 48);
+        KvWritePagedBatchInst {
+            opcode_gridx: make_opcode_gridx(OP_KV_WRITE_PAGED_BATCH, grid_x),
+            src,
+            page_table,
+            layer_kv_offset,
+            start_pos: start_pos_packed,
+            head_slice,
+            _pad: [0; 13],
+        }
+    }
+}

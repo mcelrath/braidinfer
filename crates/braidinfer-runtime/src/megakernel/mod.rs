@@ -18,16 +18,16 @@ include!(concat!(env!("BRAIDINFER_KERNEL_DIR"), "/opcodes.rs"));
 
 /// Shared memory bytes per block for tiled-LDS linear_proj ops: (8 + 7680 + 256) * 4.
 /// Must match SHARED_LPROJ_TOTAL in kernels/megakernel_ops.hip.
-pub(crate) const SHARED_LPROJ_TOTAL: u32 = 31776;
+pub const SHARED_LPROJ_TOTAL: u32 = 31776;
 
-pub(crate) const INST_SIZE: usize = 19; // 19 u64s per instruction = 152 bytes (bd srg6.2)
+pub const INST_SIZE: usize = 19; // 19 u64s per instruction = 152 bytes (bd srg6.2)
 // RDNA3 7900XTX: 96 CUs grouped into 48 WGPs. hipDeviceAttributeMultiprocessorCount=48 (WGPs).
 // Cooperative kernel max blocks = blocks_per_sm * WGPs = blocks_per_sm * 48.
 pub(crate) const NUM_CUS: u32 = 48;
 
 /// A single instruction for the megakernel program.
 #[derive(Clone)]
-pub(crate) struct Instruction {
+pub struct Instruction {
     pub(crate) words: [u64; INST_SIZE],
 }
 
@@ -257,6 +257,62 @@ impl PrefillBuffers {
 pub(crate) mod instructions;
 pub(crate) use instructions::*;
 
+/// bd srg6.4 Phase 3b: thin public facade for the OP_KV_WRITE_PAGED_BATCH
+/// integration test. Exposes only the items the test needs to construct
+/// raw Instructions and dispatch them via PersistentDispatch.
+/// Not intended for production use.
+#[doc(hidden)]
+pub mod srg6_4_test_api {
+    pub use super::INST_SIZE;
+    pub use super::Instruction;
+    pub use super::SHARED_LPROJ_TOTAL;
+    pub use super::instructions::{D2dCopyInst, KvWritePagedBatchInst};
+    pub use super::OP_HALT;
+
+    impl Instruction {
+        #[doc(hidden)]
+        pub fn test_new(opcode: u32, grid_x: u32) -> Self {
+            Self::new(opcode, grid_x)
+        }
+    }
+
+    impl D2dCopyInst {
+        #[doc(hidden)]
+        #[allow(clippy::new_ret_no_self)]
+        pub fn test_new(grid_x: u32, dst: *mut f32, src: *const f32, n_elems: i32) -> Self {
+            Self::new(grid_x, dst, src, n_elems)
+        }
+    }
+
+    impl KvWritePagedBatchInst {
+        #[doc(hidden)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn test_new(
+            src: *const f32,
+            page_table: *const u64,
+            layer_kv_offset: u64,
+            start_pos: u32,
+            n_tokens: u32,
+            local_kv_head_start: u16,
+            local_nkh: u16,
+            head_dim: u16,
+            chunk_tokens: u16,
+        ) -> Self {
+            Self::new(
+                src,
+                page_table,
+                layer_kv_offset,
+                start_pos,
+                n_tokens,
+                local_kv_head_start,
+                local_nkh,
+                head_dim,
+                chunk_tokens,
+            )
+        }
+    }
+}
+
 pub(crate) mod compile_common;
 mod compile_attention;
 mod compile_layers;
@@ -425,6 +481,7 @@ fn opcode_name(op: u32) -> &'static str {
         OP_MOE_DISPATCH => "MOE_DISPATCH",
         OP_MOE_DISPATCH_POST => "MOE_DISPATCH_POST",
         OP_MOE_FFN_REMOTE => "MOE_FFN_REMOTE",
+        OP_KV_WRITE_PAGED_BATCH => "KV_WRITE_PAGED_BATCH",
         _ => "UNKNOWN",
     }
 }

@@ -172,6 +172,7 @@ __device__ __forceinline__ void dispatch_opcode(
             case OP_FFN_GATE_UP_WX:       op_ffn_gate_up_wx(inst, vb); break;
             case OP_FFN_GATE_UP_RNF4_WX:  op_ffn_gate_up_rnf4_wx(inst, vb); break;
             case OP_LINEAR_PROJ_2X:       op_linear_proj_2x(inst, vb); break;
+            case OP_KV_WRITE_PAGED_BATCH: op_kv_write_paged_batch(inst, vb); break;
             default:
                 if (threadIdx.x == 0 && blockIdx.x == 0)
                     printf("dispatch_opcode: unknown opcode %u at pc %d\n", opcode, pc);

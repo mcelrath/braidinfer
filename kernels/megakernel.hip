@@ -28,6 +28,7 @@ __device__ static uint32_t g_shutdown_seen;
 #include "megakernel_ops.hip"
 #include "megakernel_moe.hip"
 #include "megakernel_moe_dispatch.hip"
+#include "op_kv_write_paged_batch.hip"  // bd srg6.4 Phase 3b: OP_KV_WRITE_PAGED_BATCH
 #include "worker_queue.h"               // struct WorkerQueue (persistent_worker entry)
 #include "megakernel_dispatch.hip"  // unified dispatch_opcode helper (zqw)
 

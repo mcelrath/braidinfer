@@ -50,3 +50,9 @@
 #define OP_MOE_FFN_REMOTE    44 // MoE expert FFN dispatched on worker GPUs: P2P-read activation from GPU 0, compute experts (per-config skip if not local), P2P-write to per-worker output_slot. See MoeFfnRemoteInst.
 #define OP_MOE_DISPATCH_POST 45 // GPU 0 sums output_slots[0..num_gpus * hs] into final_output. Uses MoeDispatchInst layout (only output_slots, final_output, num_workers_hs, num_gpus, gate_up_in_dim are read).
 #define OP_DOT_SIGMOID_SCALE_ADD 46 // FUSED: output[i] += sigmoid(dot(weight, input)) * src[i]. Single-block. bd 9gmh: replaces OP_LINEAR_PROJ(1×hs) + OP_SIGMOID_WEIGHTED_ADD which had cross-block L0 staleness on intermediate scratch.
+// bd srg6.4: Paged K-or-V batched writer. Replaces N × OP_D2D_COPY per
+// (token, head) pair in the per-token paged decode write path. One
+// instruction walks the page_table internally to find the destination
+// chunk + in-chunk offset for each (token, head) virtual block.
+// See KvWritePagedBatchInst in instructions.rs / megakernel_common.h.
+#define OP_KV_WRITE_PAGED_BATCH 47
