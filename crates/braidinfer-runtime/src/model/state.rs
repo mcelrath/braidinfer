@@ -733,6 +733,28 @@ impl Model {
                 }
             }
         }
+        // bd srg6.13: dual-write transitional. Wire broadcast_paged_chunks_to_workers
+        // alongside the existing flat broadcast. The multi-GPU MoE arm of
+        // prefill_mixed_chunk currently uses the flat path and does NOT populate
+        // GPU 0's paged_seq, so this call iterates over an empty chunks Vec and
+        // returns Ok(()) — true no-op. The decode-side switch to the paged
+        // worker caches happens in bd srg6.12b; until then this exists to make
+        // the broadcast helper a live (non-dead) symbol so it shares the build
+        // with its eventual caller.
+        {
+            let seq_alloc = self
+                .paged_seq
+                .as_ref()
+                .zip(self.page_allocator.as_ref());
+            if let (Some(mgpu), Some((seq, alloc))) = (self.multi_gpu.as_mut(), seq_alloc) {
+                let has_attn_kv =
+                    !mgpu.workers.is_empty() && !mgpu.workers[0].attn_kv_caches.is_empty();
+                if has_attn_kv {
+                    mgpu.broadcast_paged_chunks_to_workers(seq, alloc)
+                        .map_err(ModelError::Hip)?;
+                }
+            }
+        }
         // Persistent worker holds GPU 0 CUs — synchronous copy_to_host would
         // deadlock. Use the dispatch's SDMA stream (no CU contention).
         let gpu_idx = self.device.0 as usize;

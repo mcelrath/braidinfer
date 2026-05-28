@@ -547,9 +547,10 @@ impl MultiGpuContext {
     /// GPU 0, each holding a peer-copy of the corresponding GPU 0 chunk's
     /// bytes; chunks' valid `len` matches GPU 0.
     ///
-    /// Currently DEAD CODE — srg6.6.b wires this into `prefill_batched`
-    /// + paged decode and deletes `broadcast_prefill_kv_to_workers`.
-    #[allow(dead_code)]
+    /// bd srg6.13: wired into `prefill_batched` as a transitional no-op
+    /// (multi-GPU MoE arm still uses the flat path and does NOT populate
+    /// GPU 0's paged_seq, so this is effectively a no-op until srg6.12b
+    /// switches the decode side and the prefill path populates paged_seq).
     pub fn broadcast_paged_chunks_to_workers(
         &mut self,
         gpu0_paged_seq: &SequenceState,
