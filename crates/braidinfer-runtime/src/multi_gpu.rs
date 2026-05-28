@@ -2,11 +2,14 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::device::{Device, DeviceGuard};
-use braidinfer_hip::memory::DeviceBuffer;
+use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::module::Module;
 use braidinfer_hip::staging::CrossGpuStaging;
 use braidinfer_hip::stream::Stream;
 use braidinfer_hip::{HipResult, ffi};
+
+use crate::config::ModelConfig;
+use crate::paged_kv::{PageAllocator, SequenceState};
 
 /// Opaque HIP event wrapper. NOT Send — pinned to creation device.
 pub struct HipEvent {
@@ -95,6 +98,16 @@ pub struct GpuWorker {
     pub attn_w_q_gate: Vec<crate::quant::LinearWeight>, // [local_nqh*hd*q_mult, hs] per attn layer
     pub attn_w_k: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
     pub attn_w_v: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
+    // bd srg6.11 Phase A: per-worker paged KV state. GQA replicates KV heads
+    // across workers (decode/mod.rs:1080 local_nkh = nkh), so each worker's
+    // chunk holds the FULL nkh × CHUNK_TOKENS × hd × 4 bytes. Allocated by
+    // init_attn_buffers; consumed by Phase B broadcast + srg6.6.b paged
+    // decode wire-up. Currently dead code alongside attn_kv_caches (dual
+    // state) until srg6.6.b switches readers/writers and removes flat infra.
+    pub page_allocator: Option<PageAllocator>,
+    pub paged_seq: Option<SequenceState>,
+    pub paged_page_table: Option<MappedHostBuffer<u64>>,
+    pub paged_position_table: Option<MappedHostBuffer<i32>>,
 }
 
 /// Multi-GPU context for expert parallel dispatch.
@@ -215,6 +228,10 @@ impl MultiGpuContext {
                 attn_w_q_gate: Vec::new(),
                 attn_w_k: Vec::new(),
                 attn_w_v: Vec::new(),
+                page_allocator: None,
+                paged_seq: None,
+                paged_page_table: None,
+                paged_position_table: None,
             });
         }
 
@@ -237,7 +254,10 @@ impl MultiGpuContext {
         max_seq_len: usize,
         hidden_size: usize,
         q_mult: usize,
+        config: &ModelConfig,
+        chunk_tokens: usize,
     ) -> HipResult<()> {
+        let max_paged_chunks = ((max_seq_len + chunk_tokens - 1) / chunk_tokens) as u32;
         for worker in self.workers.iter_mut() {
             // DeviceGuard saves the caller's current device once per iteration
             // and restores it when the guard drops at end of iteration.
@@ -302,6 +322,24 @@ impl MultiGpuContext {
                     )?,
                 });
             }
+            // bd srg6.11 Phase A: per-worker paged KV state. Sized for FULL
+            // nkh × chunk_tokens × hd × 4 bytes per chunk (KV heads replicated
+            // under GQA — local_nkh = nkh). PageAllocator + position table are
+            // GPU-resident; MappedHostBuffer alloc binds to the current device
+            // (worker.device — DeviceGuard already switched above). page_table
+            // is host-mapped (GART) so the host writes slot pointers per
+            // dispatch without round-tripping through the persistent worker.
+            worker.page_allocator = Some(PageAllocator::new(
+                worker.device,
+                config,
+                chunk_tokens,
+                max_paged_chunks,
+            )?);
+            worker.paged_seq = Some(SequenceState::new(chunk_tokens as u32));
+            worker.paged_page_table =
+                Some(MappedHostBuffer::<u64>::alloc(max_paged_chunks as usize)?);
+            worker.paged_position_table =
+                Some(MappedHostBuffer::<i32>::alloc(3 * max_seq_len)?);
         }
         eprintln!(
             "Multi-GPU attn: {} layers × {} workers, local_nqh={local_nqh} local_nkh={local_nkh} q_mult={q_mult}",
@@ -485,6 +523,127 @@ impl MultiGpuContext {
                 if start.elapsed().as_secs() > 30 {
                     panic!(
                         "broadcast_prefill_kv_to_workers timeout gpu={gpu_i} \
+                         seq={next_seq} flag_value={v}"
+                    );
+                }
+                std::hint::spin_loop();
+            }
+        }
+        Ok(())
+    }
+
+    /// bd srg6.11 Phase B: broadcast GPU 0's paged KV chunks to each worker's
+    /// per-worker paged state (Strategy A). Mirrors `broadcast_prefill_kv_to_workers`
+    /// but copies WHOLE chunks instead of per-(layer, head) slabs — under GQA
+    /// the per-worker chunk holds the FULL nkh × CHUNK_TOKENS × hd × 4 bytes
+    /// (KV heads replicated, not sliced), so a single hipMemcpyPeerAsync per
+    /// chunk per worker suffices.
+    ///
+    /// Pre: GPU 0's paged_seq is populated by prefill_mixed_chunk_paged (or
+    /// equivalent); each worker's `page_allocator`/`paged_seq` are
+    /// initialized (init_attn_buffers).
+    ///
+    /// Post: each worker's `paged_seq` has chunks at the same indices as
+    /// GPU 0, each holding a peer-copy of the corresponding GPU 0 chunk's
+    /// bytes; chunks' valid `len` matches GPU 0.
+    ///
+    /// Currently DEAD CODE — srg6.6.b wires this into `prefill_batched`
+    /// + paged decode and deletes `broadcast_prefill_kv_to_workers`.
+    #[allow(dead_code)]
+    pub fn broadcast_paged_chunks_to_workers(
+        &mut self,
+        gpu0_paged_seq: &SequenceState,
+        gpu0_allocator: &PageAllocator,
+    ) -> HipResult<()> {
+        if self.num_devices <= 1 {
+            return Ok(());
+        }
+        let chunk_bytes = gpu0_allocator.chunk_bytes();
+        let gpu0_device = gpu0_allocator.device();
+
+        for (chunk_idx, gpu0_chunk) in gpu0_paged_seq.chunks.iter().enumerate() {
+            let gpu0_slot = gpu0_chunk.slot_index();
+            let gpu0_len = gpu0_chunk.len();
+            let gpu0_ptr = gpu0_allocator.slot_ptr(gpu0_slot);
+
+            for gpu_i in 0..self.num_devices {
+                if DeviceId(gpu_i as u32) == gpu0_device {
+                    continue;
+                }
+                let worker = &mut self.workers[gpu_i];
+                let worker_allocator = worker
+                    .page_allocator
+                    .as_mut()
+                    .expect("worker.page_allocator must be initialized via init_attn_buffers");
+                let worker_seq = worker
+                    .paged_seq
+                    .as_mut()
+                    .expect("worker.paged_seq must be initialized via init_attn_buffers");
+
+                // Ensure worker has a chunk at this index. paged_seq tracks
+                // its own positions via append_token; we keep it in lockstep
+                // with GPU 0 by appending positions until chunks.len() exceeds
+                // chunk_idx. The position values mirror GPU 0's positions
+                // vector. Allocator hands out a fresh slot whenever the
+                // current chunk fills; that slot is what we peer-copy into.
+                while worker_seq.chunks.len() <= chunk_idx {
+                    let next_pos_idx = worker_seq.positions.len();
+                    let pos = gpu0_paged_seq.positions[next_pos_idx];
+                    worker_seq.append_token(pos, worker_allocator)?;
+                }
+                // Catch up `len` on the (possibly current) chunk so it
+                // matches GPU 0's len. append_token incremented for one
+                // position; we need additional bumps until the worker's
+                // chunk len equals gpu0_len.
+                while worker_seq.chunks[chunk_idx].len() < gpu0_len {
+                    let next_pos_idx = worker_seq.positions.len();
+                    let pos = gpu0_paged_seq.positions[next_pos_idx];
+                    worker_seq.append_token(pos, worker_allocator)?;
+                }
+
+                let worker_slot = worker_seq.chunks[chunk_idx].slot_index();
+                let worker_ptr =
+                    worker_allocator.slot_ptr(worker_slot) as *mut std::ffi::c_void;
+                braidinfer_hip::error::check(unsafe {
+                    ffi::hipMemcpyPeerAsync(
+                        worker_ptr,
+                        gpu_i as i32,
+                        gpu0_ptr as *const std::ffi::c_void,
+                        gpu0_device.0 as i32,
+                        chunk_bytes,
+                        worker.compute_stream.raw(),
+                    )
+                })?;
+            }
+        }
+
+        // Synchronize via mailbox: launch set_flag on each worker stream and
+        // CPU-poll. Avoids hipStreamSynchronize (would deadlock against the
+        // cooperative worker on the same device).
+        use std::sync::atomic::Ordering;
+        for gpu_i in 0..self.num_devices {
+            if DeviceId(gpu_i as u32) == gpu0_device {
+                continue;
+            }
+            let _guard = DeviceGuard::switch_to(DeviceId(gpu_i as u32))?;
+            let worker = &self.workers[gpu_i];
+            let next_seq = worker.compute_done_seq.fetch_add(1, Ordering::Relaxed) + 1;
+            Self::launch_set_flag(
+                &worker.sync_flag_module,
+                worker.compute_done_flag.as_write_ptr(),
+                next_seq,
+                &worker.compute_stream,
+            )?;
+            let host_ptr = worker.compute_done_flag.host_ptr();
+            let start = std::time::Instant::now();
+            loop {
+                let v = unsafe { std::ptr::read_volatile(host_ptr) };
+                if v >= next_seq {
+                    break;
+                }
+                if start.elapsed().as_secs() > 30 {
+                    panic!(
+                        "broadcast_paged_chunks_to_workers timeout gpu={gpu_i} \
                          seq={next_seq} flag_value={v}"
                     );
                 }

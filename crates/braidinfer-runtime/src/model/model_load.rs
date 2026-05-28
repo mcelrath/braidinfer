@@ -1302,6 +1302,8 @@ impl Model {
                     self.config.max_seq_len,
                     self.config.hidden_size,
                     q_mult,
+                    &self.config,
+                    crate::megakernel::CHUNK_TOKENS,
                 )?;
                 print_vram("init_attn_buffers");
                 // Split Q/K/V projection weights onto each GPU
