@@ -1290,6 +1290,291 @@ impl MegakernelProgram {
         })
     }
 
+    /// bd srg6.10: paged variant of `compile_prefill_segment_with_module`.
+    ///
+    /// Compiles a megakernel program for ONE segment of a mixed (MoE) prefill,
+    /// covering layers `layer_start..layer_end`. Attention layers in the segment
+    /// emit paged KV writes (`AttentionVariant::PrefillPagedKv`) instead of
+    /// flat `legacy_kv_caches` writes. Used by `prefill_mixed_chunk` for
+    /// single-GPU MoE prefill (bd srg6.10) and (via broadcast) for multi-GPU
+    /// MoE prefill (bd srg6.6).
+    ///
+    /// Differences from `compile_prefill_paged_persistent`:
+    ///   - Layer range is `layer_start..layer_end` (not all layers).
+    ///   - Caller (`prefill_mixed_chunk`) has ALREADY called
+    ///     `seq.append_token(...)` for ALL `n` prompt tokens BEFORE invoking
+    ///     this function. This function does NOT touch `seq`/`allocator`.
+    ///   - Each call writes the FULL `seq.chunks` slice into `page_table_buf`
+    ///     (covers the whole prefill range so attention reads see all history).
+    ///   - `is_last_segment` controls emission of final RMSNorm + LM head.
+    ///   - MoeFfn layers in-range are skipped (CPU dispatches between segments).
+    ///   - Caller must NOT cache the returned program (page_table_buf contents
+    ///     change between prefills); compile fresh per call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_prefill_segment_paged(
+        model: &Model,
+        module: Arc<Module>,
+        tokens: &[u32],
+        start_pos: u32,
+        layer_start: usize,
+        layer_end: usize,
+        is_last_segment: bool,
+        seq: &crate::paged_kv::SequenceState,
+        allocator: &crate::paged_kv::PageAllocator,
+        page_table_buf: &braidinfer_hip::memory::MappedHostBuffer<u64>,
+        position_table_buf: &braidinfer_hip::memory::MappedHostBuffer<i32>,
+        prefill_bufs: &mut PrefillBuffers,
+    ) -> HipResult<Self> {
+        let n = tokens.len();
+        assert!(n > 0 && n <= CHUNK_TOKENS);
+        assert!(layer_start <= layer_end);
+        assert!(layer_end <= model.config.num_layers);
+        let cfg = &model.config;
+        let device = model.device;
+        let act = &model.activations;
+        let shared_mem = (256u32 * 4 * 2)
+            .max((cfg.hidden_size as u32) * 4)
+            .max(31776u32);
+        let func = module.get_function("persistent_worker")?;
+        let blocks_per_sm = func.max_active_blocks_per_sm(256, shared_mem as usize)?;
+        let blocks_per_sm_clamped = blocks_per_sm.max(1) as u32;
+        let num_blocks = blocks_per_sm_clamped * NUM_CUS;
+        let mut instructions: Vec<Instruction> = Vec::new();
+
+        let hs = cfg.hidden_size;
+        let nh_gdn = cfg.linear_num_heads;
+        let nvh_gdn = cfg.linear_num_value_heads;
+        let kd = cfg.linear_key_head_dim;
+        let vd = cfg.linear_value_head_dim;
+        let conv_dim = nh_gdn * kd * 2 + nvh_gdn * vd;
+        let ck = cfg.linear_conv_kernel_dim;
+        let eps = cfg.rms_norm_eps;
+
+        // Seed per-layer counters by walking 0..layer_start (mirror flat variant
+        // at lines 808-820). attn_layer_idx must be GLOBAL across the model — the
+        // PrefillPagedKv arm bakes attn_layer_index into the K/V offset
+        // (layer_k_off = attn_layer_index * 2 * chunk_tokens * kv_stride * sizeof(f32))
+        // which addresses into a shared per-chunk multi-layer slab.
+        let mut gdn_idx = 0usize;
+        let mut mamba2_idx = 0usize;
+        let mut attn_layer_idx = 0usize;
+        for i in 0..layer_start {
+            use crate::config::LayerType;
+            match cfg.layers[i].layer_type {
+                LayerType::Gdn => gdn_idx += 1,
+                LayerType::Mamba2 => mamba2_idx += 1,
+                LayerType::Attention => attn_layer_idx += 1,
+                _ => {}
+            }
+        }
+
+        // Write host-mapped page_table_buf with the FULL seq.chunks slice
+        // (covers all prefill tokens so far — not just this segment's n).
+        // Each prefill_mixed_chunk iteration calls this function with the same
+        // seq.chunks (populated once by the outer driver before any segment).
+        {
+            let host_pt = page_table_buf.host_ptr();
+            for (i, chunk) in seq.chunks.iter().enumerate() {
+                let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
+                unsafe { host_pt.add(i).write_volatile(addr); }
+            }
+        }
+        // Write position_table_buf with mRoPE 3-tuples for the FULL prompt
+        // range tokens 0..(start_pos + n). Attention reads at position
+        // start_pos + t needs all prior positions visible.
+        {
+            let host_pos = position_table_buf.host_ptr();
+            let total = start_pos as usize + n;
+            for i in 0..total {
+                unsafe {
+                    let base = host_pos.add(i * 3);
+                    base.add(0).write_volatile(i as i32);
+                    base.add(1).write_volatile(i as i32);
+                    base.add(2).write_volatile(i as i32);
+                }
+            }
+        }
+
+        let page_table_ptr_u64 = page_table_buf.as_ptr() as u64;
+        let position_table_ptr_u64 = position_table_buf.as_ptr() as u64;
+
+        let mut attn_paged_inst_indices: Vec<usize> = Vec::new();
+
+        for layer_i in layer_start..layer_end {
+            use crate::config::LayerType;
+            match cfg.layers[layer_i].layer_type {
+                LayerType::Attention => {
+                    let w = match &model.layers[layer_i] {
+                        LayerWeights::Attention(w) => w,
+                        _ => panic!("expected attention layer at {layer_i}"),
+                    };
+                    Self::emit_attention_layer(
+                        cfg,
+                        w,
+                        act,
+                        Some((prefill_bufs, n)),
+                        &AttentionVariant::PrefillPagedKv {
+                            attn_layer_index: attn_layer_idx,
+                            start_pos,
+                            n,
+                            page_table_ptr: page_table_ptr_u64,
+                            position_table_ptr: position_table_ptr_u64,
+                        },
+                        &mut instructions,
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut Vec::new(),
+                        &mut attn_paged_inst_indices,
+                        &mut Vec::new(),
+                    );
+                    Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                    attn_layer_idx += 1;
+                }
+                LayerType::Gdn => {
+                    let w = match &model.layers[layer_i] {
+                        LayerWeights::Gdn(w) => w,
+                        _ => panic!("expected GDN layer at {layer_i}"),
+                    };
+                    let conv_state = &model.gdn_conv_states[gdn_idx];
+                    let gdn_state = &model.gdn_states[gdn_idx];
+
+                    instructions.push(RmsNormInst::new(
+                        rmsnorm_opcode(cfg.rms_norm_one_plus_w),
+                        n as u32,
+                        prefill_bufs.normed.as_write_ptr(),
+                        prefill_bufs.hidden.as_ptr(),
+                        w.input_norm.as_ptr(),
+                        hs as i32,
+                        eps,
+                    ).into_inst());
+
+                    emit_batched_linear_proj(&w.w_qkv, prefill_bufs.qkv.as_write_ptr(), prefill_bufs.normed.as_ptr(), conv_dim, hs, n, &mut instructions);
+                    emit_batched_linear_proj(&w.w_a, prefill_bufs.a_proj.as_write_ptr(), prefill_bufs.normed.as_ptr(), nvh_gdn, hs, n, &mut instructions);
+                    emit_batched_linear_proj(&w.w_b, prefill_bufs.b_proj.as_write_ptr(), prefill_bufs.normed.as_ptr(), nvh_gdn, hs, n, &mut instructions);
+                    emit_batched_linear_proj(&w.w_z, prefill_bufs.z_proj.as_write_ptr(), prefill_bufs.normed.as_ptr(), nvh_gdn * vd, hs, n, &mut instructions);
+
+                    let q_dim = nh_gdn * kd;
+                    let k_dim = nh_gdn * kd;
+                    let v_dim = nvh_gdn * vd;
+
+                    for t in 0..n {
+                        instructions.push(Conv1dInst::new(div_ceil(q_dim as u32, 256), conv_state.as_write_ptr(), unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim) }, w.conv1d_weight_q.as_ptr(), act.q_gdn.as_write_ptr(), q_dim as i32, ck as i32).into_inst());
+                        instructions.push(Conv1dInst::new(div_ceil(k_dim as u32, 256), unsafe { conv_state.as_write_ptr().add(q_dim * (ck - 1)) }, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim) }, w.conv1d_weight_k.as_ptr(), act.k_gdn.as_write_ptr(), k_dim as i32, ck as i32).into_inst());
+                        instructions.push(Conv1dInst::new(div_ceil(v_dim as u32, 256), unsafe { conv_state.as_write_ptr().add((q_dim + k_dim) * (ck - 1)) }, unsafe { prefill_bufs.qkv.as_ptr().add(t * conv_dim + q_dim + k_dim) }, w.conv1d_weight_v.as_ptr(), act.v_gdn.as_write_ptr(), v_dim as i32, ck as i32).into_inst());
+                        {
+                            let gqa_group = nvh_gdn / nh_gdn;
+                            let blocks_per_head = (num_blocks / nvh_gdn as u32).max(1);
+                            instructions.push(GdnGateInst::new(div_ceil(nvh_gdn as u32, 256), act.gate_gdn.as_write_ptr(), unsafe { prefill_bufs.a_proj.as_ptr().add(t * nvh_gdn) }, w.a_log.as_ptr(), w.dt_bias.as_ptr(), nvh_gdn as i32).into_inst());
+                            instructions.push(GdnRecurInst::new(nvh_gdn as u32 * blocks_per_head, nvh_gdn as u32, act.q_gdn.as_ptr(), act.k_gdn.as_ptr(), act.v_gdn.as_ptr(), act.gate_gdn.as_ptr(), unsafe { prefill_bufs.b_proj.as_ptr().add(t * nvh_gdn) }, gdn_state.recurrent.as_write_ptr(), act.recurrent_out.as_write_ptr(), kd as i32, vd as i32, gqa_group as i32).into_inst());
+                        }
+                        instructions.push(RmsNormGateInst::new(nvh_gdn as u32, act.normed_gated.as_write_ptr(), act.recurrent_out.as_ptr(), unsafe { prefill_bufs.z_proj.as_ptr().add(t * nvh_gdn * vd) }, w.output_norm.as_ptr(), nvh_gdn as i32, vd as i32, eps).into_inst());
+                        {
+                            let (lp_op, lp_w) = linear_proj_opcode_ptr(&w.w_out);
+                            instructions.push(LinearProjInst::new(lp_op, hs as u32, act.out_proj.as_write_ptr(), lp_w, act.normed_gated.as_ptr(), hs as i32, (nvh_gdn * vd) as i32, 0).into_inst());
+                        }
+                        let hidden_t = unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) };
+                        instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), hidden_t, act.out_proj.as_ptr(), hidden_t, hs as i32).into_inst());
+                    }
+
+                    Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                    gdn_idx += 1;
+                }
+                LayerType::Mamba2 => {
+                    let state = &model.mamba2_states[mamba2_idx];
+                    for t in 0..n {
+                        let hidden_t = unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) };
+                        let hidden_t_w = unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) };
+                        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), hidden_t, hs as i32).into_inst());
+                        Self::compile_mamba2_layer(cfg, &model.layers[layer_i], act, state, &mut instructions);
+                        instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), hidden_t_w, act.hidden.as_ptr(), hs as i32).into_inst());
+                    }
+                    mamba2_idx += 1;
+                }
+                LayerType::MoeFfn => {
+                    // Handled by CPU path in prefill_mixed_chunk — skip here.
+                }
+                LayerType::LfmConv => {
+                    panic!("LfmConv layers not yet implemented in megakernel (braidinfer-aes.4)");
+                }
+            }
+        }
+
+        if is_last_segment {
+            instructions.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                act.hidden.as_write_ptr(),
+                unsafe { prefill_bufs.hidden.as_ptr().add((n - 1) * hs) },
+                hs as i32,
+            ).into_inst());
+            instructions.push(D2dCopyInst::new(
+                div_ceil(hs as u32, 256),
+                act.normed.as_write_ptr(),
+                act.hidden.as_ptr(),
+                hs as i32,
+            ).into_inst());
+            instructions.push(RmsNormInst::new(
+                rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
+                act.hidden.as_write_ptr(), act.normed.as_ptr(),
+                model.final_norm_weight.as_ptr(), hs as i32, eps,
+            ).into_inst());
+            {
+                let lm_w_ptr = if cfg.tie_word_embeddings {
+                    model.embed_weight.as_ptr() as *const u8
+                } else {
+                    model.lm_head_weight.as_ptr() as *const u8
+                };
+                instructions.push(LinearProjInst::new(
+                    OP_LM_HEAD, cfg.vocab_size as u32,
+                    act.logits.as_write_ptr(), lm_w_ptr, act.hidden.as_ptr(),
+                    cfg.vocab_size as i32, hs as i32, 0,
+                ).into_inst());
+            }
+        }
+        instructions.push(Instruction::new(OP_HALT, 0));
+
+        let watchdog = model.watchdog.clone();
+        let _wd_state_dev = watchdog.register(device)?;
+        let nkh = cfg.num_kv_heads;
+        let hd = cfg.head_dim;
+
+        Ok(MegakernelProgram {
+            instructions,
+            num_blocks,
+            device,
+            embedding_inst_idx: 0,
+            _mrope_inst_indices: Vec::new(),
+            gqa_attn_inst_indices: Vec::new(),
+            kv: super::KvConfig {
+                max_seq_len: cfg.max_seq_len as u32,
+                num_kv_heads: nkh,
+                head_dim: hd,
+                kv_write_indices: Vec::new(),
+                kv_base_ptrs: Vec::new(),
+            },
+            paged: true,
+            paged_kv: Some(super::PagedKvState {
+                page_table: None,
+                position_table: None,
+                attn_paged_inst_indices,
+                attn_quant_inst_indices: Vec::new(),
+                last_page_table_len: seq.chunks.len(),
+                kv_stride_paged: nkh * hd,
+            }),
+            quantized_kv: false,
+            quant_kv: None,
+            prefill_cache: None,
+            dump_buffer: None,
+            dump_counter: None,
+            dump_capacity: 0,
+            trace_probe_map: Vec::new(),
+            barrier_layer_map: Vec::new(),
+            multi_gpu_attn_boundaries: Vec::new(),
+            _watchdog: watchdog,
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     /// Compile a tiny program that applies final RMSNorm + LM head to the last token
     /// in prefill_bufs.hidden and writes logits to act.logits.
     /// Used when the model's last layer is a standalone MoeFfn (no dense is_last span).

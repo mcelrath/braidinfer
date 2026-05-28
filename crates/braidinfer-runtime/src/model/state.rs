@@ -214,6 +214,12 @@ impl Model {
         // Must happen before MoE layer processing and before the decode persistent worker launches.
         self.ensure_moe_workers_started()?;
 
+        // bd srg6.10: single-GPU MoE uses the paged segment compile path.
+        // Multi-GPU MoE remains on the flat path until bd srg6.6 broadcasts.
+        if self.multi_gpu.is_none() {
+            return self.prefill_mixed_chunk_paged(chunk, start_pos);
+        }
+
         let n = chunk.len();
         let hs = self.config.hidden_size;
         let num_layers = self.config.num_layers;
@@ -373,6 +379,214 @@ impl Model {
 
         // When the last layer is a standalone MoeFfn, no dense span has is_last=true,
         // so the final norm + LM head was never emitted. Compute it now.
+        if self.config.layers[num_layers - 1].layer_type == LayerType::MoeFfn {
+            let bufs = self.prefill_bufs.take().unwrap();
+            let mut mk = MegakernelProgram::compile_final_norm_lm_head(
+                self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
+            ).map_err(ModelError::Hip)?;
+            self.prefill_bufs = Some(bufs);
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers must be initialized in Model::prefill");
+            mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                .map_err(ModelError::Hip)?;
+        }
+
+        Ok(())
+    }
+
+    /// bd srg6.10: single-GPU MoE prefill via paged KV segment compile.
+    /// Replaces the flat `legacy_kv_caches` writes used by `prefill_mixed_chunk`
+    /// for single-GPU MoE models. Multi-GPU MoE stays on the flat path until
+    /// bd srg6.6 lands the paged broadcast.
+    ///
+    /// Outer driver:
+    ///   1. Ensure paged decode state (allocator + paged_seq).
+    ///   2. append_token for ALL n prompt tokens (mirror srg6.5 invariant).
+    ///   3. Embed all tokens into prefill_bufs.hidden via mailbox.
+    ///   4. For each layer span (MoE-boundary-split): compile + dispatch a
+    ///      paged segment program (NO cache — page_table contents would go
+    ///      stale across prefills).
+    ///   5. Between segments at MoE boundaries: CPU MoE dispatch
+    ///      (moe_ffn_forward_prefill_batched), unchanged from flat path.
+    fn prefill_mixed_chunk_paged(
+        &mut self,
+        chunk: &[u32],
+        start_pos: u32,
+    ) -> Result<(), ModelError> {
+        use crate::config::LayerType;
+        use crate::megakernel::{MegakernelProgram, instructions::*, Instruction};
+        use braidinfer_hip::memory::MappedHostBuffer;
+
+        // Lazy-init page_allocator + paged_seq.
+        self.ensure_paged_decode_state(false)?;
+
+        // Lazy-alloc host-mapped page/position tables (reuse the fields added
+        // for single-GPU dense paged prefill in srg6.7).
+        let max_chunks = self.max_paged_chunks();
+        if self.prefill_paged_page_table.is_none() {
+            self.prefill_paged_page_table = Some(
+                MappedHostBuffer::<u64>::alloc(max_chunks).map_err(ModelError::Hip)?,
+            );
+        }
+        if self.prefill_paged_position_table.is_none() {
+            self.prefill_paged_position_table = Some(
+                MappedHostBuffer::<i32>::alloc(3 * self.config.max_seq_len)
+                    .map_err(ModelError::Hip)?,
+            );
+        }
+
+        let n = chunk.len();
+        let hs = self.config.hidden_size;
+        let num_layers = self.config.num_layers;
+
+        let megakernel_module = std::sync::Arc::new(
+            braidinfer_hip::module::Module::load(
+                self.device,
+                &crate::kernel::kernel_dir().join("megakernel.hsaco"),
+            ).map_err(ModelError::Hip)?,
+        );
+
+        // Step 1: append_token for ALL n prompt tokens BEFORE any segment
+        // compile (light-review F2 lock).
+        {
+            let mut seq = self.paged_seq.take().unwrap();
+            let mut allocator = self.page_allocator.take().unwrap();
+            for t in 0..n {
+                let pos = start_pos as i32 + t as i32;
+                seq.append_token(pos, &mut allocator).map_err(ModelError::Hip)?;
+            }
+            self.paged_seq = Some(seq);
+            self.page_allocator = Some(allocator);
+        }
+
+        // Step 2: Embed all tokens into prefill_bufs.hidden via mailbox.
+        {
+            let grid_x = (hs as u32 + 255) / 256;
+            let mut insts: Vec<Instruction> = Vec::with_capacity(n);
+            let bufs = self.prefill_bufs.as_ref().unwrap();
+            for t in 0..n {
+                insts.push(EmbeddingInst::new(
+                    grid_x,
+                    unsafe { bufs.hidden.as_write_ptr().add(t * hs) },
+                    self.embed_weight.as_ptr(),
+                    chunk[t] as i32,
+                    hs as i32,
+                ).into_inst());
+            }
+            let dispatch = self.persistent_workers.as_mut()
+                .expect("persistent_workers must be initialized in Model::prefill");
+            dispatch.dispatch_batch_slice(self.device.0 as usize, &insts);
+        }
+
+        // Step 3: Walk layers, splitting on MoE FFN boundaries. Each
+        // contiguous non-MoE span compiles a paged segment program. MoE
+        // layers dispatch CPU-side between segments.
+        let mut layer_i = 0usize;
+        while layer_i < num_layers {
+            let lt = self.config.layers[layer_i].layer_type.clone();
+            if lt == LayerType::MoeFfn {
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
+                    .map_err(ModelError::Hip)?;
+                self.prefill_bufs = Some(bufs);
+                layer_i += 1;
+            } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
+                && (lt == LayerType::Attention || lt == LayerType::Gdn)
+            {
+                // Attention/GDN with MoE FFN: 1-layer mixer segment, then CPU MoE.
+                let span_start = layer_i;
+                let span_end = layer_i + 1;
+                let is_truly_last = span_end == num_layers;
+
+                // Compile fresh (NO cache — light-review F1 lock).
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                let seq = self.paged_seq.take().unwrap();
+                let allocator = self.page_allocator.take().unwrap();
+                let mut mk = {
+                    let page_table = self.prefill_paged_page_table.as_ref().unwrap();
+                    let pos_table = self.prefill_paged_position_table.as_ref().unwrap();
+                    MegakernelProgram::compile_prefill_segment_paged(
+                        self,
+                        std::sync::Arc::clone(&megakernel_module),
+                        chunk, start_pos,
+                        span_start, span_end,
+                        false, // never is_last: LM head runs after MoE below
+                        &seq, &allocator,
+                        page_table, pos_table,
+                        &mut bufs,
+                    ).map_err(ModelError::Hip)?
+                };
+                self.prefill_bufs = Some(bufs);
+                self.paged_seq = Some(seq);
+                self.page_allocator = Some(allocator);
+
+                {
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
+                }
+
+                // CPU MoE FFN dispatch.
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
+                    .map_err(ModelError::Hip)?;
+                self.prefill_bufs = Some(bufs);
+
+                if is_truly_last {
+                    let bufs = self.prefill_bufs.take().unwrap();
+                    let mut mk = MegakernelProgram::compile_final_norm_lm_head(
+                        self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
+                    ).map_err(ModelError::Hip)?;
+                    self.prefill_bufs = Some(bufs);
+                    let dispatch = self.persistent_workers.as_mut()
+                        .expect("persistent_workers must be initialized in Model::prefill");
+                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                        .map_err(ModelError::Hip)?;
+                }
+                layer_i += 1;
+            } else {
+                // Dense non-MoE span.
+                let span_start = layer_i;
+                while layer_i < num_layers {
+                    let l = &self.config.layers[layer_i];
+                    if l.layer_type == LayerType::MoeFfn { break; }
+                    if matches!(l.ffn_type, FfnType::MoE { .. })
+                        && (l.layer_type == LayerType::Attention || l.layer_type == LayerType::Gdn) { break; }
+                    layer_i += 1;
+                }
+                let span_end = layer_i;
+                let is_last = span_end == num_layers;
+
+                let mut bufs = self.prefill_bufs.take().unwrap();
+                let seq = self.paged_seq.take().unwrap();
+                let allocator = self.page_allocator.take().unwrap();
+                let mut mk = {
+                    let page_table = self.prefill_paged_page_table.as_ref().unwrap();
+                    let pos_table = self.prefill_paged_position_table.as_ref().unwrap();
+                    MegakernelProgram::compile_prefill_segment_paged(
+                        self,
+                        std::sync::Arc::clone(&megakernel_module),
+                        chunk, start_pos,
+                        span_start, span_end,
+                        is_last,
+                        &seq, &allocator,
+                        page_table, pos_table,
+                        &mut bufs,
+                    ).map_err(ModelError::Hip)?
+                };
+                self.prefill_bufs = Some(bufs);
+                self.paged_seq = Some(seq);
+                self.page_allocator = Some(allocator);
+
+                let dispatch = self.persistent_workers.as_mut()
+                    .expect("persistent_workers must be initialized in Model::prefill");
+                mk.dispatch_via_worker(dispatch, self.device.0 as usize)
+                    .map_err(ModelError::Hip)?;
+            }
+        }
+
+        // If last layer is standalone MoeFfn, emit final norm + LM head now.
         if self.config.layers[num_layers - 1].layer_type == LayerType::MoeFfn {
             let bufs = self.prefill_bufs.take().unwrap();
             let mut mk = MegakernelProgram::compile_final_norm_lm_head(
