@@ -12,7 +12,13 @@
 #include <fstream>
 #include <vector>
 
-#define INST_SIZE_WORDS 18
+// MUST equal kernels/megakernel_common.h INST_SIZE_WORDS (currently 19). A stale
+// value here shifts the WorkerQueue ack/done/progress_pc fields (which sit AFTER
+// inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]) by 256*(delta)*8 bytes, so the
+// host reads ack/progress_pc at the WRONG offset → always 0 → a FALSE "wedge"
+// even though the kernel acked correctly. (Was 18 vs kernel's 19 → ack read at
+// 36880 instead of 38928; produced the deterministic dispatch-1 false-wedge.)
+#define INST_SIZE_WORDS 19
 #define MAX_BATCH_INSTRUCTIONS 256
 
 // Layout MUST match kernels/worker_queue.h exactly.
