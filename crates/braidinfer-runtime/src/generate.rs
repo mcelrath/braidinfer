@@ -197,6 +197,7 @@ pub fn generate_from_ids(
     max_tokens: usize,
 ) -> Result<GenerateResult, ModelError> {
     let n_prompt = prompt_ids.len();
+    let pp_t0 = std::time::Instant::now();
     let last_logits = if n_prompt == 0 {
         return Ok(GenerateResult {
             tokens: vec![],
@@ -207,6 +208,8 @@ pub fn generate_from_ids(
     } else {
         model.prefill(prompt_ids)?
     };
+    // Prefill (prompt-processing) timing. pp tok/s = prompt tokens / prefill seconds.
+    let pp_secs = pp_t0.elapsed().as_secs_f64();
 
     // Opt-in RT scheduling for the dispatch (= main) thread. Promoted AFTER
     // the first dispatch so the persistent worker launch + watchdog thread
@@ -274,6 +277,8 @@ pub fn generate_from_ids(
     let mut next_token = argmax(&last_logits);
     log_logits(0, next_token, &last_logits, &logit_trace_path);
 
+    let tg_t0 = std::time::Instant::now();
+    let mut tg_count = 0usize;
     for step in 0..max_tokens {
         if token_config.is_stop_token(next_token) {
             break;
@@ -291,7 +296,19 @@ pub fn generate_from_ids(
             next_token = model.decode_step_token(next_token, position)?;
         }
         position += 1;
+        tg_count += 1;
     }
+    // pp/tg split for the model sweep (parsed by scripts/sweep_all_models.py).
+    // pp = prompt-processing (prefill) throughput; tg = token-generation (decode).
+    let tg_secs = tg_t0.elapsed().as_secs_f64();
+    let pp_toks = if n_prompt > 1 { n_prompt } else { 0 };
+    eprintln!(
+        "PPTG pp={:.1} tok/s ({} prompt tok / {:.3}s) tg={:.1} tok/s ({} tok / {:.3}s)",
+        if pp_secs > 0.0 { pp_toks as f64 / pp_secs } else { 0.0 },
+        pp_toks, pp_secs,
+        if tg_secs > 0.0 { tg_count as f64 / tg_secs } else { 0.0 },
+        tg_count, tg_secs,
+    );
 
     Ok(GenerateResult {
         tokens: all_tokens[n_prompt..].to_vec(),

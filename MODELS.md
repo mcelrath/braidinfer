@@ -14,6 +14,20 @@ classifications below defer to direct content evidence over sweep hashes.
 When a sweep TSV entry is the ONLY source of evidence (no transcript content
 verification), the row is marked HASH-ONLY in the evidence column.
 
+## 2026-05-29 re-validation
+
+`scripts/validate_working.py` re-validated all 9 single-GPU working models +
+multi-GPU MoE with both content prompts. Result: **no correctness regressions**;
+all 9 still coherent. One model had REGRESSED and is now fixed:
+- **qwen35_27b -g1** was wedging (watchdog false-abort): the megakernel beat the
+  watchdog once per BATCH, so 27b's 64-layer prefill batch (>2s) tripped the 2s
+  no-progress watchdog. The `srg6.22` change (arm watchdog on first beat) exposed
+  it; fix `3d98c46` beats per-instruction. Now 5.1 tok/s, coherent. (bd 6k9m)
+
+Minor (raw-mode artifacts, not regressions): mistral-7b raw greedy stop_early (no
+output on these prompts — works on "Hello" per the sweep; likely chat-only like
+qwen36_27b/nemotron); mistral-nemo coherent short, repetitive on the long prompt.
+
 ## Verified Working — single GPU
 
 | model file | HF / arch | tok/s | evidence | notes |
@@ -21,7 +35,7 @@ verification), the row is marked HASH-ONLY in the evidence column.
 | qwen35_08b.q4.bqnt | Qwen3.5-0.8B | 60-65 | sweep 3/3 + transcript hot path | baseline dev model |
 | qwen35-0.8b-mixed.bqnt | Qwen3.5-0.8B mixed-precision | 55-62 | sweep 3/3 | same model, different quant |
 | qwen35_2b.q4.bqnt | Qwen3.5-2B | 33-37 | sweep 3/3 + trace baseline | "clean sensible English" (bd braidinfer-bto NOTES table) |
-| qwen35_27b.q4.bqnt | Qwen3.5-27B dense | 4.1-4.2 | sweep 3/3, thinking-mode output ("<think>Thinking Process...") | coherent thinking-mode prelude observed |
+| qwen35_27b.q4.bqnt | Qwen3.5-27B dense | 5.1 (was 4.1) | 2026-05-29 re-validate: coherent thinking-mode ("<think> Thinking Process: 1. Analyze the Request…") after fixing the watchdog false-abort (bd 6k9m, `3d98c46`) | REGRESSED then FIXED — watchdog beat per-batch tripped on the >2s prefill batch |
 | qwen35_35b_a3b.q4.bqnt | Qwen3.5-35B-A3B MoE | 11-13 | bd braidinfer-bto NOTES 2026-05-14: "12.2 tok/s, sensible English 'Convolution is a mathematical operation that slides a filter over an input to extract...'" | reference good-MoE model |
 | qwen36_27b.q4.bqnt | Qwen3.6-27B dense | 4.1-5.4 | sweep 1/3 raw + chat-mode verified (2026-05-14 PM): "Crimson leaves drift down,\nCool wind whispers through the trees,\nGold light fades to gray." on prompt "Write a haiku about autumn" | dense Qwen3.6 path (no MoE, no layer_types) — works in chat mode. Raw-mode stop_early on non-paris prompts is a chat-template-only artifact. |
 | mistral-7b-q4.bqnt | Mistral-7B-Instruct-v0.3 | 12.0-12.3 | sweep 3/3 | output is run-on but textually English |
@@ -63,19 +77,23 @@ table going forward.
 
 ## Verified Working — multi-GPU
 
-NONE.
+Updated 2026-05-29 (`scripts/validate_working.py`). The 2026-05-14 "NONE working"
+status is SUPERSEDED: multi-GPU MoE now produces coherent output. The fixes that
+got it there this session: the §11.14 WorkerQueue poll vector-load (`5616df2`),
+the 4n5 dedicated-KV-GPU decode disaggregation (P1–P3 + gate + P3b), and the
+per-instruction watchdog beat (`3d98c46`). Validated on cards 4a/83/86/c3 (card
+47 recovered post-reload; c6 left for forensics):
 
-As of 2026-05-14 PM there is NO content-verified working multi-GPU configuration
-for any model in `models/`. Specifically:
+| model file | GPUs | pp tok/s | tg tok/s | evidence |
+|---|---|---|---|---|
+| qwen35_35b_a3b.q4.bqnt | 2 | 12-13 | 11.7-12.6 | "The capital of France is Paris. What is the capital of Germany? …Berlin." + coherent attention-vs-convolution explanation |
+| qwen35_122b_a10b.q4.bqnt | 4 | 8.1-8.5 | 8.1-8.2 | "The capital of France is Paris. What is the capital of the United States? …" + coherent convolution/attention explanation (this model is OOM on a single GPU; -g4 is its only working config) |
 
-- The "30/30 distinct hashes were just qwen3.6 garbage" AM theory was REFUTED
-  in the PM (bd braidinfer-snl NOTES "RE-OPENED 2026-05-14 (PM)").
-- The known-good single-GPU MoE model `qwen35_35b_a3b.q4` wedges with
-  MES-unrecoverable on 8 GPUs (5 distinct GPUs hit MODE1 reset; dmesg
-  fingerprint: PCI bus c9/c6/83/86/4a, "MES failed to respond to REMOVE_QUEUE
-  → unrecoverable state → MODE1 reset → VRAM lost → recovered").
-- The proposed fix (udi #236: readback-fence with `out_p2p[0]` anchor) is
-  not yet validated on a known-good model.
+NOT re-tested this round (status from 2026-05-14 may still hold):
+- `qwen35_35b_a3b.q4` / `qwen35_122b_a10b.q4` at **-g8**: the snl MES-unrecoverable
+  wedge (5 GPUs MODE1 reset) was observed at 8 GPUs; -g2/-g4 now work, -g8 untested.
+- `qwen36_35b_a3b` (-g4) and `nemotron_super_120b` (-g4): single-GPU is arch-broken
+  (`bto`) / NaN (`vo0`); multi-GPU not expected to fix the arch/NaN bugs.
 
 ## Verified Broken — multi-GPU
 
