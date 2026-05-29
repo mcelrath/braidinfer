@@ -627,66 +627,30 @@ impl Model {
         // so that dispatch_head_parallel_attention sees the correct chunk/slot.
         // Also update per-worker position_table (3 i32s per token) and page_table
         // via write_volatile (MappedHostBuffer — no HIP API, safe under persistent worker).
+        // bd 4n5 P3b: disaggregated decode — GPU 0 runs ALL attention (the p2p
+        // megakernel's OP_ATTN_PAGED, patched below from self.paged_seq via
+        // update_step_paged_no_upload). Workers do NOT attend in decode (P2 removed
+        // head-parallel dispatch for MoE decode), so the old per-worker KV maintenance
+        // is VESTIGIAL — it wrote worker page/position tables nothing reads AND did
+        // worker.paged_seq.append_token, a per-step worker-pool VRAM alloc that could
+        // return OutOfMemory at runtime for KV nobody uses. Removed (both the wasted
+        // work and that gratuitous OOM path). Only GPU 0's self.paged_seq grows here.
+        //
+        // The worker KV buffers stay ALLOCATED: they're reused by the next
+        // head-parallel prefill, and they cannot be freed mid-session anyway (the
+        // worker cooperative kernels run for the model's lifetime, so hipFree would
+        // deadlock). Pools are pre-allocated once (max_chunks = max_seq_len/CHUNK_TOKENS)
+        // and reused — no per-request grow/free, hence no fragmentation and no surprise
+        // runtime OOM within max_seq_len; past it, a clean hipErrorOutOfMemory (not a
+        // fragmentation crash). GPU 0's append below is the only runtime KV alloc.
         if has_head_parallel {
-            // GPU 0: append to self.paged_seq + self.page_allocator (authoritative GPU 0
-            // paged state populated by prefill — broadcast_paged_chunks_to_workers skips
-            // GPU 0). Mirror chunk pointers into workers[0].paged_page_table (the host-mapped
-            // buffer the dispatch path reads).
-            {
-                let seq = self.paged_seq.as_mut()
-                    .expect("self.paged_seq must be initialized for GPU 0 head-parallel paged");
-                let alloc = self.page_allocator.as_mut()
-                    .expect("self.page_allocator must be initialized for GPU 0");
-                // Multi-GPU path: per-worker host-tier extension is Phase D.4
-                // (deferred). Pass None so the current per-worker VRAM-only behavior
-                // is preserved — if VRAM is exhausted, OutOfMemory is returned as before.
-                let host_alloc = self.host_page_allocator.as_mut();
-                seq.append_token(position as i32, alloc, host_alloc)
-                    .map_err(ModelError::Hip)?;
-                let mgpu = self.multi_gpu.as_ref().unwrap();
-                let pt = mgpu.workers[0].paged_page_table.as_ref()
-                    .expect("workers[0].paged_page_table must be initialized");
-                let pt_host = pt.host_ptr();
-                for (ci, chunk) in seq.chunks.iter().enumerate() {
-                    let slot_ptr = alloc.slot_ptr(chunk.slot_index()) as u64;
-                    unsafe { pt_host.add(ci).write_volatile(slot_ptr); }
-                }
-            }
-            // Workers gpu_i>0: append to worker.paged_seq + update worker.paged_page_table
-            // (populated by broadcast from GPU 0's chunks). Per-worker position_table is
-            // updated for ALL workers including 0 (dispatch reads it uniformly).
-            if let Some(mgpu) = self.multi_gpu.as_mut() {
-                for gpu_i in 0..mgpu.num_devices {
-                    let worker = &mut mgpu.workers[gpu_i];
-                    let pos_table = worker.paged_position_table.as_ref()
-                        .expect("worker.paged_position_table must be initialized");
-                    let host_ptr = pos_table.host_ptr();
-                    let tok_idx = position as usize;
-                    unsafe {
-                        let base = host_ptr.add(tok_idx * 3);
-                        base.add(0).write_volatile(position as i32);
-                        base.add(1).write_volatile(position as i32);
-                        base.add(2).write_volatile(position as i32);
-                    }
-                    if gpu_i == 0 {
-                        continue;
-                    }
-                    let seq = worker.paged_seq.as_mut()
-                        .expect("worker.paged_seq must be initialized for head-parallel paged");
-                    let alloc = worker.page_allocator.as_mut()
-                        .expect("worker.page_allocator must be initialized for head-parallel paged");
-                    // Per-worker host tier is deferred to Phase D.4.
-                    seq.append_token(position as i32, alloc, None)
-                        .map_err(ModelError::Hip)?;
-                    let page_table = worker.paged_page_table.as_ref()
-                        .expect("worker.paged_page_table must be initialized");
-                    let pt_host = page_table.host_ptr();
-                    for (ci, chunk) in seq.chunks.iter().enumerate() {
-                        let slot_ptr = alloc.slot_ptr(chunk.slot_index()) as u64;
-                        unsafe { pt_host.add(ci).write_volatile(slot_ptr); }
-                    }
-                }
-            }
+            let seq = self.paged_seq.as_mut()
+                .expect("self.paged_seq must be initialized for GPU 0 paged decode");
+            let alloc = self.page_allocator.as_mut()
+                .expect("self.page_allocator must be initialized for GPU 0");
+            let host_alloc = self.host_page_allocator.as_mut();
+            seq.append_token(position as i32, alloc, host_alloc)
+                .map_err(ModelError::Hip)?;
         }
 
         // P2 (braidinfer-4n5.6): GPU 0 runs the full local paged-KV attention
