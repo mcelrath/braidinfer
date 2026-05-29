@@ -395,11 +395,37 @@ def get_held_gpus():
     return held
 
 
+def _parse_avoid_gpus():
+    """HIP indices to exclude from selection, from BRAIDINFER_AVOID_GPUS
+    (comma-separated). Each token is a HIP index (e.g. "1") or a BDF substring
+    (e.g. "47:00.0" or "47"). For marking known-degraded cards (e.g. card 47
+    pending reboot) so cold-launches don't keep landing on them — see the
+    launch-gpu card-selection-bias note (mes-researcher 2026-05-29)."""
+    raw = os.environ.get("BRAIDINFER_AVOID_GPUS", "").strip()
+    if not raw:
+        return set()
+    hip_to_bdf = _hip_index_to_bdf()
+    avoid = set()
+    for tok in (t.strip() for t in raw.split(",")):
+        if not tok:
+            continue
+        if tok.isdigit():
+            avoid.add(int(tok))
+        else:
+            for idx, bdf in hip_to_bdf.items():
+                if tok in bdf:
+                    avoid.add(idx)
+    return avoid
+
+
 def find_free_gpus(count, min_vram_mb):
     gpus = get_gpu_vram()
     held = get_held_gpus()
+    avoid = _parse_avoid_gpus()
     candidates = []
     for idx, total, used in gpus:
+        if idx in avoid:
+            continue
         free = total - used
         if free < min_vram_mb:
             continue
