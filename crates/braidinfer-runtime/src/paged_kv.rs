@@ -313,12 +313,16 @@ impl HostPageAllocator {
 
 /// Shared metadata for one KV chunk slot. The actual data lives in the PageAllocator pool.
 ///
-/// # Tier model (Phase A, braidinfer-4n5)
+/// # Tier model (Phase B, braidinfer-4n5)
 ///
 /// `tier_discriminant` is an `AtomicU8` encoding `ChunkTier` (0=Vram, 1=HostPinned).
-/// `slot_index` indexes into whichever pool the discriminant selects:
-/// - Vram:       `PageAllocator::slot_ptr(slot_index)`
-/// - HostPinned: `HostPageAllocator::slot_ptr(slot_index)`
+/// Two companion atomics track WHICH slot in each pool this chunk occupies:
+/// - `vram_slot`:  AtomicU32, index into `PageAllocator`.  u32::MAX = no VRAM slot.
+/// - `host_slot`:  AtomicU32, index into `HostPageAllocator`. u32::MAX = no host slot.
+///
+/// Promote changes `vram_slot` (new slot allocated) + sets tier=Vram.
+/// Evict sets tier=HostPinned (VRAM slot freed by caller after flush_tier_ops).
+/// The host_slot never changes once set; it is the write-through backing slot.
 ///
 /// `generation` is a monotonically-increasing `AtomicU64` used for LRU eviction
 /// policy (Phase D).  Bumped once per page_table write_volatile loop iteration.
@@ -326,8 +330,19 @@ impl HostPageAllocator {
 ///
 /// Tier transitions are CPU-only and occur only between megakernel batches.
 /// No concurrent mutation with the persistent worker occurs.
+///
+/// # Backward compatibility
+///
+/// `ChunkHandle::new(slot)` sets `vram_slot=slot`, `host_slot=u32::MAX` — identical
+/// behavior to Phase A.  `slot_index()` reads `vram_slot` (the active VRAM slot).
+/// `make_exclusive` copies `vram_slot` into the new `ChunkRef`.
 pub struct ChunkRef {
-    pub slot_index: u32,
+    /// VRAM pool slot index (PageAllocator).  AtomicU32; u32::MAX = no VRAM slot.
+    /// Mutable through Arc: promote writes a new slot here before flipping tier.
+    pub(crate) vram_slot: AtomicU32,
+    /// Host-pinned pool slot index (HostPageAllocator).  AtomicU32; u32::MAX = none.
+    /// Set once at `alloc_with_host_backing`; never reassigned.
+    pub(crate) host_slot: AtomicU32,
     /// Number of valid tokens written into this chunk (0..=chunk_tokens).
     pub len: AtomicU32,
     /// Content hash; set when the chunk is sealed (full). Used for radix-tree dedup.
@@ -350,10 +365,12 @@ pub struct ChunkHandle {
 impl ChunkHandle {
     /// Wrap a freshly allocated VRAM slot.  Tier is always `Vram` on construction;
     /// existing callers are unaffected and behavior is byte-identical.
+    /// `host_slot` is u32::MAX (no host backing); use `alloc_with_host_backing` to get both.
     pub fn new(slot_index: u32) -> Self {
         ChunkHandle {
             inner: Arc::new(ChunkRef {
-                slot_index,
+                vram_slot: AtomicU32::new(slot_index),
+                host_slot: AtomicU32::new(u32::MAX),
                 len: AtomicU32::new(0),
                 content_hash: None,
                 tier_discriminant: AtomicU8::new(ChunkTier::Vram as u8),
@@ -378,7 +395,8 @@ impl ChunkHandle {
         let (new_slot, new_ptr) = allocator
             .alloc()
             .ok_or(HipError(ffi::hipErrorOutOfMemory))?;
-        let old_ptr = allocator.slot_ptr(self.inner.slot_index);
+        let old_vram_slot = self.inner.vram_slot.load(Ordering::Acquire);
+        let old_ptr = allocator.slot_ptr(old_vram_slot);
         let len = self.inner.len.load(Ordering::Acquire) as usize;
         // KV layout is [num_layers, K/V, num_heads, chunk_tokens, head_dim].
         // Valid tokens 0..len occupy stride-offset positions within each head's
@@ -398,9 +416,11 @@ impl ChunkHandle {
             })?;
         }
         // make_exclusive always produces a VRAM chunk (new_slot is from VRAM PageAllocator).
+        // Host backing slot is not copied — make_exclusive is for CoW sharing, not tiering.
         Ok(ChunkHandle {
             inner: Arc::new(ChunkRef {
-                slot_index: new_slot,
+                vram_slot: AtomicU32::new(new_slot),
+                host_slot: AtomicU32::new(u32::MAX),
                 len: AtomicU32::new(len as u32),
                 content_hash: None,
                 tier_discriminant: AtomicU8::new(ChunkTier::Vram as u8),
@@ -409,8 +429,20 @@ impl ChunkHandle {
         })
     }
 
+    /// Current VRAM slot index.  Only valid when `tier() == Vram`; panics in debug
+    /// builds otherwise.  Used by page_table write loops to obtain the VRAM slot_ptr.
     pub fn slot_index(&self) -> u32 {
-        self.inner.slot_index
+        debug_assert_eq!(
+            self.tier(),
+            ChunkTier::Vram,
+            "slot_index() called on a HostPinned-tier chunk"
+        );
+        self.inner.vram_slot.load(Ordering::Acquire)
+    }
+
+    /// Host-pinned pool slot index.  u32::MAX if no host backing was allocated.
+    pub fn host_slot_index(&self) -> u32 {
+        self.inner.host_slot.load(Ordering::Acquire)
     }
 
     pub fn len(&self) -> u32 {
@@ -434,29 +466,28 @@ impl ChunkHandle {
     }
 
     /// VRAM pointer for this chunk's slot. Returns `Some` only when `tier() == Vram`.
-    /// Use `PageAllocator::slot_ptr(self.slot_index())` from the caller if you need
-    /// the raw pointer; this method returns `None` as a safety gate.
+    /// Reads from `vram_slot` (which may have been updated by `promote_chunk`).
     pub fn vram_ptr(&self, vram_alloc: &PageAllocator) -> Option<*const u8> {
         if self.tier() == ChunkTier::Vram {
-            Some(vram_alloc.slot_ptr(self.inner.slot_index))
+            let slot = self.inner.vram_slot.load(Ordering::Acquire);
+            Some(vram_alloc.slot_ptr(slot))
         } else {
             None
         }
     }
 
-    /// Host-pinned pointer for this chunk's slot.  Always valid once a host slot has
-    /// been allocated.  Panics if `tier() == Vram` (no host slot assigned yet).
+    /// Host-pinned pointer for this chunk's slot.  Valid once a host slot has been
+    /// allocated via `alloc_with_host_backing`.  Reads from `host_slot` (AtomicU32).
     ///
     /// # Panics
-    /// Panics in debug builds if the chunk is currently in Vram tier.
+    /// Panics if `host_slot == u32::MAX` (no host backing allocated).
     pub fn host_ptr(&self, host_alloc: &HostPageAllocator) -> *const u8 {
-        debug_assert_eq!(
-            self.tier(),
-            ChunkTier::HostPinned,
-            "host_ptr called on a Vram-tier chunk (slot {})",
-            self.inner.slot_index
+        let slot = self.inner.host_slot.load(Ordering::Acquire);
+        assert_ne!(
+            slot, u32::MAX,
+            "host_ptr called on chunk with no host backing (use alloc_with_host_backing)"
         );
-        host_alloc.slot_ptr(self.inner.slot_index)
+        host_alloc.slot_ptr(slot)
     }
 
     /// Current LRU generation (larger = more recently used).
@@ -473,6 +504,10 @@ impl ChunkHandle {
 /// Allocate one VRAM slot and one host-pinned slot together, returning a `ChunkHandle`
 /// in `Vram` tier (the host slot acts as a write-through backing store).
 ///
+/// The host slot index is stored on `ChunkRef.host_slot` (AtomicU32).  Callers do
+/// not need to track the host slot separately — `host_ptr()` and `evict_chunk()`
+/// read it from the handle.
+///
 /// This is the canonical alloc site for Phase C+: using this instead of
 /// `ChunkHandle::new` ensures every VRAM chunk always has a host backing slot,
 /// implementing the write-through invariant required by the evict path.
@@ -481,7 +516,7 @@ impl ChunkHandle {
 pub fn alloc_with_host_backing(
     vram_alloc: &mut PageAllocator,
     host_alloc: &mut HostPageAllocator,
-) -> HipResult<(ChunkHandle, u32)> {
+) -> HipResult<ChunkHandle> {
     let (vram_slot, _vram_ptr) = vram_alloc
         .alloc()
         .ok_or(HipError(ffi::hipErrorOutOfMemory))?;
@@ -493,16 +528,185 @@ pub fn alloc_with_host_backing(
             return Err(HipError(ffi::hipErrorOutOfMemory));
         }
     };
-    let handle = ChunkHandle {
+    Ok(ChunkHandle {
         inner: Arc::new(ChunkRef {
-            slot_index: vram_slot,
+            vram_slot: AtomicU32::new(vram_slot),
+            host_slot: AtomicU32::new(host_slot),
             len: AtomicU32::new(0),
             content_hash: None,
             tier_discriminant: AtomicU8::new(ChunkTier::Vram as u8),
             generation: AtomicU64::new(0),
         }),
-    };
-    Ok((handle, host_slot))
+    })
+}
+
+// ---- Phase B: Tier transition primitives ----
+
+/// Promote a chunk from `HostPinned` tier to `Vram` tier via an async H2D copy on `stream`.
+///
+/// ## Contract
+///
+/// 1. `handle.tier()` MUST be `HostPinned` on entry.
+/// 2. `handle.host_slot_index()` MUST NOT be `u32::MAX` (host backing required).
+/// 3. A new VRAM slot is allocated from `vram_alloc`.  On OOM, returns
+///    `Err(hipErrorOutOfMemory)` and leaves the handle in `HostPinned` tier (no
+///    partial state update).
+/// 4. `hipMemcpyAsync(vram_dst, host_src, chunk_bytes, H2D, stream)` is issued.
+///    The copy is **in-flight** after this call.
+/// 5. `vram_slot` and `tier_discriminant` are updated atomically (in this order)
+///    BEFORE returning.  This means the next `slot_index()` call will return the
+///    new VRAM slot even before the copy completes.
+/// 6. **Caller MUST call `flush_tier_ops` (or `hipStreamSynchronize(stream)`) before
+///    writing the new `slot_ptr` into any page_table**.  The page_table write loop
+///    must observe coherent VRAM data; without the synchronize the megakernel reads
+///    stale or partially-written VRAM.
+///
+/// ## Write-through note
+///
+/// The host slot is retained (not freed) after promote.  It remains the durable
+/// canonical copy.  A subsequent evict does NOT need a D2H copy — the host slot
+/// already holds the sealed data.
+pub fn promote_chunk(
+    handle: &ChunkHandle,
+    vram_alloc: &mut PageAllocator,
+    host_alloc: &HostPageAllocator,
+    stream: ffi::hipStream_t,
+) -> HipResult<()> {
+    assert_eq!(
+        handle.tier(),
+        ChunkTier::HostPinned,
+        "promote_chunk: handle is not HostPinned (tier={:?})",
+        handle.tier()
+    );
+    let h_slot = handle.inner.host_slot.load(Ordering::Acquire);
+    assert_ne!(h_slot, u32::MAX, "promote_chunk: no host backing slot");
+
+    let (new_vram_slot, vram_dst) = vram_alloc
+        .alloc()
+        .ok_or(HipError(ffi::hipErrorOutOfMemory))?;
+
+    let host_src = host_alloc.slot_ptr(h_slot);
+    let chunk_bytes = vram_alloc.chunk_bytes();
+
+    hip_check(unsafe {
+        ffi::hipMemcpyAsync(
+            vram_dst.cast(),
+            host_src.cast(),
+            chunk_bytes,
+            ffi::hipMemcpyHostToDevice,
+            stream,
+        )
+    })
+    .map_err(|e| {
+        // Roll back VRAM alloc so the pool stays consistent.
+        vram_alloc.free(new_vram_slot);
+        e
+    })?;
+
+    // Update vram_slot first, then flip tier.  Ordering: Release on the store that
+    // must be visible before any reader observes the tier flip.
+    handle.inner.vram_slot.store(new_vram_slot, Ordering::Release);
+    handle
+        .inner
+        .tier_discriminant
+        .store(ChunkTier::Vram as u8, Ordering::Release);
+    Ok(())
+}
+
+/// Evict a chunk from `Vram` tier to `HostPinned` tier.
+///
+/// ## Two-phase ordering contract
+///
+/// This function issues the async D2H copy but does **not** free the VRAM slot.
+/// The caller MUST sequence as follows:
+///
+/// ```text
+/// evict_chunk(handle, vram_alloc, host_alloc, stream)?;   // issues D2H copy
+/// flush_tier_ops(gpu_idx)?;                               // hipStreamSynchronize
+/// vram_alloc.free(handle.inner.vram_slot.load(...));      // VRAM slot freed
+/// handle.inner.vram_slot.store(u32::MAX, Release);        // mark slot gone
+/// handle.set_tier(ChunkTier::HostPinned);                 // tier flip
+/// ```
+///
+/// The reason for the split: freeing the VRAM slot before the D2H copy completes
+/// allows the allocator to hand it to another sequence while SDMA is still reading
+/// from it — a use-after-free.  The two-phase design makes the hazard explicit in
+/// caller code rather than hiding it inside a synchronous evict call.
+///
+/// See `evict_chunk_and_free` for a single-call wrapper that handles the
+/// synchronization inline (for call sites that only evict one chunk per step).
+///
+/// ## Preconditions
+///
+/// - `handle.tier() == Vram`.
+/// - `handle.host_slot_index() != u32::MAX` (write-through backing exists).
+/// - Chunk MUST be sealed (`handle.len() == chunk_tokens`).  R4 scope: f32 only —
+///   **caller must not pass a handle whose slot came from a quantized PageAllocator**.
+///   (ChunkRef carries no quant marker; the CALLER is responsible for this invariant.)
+pub fn evict_chunk(
+    handle: &ChunkHandle,
+    vram_alloc: &PageAllocator,
+    host_alloc: &HostPageAllocator,
+    stream: ffi::hipStream_t,
+) -> HipResult<()> {
+    assert_eq!(
+        handle.tier(),
+        ChunkTier::Vram,
+        "evict_chunk: handle is not Vram (tier={:?})",
+        handle.tier()
+    );
+    let h_slot = handle.inner.host_slot.load(Ordering::Acquire);
+    assert_ne!(h_slot, u32::MAX, "evict_chunk: no host backing slot");
+
+    let v_slot = handle.inner.vram_slot.load(Ordering::Acquire);
+    let vram_src = vram_alloc.slot_ptr(v_slot);
+    let host_dst = host_alloc.slot_ptr(h_slot);
+    let chunk_bytes = vram_alloc.chunk_bytes();
+
+    // Write-through note: the host slot already holds the sealed data from the wt1
+    // mirror (kv_mirror_chunk / drain_kv_chunk_mirror at seal boundaries).  This D2H
+    // copy is therefore idempotent for sealed chunks — it refreshes host with the same
+    // data.  We issue it unconditionally so the evict path works even if the caller
+    // has not enabled wt1 (e.g. in tests).
+    hip_check(unsafe {
+        ffi::hipMemcpyAsync(
+            host_dst as *mut std::ffi::c_void,
+            vram_src.cast(),
+            chunk_bytes,
+            ffi::hipMemcpyDeviceToHost,
+            stream,
+        )
+    })?;
+
+    // Do NOT free the VRAM slot here.  The caller must call flush_tier_ops, then free.
+    // See two-phase ordering contract above.
+    Ok(())
+}
+
+/// Convenience wrapper: evict + synchronize + free VRAM slot + flip tier.
+///
+/// Use when evicting a single chunk per step and the caller can tolerate a
+/// synchronous stream flush.  For bulk evictions (evict N then flush once), call
+/// `evict_chunk` N times followed by one `flush_tier_ops` + N manual free+flip calls.
+///
+/// After this call `handle.tier() == HostPinned` and the VRAM slot has been freed.
+pub fn evict_chunk_and_free(
+    handle: &ChunkHandle,
+    vram_alloc: &mut PageAllocator,
+    host_alloc: &HostPageAllocator,
+    stream: ffi::hipStream_t,
+) -> HipResult<()> {
+    evict_chunk(handle, vram_alloc, host_alloc, stream)?;
+    // Synchronize the SDMA stream so the D2H copy is complete before we free.
+    braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })?;
+    let v_slot = handle.inner.vram_slot.load(Ordering::Acquire);
+    vram_alloc.free(v_slot);
+    handle.inner.vram_slot.store(u32::MAX, Ordering::Release);
+    handle
+        .inner
+        .tier_discriminant
+        .store(ChunkTier::HostPinned as u8, Ordering::Release);
+    Ok(())
 }
 
 // ---- SequenceState ----
@@ -592,10 +796,18 @@ impl SequenceState {
     /// (copy-on-write sharing via `make_exclusive`). Freeing such a chunk would
     /// corrupt the other sequence's KV data. The slot is freed by the last owner
     /// whose `reset()` observes refcount == 1.
+    ///
+    /// Phase B note: only frees VRAM slots.  HostPinned chunks are skipped here;
+    /// Phase C will add `host_alloc` to `reset()` and free host slots as well.
     pub fn reset(&mut self, allocator: &mut PageAllocator) {
         for chunk in self.chunks.drain(..) {
-            if Arc::strong_count(&chunk.inner) == 1 {
-                allocator.free(chunk.slot_index());
+            if Arc::strong_count(&chunk.inner) == 1
+                && chunk.tier() == ChunkTier::Vram
+            {
+                let v_slot = chunk.inner.vram_slot.load(Ordering::Acquire);
+                if v_slot != u32::MAX {
+                    allocator.free(v_slot);
+                }
             }
         }
         self.seq_len = 0;

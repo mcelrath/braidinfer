@@ -505,6 +505,39 @@ impl PersistentDispatch {
         Ok(())
     }
 
+    /// Synchronize the SDMA stream for `gpu_idx`, completing all in-flight tier
+    /// transitions (promote H2D copies and evict D2H copies) issued since the last
+    /// `flush_tier_ops` call.
+    ///
+    /// ## Ordering contract
+    ///
+    /// This MUST be called after all `promote_chunk` / `evict_chunk` calls for a
+    /// batch and BEFORE the page_table write_volatile loop.  The sequence:
+    ///
+    /// ```text
+    /// // 1. Issue async copies for all tier transitions.
+    /// for chunk in host_pinned_chunks { promote_chunk(chunk, ..., sdma_stream)? }
+    /// for chunk in vram_chunks_to_evict { evict_chunk(chunk, ..., sdma_stream)? }
+    ///
+    /// // 2. Flush: wait for ALL copies to complete.
+    /// dispatch.flush_tier_ops(gpu_idx)?;
+    ///
+    /// // 3. Free VRAM slots for evicted chunks (safe: copies are done).
+    /// // 4. Update page_table (write_volatile loop).
+    /// // 5. dispatch_batch_slice(...)
+    /// ```
+    ///
+    /// No-op if the SDMA stream for `gpu_idx` is null (stream not initialized).
+    /// Safe to call while the persistent cooperative worker is running: SDMA is a
+    /// separate engine, not CU-dependent.
+    pub fn flush_tier_ops(&self, gpu_idx: usize) -> HipResult<()> {
+        let stream = self.sdma_stream(gpu_idx);
+        if stream.is_null() {
+            return Ok(());
+        }
+        braidinfer_hip::error::check(unsafe { ffi::hipStreamSynchronize(stream) })
+    }
+
     /// Wire the dump buffer from `program` into the persistent worker's WorkerQueue
     /// so that `dispatch_opcode` writes per-instruction output into it.
     ///
