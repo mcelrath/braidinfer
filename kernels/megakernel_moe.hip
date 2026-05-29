@@ -355,14 +355,21 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
 
     // bd el1f: acquire-load Step 1 drain sentinel before any P2P read of
     // act_p2p. Pair with Rust dispatch's with_signal(seq=layer_idx+1) on
-    // the multi-block D2D-copy that ends Step 1. Same pattern as op_d2d_copy
-    // wait_ptr at megakernel_ops.hip:1736-1745. wait_ptr=null disables (decode
+    // the multi-block D2D-copy that ends Step 1. wait_ptr=null disables (decode
     // path, where the multi-token race doesn't apply).
+    //
+    // srg6.22 / arch-review finding #1: use sentinel_spin_load_u32, NOT a plain
+    // __atomic_load_n(ACQUIRE) on the uniform wait_ptr. The latter scalarizes to
+    // s_load_dword → scalar K$, which gfx11 cannot invalidate (§11.14), so a
+    // stale value latched on iteration 0 re-reads forever → spin-forever wedge
+    // (the exact class fixed in op_d2d_copy). This site is latent today
+    // (wait_ptr always null) but activates with el1f/a3ii multi-token prefill
+    // drain — fixing in lockstep so the sibling can't ship the wedge the cited
+    // op_d2d_copy fix already closed.
     if (i->wait_ptr != nullptr) {
         if (threadIdx.x == 0) {
-            while (__atomic_load_n(
-                       (volatile unsigned int*)i->wait_ptr,
-                       __ATOMIC_ACQUIRE) != (unsigned int)i->wait_seq) {
+            while (braidinfer::rdna3::sentinel_spin_load_u32(
+                       (const unsigned int*)i->wait_ptr) != (unsigned int)i->wait_seq) {
                 /* spin */
             }
         }
