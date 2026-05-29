@@ -12,32 +12,16 @@
 #include <fstream>
 #include <vector>
 
-// MUST equal kernels/megakernel_common.h INST_SIZE_WORDS (currently 19). A stale
-// value here shifts the WorkerQueue ack/done/progress_pc fields (which sit AFTER
-// inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS]) by 256*(delta)*8 bytes, so the
-// host reads ack/progress_pc at the WRONG offset → always 0 → a FALSE "wedge"
-// even though the kernel acked correctly. (Was 18 vs kernel's 19 → ack read at
-// 36880 instead of 38928; produced the deterministic dispatch-1 false-wedge.)
-#define INST_SIZE_WORDS 19
-#define MAX_BATCH_INSTRUCTIONS 256
-
-// Layout MUST match kernels/worker_queue.h exactly.
-struct WorkerQueueLayout {
-    volatile uint32_t seq_num;
-    volatile uint32_t shutdown;
-    uint32_t num_instructions;
-    volatile uint32_t block_alive_count;
-    uint64_t inst[MAX_BATCH_INSTRUCTIONS * INST_SIZE_WORDS];
-    volatile uint32_t ack;
-    volatile uint32_t done;
-    volatile uint32_t progress_pc;
-    uint32_t _pad2;
-    uint64_t* op_profile;
-    char* dump_base;
-    int* dump_count;
-    int dump_capacity;
-    uint32_t _pad3;
-};
+// Use the REAL canonical ABI — do NOT hardcopy. This harness previously hardcoded
+// INST_SIZE_WORDS=18 (kernel's is 19) + MAX_BATCH_INSTRUCTIONS + a WorkerQueue
+// struct; the stale 18 silently shifted ack/progress_pc by 256*1*8 = 2048 bytes
+// (ack read @36880 vs kernel @38928) → a deterministic FALSE dispatch-1 wedge that
+// looked like a kernel/loop bug. Including the single source of truth makes drift
+// IMPOSSIBLE: worker_queue.h provides the WorkerQueue struct + MAX_BATCH_INSTRUCTIONS,
+// and (via megakernel_common.h) INST_SIZE_WORDS + the static_asserts that
+// compile-check every typed Inst struct against INST_SIZE_WORDS*8. If the kernel ABI
+// changes, this harness fails to COMPILE instead of silently false-wedging.
+#include "../../worker_queue.h"   // -> WorkerQueue, INST_SIZE_WORDS, MAX_BATCH_INSTRUCTIONS
 
 #define CHK(x) do { hipError_t e=(x); if(e!=hipSuccess){ \
     fprintf(stderr,"HIP err %d at %s\n",(int)e,#x); std::exit(2);} } while(0)
@@ -68,11 +52,11 @@ int main(int argc, char** argv) {
     printf("{\"phase\":\"loaded\",\"sym\":\"%s\"}\n", sym);
 
     void* host_ptr = nullptr;
-    CHK(hipHostMalloc(&host_ptr, sizeof(WorkerQueueLayout), hipHostMallocMapped));
-    std::memset(host_ptr, 0, sizeof(WorkerQueueLayout));
+    CHK(hipHostMalloc(&host_ptr, sizeof(WorkerQueue), hipHostMallocMapped));
+    std::memset(host_ptr, 0, sizeof(WorkerQueue));
     void* dev_queue_ptr = nullptr;
     CHK(hipHostGetDevicePointer(&dev_queue_ptr, host_ptr, 0));
-    auto* q_host = (WorkerQueueLayout*)host_ptr;
+    auto* q_host = (WorkerQueue*)host_ptr;
 
     hipStream_t stream;
     CHK(hipStreamCreate(&stream));
