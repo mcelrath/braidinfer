@@ -44,9 +44,27 @@ impl Drop for HipEvent {
     }
 }
 
+/// Role of a GPU in the disaggregated decode topology (bd 4n5 P1).
+///
+/// DORMANT in P1: the field is assigned at `init` but not yet read, so current
+/// symmetric multi-GPU behavior is unchanged. P2/P3 activate the disaggregated
+/// dispatch (GPU 0 = attention + canonical KV; GPUs 1..N = MoE experts only) by
+/// gating on this role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuRole {
+    /// Holds canonical KV, runs all attention heads + coordinator work
+    /// (embed / RMSNorm / GDN / MoE gate / residual / lm_head). GPU 0.
+    SequenceAttention,
+    /// Holds MoE expert weights only; runs OP_MOE_FFN_REMOTE only. GPUs 1..N.
+    Expert,
+}
+
 /// Per-GPU resources for expert parallel dispatch.
 pub struct GpuWorker {
     pub device: DeviceId,
+    /// Disaggregation role (bd 4n5). Assigned at init; read by the decode-time
+    /// disaggregated dispatch in P2/P3. Dormant in P1.
+    pub role: GpuRole,
     pub compute_stream: Stream,
     // Compute-path P2P copy kernel (avoids SDMA PERMISSION_FAULT on RDNA3 PCIe)
     pub peer_copy_module: Module,
@@ -200,6 +218,13 @@ impl MultiGpuContext {
             );
             workers.push(GpuWorker {
                 device,
+                // bd 4n5 P1: GPU 0 = canonical KV + attention; GPUs 1..N = experts.
+                // Dormant — assigned here, read by the disaggregated decode in P2/P3.
+                role: if i == 0 {
+                    GpuRole::SequenceAttention
+                } else {
+                    GpuRole::Expert
+                },
                 compute_stream: Stream::new(device)?,
                 peer_copy_module: Module::load(
                     device,
