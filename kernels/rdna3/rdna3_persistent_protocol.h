@@ -101,6 +101,7 @@
 #include "../worker_queue.h"
 #include "rdna3_barrier.h"
 #include "rdna3_peer.h"  // host_uc_store_agent
+#include "rdna3_mailbox.h"  // sentinel_spin_load_u32 (§11.14 vector-load poll)
 
 namespace braidinfer { namespace rdna3 {
 
@@ -156,12 +157,21 @@ persistent_iter_poll_barrier(
             // L0/L1 invalidation is documented silently no-op on gfx11+ in
             // cooperative-kernel polling context (kb gl-inv-noop-gfx11) but
             // retained for code intent.
+            // §11.14 fix: queue->shutdown / queue->seq_num are host-written UC
+            // scalars. A plain `queue->field` read compiles to s_load, cached in
+            // the gfx11 scalar cache (K$) across poll iterations — buffer_gl0/gl1_inv
+            // is a documented no-op for it, so block0 reads a STALE value and never
+            // sees the host's next seq_num bump (round-2 wedge confirmed by am-rs
+            // driving this same .hsaco from a non-ROCr host; UC->CC mapping did NOT
+            // fix it, proving it's K$ not L2). sentinel_spin_load_u32 forces a VECTOR
+            // global_load_dword glc dlc (VGPR address → no scalarization) that
+            // refetches every iteration. (gl-inv kept for intent; it's a no-op.)
             asm volatile("buffer_gl0_inv\n\t" "buffer_gl1_inv\n\t" ::: "memory");
-            if (queue->shutdown) {
+            if (sentinel_spin_load_u32((const unsigned int*)&queue->shutdown)) {
                 *shutdown_seen_flag = 1u;
                 break;
             }
-            uint32_t s = queue->seq_num;
+            uint32_t s = sentinel_spin_load_u32((const unsigned int*)&queue->seq_num);
             if (s > last_seq) break;
             __builtin_amdgcn_s_sleep(1);
         }
