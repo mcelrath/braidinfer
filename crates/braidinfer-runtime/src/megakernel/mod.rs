@@ -87,14 +87,6 @@ pub(crate) struct QuantizedKvState {
     pub last_quant_page_table_len: usize,
 }
 
-/// Prefill-specific caching state — only populated on prefill programs.
-pub(crate) struct PrefillCacheState {
-    pub embedding_start: usize,
-    pub kv_entries: Vec<PrefillKvEntry>,
-    pub attn_inst_indices: Vec<usize>,
-    pub n: usize,
-}
-
 /// Set opcode + weight pointer for a linear projection instruction.
 /// For bf16: keeps OP_LINEAR_PROJ, sets bf16 pointer.
 /// For packed: switches opcode to OP_LINEAR_PROJ_RNF4/PCG32, sets u8 pointer.
@@ -113,8 +105,6 @@ pub struct MegakernelProgram {
     // Quantized KV support (Some only when quantized_kv=true)
     pub quantized_kv: bool,
     pub(crate) quant_kv: Option<QuantizedKvState>,
-    // Prefill-specific caching (Some only for prefill programs)
-    pub(crate) prefill_cache: Option<PrefillCacheState>,
     // Dump mode: per-instruction activation capture.
     // dump_counter is host-mapped (MappedHostBuffer) so we can initialize it
     // and read/reset it from the CPU without a hipMemcpy — the persistent
@@ -142,15 +132,6 @@ pub struct MegakernelProgram {
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,
-}
-
-/// One KV-write D2dCopy pair (K and V) for prefill chunk patching.
-pub(crate) struct PrefillKvEntry {
-    pub k_inst_idx: usize,
-    pub v_inst_idx: usize,
-    pub t: usize,           // token offset within chunk (0..n)
-    pub h: usize,           // KV head index
-    pub layer_kv_idx: usize, // index into kv_base_ptrs
 }
 
 /// Activation buffers sized for N-token prefill chunks.

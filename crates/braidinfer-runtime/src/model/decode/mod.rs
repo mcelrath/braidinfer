@@ -5,60 +5,6 @@ use crate::weights::LayerWeights;
 use super::Model;
 use crate::weights::ModelError;
 
-// ---- Decode-mirror print helpers (Phase 2b) --------------------------------
-
-fn print_stats_decode(
-    tracer: &crate::tracer::Tracer,
-    label: &str,
-    position: u32,
-    num_workers: usize,
-    max_seq_len: usize,
-    head_dim: usize,
-) {
-    use crate::tracer::Probe;
-    let stat = |name: &str, slice: &[f32]| {
-        let mut n_nan = 0usize;
-        let mut n_inf = 0usize;
-        let mut max_abs = 0.0f32;
-        for &x in slice {
-            if x.is_nan() { n_nan += 1; }
-            else if x.is_infinite() { n_inf += 1; }
-            else if x.abs() > max_abs { max_abs = x.abs(); }
-        }
-        eprintln!(
-            "[snap {label} pos={position}] {name}: n={} nan={} inf={} max_abs={:.4} first4={:?}",
-            slice.len(), n_nan, n_inf, max_abs, &slice[..slice.len().min(4)]
-        );
-    };
-    let empty: &[f32] = &[];
-    stat("act.hidden", tracer.read_f32(Probe::Hidden { gpu: 0, head_only: false }).unwrap_or(empty));
-    stat("act.attn_out", tracer.read_f32(Probe::Custom(std::borrow::Cow::Borrowed("act.attn_out"))).unwrap_or(empty));
-    for w_idx in 0..num_workers {
-        stat(&format!("g{}.attn_normed", w_idx + 1), tracer.read_f32(Probe::AttnNormed { gpu: w_idx + 1 }).unwrap_or(empty));
-    }
-    for w_idx in 0..num_workers {
-        stat(&format!("g{}.attn_q_gate", w_idx + 1), tracer.read_f32(Probe::AttnQGate { gpu: w_idx + 1 }).unwrap_or(empty));
-    }
-    for w_idx in 0..num_workers {
-        stat(&format!("g{}.attn_k", w_idx + 1), tracer.read_f32(Probe::AttnK { gpu: w_idx + 1 }).unwrap_or(empty));
-    }
-    let used = (position as usize + 1).min(max_seq_len);
-    let slice_len = used * head_dim;
-    let num_gpus = 1 + num_workers;
-    for gpu_i in 0..num_gpus {
-        for layer_i in 0..2usize {
-            if let Some(k_full) = tracer.read_f32(Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: true, head: 0 }) {
-                let k_slice = &k_full[..slice_len.min(k_full.len())];
-                stat(&format!("g{gpu_i}.kv[{layer_i}].k(h0,p0..{used})"), k_slice);
-            }
-            if let Some(v_full) = tracer.read_f32(Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: false, head: 0 }) {
-                let v_slice = &v_full[..slice_len.min(v_full.len())];
-                stat(&format!("g{gpu_i}.kv[{layer_i}].v(h0,p0..{used})"), v_slice);
-            }
-        }
-    }
-}
-
 fn print_moe_stats_decode(
     tracer: &crate::tracer::Tracer,
     label: &str,
@@ -91,28 +37,6 @@ fn print_moe_stats_decode(
         let buf = tracer.read_f32(Probe::WorkerFfnOut { worker: w_idx, layer: 0 }).unwrap_or(empty);
         stat(&format!("worker{}_ffn_out(gpu{})", w_idx, w_idx + 1), buf);
     }
-}
-
-fn print_normed_stage_stats(label: &str, position: u32, normed_stage_host: &[f32]) {
-    let mut n_nan = 0usize;
-    let mut n_inf = 0usize;
-    let mut n_denorm = 0usize;
-    let mut max_abs = 0.0f32;
-    for &x in normed_stage_host {
-        let bits = x.to_bits();
-        let exp = (bits >> 23) & 0xFF;
-        let mant = bits & 0x7F_FFFF;
-        if x.is_nan() { n_nan += 1; }
-        else if x.is_infinite() { n_inf += 1; }
-        else if exp == 0 && mant != 0 { n_denorm += 1; }
-        else if x.abs() > max_abs { max_abs = x.abs(); }
-    }
-    eprintln!(
-        "[snap {label}] normed_stage(CPU-view): n={} nan={} inf={} denorm={} max_abs={:.4} first4={:?}",
-        normed_stage_host.len(), n_nan, n_inf, n_denorm, max_abs,
-        &normed_stage_host[..normed_stage_host.len().min(4)]
-    );
-    let _ = position;
 }
 
 impl Model {
@@ -497,76 +421,6 @@ impl Model {
         Ok(())
     }
 
-    /// 5ax-decode MTYPE audit: dump (memory_type, alloc_flags) for every
-    /// cross-agent or reused buffer in the multi-GPU decode path. Per
-    /// GFX1100_ARCH.md §5.5 Rule 5 — `mem_type=2 alloc_flags=0x0` ==
-    /// cached device buffer == L2-stale candidate. `0x3` = UC. `1` = host.
-    fn dump_mtype_audit(&self) {
-        eprintln!("=== MTYPE audit (5ax-decode) ===");
-        eprintln!("Legend: mem_type 1=Host 2=Device | alloc_flags 0x0=cached 0x1=fine-grained 0x3=UC");
-        let dev = |b: &braidinfer_hip::DeviceBuffer<f32>, name: &str| {
-            match b.pointer_attributes() {
-                Ok((t, f)) => eprintln!("  {name:46} mem_type={t} alloc_flags=0x{f:x}"),
-                Err(e) => eprintln!("  {name:46} ERR {e:?}"),
-            }
-        };
-        let host = |b: &braidinfer_hip::MappedHostBuffer<f32>, name: &str| {
-            match b.pointer_attributes() {
-                Ok((t, f)) => eprintln!("  {name:46} mem_type={t} alloc_flags=0x{f:x}"),
-                Err(e) => eprintln!("  {name:46} ERR {e:?}"),
-            }
-        };
-
-        eprintln!("-- activations (GPU 0) --");
-        dev(&self.activations.hidden, "activations.hidden");
-        dev(&self.activations.normed, "activations.normed");
-        host(&self.activations.normed_stage, "activations.normed_stage");
-        dev(&self.activations.q_attn, "activations.q_attn");
-        dev(&self.activations.k_attn, "activations.k_attn");
-        dev(&self.activations.v_attn, "activations.v_attn");
-        dev(&self.activations.gate_attn, "activations.gate_attn");
-        dev(&self.activations.attn_out, "activations.attn_out");
-        dev(&self.activations.gated_out, "activations.gated_out");
-        dev(&self.activations.residual, "activations.residual");
-
-        if let Some(legacy) = self.legacy_kv_caches.as_ref() {
-            eprintln!("-- legacy_kv_caches (GPU 0, prefill K/V) --");
-            for (i, kv) in legacy.iter().enumerate() {
-                dev(&kv.k, &format!("legacy_kv_caches[{i}].k"));
-                if i == 0 { dev(&kv.v, &format!("legacy_kv_caches[{i}].v")); }
-                if i >= 2 { eprintln!("  ... ({} total layers)", legacy.len()); break; }
-            }
-        }
-
-        if let Some(mgpu) = self.multi_gpu.as_ref() {
-            for (gpu_i, w) in mgpu.workers.iter().enumerate() {
-                eprintln!("-- worker[{gpu_i}] (device {}) --", w.device.0);
-                if let Some(b) = w.attn_normed.as_ref() { dev(b, &format!("workers[{gpu_i}].attn_normed")); }
-                if let Some(b) = w.attn_q_gate.as_ref() { dev(b, &format!("workers[{gpu_i}].attn_q_gate")); }
-                if let Some(b) = w.attn_k.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_k")); }
-                if let Some(b) = w.attn_v.as_ref()      { dev(b, &format!("workers[{gpu_i}].attn_v")); }
-                if let Some(b) = w.attn_gate.as_ref()   { dev(b, &format!("workers[{gpu_i}].attn_gate")); }
-                if let Some(b) = w.attn_out.as_ref()    { host(b.host(), &format!("workers[{gpu_i}].attn_out")); }
-                for (i, kv) in w.attn_kv_caches.iter().enumerate() {
-                    if i < 2 {
-                        dev(&kv.k, &format!("workers[{gpu_i}].attn_kv_caches[{i}].k"));
-                        dev(&kv.v, &format!("workers[{gpu_i}].attn_kv_caches[{i}].v"));
-                    }
-                }
-                if w.attn_kv_caches.len() > 2 {
-                    eprintln!("  ... ({} attn_kv_cache layers)", w.attn_kv_caches.len());
-                }
-            }
-        }
-
-        if let Some(p2p) = self.moe_p2p.as_ref() {
-            eprintln!("-- moe_p2p --");
-            host(p2p.output_slots.host(), "moe_p2p.output_slots");
-            host(p2p.activation_staging.host(), "moe_p2p.activation_staging");
-        }
-        eprintln!("=== end MTYPE audit ===");
-    }
-
     /// DEBUG_P2P_HIDDEN probe: copy first 16 floats of `activations.hidden` via SDMA
     /// (GPU 0 stream) and print a one-line diagnostic. Safe under the persistent
     /// cooperative kernel — SDMA operates independently of the held CUs.
@@ -645,97 +499,6 @@ impl Model {
         Ok(())
     }
 
-    /// SDMA-based snapshot of cross-GPU debug-relevant tensors (KV caches +
-    /// GPU 0 activations) into pinned host buffers via tracer, with per-buffer
-    /// stats printed to stderr. No-op if tracer is disabled or multi_gpu is None.
-    pub(super) fn decode_mirror_snapshot(&mut self, label: &str, position: u32) {
-        if !self.tracer.enabled() || self.multi_gpu.is_none() {
-            return;
-        }
-        use braidinfer_hip::device::{Device, DeviceGuard};
-        use crate::tracer::Probe;
-        let gpu0 = self.device;
-        let hs = self.config.hidden_size;
-        let local_nkh = self.config.num_kv_heads;
-        let max_seq_len = self.config.max_seq_len;
-        let head_dim = self.config.head_dim;
-        let hs_bytes = hs * 4;
-        let mgpu = self.multi_gpu.as_ref().unwrap();
-        let worker_devices: Vec<_> = mgpu.workers.iter().skip(1).map(|w| w.device).collect();
-        let workers_kv_refs: Vec<Vec<(*const u8, *const u8)>> =
-            mgpu.workers.iter().map(|w| {
-                w.attn_kv_caches.iter().map(|kv| (kv.k.as_ptr() as *const u8, kv.v.as_ptr() as *const u8)).collect()
-            }).collect();
-        let workers_normed: Vec<Option<*const f32>> = mgpu.workers.iter()
-            .map(|w| w.attn_normed.as_ref().map(|b| b.as_ptr() as *const f32)).collect();
-        let workers_q_gate: Vec<Option<(*const f32, usize)>> = mgpu.workers.iter()
-            .map(|w| w.attn_q_gate.as_ref().map(|b| (b.as_ptr() as *const f32, b.len()))).collect();
-        let workers_k: Vec<Option<*const f32>> = mgpu.workers.iter()
-            .map(|w| w.attn_k.as_ref().map(|b| b.as_ptr() as *const f32)).collect();
-        let num_workers = worker_devices.len();
-        let nqh_total = self.config.num_q_heads;
-        let attn_out_floats = nqh_total * head_dim;
-        let attn_out_bytes = attn_out_floats * 4;
-        let kv_bytes = local_nkh * max_seq_len * head_dim * 4;
-        let dispatch = self.persistent_workers.as_ref().unwrap();
-
-        let _guard = match DeviceGuard::switch_to(gpu0) {
-            Ok(g) => g,
-            Err(e) => { eprintln!("[snap {label}] DeviceGuard error: {e:?}"); return; }
-        };
-        // GPU 0: act.hidden + act.attn_out
-        if let Err(e) = self.tracer.capture(0, Probe::Hidden { gpu: 0, head_only: false }, self.activations.hidden.as_ptr() as *const u8, hs_bytes) {
-            eprintln!("[snap {label}] FAILED: {e:?}"); return;
-        }
-        if let Err(e) = self.tracer.capture(0, Probe::Custom(std::borrow::Cow::Borrowed("act.attn_out")), self.activations.attn_out.as_ptr() as *const u8, attn_out_bytes) {
-            eprintln!("[snap {label}] FAILED: {e:?}"); return;
-        }
-        // Per-GPU attn_kv (GPU 0 first, then workers).
-        for (gpu_i, kv_layers) in workers_kv_refs.iter().enumerate() {
-            let dev = if gpu_i == 0 { gpu0 } else { worker_devices[gpu_i - 1] };
-            if let Err(e) = Device::set_current(dev) { eprintln!("[snap {label}] set_current: {e:?}"); return; }
-            if gpu_i > 0 {
-                if let Err(e) = dispatch.record_kv_event(dev.0 as usize) { eprintln!("[snap {label}] record_kv_event: {e:?}"); return; }
-                if let Err(e) = dispatch.wait_kv_event_on_sdma(dev.0 as usize) { eprintln!("[snap {label}] wait_kv_event: {e:?}"); return; }
-            }
-            for (layer_i, &(k_ptr, v_ptr)) in kv_layers.iter().enumerate() {
-                if let Err(e) = self.tracer.capture(gpu_i, Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: true, head: 0 }, k_ptr, kv_bytes) {
-                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
-                }
-                if let Err(e) = self.tracer.capture(gpu_i, Probe::KvCache { gpu: gpu_i, attn_layer: layer_i, k: false, head: 0 }, v_ptr, kv_bytes) {
-                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
-                }
-            }
-        }
-        // Per-worker attn_normed / attn_q_gate / attn_k
-        let local_nqh = attn_out_floats / head_dim / (1 + num_workers);
-        for (w_idx, &dev) in worker_devices.iter().enumerate() {
-            if let Err(e) = Device::set_current(dev) { eprintln!("[snap {label}] set_current: {e:?}"); return; }
-            if let Some(Some(p)) = workers_normed.get(w_idx + 1).copied() {
-                if let Err(e) = self.tracer.capture(w_idx + 1, Probe::AttnNormed { gpu: w_idx + 1 }, p as *const u8, hs_bytes) {
-                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
-                }
-            }
-            if let Some(Some((p, n))) = workers_q_gate.get(w_idx + 1).copied() {
-                let cap = local_nqh * head_dim * 2;
-                let copy_bytes = n.min(cap) * 4;
-                if let Err(e) = self.tracer.capture(w_idx + 1, Probe::AttnQGate { gpu: w_idx + 1 }, p as *const u8, copy_bytes) {
-                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
-                }
-            }
-            if let Some(Some(p)) = workers_k.get(w_idx + 1).copied() {
-                let copy_bytes = local_nkh * head_dim * 4;
-                if let Err(e) = self.tracer.capture(w_idx + 1, Probe::AttnK { gpu: w_idx + 1 }, p as *const u8, copy_bytes) {
-                    eprintln!("[snap {label}] FAILED: {e:?}"); return;
-                }
-            }
-        }
-        if let Err(e) = self.tracer.drain() {
-            eprintln!("[snap {label}] drain FAILED: {e:?}"); return;
-        }
-        print_stats_decode(&self.tracer, label, position, num_workers, max_seq_len, head_dim);
-    }
-
     /// Snapshot MoE output_slots (host-mapped, direct read) and per-worker FFN_REMOTE
     /// local_output (SDMA copy) via tracer, then print stats. No-op if tracer is
     /// disabled or moe_p2p is None.
@@ -774,33 +537,12 @@ impl Model {
     }
 
     pub(super) fn decode_step_p2p(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
-        let max_steps: u32 = std::env::var("BRAIDINFER_DECODE_MIRROR_STEPS")
-            .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-        let do_snap = self.tracer.enabled() && (position < (self.seq_len + max_steps));
-        if do_snap {
-            self.decode_mirror_snapshot(&format!("step-begin pos={position}"), position);
-        }
-        let r = self.decode_step_p2p_inner(token_id, position);
-        if do_snap {
-            self.decode_mirror_snapshot(&format!("step-end pos={position}"), position);
-        }
-        r
+        self.decode_step_p2p_inner(token_id, position)
     }
 
     pub(super) fn decode_step_p2p_inner(&mut self, token_id: u32, position: u32) -> Result<Vec<f32>, ModelError> {
         // 5ax-decode probe: BRAIDINFER_MTYPE_AUDIT=1 dumps the MTYPE table
         // for all cross-agent and reused buffers in the decode path. Runs
-        // once on the first decode step. Surfaces buffers that should be
-        // UC but aren't (mem_type=2 device + alloc_flags=0 means cached,
-        // the canonical L2-stale candidate). Uses static AtomicBool to
-        // run only once even though decode_step_p2p is called per step.
-        static AUDITED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if std::env::var("BRAIDINFER_MTYPE_AUDIT").is_ok()
-            && !AUDITED.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.dump_mtype_audit();
-        }
         self.set_position(position).map_err(ModelError::Hip)?;
 
         // β'''' sentinel monotonic-seq (bd braidinfer-sm16, udi #3189): use
@@ -1117,7 +859,6 @@ impl Model {
         };
         use crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS;
         use crate::quant::{LinearWeight, WeightFormat};
-        use crate::paged_kv::quantized_kv_offsets;
 
         fn emit_linear_proj_inst(
             batch: &mut Vec<Instruction>,
@@ -1476,19 +1217,6 @@ impl Model {
         // (not just attn_i==0) to find FIRST layer where normed_stage(CPU-view)
         // first turns NaN. attn_i==0 alone catches downstream propagation but
         // misses which attn layer originated the NaN.
-        let all_attn = std::env::var("BRAIDINFER_DECODE_MIRROR_ALL_ATTN").is_ok();
-        if self.tracer.enabled() && (attn_i == 0 || all_attn) {
-            let normed_stage_host: Vec<f32> = unsafe {
-                std::slice::from_raw_parts(
-                    self.activations.normed_stage.host_ptr() as *const f32,
-                    hs,
-                )
-            }.to_vec();
-            let label = format!("attn{attn_i}-post-ack pos={position}");
-            self.decode_mirror_snapshot(&label, position);
-            print_normed_stage_stats(&label, position, &normed_stage_host);
-        }
-
         // Gather GPU 1..num_gpus attn_out + gate_attn via persistent worker OP_D2D_COPY.
         // MUST NOT use peer_copy_async (kernel launch on GPU 0) while persistent cooperative
         // worker holds all CUs. Route all GPU-0 copies through persistent worker protocol.

@@ -4,7 +4,6 @@ use braidinfer_hip::memory::DeviceBuffer;
 use super::Model;
 use crate::config::*;
 use crate::weights::*;
-use crate::gpu_utils::d2d_copy_f32;
 use crate::moe_p2p::{MAX_ACTIVE_EXPERTS, MAX_PREFILL_BATCH};
 
 impl Model {

@@ -200,8 +200,7 @@ impl Model {
         chunk: &[u32],
         start_pos: u32,
     ) -> Result<(), ModelError> {
-        use crate::config::LayerType;
-        use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, PrefillBuffers};
+        use crate::megakernel::{CHUNK_TOKENS, PrefillBuffers};
 
         if self.prefill_bufs.is_none() {
             self.prefill_bufs = Some(
@@ -217,180 +216,7 @@ impl Model {
         // bd srg6.X3: MoE prefill uses paged KV segment compile path for
         // both single-GPU and multi-GPU. The flat path is retired; paged
         // broadcast to workers happens in prefill_batched after this returns.
-        return self.prefill_mixed_chunk_paged(chunk, start_pos);
-
-        let n = chunk.len();
-        let hs = self.config.hidden_size;
-        let num_layers = self.config.num_layers;
-
-        // Load megakernel module once and share across all segment compilations via Arc.
-        let megakernel_module = std::sync::Arc::new(
-            braidinfer_hip::module::Module::load(
-                self.device,
-                &crate::kernel::kernel_dir().join("megakernel.hsaco"),
-            ).map_err(ModelError::Hip)?
-        );
-
-        // Emit embedding instructions via megakernel: one per token into prefill_bufs.hidden[t*hs]
-        // We compile a tiny "embedding-only" segment by treating layer_start=0,layer_end=0.
-        // Then for each span of non-MoE layers, compile_prefill_segment handles them.
-        // For MoE layers, use moe_ffn_forward with d2d handoff.
-
-        // Step 1: Embed all tokens into prefill_bufs.hidden via the persistent
-        // worker mailbox (bd 9gmh Phase 1E). No OP_HALT — mailbox path must
-        // never send HALT (would terminate the worker).
-        {
-            use crate::megakernel::instructions::*;
-            use crate::megakernel::Instruction;
-
-            let grid_x = (hs as u32 + 255) / 256;
-            let mut insts: Vec<Instruction> = Vec::new();
-            let bufs = self.prefill_bufs.as_ref().unwrap();
-            for t in 0..n {
-                insts.push(EmbeddingInst::new(
-                    grid_x,
-                    unsafe { bufs.hidden.as_write_ptr().add(t * hs) },
-                    self.embed_weight.as_ptr(),
-                    chunk[t] as i32,
-                    hs as i32,
-                ).into_inst());
-            }
-            let dispatch = self.persistent_workers.as_mut()
-                .expect("persistent_workers must be initialized in Model::prefill");
-            dispatch.dispatch_batch_slice(self.device.0 as usize, &insts);
-        }
-
-        // Step 2: Walk layers, identify contiguous non-MoE spans vs MoE layers.
-        // MoE layer types:
-        //   - LayerType::MoeFfn: standalone MoE FFN (Nemotron 'E'), no attention — dispatch only
-        //   - LayerType::Attention + ffn_type::MoE: attention + MoE FFN (Qwen) — 1-layer attention
-        //     span (compile_prefill_segment skips FFN for MoE) then MoE FFN dispatch
-        let mut layer_i = 0usize;
-
-        while layer_i < num_layers {
-            let lt = self.config.layers[layer_i].layer_type.clone();
-            if lt == LayerType::MoeFfn {
-                // Nemotron standalone MoE FFN layer (no attention part).
-                // bd 174k Phase D: single-GPU and multi-GPU share the same
-                // mailbox-routed MoE prefill path. ensure_moe_workers_started
-                // (called above) initializes moe_p2p for both (num_workers=0
-                // when single-GPU).
-                let mut bufs = self.prefill_bufs.take().unwrap();
-                self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
-                    .map_err(ModelError::Hip)?;
-                self.prefill_bufs = Some(bufs);
-                layer_i += 1;
-            } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
-                && (lt == LayerType::Attention || lt == LayerType::Gdn) {
-                // Attention/GDN + MoE FFN layer: run mixer via 1-layer segment,
-                // then dispatch MoE FFN separately.
-                // Never set is_last=true here: the segment would emit final_norm+LM_head
-                // BEFORE the MoE FFN runs, producing logits from the pre-MoE hidden state.
-                // Instead, we handle is_last after MoE below.
-                let span_start = layer_i;
-                let span_end = layer_i + 1;
-                let is_truly_last = span_end == num_layers;
-
-                // start_pos encodes RoPE positions baked into the compiled program.
-                // Must be part of the key to avoid wrong positions on sequential calls.
-                let key = (span_start, span_end, n, start_pos as usize);
-                let mut bufs = self.prefill_bufs.take().unwrap();
-                if !self.megakernel_prefill_segments.contains_key(&key) {
-                    let mk = MegakernelProgram::compile_prefill_segment_with_module(
-                        self, std::sync::Arc::clone(&megakernel_module), chunk, start_pos,
-                        span_start, span_end, false, // never is_last: LM head runs after MoE below
-                        &mut bufs,
-                    ).map_err(ModelError::Hip)?;
-                    self.megakernel_prefill_segments.insert(key, mk);
-                }
-                // 5ax fix: position_ids is a SHARED buffer; cached segment programs
-                // do NOT re-write it on execute. Refresh before every execute so the
-                // FIRST run of a previously-compiled program reads the correct positions
-                // (otherwise stale values from the LAST compiled program leak into
-                // subsequent runs — manifests as MROPE reading wrong pos at token 0).
-                bufs.write_positions(start_pos, n).map_err(ModelError::Hip)?;
-                self.prefill_bufs = Some(bufs);
-                {
-                    let mk = self.megakernel_prefill_segments.get_mut(&key).unwrap();
-                    let dispatch = self.persistent_workers.as_mut()
-                        .expect("persistent_workers must be initialized in Model::prefill");
-                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
-                        .map_err(ModelError::Hip)?;
-                }
-
-                // Dispatch MoE FFN for this layer via unified mailbox path
-                // (bd 174k Phase D: single-GPU also uses moe_p2p with num_workers=0).
-                let mut bufs = self.prefill_bufs.take().unwrap();
-                self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
-                    .map_err(ModelError::Hip)?;
-                self.prefill_bufs = Some(bufs);
-
-                // If this is the last layer, emit final norm + LM head now (post-MoE).
-                if is_truly_last {
-                    let bufs = self.prefill_bufs.take().unwrap();
-                    let mut mk = MegakernelProgram::compile_final_norm_lm_head(
-                        self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
-                    ).map_err(ModelError::Hip)?;
-                    self.prefill_bufs = Some(bufs);
-                    let dispatch = self.persistent_workers.as_mut()
-                        .expect("persistent_workers must be initialized in Model::prefill");
-                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
-                        .map_err(ModelError::Hip)?;
-                }
-                layer_i += 1;
-            } else {
-                // Dense non-MoE span: accumulate contiguous dense layers
-                let span_start = layer_i;
-                while layer_i < num_layers {
-                    let l = &self.config.layers[layer_i];
-                    if l.layer_type == LayerType::MoeFfn { break; }
-                    if matches!(l.ffn_type, FfnType::MoE { .. })
-                        && (l.layer_type == LayerType::Attention || l.layer_type == LayerType::Gdn) { break; }
-                    layer_i += 1;
-                }
-                let span_end = layer_i;
-                let is_last = span_end == num_layers;
-
-                let key = (span_start, span_end, n, start_pos as usize);
-                let mut bufs = self.prefill_bufs.take().unwrap();
-
-                if !self.megakernel_prefill_segments.contains_key(&key) {
-                    let mk = MegakernelProgram::compile_prefill_segment_with_module(
-                        self, std::sync::Arc::clone(&megakernel_module), chunk, start_pos,
-                        span_start, span_end, is_last,
-                        &mut bufs,
-                    ).map_err(ModelError::Hip)?;
-                    self.megakernel_prefill_segments.insert(key, mk);
-                }
-                // 5ax fix: refresh position_ids before every execute (cached programs
-                // share the prefill_bufs.position_ids buffer).
-                bufs.write_positions(start_pos, n).map_err(ModelError::Hip)?;
-                self.prefill_bufs = Some(bufs);
-                {
-                    let mk = self.megakernel_prefill_segments.get_mut(&key).unwrap();
-                    let dispatch = self.persistent_workers.as_mut()
-                        .expect("persistent_workers must be initialized in Model::prefill");
-                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
-                        .map_err(ModelError::Hip)?;
-                }
-            }
-        }
-
-        // When the last layer is a standalone MoeFfn, no dense span has is_last=true,
-        // so the final norm + LM head was never emitted. Compute it now.
-        if self.config.layers[num_layers - 1].layer_type == LayerType::MoeFfn {
-            let bufs = self.prefill_bufs.take().unwrap();
-            let mut mk = MegakernelProgram::compile_final_norm_lm_head(
-                self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
-            ).map_err(ModelError::Hip)?;
-            self.prefill_bufs = Some(bufs);
-            let dispatch = self.persistent_workers.as_mut()
-                .expect("persistent_workers must be initialized in Model::prefill");
-            mk.dispatch_via_worker(dispatch, self.device.0 as usize)
-                .map_err(ModelError::Hip)?;
-        }
-
-        Ok(())
+        self.prefill_mixed_chunk_paged(chunk, start_pos)
     }
 
     /// bd srg6.10: single-GPU MoE prefill via paged KV segment compile.
@@ -602,7 +428,7 @@ impl Model {
     }
 
     fn prefill_batched(&mut self, tokens: &[u32]) -> Result<Vec<f32>, ModelError> {
-        use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram, PrefillBuffers};
+        use crate::megakernel::{CHUNK_TOKENS, PrefillBuffers};
 
         // Lazy-alloc prefill buffers.
         if self.prefill_bufs.is_none() {
@@ -616,65 +442,14 @@ impl Model {
         let total = tokens.len();
         let mut offset = 0;
 
-        if self.has_moe {
-            // Mixed path: batch non-MoE spans, sequential MoE layers
-            while offset < total {
-                let end = (offset + CHUNK_TOKENS).min(total);
-                let chunk = &tokens[offset..end];
-                let start_pos = self.seq_len + offset as u32;
-                self.prefill_mixed_chunk(chunk, start_pos)?;
-                offset = end;
-            }
-        } else {
-            // Pure non-MoE path: use original compile_prefill
-            while offset < total {
-                let end = (offset + CHUNK_TOKENS).min(total);
-                let chunk = &tokens[offset..end];
-                let start_pos = self.seq_len + offset as u32;
-
-                // take() avoids split-borrow: compile/update take &Model + &mut PrefillBuffers
-                let mut bufs = self.prefill_bufs.take().unwrap();
-
-                if chunk.len() == CHUNK_TOKENS {
-                    // Full chunk: compile once and cache, then patch per chunk.
-                    if self.megakernel_prefill.is_none() {
-                        let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
-                            .map_err(ModelError::Hip)?;
-                        self.megakernel_prefill = Some(mk);
-                    } else {
-                        let mk = self.megakernel_prefill.as_mut().unwrap();
-                        mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
-                    }
-                    self.prefill_bufs = Some(bufs);
-                    let mk = self.megakernel_prefill.as_mut().unwrap();
-                    let dispatch = self.persistent_workers.as_mut()
-                        .expect("persistent_workers must be initialized in Model::prefill");
-                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
-                        .map_err(ModelError::Hip)?;
-                } else {
-                    // Partial last chunk: cache by token count to avoid recompile on repeated prompts.
-                    let n = chunk.len();
-                    if self.megakernel_prefill_partial_n == n
-                        && self.megakernel_prefill_partial.is_some()
-                    {
-                        let mk = self.megakernel_prefill_partial.as_mut().unwrap();
-                        mk.update_prefill_chunk(chunk, start_pos, &mut bufs).map_err(ModelError::Hip)?;
-                    } else {
-                        let mk = MegakernelProgram::compile_prefill(self, chunk, start_pos, &mut bufs)
-                            .map_err(ModelError::Hip)?;
-                        self.megakernel_prefill_partial = Some(mk);
-                        self.megakernel_prefill_partial_n = n;
-                    }
-                    self.prefill_bufs = Some(bufs);
-                    let mk = self.megakernel_prefill_partial.as_mut().unwrap();
-                    let dispatch = self.persistent_workers.as_mut()
-                        .expect("persistent_workers must be initialized in Model::prefill");
-                    mk.dispatch_via_worker(dispatch, self.device.0 as usize)
-                        .map_err(ModelError::Hip)?;
-                }
-
-                offset = end;
-            }
+        // has_moe is always true when prefill_batched is called (prefill() routes
+        // non-MoE to prefill_paged). Non-MoE path (compile_prefill) deleted in srg6.21.
+        while offset < total {
+            let end = (offset + CHUNK_TOKENS).min(total);
+            let chunk = &tokens[offset..end];
+            let start_pos = self.seq_len + offset as u32;
+            self.prefill_mixed_chunk(chunk, start_pos)?;
+            offset = end;
         }
 
         self.seq_len += total as u32;
@@ -700,9 +475,6 @@ impl Model {
                     .map_err(ModelError::Hip)?;
                 // Free prefill scratch: paged decode never re-invokes compile_prefill*.
                 self.prefill_bufs = None;
-                self.megakernel_prefill = None;
-                self.megakernel_prefill_partial = None;
-                self.megakernel_prefill_segments.clear();
             }
         }
         // Persistent worker holds GPU 0 CUs — synchronous copy_to_host would
@@ -812,66 +584,6 @@ impl Model {
         Ok(result)
     }
 
-    /// Read legacy_kv_caches K and V tensors per layer (diagnostic).
-    /// Returns Vec<(K_layer, V_layer)>; empty Vec if legacy_kv_caches not initialized.
-    /// Used by bench_coherence to compare K/V cache contents across runs (track 5ax).
-    pub fn read_legacy_kv_caches(&self) -> Result<Vec<(Vec<f32>, Vec<f32>)>, ModelError> {
-        self.stream.synchronize()?;
-        let Some(caches) = self.legacy_kv_caches.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let mut result = Vec::with_capacity(caches.len());
-        for cache in caches {
-            let n = cache.k.len();
-            let mut k_buf = vec![0.0f32; n];
-            let mut v_buf = vec![0.0f32; n];
-            cache.k.copy_to_host(&mut k_buf)?;
-            cache.v.copy_to_host(&mut v_buf)?;
-            result.push((k_buf, v_buf));
-        }
-        Ok(result)
-    }
-
-    /// Read per-GPU attn_kv_caches for the first attention layer, all KV heads,
-    /// positions [0..max_pos). Returns Vec of (gpu_idx, k_slice, v_slice).
-    /// Diagnostic for braidinfer-sew: compares against read_legacy_kv_caches[0]
-    /// to verify the prefill broadcast reached every worker AND decode-time
-    /// writes match the broadcast format.
-    pub fn read_attn_kv_first_layer(
-        &self,
-        max_pos: usize,
-    ) -> Result<Vec<(usize, Vec<f32>, Vec<f32>)>, ModelError> {
-        self.stream.synchronize()?;
-        let Some(mgpu) = self.multi_gpu.as_ref() else {
-            return Ok(Vec::new());
-        };
-        let nkh = self.config.num_kv_heads;
-        let hd = self.config.head_dim;
-        let max_sl = self.config.max_seq_len;
-        let mut result = Vec::with_capacity(mgpu.num_devices);
-        for (gpu_i, worker) in mgpu.workers.iter().enumerate() {
-            if worker.attn_kv_caches.is_empty() { continue; }
-            let kv = &worker.attn_kv_caches[0];
-            let k_full_len = kv.k.len();
-            let mut k_full = vec![0.0f32; k_full_len];
-            let mut v_full = vec![0.0f32; k_full_len];
-            kv.k.copy_to_host(&mut k_full)?;
-            kv.v.copy_to_host(&mut v_full)?;
-            // Extract positions [0..max_pos) for each head into a flat slice.
-            // Layout: [nkh, max_sl, hd]; we want [nkh, max_pos, hd].
-            let mut k_slice = Vec::with_capacity(nkh * max_pos * hd);
-            let mut v_slice = Vec::with_capacity(nkh * max_pos * hd);
-            for h in 0..nkh {
-                let base = h * max_sl * hd;
-                let want = max_pos * hd;
-                k_slice.extend_from_slice(&k_full[base..base + want]);
-                v_slice.extend_from_slice(&v_full[base..base + want]);
-            }
-            result.push((gpu_i, k_slice, v_slice));
-        }
-        Ok(result)
-    }
-
     /// Read KV chunk pool slot 0 contents (raw bytes) for diagnostic inspection.
     /// Returns empty Vec if page_allocator is not initialized (e.g., multi-GPU non-paged path).
     /// PRE-WORKER-ONLY: calls `memcpy_d2h` — must NOT be called while the persistent
@@ -946,14 +658,6 @@ impl Model {
         for conv_state in &mut self.gdn_conv_states {
             let zeros = vec![0.0f32; qkv_out * (ck - 1)];
             conv_state.copy_from_host(&zeros)?;
-        }
-        if let Some(caches) = self.legacy_kv_caches.as_mut() {
-            let kv_size = self.config.max_seq_len * self.config.num_kv_heads * self.config.head_dim;
-            let zeros_kv = vec![0.0f32; kv_size];
-            for cache in caches {
-                cache.k.copy_from_host(&zeros_kv)?;
-                cache.v.copy_from_host(&zeros_kv)?;
-            }
         }
         if let RecurrentLayerKind::Mamba2 { num_heads: m_nh, head_dim: m_hd, state_dim: m_sd, conv_kernel: m_ck, conv_dim: m_cd, .. } = &self.config.recurrent_kind {
             for state in &mut self.mamba2_states {

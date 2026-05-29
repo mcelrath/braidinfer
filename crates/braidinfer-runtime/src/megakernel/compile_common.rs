@@ -6,7 +6,7 @@ use super::{
     OP_FFN_GATE_UP, OP_FFN_GATE_UP_RNF4, OP_FFN_GATE_UP_RNF4_WX, OP_FFN_GATE_UP_WX,
     OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4, OP_RMSNORM, OP_RMSNORM_WX,
 };
-use crate::weights::{KvCache, LinearWeight, WeightFormat};
+use crate::weights::{LinearWeight, WeightFormat};
 
 /// Emit a batched linear projection. For bf16, uses single batched instruction.
 /// For quantized (PCG32/RNF4), emits per-token loop (kernel batching TODO: braidinfer-xxy).
@@ -59,16 +59,9 @@ pub(crate) fn div_ceil(a: u32, b: u32) -> u32 {
 }
 
 /// Discriminates the variant parts (KV write + attention op) of an attention layer.
-pub(super) enum AttentionVariant<'a> {
-    /// Flat (non-paged) decode: GQA attention, KV written after mRoPE.
-    FlatKv { kv_cache: &'a KvCache },
+pub(super) enum AttentionVariant {
     /// Paged decode: OP_ATTN_PAGED, KV written BEFORE mRoPE.
     PagedKv { attn_layer_index: usize },
-    /// Prefill (N tokens): OP_ATTN_PREFILL, bulk KV write after mRoPE.
-    Prefill {
-        kv_cache: &'a KvCache,
-        start_pos: u32,
-    },
     /// bd srg6.5 Phase 3c: Prefill (N tokens) into paged KV chunks.
     /// Batched OP_KV_WRITE_PAGED_BATCH (one K + one V) after mRoPE, then
     /// per-token OP_ATTN_PAGED loop with seq_len = start_pos + t + 1.

@@ -10,7 +10,7 @@ pub use crate::kernel::AllKernels;
 
 use crate::config::ModelConfig;
 use crate::weights::{
-    ActivationBuffers, GdnState, KvCache, LayerWeights, Mamba2State, ModelError, MoeWeights,
+    ActivationBuffers, GdnState, LayerWeights, Mamba2State, ModelError, MoeWeights,
 };
 
 mod decode; // decode_step_* implementations and dispatch helpers
@@ -48,15 +48,9 @@ pub struct Model {
     pub(crate) moe_weights: Vec<Option<MoeWeights>>, // per-layer MoE FFN (None for dense FFN layers)
     pub(crate) activations: ActivationBuffers,
     pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
-    pub(crate) legacy_kv_caches: Option<Vec<KvCache>>,
     pub(crate) gdn_states: Vec<GdnState>,
     pub(crate) mamba2_states: Vec<Mamba2State>,
     pub(crate) seq_len: u32,
-    pub(crate) megakernel_prefill: Option<MegakernelProgram>,
-    pub(crate) megakernel_prefill_partial: Option<MegakernelProgram>,
-    pub(crate) megakernel_prefill_partial_n: usize,
-    /// Cache of segment megakernel programs keyed by (layer_start, layer_end, chunk_len, start_pos).
-    pub(crate) megakernel_prefill_segments: std::collections::HashMap<(usize, usize, usize, usize), MegakernelProgram>,
     pub(crate) prefill_bufs: Option<crate::megakernel::PrefillBuffers>,
     // Paged KV path (lazy-init)
     pub(crate) megakernel_paged: Option<MegakernelProgram>,

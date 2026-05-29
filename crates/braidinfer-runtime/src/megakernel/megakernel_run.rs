@@ -3,15 +3,14 @@
 
 use braidinfer_hip::HipResult;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
-use braidinfer_hip::stream::Stream;
 
 use crate::paged_kv::{PageAllocator, SequenceState};
 use crate::persistent_dispatch::PersistentDispatch;
 
 use super::{
-    CHUNK_TOKENS, INST_SIZE, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
+    CHUNK_TOKENS, Instruction, MegakernelProgram, OP_ATTN_PAGED_Q, OP_KV_QUANTIZE,
 };
-use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingInst, GqaAttnInst, KvQuantizeInst, make_opcode_gridx};
+use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingInst, KvQuantizeInst, make_opcode_gridx};
 
 impl MegakernelProgram {
     fn patch_kv_write_offsets(&mut self, position: u32) {
@@ -48,14 +47,6 @@ impl MegakernelProgram {
         // GPU reads through device_ptr. No hipMemcpy needed.
 
         self.patch_kv_write_offsets(position);
-
-        let seq_len = position + 1;
-        for &idx in &self.gqa_attn_inst_indices {
-            unsafe {
-                let inst = self.instructions[idx].words.as_mut_ptr() as *mut GqaAttnInst;
-                (*inst).seq_len = seq_len as u64;
-            }
-        }
 
         Ok(())
     }
@@ -428,63 +419,5 @@ impl MegakernelProgram {
     // bd 9gmh Phase 2F: quantize_sealed_chunk (legacy launch_cooperative path) deleted.
     // The mailbox-only quantize_sealed_chunk_via_worker above is the sole code path.
 
-    /// Patch a cached prefill MegakernelProgram for a new chunk (tokens, start_pos).
-    /// Faster than recompiling: only updates token IDs, KV write pointers, AttnPrefillInst, and position IDs.
-    pub(crate) fn update_prefill_chunk(
-        &mut self,
-        tokens: &[u32],
-        start_pos: u32,
-        prefill_bufs: &mut super::PrefillBuffers,
-    ) -> HipResult<()> {
-        use super::instructions::{AttnPrefillInst, D2dCopyInst};
-        let prefill_cache = self.prefill_cache.as_ref().expect("update_prefill_chunk called on non-prefill program");
-        let n = tokens.len();
-        assert_eq!(n, prefill_cache.n, "update_prefill_chunk: token count must match template size {}", prefill_cache.n);
-        let prefill_embedding_start = prefill_cache.embedding_start;
-        let prefill_kv_entries: Vec<_> = prefill_cache.kv_entries.iter().map(|e| (e.k_inst_idx, e.v_inst_idx, e.h, e.layer_kv_idx, e.t)).collect();
-        let prefill_attn_inst_indices: Vec<_> = prefill_cache.attn_inst_indices.clone();
-
-
-        // 1. Patch embedding token IDs
-        for (i, &tok) in tokens.iter().enumerate() {
-            let idx = prefill_embedding_start + i;
-            unsafe {
-                let inst = self.instructions[idx].words.as_mut_ptr() as *mut EmbeddingInst;
-                (*inst).token_id = tok as u64;
-            }
-        }
-
-        // 2. Patch KV write D2dCopy destinations
-        let hd = self.kv.head_dim;
-        let max_sl = self.kv.max_seq_len as usize;
-        for (k_inst_idx, v_inst_idx, h, layer_kv_idx, t) in &prefill_kv_entries {
-            let (k_base, v_base) = self.kv.kv_base_ptrs[*layer_kv_idx];
-            let token_offset = start_pos as usize + t;
-            let byte_offset = (h * max_sl * hd + token_offset * hd) * std::mem::size_of::<f32>();
-            unsafe {
-                let k_inst = self.instructions[*k_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
-                (*k_inst).dst = (k_base + byte_offset as u64) as *mut f32;
-                let v_inst = self.instructions[*v_inst_idx].words.as_mut_ptr() as *mut D2dCopyInst;
-                (*v_inst).dst = (v_base + byte_offset as u64) as *mut f32;
-            }
-        }
-
-        // 3. Patch AttnPrefillInst start_pos fields
-        for &idx in &prefill_attn_inst_indices {
-            unsafe {
-                let inst = self.instructions[idx].words.as_mut_ptr() as *mut AttnPrefillInst;
-                (*inst).start_pos = start_pos as u64;
-            }
-        }
-
-        // 4. Update position IDs (host-mapped, no hipMemcpy — bd pywl partial fix a33685b).
-        prefill_bufs.write_positions(start_pos, n)?;
-
-        // bd 9gmh Phase 1D: no Step 5 re-upload. The mailbox path (dispatch_via_worker
-        // → dispatch_batch_slice) reads instructions directly from self.instructions in
-        // CPU memory; device_program is a 1-element placeholder allocated at compile
-        // time, never read. Patched fields above (token IDs, KV write dsts, attn
-        // start_pos, position IDs) are already in self.instructions before dispatch.
-        Ok(())
-    }
 }
+

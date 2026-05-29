@@ -9,8 +9,8 @@
 
 use super::{
     INST_SIZE, Instruction,
-    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_ATTN_PREFILL, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
-    OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_GQA_ATTN, OP_HALT,
+    OP_ATTN_PAGED, OP_ATTN_PAGED_Q, OP_BARRIER, OP_CONV1D, OP_D2D_COPY,
+    OP_DEINTERLEAVE, OP_EMBEDDING, OP_GDN_GATE, OP_GDN_RECUR, OP_HALT,
     OP_MAMBA2_CONV1D, OP_MAMBA2_NORM_GATED,
     OP_MOE_FFN_REMOTE, OP_MOE_GATE, OP_MROPE, OP_OUTPUT_GATE, OP_QK_NORM,
     OP_RELU_SQ, OP_CONV1D_3X, OP_LINEAR_PROJ_2X, OP_RESIDUAL_ADD, OP_RMSNORM_GATE,
@@ -398,46 +398,6 @@ impl MropeInst {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OP_GQA_ATTN (opcode 10)
-// words[1]=out(w), [2]=q, [3]=k_cache, [4]=v_cache, [5]=nqh, [6]=nkh,
-//        [7]=hd, [8]=seq_len, [9]=max_seq_len, [10]=q_head_start
-// (q_head_start is only for multi-GPU head-parallel; defaults 0)
-// ─────────────────────────────────────────────────────────────────────────────
-#[repr(C)]
-pub(crate) struct GqaAttnInst {
-    pub opcode_gridx: u64,
-    pub output: *mut f32,
-    pub q: *const f32,
-    pub k_cache: *const f32,
-    pub v_cache: *const f32,
-    pub nqh: u64,
-    pub nkh: u64,
-    pub hd: u64,
-    pub seq_len: u64,
-    pub max_seq_len: u64,
-    pub q_head_start: u64,
-    pub _pad: [u64; 8],
-}
-assert_inst_size!(GqaAttnInst);
-impl_inst!(GqaAttnInst);
-
-impl GqaAttnInst {
-    pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32, nqh: i32, nkh: i32, hd: i32, seq_len: i32, max_seq_len: i32) -> Self {
-        GqaAttnInst {
-            opcode_gridx: make_opcode_gridx(OP_GQA_ATTN, grid_x),
-            output, q, k_cache, v_cache,
-            nqh: nqh as u64,
-            nkh: nkh as u64,
-            hd: hd as u64,
-            seq_len: seq_len as u64,
-            max_seq_len: max_seq_len as u64,
-            q_head_start: 0,
-            _pad: [0; 8],
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // OP_OUTPUT_GATE (opcode 11)
 // words[1]=output(w), [2]=attn_out, [3]=gate, [4]=size(i32)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,45 +674,6 @@ impl AttnPagedInst {
             k_norm,
             eps_bits: eps.to_bits() as u64,
             head_slice,
-        }
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// OP_ATTN_PREFILL (opcode 19)
-// words[1]=out(w), [2]=q, [3]=k_cache, [4]=v_cache, [5]=nqh, [6]=nkh, [7]=hd,
-//        [8]=start_pos, [9]=n, [10]=max_seq_len
-// ─────────────────────────────────────────────────────────────────────────────
-#[repr(C)]
-pub(crate) struct AttnPrefillInst {
-    pub opcode_gridx: u64,
-    pub output: *mut f32,
-    pub q: *const f32,
-    pub k_cache: *const f32,
-    pub v_cache: *const f32,
-    pub nqh: u64,
-    pub nkh: u64,
-    pub hd: u64,
-    pub start_pos: u64,
-    pub n: u64,
-    pub max_seq_len: u64,
-    pub _pad: [u64; 8],
-}
-assert_inst_size!(AttnPrefillInst);
-impl_inst!(AttnPrefillInst);
-
-impl AttnPrefillInst {
-    pub(crate) fn new(grid_x: u32, output: *mut f32, q: *const f32, k_cache: *const f32, v_cache: *const f32, nqh: i32, nkh: i32, hd: i32, start_pos: i32, n: i32, max_seq_len: i32) -> Self {
-        AttnPrefillInst {
-            opcode_gridx: make_opcode_gridx(OP_ATTN_PREFILL, grid_x),
-            output, q, k_cache, v_cache,
-            nqh: nqh as u64,
-            nkh: nkh as u64,
-            hd: hd as u64,
-            start_pos: start_pos as u64,
-            n: n as u64,
-            max_seq_len: max_seq_len as u64,
-            _pad: [0; 8],
         }
     }
 }

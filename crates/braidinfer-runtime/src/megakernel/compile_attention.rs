@@ -4,7 +4,7 @@ use super::compile_common::{AttentionVariant, div_ceil, emit_batched_linear_proj
 use super::instructions::*;
 use super::{CHUNK_TOKENS, Instruction, MegakernelProgram, PrefillBuffers};
 use crate::config::ModelConfig;
-use crate::weights::{ActivationBuffers, AttentionLayerWeights, KvCache, LayerWeights};
+use crate::weights::{ActivationBuffers, AttentionLayerWeights, LayerWeights};
 
 impl MegakernelProgram {
     pub(super) fn emit_attention_layer(
@@ -144,66 +144,6 @@ impl MegakernelProgram {
 
         // Variant-specific: KV write placement and attention op
         match variant {
-            AttentionVariant::FlatKv { kv_cache } => {
-                // mRoPE first (step 5), then KV write (step 6), then GQA (step 7)
-                let mrope_idx = instructions.len();
-                mrope_indices.push(mrope_idx);
-                instructions.push(MropeInst::new(
-                    (n * (nqh + nkh)) as u32,
-                    q_attn_ptr, k_attn_ptr,
-                    act.inv_freq.as_ptr(), position_ids_ptr,
-                    nqh as i32, nkh as i32, hd as i32, rd as i32,
-                    cfg.mrope_sections()[0] as i32,
-                    cfg.mrope_sections()[1] as i32,
-                    cfg.mrope_sections()[2] as i32,
-                    n as i32,
-                ).into_inst());
-
-                // Per-head D2D_COPY for [H,T,D] layout: each head's cache slot
-                // is at base + h * max_seq_len * hd, updated at runtime with position offset.
-                let max_sl = cfg.max_seq_len;
-                let head_stride = max_sl * hd; // elements between consecutive heads
-                {
-                    let mut head_indices = Vec::new();
-                    for h in 0..nkh {
-                        let k_copy_idx = instructions.len();
-                        let ki = D2dCopyInst::new(
-                            div_ceil(hd as u32, 256),
-                            unsafe { kv_cache.k.as_write_ptr().add(h * head_stride) },
-                            unsafe { k_attn_ptr.add(h * hd) as *const f32 },
-                            hd as i32,
-                        );
-                        instructions.push(ki.into_inst());
-                        let v_copy_idx = instructions.len();
-                        let vi = D2dCopyInst::new(
-                            div_ceil(hd as u32, 256),
-                            unsafe { kv_cache.v.as_write_ptr().add(h * head_stride) },
-                            unsafe { v_attn_ptr.add(h * hd) as *const f32 },
-                            hd as i32,
-                        );
-                        // no_sync removed
-                        instructions.push(vi.into_inst());
-                        head_indices.push((k_copy_idx, v_copy_idx));
-                    }
-                    kv_write_indices.push(head_indices);
-                    kv_base_ptrs.push((kv_cache.k.as_ptr() as u64, kv_cache.v.as_ptr() as u64));
-                }
-
-                // GQA attention
-                let gqa_idx = instructions.len();
-                gqa_attn_inst_indices.push(gqa_idx);
-                instructions.push(GqaAttnInst::new(
-                    nqh as u32,
-                    attn_out_ptr,
-                    q_attn_ptr as *const f32,
-                    kv_cache.k.as_ptr(),
-                    kv_cache.v.as_ptr(),
-                    nqh as i32, nkh as i32, hd as i32,
-                    1, // seq_len — updated per step
-                    cfg.max_seq_len as i32,
-                ).into_inst());
-            }
-
             AttentionVariant::PagedKv { attn_layer_index } => {
                 // Cache now stores pre-QK-norm K/V for quantization quality.
 
@@ -275,70 +215,6 @@ impl MegakernelProgram {
                         local_nqh,
                     ).into_inst());
                 }
-            }
-
-            AttentionVariant::Prefill {
-                kv_cache,
-                start_pos,
-            } => {
-                // mRoPE first (batched)
-                let mrope_idx = instructions.len();
-                mrope_indices.push(mrope_idx);
-                let mrope_inst = MropeInst::new(
-                    (n * (nqh + nkh)) as u32,
-                    q_attn_ptr, k_attn_ptr,
-                    act.inv_freq.as_ptr(), position_ids_ptr,
-                    nqh as i32, nkh as i32, hd as i32, rd as i32,
-                    cfg.mrope_sections()[0] as i32,
-                    cfg.mrope_sections()[1] as i32,
-                    cfg.mrope_sections()[2] as i32,
-                    n as i32,
-                );
-                instructions.push(mrope_inst.into_inst());
-                // Note: phase-3 (post-MROPE K) snapshot is redundant —
-                // legacy_kv_caches[0][0..nkh*hd] captures exactly the post-MROPE K
-                // (Prefill variant: KV write happens AFTER MROPE, copies k_attn → kv_cache.k).
-
-                // Per-head KV write for N tokens ([H,T,D] layout)
-                // Source k_attn is [N, nkh, hd], dest is [nkh, max_seq_len, hd]
-                // For each head h, copy N*hd elements from src offset [0,h,0] stride nkh*hd
-                // to dst offset [h, start_pos, 0].
-                // Since source is token-major [N, nkh, hd], we need per-token-per-head copies
-                // OR a new scatter op. For prefill N is small (≤64), so N*nkh copies of hd floats.
-                let max_sl = cfg.max_seq_len;
-                for t in 0..n {
-                    for h in 0..nkh {
-                        let src_off = (t * nkh + h) * hd;
-                        let dst_off = h * max_sl * hd + (*start_pos as usize + t) * hd;
-                        let k_dst = unsafe { kv_cache.k.as_write_ptr().add(dst_off) };
-                        let k_src = unsafe { k_attn_ptr.add(src_off) };
-                        let ki = D2dCopyInst::new(
-                            div_ceil(hd as u32, 256), k_dst, k_src as *const f32, hd as i32,
-                        );
-                        instructions.push(ki.into_inst());
-
-                        let v_dst = unsafe { kv_cache.v.as_write_ptr().add(dst_off) };
-                        let v_src = unsafe { v_attn_ptr.add(src_off) };
-                        let vi = D2dCopyInst::new(
-                            div_ceil(hd as u32, 256), v_dst, v_src as *const f32, hd as i32,
-                        );
-                        // no_sync removed
-                        instructions.push(vi.into_inst());
-                    }
-                }
-
-                // OP_ATTN_PREFILL
-                instructions.push(AttnPrefillInst::new(
-                    (n * nqh) as u32,
-                    attn_out_ptr,
-                    q_attn_ptr as *const f32,
-                    kv_cache.k.as_ptr(),
-                    kv_cache.v.as_ptr(),
-                    nqh as i32, nkh as i32, hd as i32,
-                    *start_pos as i32,
-                    n as i32,
-                    cfg.max_seq_len as i32,
-                ).into_inst());
             }
 
             AttentionVariant::PrefillPagedKv {
@@ -498,37 +374,6 @@ impl MegakernelProgram {
                 hs as i32,
             ).into_inst());
         }
-    }
-
-    pub(super) fn compile_attention_layer(
-        cfg: &ModelConfig,
-        layer: &LayerWeights,
-        act: &ActivationBuffers,
-        kv_cache: &KvCache,
-        instructions: &mut Vec<Instruction>,
-        mrope_indices: &mut Vec<usize>,
-        gqa_indices: &mut Vec<usize>,
-        kv_write_indices: &mut Vec<Vec<(usize, usize)>>,
-        kv_base_ptrs: &mut Vec<(u64, u64)>,
-    ) {
-        let w = match layer {
-            LayerWeights::Attention(w) => w,
-            _ => panic!("expected attention layer"),
-        };
-        Self::emit_attention_layer(
-            cfg,
-            w,
-            act,
-            None,
-            &AttentionVariant::FlatKv { kv_cache },
-            instructions,
-            mrope_indices,
-            gqa_indices,
-            kv_write_indices,
-            kv_base_ptrs,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        );
     }
 
     /// Multi-GPU attention: emit only RMSNorm + output-gate + O-proj + residual.

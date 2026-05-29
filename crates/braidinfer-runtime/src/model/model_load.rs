@@ -838,20 +838,6 @@ impl Model {
             }
         }
 
-        // KV caches
-        let kv_size = config.max_seq_len * config.num_kv_heads * config.head_dim;
-        let zeros_kv = vec![0.0f32; kv_size];
-        let mut kv_caches = Vec::new();
-        for i in 0..config.num_layers {
-            if config.layers[i].layer_type == LayerType::Attention {
-                let mut k = DeviceBuffer::<f32>::alloc(device, kv_size)?;
-                let mut v = DeviceBuffer::<f32>::alloc(device, kv_size)?;
-                k.copy_from_host(&zeros_kv)?;
-                v.copy_from_host(&zeros_kv)?;
-                kv_caches.push(KvCache { k, v });
-            }
-        }
-
         // inv_freq
         let inv_freq_data = compute_inv_freq(config.rope_dim, config.rope_theta);
         let mut inv_freq_buf = DeviceBuffer::<f32>::alloc(device, inv_freq_data.len())?;
@@ -1110,11 +1096,6 @@ impl Model {
             moe_weights: moe_weights_vec,
             activations,
             gdn_conv_states,
-            legacy_kv_caches: Some(kv_caches),
-            megakernel_prefill: None,
-            megakernel_prefill_partial: None,
-            megakernel_prefill_partial_n: 0,
-            megakernel_prefill_segments: std::collections::HashMap::new(),
             prefill_bufs: None,
             gdn_states,
             mamba2_states,
