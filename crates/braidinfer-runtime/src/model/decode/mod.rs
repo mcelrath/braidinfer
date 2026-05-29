@@ -884,6 +884,18 @@ impl Model {
         let max_sl = self.config.max_seq_len;
         let local_nqh = nqh / num_gpus;
         let local_nkh = nkh; // GQA: KV heads replicated on every GPU, not split
+        // bd 6u4l: partition-validity guard for the absolute-vs-local head-index
+        // OOB class (srg6.15: op_attn_paged indexed q/output by absolute head into
+        // worker-LOCAL local_nqh-sized buffers → GPU wedge). The kernel-side fix
+        // (1824f51) made op_attn_paged index by q_head_local; these host asserts
+        // catch a partition/config regression at dispatch instead of as a
+        // kfd_wait_on_events wedge.
+        debug_assert!(
+            nqh % num_gpus == 0,
+            "nqh={} not divisible by num_gpus={}: head partition will OOB",
+            nqh, num_gpus
+        );
+        debug_assert!(local_nqh > 0, "local_nqh=0: degenerate head partition");
         let head_stride = max_sl * hd;
         let q_mult = if self.config.has_output_gate { 2 } else { 1 };
         let has_gate = self.config.has_output_gate;
@@ -1093,6 +1105,22 @@ impl Model {
                     let seq_len = (position + 1) as i32;
                     let local_q_head_start = (gpu_i * local_nqh) as u16;
                     let local_nqh_u16 = local_nqh as u16;
+                    // bd 6u4l: u16-cast sanity (not a tautology — catches a future
+                    // divergence between the cast and the size computation).
+                    debug_assert!(
+                        local_nqh_u16 as usize == local_nqh,
+                        "local_nqh u16 cast overflow: local_nqh={} u16={}",
+                        local_nqh, local_nqh_u16
+                    );
+                    // bd 6u4l defense-in-depth: catches a FUTURE regression that
+                    // passes a gpu0-absolute slice pointer for a worker instead of
+                    // the worker-local buffer. Does NOT test the kernel-indexing
+                    // invariant (the srg6.15 bug, already fixed kernel-side in 1824f51).
+                    debug_assert!(
+                        gpu_i == 0
+                            || q_ptr != q_attn_base + (gpu_i * local_nqh * hd * 4) as u64,
+                        "gpu_i={} q_ptr is a gpu0-absolute slice offset", gpu_i
+                    );
                     let mut inst = AttnPagedInst::new(
                         local_nqh as u32,
                         out_ptr as *mut f32,
@@ -1143,6 +1171,22 @@ impl Model {
                     let q_src = if gpu_i == 0 { q_attn_base } else { q_ptr };
                     let local_q_head_start = (gpu_i * local_nqh) as u16;
                     let local_nqh_u16 = local_nqh as u16;
+                    // bd 6u4l: u16-cast sanity (not a tautology — catches a future
+                    // divergence between the cast and the size computation).
+                    debug_assert!(
+                        local_nqh_u16 as usize == local_nqh,
+                        "local_nqh u16 cast overflow: local_nqh={} u16={}",
+                        local_nqh, local_nqh_u16
+                    );
+                    // bd 6u4l defense-in-depth: catches a FUTURE regression that
+                    // passes a gpu0-absolute slice pointer for a worker instead of
+                    // the worker-local buffer. Does NOT test the kernel-indexing
+                    // invariant (the srg6.15 bug, already fixed kernel-side in 1824f51).
+                    debug_assert!(
+                        gpu_i == 0
+                            || q_ptr != q_attn_base + (gpu_i * local_nqh * hd * 4) as u64,
+                        "gpu_i={} q_ptr is a gpu0-absolute slice offset", gpu_i
+                    );
                     let mut inst = AttnPagedInst::new(
                         local_nqh as u32,
                         out_ptr as *mut f32,

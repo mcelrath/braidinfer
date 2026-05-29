@@ -219,10 +219,8 @@ impl Model {
         self.prefill_mixed_chunk_paged(chunk, start_pos)
     }
 
-    /// bd srg6.10: single-GPU MoE prefill via paged KV segment compile.
-    /// Replaces the flat `legacy_kv_caches` writes used by `prefill_mixed_chunk`
-    /// for single-GPU MoE models. Multi-GPU MoE stays on the flat path until
-    /// bd srg6.6 lands the paged broadcast.
+    /// MoE prefill via paged KV segment compile (srg6.10/srg6.15). Emits paged
+    /// KV writes (AttentionVariant::PrefillPagedKv) for single- and multi-GPU MoE.
     ///
     /// Outer driver:
     ///   1. Ensure paged decode state (allocator + paged_seq).
@@ -453,7 +451,7 @@ impl Model {
         }
 
         self.seq_len += total as u32;
-        // Ensure prefill writes to legacy_kv_caches have completed on GPU 0
+        // Ensure prefill writes to the paged KV chunks have completed on GPU 0
         // before the broadcast reads them. Safe — no cooperative kernel runs
         // on GPU 0 between prefill end and decode start (persistent_worker is
         // launched lazily on first decode call).

@@ -1104,8 +1104,6 @@ impl Model {
             page_allocator: None,
             quant_allocator: None,
             paged_seq: None,
-            paged_page_table: None,
-            paged_position_table: None,
             prefill_paged_page_table: None,
             prefill_paged_position_table: None,
             checkpoint_pool: None,

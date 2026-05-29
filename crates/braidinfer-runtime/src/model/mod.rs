@@ -57,8 +57,6 @@ pub struct Model {
     pub(crate) page_allocator: Option<PageAllocator>,
     pub(crate) quant_allocator: Option<PageAllocator>,
     pub(crate) paged_seq: Option<SequenceState>,
-    pub(crate) paged_page_table: Option<DeviceBuffer<u64>>,
-    pub(crate) paged_position_table: Option<DeviceBuffer<i32>>,
     // bd srg6.7: host-mapped page/position tables for paged-prefill writer.
     // MappedHostBuffer (not DeviceBuffer) because writes happen while persistent
     // worker holds GPU CUs — copy_from_host would panic; host_ptr.write_volatile
@@ -108,14 +106,6 @@ impl Model {
                 max_chunks as u32,
             )?);
             self.paged_seq = Some(SequenceState::new(CHUNK_TOKENS as u32));
-        }
-
-        if self.paged_page_table.is_none() {
-            self.paged_page_table = Some(DeviceBuffer::alloc(self.device, max_chunks)?);
-        }
-        if self.paged_position_table.is_none() {
-            self.paged_position_table =
-                Some(DeviceBuffer::alloc(self.device, self.config.max_seq_len)?);
         }
 
         if quantized && self.quant_allocator.is_none() {

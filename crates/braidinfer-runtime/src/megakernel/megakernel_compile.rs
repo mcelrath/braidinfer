@@ -558,10 +558,9 @@ impl MegakernelProgram {
     ///
     /// Compiles a megakernel program for ONE segment of a mixed (MoE) prefill,
     /// covering layers `layer_start..layer_end`. Attention layers in the segment
-    /// emit paged KV writes (`AttentionVariant::PrefillPagedKv`) instead of
-    /// flat `legacy_kv_caches` writes. Used by `prefill_mixed_chunk` for
-    /// single-GPU MoE prefill (bd srg6.10) and (via broadcast) for multi-GPU
-    /// MoE prefill (bd srg6.6).
+    /// emit paged KV writes (`AttentionVariant::PrefillPagedKv`). Used by
+    /// `prefill_mixed_chunk` for single-GPU MoE prefill (bd srg6.10) and (via
+    /// broadcast) for multi-GPU MoE prefill (bd srg6.15).
     ///
     /// Differences from `compile_prefill_paged_persistent`:
     ///   - Layer range is `layer_start..layer_end` (not all layers).

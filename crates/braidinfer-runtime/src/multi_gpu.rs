@@ -97,12 +97,10 @@ pub struct GpuWorker {
     pub attn_w_q_gate: Vec<crate::quant::LinearWeight>, // [local_nqh*hd*q_mult, hs] per attn layer
     pub attn_w_k: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
     pub attn_w_v: Vec<crate::quant::LinearWeight>,      // [local_nkh*hd, hs] per attn layer
-    // bd srg6.11 Phase A: per-worker paged KV state. GQA replicates KV heads
-    // across workers (decode/mod.rs:1080 local_nkh = nkh), so each worker's
-    // chunk holds the FULL nkh × CHUNK_TOKENS × hd × 4 bytes. Allocated by
-    // init_attn_buffers; consumed by Phase B broadcast + srg6.6.b paged
-    // decode wire-up. Currently dead code alongside attn_kv_caches (dual
-    // state) until srg6.6.b switches readers/writers and removes flat infra.
+    // Per-worker paged KV state (srg6.11/srg6.15). GQA replicates KV heads
+    // across workers (local_nkh = nkh), so each worker's chunk holds the FULL
+    // nkh × CHUNK_TOKENS × hd × 4 bytes. Allocated by init_attn_buffers;
+    // the LIVE per-worker page/position tables read by the paged decode dispatch.
     pub page_allocator: Option<PageAllocator>,
     pub paged_seq: Option<SequenceState>,
     pub paged_page_table: Option<MappedHostBuffer<u64>>,
