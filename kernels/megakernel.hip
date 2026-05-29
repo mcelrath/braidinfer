@@ -194,6 +194,18 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             // emits s_waitcnt_vscnt before the next dispatch's trailing barrier.
             if (threadIdx.x == 0 && blockIdx.x == 0)
                 braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, (uint32_t)pc);
+            // bd 6k9m: beat the watchdog PER INSTRUCTION, not once per batch.
+            // Previously the only beat was before this loop (one beat per batch),
+            // so a large but HEALTHY batch — e.g. qwen35_27b's 64-layer prefill:
+            // many fast ops whose total exceeds the 2s no-progress window — tripped
+            // the watchdog and was FALSELY aborted (op_id=0/counter=1 signature).
+            // Beating each instruction resets the no-progress window per op: the
+            // watchdog still catches a genuinely STUCK op (no beat for 2s within a
+            // single instruction) but tolerates a long sequence of fast ops.
+            // watchdog_beat is block0/thr0-only and flushes to host only every
+            // 100th beat (throttled), so the per-instruction cost is a local
+            // increment, not a PCIe write.
+            if (watchdog) watchdog_beat(watchdog, &watchdog_beat_ctr);
         }
 
         // Flush all threads' writes to system-visible memory.
