@@ -1210,12 +1210,14 @@ impl Model {
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
-                // P3 (braidinfer-4n5.7): distribute experts starting at GPU 1.
-                // GPU 0 is SequenceAttention-only (runs attention + coordinator work).
-                // Expert workers are GPUs 1..N; GPU 0 holds no expert weights.
-                // This matches the OP_MOE_DISPATCH_POST kernel which now sums
-                // output_slots[1..total_gpus] only (slot 0 is no longer written).
-                let start_gpu = 1usize;
+                // P3 (braidinfer-4n5.7): MULTI-GPU disaggregation distributes experts
+                // starting at GPU 1 — GPU 0 is SequenceAttention-only (attention +
+                // coordinator), workers 1..N hold experts; OP_MOE_DISPATCH_POST sums
+                // output_slots[1..total_gpus]. SINGLE-GPU (num_devices==1) has nothing
+                // to disaggregate: GPU 0 IS the only GPU and runs experts itself via
+                // op_moe_ffn (start_gpu=0). start_gpu=1 with num_devices=1 is invalid
+                // ("start_gpu must be < num_devices") — the P3 regression caught by -g1.
+                let start_gpu = if num_devices > 1 { 1usize } else { 0usize };
                 if experts_on_gpu0 {
                     let dist = crate::weights::distribute_moe_weights_from_ref(
                         moe,

@@ -351,11 +351,31 @@ impl Model {
 
         }
 
-        // === STEP 3: GPU 0 expert compute — SKIPPED (P3, braidinfer-4n5.7) ===
-        // GPU 0 is SequenceAttention-only; expert weights are distributed to
-        // GPUs 1..N (start_gpu=1 in distribute_moe_weights*). Slot 0 in
-        // output_slots is never written; Step 5 below sums slots 1..num_gpus.
-        let _ = (per_token_ids_dev, per_token_wts_dev); // silence unused warnings
+        // === STEP 3: GPU 0 local expert compute via OP_MOE_FFN_REMOTE ===
+        // Gate: single-GPU only (num_gpus == 1). For multi-GPU, GPU 0 holds no
+        // experts (start_gpu=1 in distribute_moe_weights*); slot 0 is never
+        // written and Step 5 sums slots 1..num_gpus. For single-GPU, GPU 0
+        // runs all experts via build_ffn_remote_inst_gpu0.
+        if num_gpus == 1 {
+            for t in 0..n {
+                let expert_input = unsafe { prefill_normed_dev.add(t * latent_size) as *const f32 };
+                let gpu0_out_slot = unsafe { gpu0_out_dev.add(t * num_gpus * hs) };
+                let ids = unsafe { per_token_ids_dev.add(t * MAX_ACTIVE_EXPERTS) as *const i32 };
+                let wts = unsafe { per_token_wts_dev.add(t * MAX_ACTIVE_EXPERTS) as *const f32 };
+                let p2p = self.moe_p2p.as_ref().unwrap();
+                let inst = p2p.build_ffn_remote_inst_gpu0(
+                    layer_idx, expert_input, gpu0_out_slot, ids, wts,
+                    k, eis, hs, latent_size, has_gate, !has_gate,
+                    std::ptr::null(),
+                    0,
+                );
+                let insts = std::slice::from_ref(&inst);
+                let dispatch = self.persistent_workers.as_mut().unwrap();
+                dispatch.dispatch_batch_slice(device_idx, insts);
+            }
+        } else {
+            let _ = (per_token_ids_dev, per_token_wts_dev); // silence unused warnings (multi-GPU path)
+        }
 
         // === STEP 5: per-token sum + fc2 + shared expert + residual ===
         for t in 0..n {
@@ -377,10 +397,10 @@ impl Model {
                 div_ceil(hs as u32, 256),
                 ffn_down_dev, gpu0_zero_dev, hs as i32,
             ).into_inst());
-            // Sum worker output slots via expert_out as scratch + scale_add.
-            // P3 (braidinfer-4n5.7): start at g=1 — slot 0 is never written
-            // (GPU 0 runs no experts). Matches the decode POST kernel fix.
-            for g in 1..num_gpus {
+            // Sum output slots: single-GPU sums slot 0 (GPU 0's experts);
+            // multi-GPU starts at g=1 (slot 0 never written — GPU 0 has no experts).
+            let g_start = if num_gpus > 1 { 1 } else { 0 };
+            for g in g_start..num_gpus {
                 let slot_offset = (t * num_gpus + g) * hs;
                 let slot_src = unsafe { gpu0_out_dev.add(slot_offset) as *const f32 };
                 insts.push(D2dCopyInst::new(

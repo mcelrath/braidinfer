@@ -146,6 +146,10 @@ pub struct MoeP2pContext {
     /// gpu_id` (slice order `[gpu0, worker0, worker1, ...]`), same as
     /// [`Self::output_slots`].
     pub moe_act_uc_handoff: CrossGpuStaging<f32>,
+    /// GPU 0 per-layer config pointer array on GPU 0 VRAM: `MoeWorkerConfig*[num_layers]`.
+    pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
+    /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
+    _gpu0_config_storage: Vec<DeviceBuffer<u8>>,
     /// Portable host-mapped activation staging buffer: [MAX_PREFILL_BATCH × gate_up_in_dim].
     /// CPU writes activations directly via `host_ptr()` (no DMA, no kernel launch).
     /// Workers P2P-read via per-worker device pointers in `activation_staging_dev_ptrs`.
@@ -165,6 +169,29 @@ pub struct MoeP2pContext {
     /// see stale data even after CPU/allocator-GPU reads succeed. GPU 0 VRAM with
     /// peer-VRAM-UC mapping fixes this. Sized [MAX_PREFILL_BATCH × gate_up_in_dim].
     pub activation_staging_vram: DeviceBuffer<f32>,
+    /// GPU 0 scratch buffers for expert computation.
+    pub gpu0_scratch_gate: DeviceBuffer<f32>,
+    pub gpu0_scratch_up: DeviceBuffer<f32>,
+    pub gpu0_scratch_act: DeviceBuffer<f32>,
+    /// GPU 0 cached-local accumulator for op_moe_dispatch (PRE). Workers
+    /// already stage into local `lo` and barrierless-copy to UC `out_p2p`
+    /// at exit (megakernel_moe.hip op_moe_ffn_remote). Mirror that pattern
+    /// on GPU 0: stage zero/accumulate into `gpu0_acc` (cached), then
+    /// final barrierless copy to UC `output_slots[0..gupd]`. Eliminates
+    /// the §11.4 PCIe-write-before-barrier hazard at coop_zero and
+    /// per-expert coop_weighted_acc sites. Size = hidden_size (the slot
+    /// stride; gupd ≤ hs).
+    pub gpu0_acc: DeviceBuffer<f32>,
+    /// bd i7gl: GPU 0 local-activation buffer for self-dispatched OP_MOE_FFN_REMOTE.
+    /// Mirrors MoeWorkerGpu.local_activation but on GPU 0. Sized gate_up_in_dim
+    /// (= gupd). op_moe_ffn_remote's leading coop_copy stages the activation
+    /// from activation_p2p (which on GPU 0 self-points to prefill_normed_dev)
+    /// into this buffer before the per-expert GEMV loop.
+    pub gpu0_local_activation: DeviceBuffer<f32>,
+    /// bd i7gl: host-side copy of gpu0_layer_config_ptrs device values, so
+    /// CPU can read per-layer MoeWorkerConfig* without device→host copy
+    /// during per-token dispatch. Same pattern as MoeWorkerGpu.layer_config_ptrs_host.
+    pub gpu0_layer_config_ptrs_host: Vec<u64>,
     /// bd 9gmh Phase 1: host-mapped per-token expert routing populated by
     /// OP_MOE_GATE in moe_ffn_forward_prefill_batched Step 1. CPU reads
     /// directly to drive Step 2.5 worker dispatches and Step 3 GPU 0 local
@@ -287,10 +314,30 @@ impl MoeP2pContext {
         )?;
 
 
-        // P3 (braidinfer-4n5.7): GPU 0 no longer runs expert compute, so the
-        // gpu0 per-layer config pointer array and scratch buffers are removed.
-        // Workers on GPUs 1..N hold all expert weights and use their own
-        // per-worker build_layer_configs allocations below.
+        // GPU 0 per-layer config pointer array — always allocated (both single-GPU and
+        // multi-GPU). For multi-GPU (num_workers > 0), GPU0 has no experts (start_gpu=1),
+        // so expert_buffers[0].slot_map is all-None and build_layer_configs produces
+        // empty configs. For single-GPU, GPU0 holds all experts.
+        let (gpu0_layer_config_ptrs, gpu0_config_storage) = build_layer_configs(
+            gpu0,
+            0,
+            num_total_layers,
+            dist_moe_by_layer,
+            hidden_size,
+            expert_intermediate_size,
+            |dist, eid| {
+                let buf = &dist.expert_buffers[0];
+                buf.slot_map[eid].map(|slot| {
+                    let gu = unsafe {
+                        dist.gpu0_gate_up_base
+                            .add(slot * dist.gate_up_expert_stride)
+                    } as u64;
+                    let dn =
+                        unsafe { dist.gpu0_down_base.add(slot * dist.down_expert_stride) } as u64;
+                    (gu, dn, buf.local_expert_count as u32)
+                })
+            },
+        )?;
 
         // Activation staging: portable host-mapped (system RAM, mapped into all
         // GPU contexts). CPU writes directly via host_ptr(); workers P2P-read
@@ -324,6 +371,17 @@ impl MoeP2pContext {
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim). Used by workers.
         let scratch_gate_size = expert_intermediate_size.max(gate_up_in_dim);
+        let mut gpu0_scratch_gate = DeviceBuffer::<f32>::alloc(gpu0, scratch_gate_size)?;
+        let mut gpu0_scratch_up = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
+        let mut gpu0_scratch_act = DeviceBuffer::<f32>::alloc(gpu0, expert_intermediate_size)?;
+        // §11.4 HAZARD avoidance for op_moe_dispatch — see field doc.
+        let mut gpu0_acc = DeviceBuffer::<f32>::alloc(gpu0, hidden_size)?;
+        // bd i7gl: GPU 0 local_activation for self-dispatched OP_MOE_FFN_REMOTE.
+        let gpu0_local_activation = DeviceBuffer::<f32>::alloc(gpu0, gate_up_in_dim)?;
+        // bd i7gl: host-side mirror of gpu0_layer_config_ptrs values for
+        // per-token dispatch (avoids device→host copy in hot path).
+        let mut gpu0_layer_config_ptrs_host = vec![0u64; num_total_layers];
+        gpu0_layer_config_ptrs.copy_to_host(&mut gpu0_layer_config_ptrs_host)?;
 
         // bd 9gmh Phase 1: per-token routing host-mapped buffers (CPU reads
         // directly to drive worker dispatch). MAX_ACTIVE_EXPERTS = 32 (per
@@ -359,6 +417,10 @@ impl MoeP2pContext {
         // return 0.0 deterministically — finite, safe.
         let zeros_big = vec![0.0f32; MAX_PREFILL_BATCH * gate_up_in_dim];
         activation_staging_vram.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * gate_up_in_dim])?;
+        gpu0_scratch_gate.copy_from_host(&zeros_big[..scratch_gate_size])?;
+        gpu0_scratch_up.copy_from_host(&zeros_big[..expert_intermediate_size])?;
+        gpu0_scratch_act.copy_from_host(&zeros_big[..expert_intermediate_size])?;
+        gpu0_acc.copy_from_host(&zeros_big[..hidden_size])?;
         shared_expert_gate_scratch.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * 32])?;
         // Zero host-mapped UC buffers via CPU writes.
         output_slots.zero();
@@ -458,8 +520,16 @@ impl MoeP2pContext {
             moe_act_uc_handoff,
             work_queue,
             output_slots,
+            gpu0_layer_config_ptrs,
+            _gpu0_config_storage: gpu0_config_storage,
             activation_staging,
             activation_staging_vram,
+            gpu0_scratch_gate,
+            gpu0_scratch_up,
+            gpu0_scratch_act,
+            gpu0_acc,
+            gpu0_local_activation,
+            gpu0_layer_config_ptrs_host,
             per_token_expert_ids,
             per_token_expert_weights,
             step1_drain_sentinel,
@@ -535,6 +605,59 @@ impl MoeP2pContext {
             w.scratch_gate.as_ptr() as *mut f32,
             w.scratch_up.as_ptr() as *mut f32,
             w.scratch_act.as_ptr() as *mut f32,
+            k as u32,
+            eis as u32,
+            hs as u32,
+            gupd as u32,
+            has_gate_proj,
+            relu_sq,
+        )
+        .with_wait(wait_ptr, wait_seq)
+        .into_inst()
+    }
+
+    /// bd i7gl: build an OP_MOE_FFN_REMOTE instruction for self-dispatch on
+    /// GPU 0. Mirrors `build_ffn_remote_inst` but reads GPU-0-side scratch
+    /// buffers (gpu0_*) instead of a `workers[w]` entry. Used by prefill
+    /// Step 3 to unify GPU 0's expert compute with the peer-worker code path.
+    /// activation_p2p / output_slot_p2p self-point at GPU 0's own buffers
+    /// (prefill_normed_dev / output_slots[0]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_ffn_remote_inst_gpu0(
+        &self,
+        layer_idx: usize,
+        activation_p2p_dev_ptr: *const f32,
+        output_slot_p2p_dev_ptr: *mut f32,
+        expert_ids_p2p: *const i32,
+        expert_weights_p2p: *const f32,
+        k: usize,
+        eis: usize,
+        hs: usize,
+        gupd: usize,
+        has_gate_proj: bool,
+        relu_sq: bool,
+        wait_ptr: *const u32,
+        wait_seq: u64,
+    ) -> crate::megakernel::Instruction {
+        // bd 0hu3-b: pass GPU 0's config_array (GPU 0 VRAM, GPU 0 VA), kernel
+        // dereferences at config_array[layer_idx]. The entries are VAs valid
+        // in GPU 0's own context — and this instruction is consumed exclusively
+        // by GPU 0 (compile_inner_p2p megakernel + persistent_worker).
+        let config_array =
+            self.gpu0_layer_config_ptrs.as_ptr() as *const *const std::ffi::c_void;
+        crate::megakernel::instructions::MoeFfnRemoteInst::new(
+            1, // grid_x — kernel uses cooperative full grid; irrelevant
+            activation_p2p_dev_ptr,
+            output_slot_p2p_dev_ptr,
+            expert_ids_p2p,
+            expert_weights_p2p,
+            config_array,
+            layer_idx as u64,
+            self.gpu0_local_activation.as_ptr() as *mut f32,
+            self.gpu0_acc.as_ptr() as *mut f32,
+            self.gpu0_scratch_gate.as_ptr() as *mut f32,
+            self.gpu0_scratch_up.as_ptr() as *mut f32,
+            self.gpu0_scratch_act.as_ptr() as *mut f32,
             k as u32,
             eis as u32,
             hs as u32,
