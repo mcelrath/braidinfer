@@ -62,6 +62,12 @@ pub(crate) struct PagedKvState {
     pub attn_paged_inst_indices: Vec<usize>,
     pub attn_quant_inst_indices: Vec<usize>,
     pub last_page_table_len: usize,
+    /// Set to `true` by the prefetch pass (Phase D) whenever a tier transition
+    /// (promote or evict) changes a chunk's VRAM slot_ptr without changing
+    /// `seq.chunks.len()`.  Cleared to `false` by `update_step_paged_no_upload`
+    /// after the write_volatile loop executes.  Prevents the count-guard from
+    /// skipping a necessary page_table rewrite on tier transitions (B1 fix).
+    pub page_table_dirty: bool,
     pub kv_stride_paged: usize,
 }
 

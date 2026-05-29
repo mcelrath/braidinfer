@@ -117,12 +117,24 @@ impl Model {
 
     fn ensure_paged_decode_state(&mut self, quantized: bool) -> Result<(), ModelError> {
         let max_chunks = self.max_paged_chunks();
+        // bd 4n5 Phase D: BRAIDINFER_VRAM_KV_CHUNKS caps the f32 VRAM chunk pool
+        // below max_paged_chunks, forcing append_token to spill to the host tier
+        // (HostPageAllocator) once exhausted. Test/bench override; unset = full pool
+        // (current behavior). Only caps the VRAM (page_allocator) pool, NOT the quant
+        // pool. Capping below max_chunks without the host tier enabled would just OOM,
+        // so this is meaningful only with BRAIDINFER_HOST_KV_CHUNKS also set.
+        let vram_chunks = std::env::var("BRAIDINFER_VRAM_KV_CHUNKS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n.min(max_chunks))
+            .unwrap_or(max_chunks);
         if self.page_allocator.is_none() {
             self.page_allocator = Some(PageAllocator::new(
                 self.device,
                 &self.config,
                 CHUNK_TOKENS,
-                max_chunks as u32,
+                vram_chunks as u32,
             )?);
             self.paged_seq = Some(SequenceState::new(CHUNK_TOKENS as u32));
         }

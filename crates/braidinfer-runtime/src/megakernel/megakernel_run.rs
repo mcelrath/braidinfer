@@ -14,6 +14,12 @@ use super::instructions::{AttnPagedInst, AttnPagedQInst, D2dCopyInst, EmbeddingI
 
 impl MegakernelProgram {
     fn patch_kv_write_offsets(&mut self, position: u32) {
+        // Paged programs use update_step_paged_no_upload (step 3) to patch KV write
+        // destinations from chunk slot layout. patch_kv_write_offsets is for the flat
+        // (non-paged) KV layout only — kv_base_ptrs is empty for paged programs.
+        if self.paged {
+            return;
+        }
         let hd = self.kv.head_dim;
         let max_sl = self.kv.max_seq_len as usize;
         let head_stride = max_sl * hd;
@@ -209,17 +215,33 @@ impl MegakernelProgram {
             }
         }
 
-        // 5. Upload page_table if chunk list changed (host-mapped: no HIP API call).
-        if seq.chunks.len() != self.paged_kv.as_ref().unwrap().last_page_table_len {
-            let page_table_buf = self.paged_kv.as_ref().unwrap().page_table.as_ref().expect("page_table not allocated");
-            let host_ptr = page_table_buf.host_ptr();
-            for (i, chunk) in seq.chunks.iter().enumerate() {
-                let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
-                unsafe {
-                    host_ptr.add(i).write_volatile(addr);
+        // 5. Upload page_table if chunk list changed OR tier transitions changed a
+        //    slot_ptr (B1 fix: page_table_dirty flag set by prefetch pass).
+        {
+            let paged_kv = self.paged_kv.as_ref().unwrap();
+            let needs_rewrite = paged_kv.page_table_dirty
+                || seq.chunks.len() != paged_kv.last_page_table_len;
+            if needs_rewrite {
+                let page_table_buf = self.paged_kv.as_ref().unwrap().page_table.as_ref().expect("page_table not allocated");
+                let host_ptr = page_table_buf.host_ptr();
+                for (i, chunk) in seq.chunks.iter().enumerate() {
+                    debug_assert_eq!(
+                        chunk.tier(),
+                        crate::paged_kv::ChunkTier::Vram,
+                        "chunk {} is not Vram in page_table write loop — prefetch pass must promote all HostPinned chunks before update_step_paged_no_upload",
+                        i
+                    );
+                    let addr = allocator.slot_ptr(chunk.slot_index()) as u64;
+                    unsafe {
+                        host_ptr.add(i).write_volatile(addr);
+                    }
+                    // Bump LRU generation: larger = more recently used by this batch.
+                    chunk.bump_generation();
                 }
+                let paged_kv_mut = self.paged_kv.as_mut().unwrap();
+                paged_kv_mut.last_page_table_len = seq.chunks.len();
+                paged_kv_mut.page_table_dirty = false;
             }
-            self.paged_kv.as_mut().unwrap().last_page_table_len = seq.chunks.len();
         }
 
         // Step 6 (hipMemcpyAsync upload) intentionally SKIPPED.

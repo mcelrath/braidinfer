@@ -281,6 +281,7 @@ impl MegakernelProgram {
                     attn_paged_inst_indices,
                     attn_quant_inst_indices,
                     last_page_table_len: 0,
+                    page_table_dirty: false,
                     kv_stride_paged: cfg.num_kv_heads * cfg.head_dim,
                 })
             } else {
@@ -542,6 +543,7 @@ impl MegakernelProgram {
                 attn_paged_inst_indices,
                 attn_quant_inst_indices: Vec::new(),
                 last_page_table_len: seq.chunks.len(),
+                page_table_dirty: false,
                 kv_stride_paged: nkh * hd,
             }),
             quantized_kv: false,
@@ -825,6 +827,7 @@ impl MegakernelProgram {
                 attn_paged_inst_indices,
                 attn_quant_inst_indices: Vec::new(),
                 last_page_table_len: seq.chunks.len(),
+                page_table_dirty: false,
                 kv_stride_paged: nkh * hd,
             }),
             quantized_kv: false,
@@ -924,7 +927,17 @@ impl MegakernelProgram {
     ///   - OP_MOE_DISPATCH uses moe_latent as activation and writes to moe_latent
     ///   - fc2_latent_proj (moe_latent→ffn_down_stage) + residual_add are emitted after
     fn compile_inner_p2p(model: &Model, p2p: &mut crate::moe_p2p::MoeP2pContext) -> HipResult<Self> {
-        let mut prog = Self::compile_inner(model, false, true)?;
+        // P2 (braidinfer-4n5.6): paged=true so GPU 0 runs the full local paged-KV
+        // attention sequence (OP_ATTN_PAGED_Q + OP_ATTN_PAGED) instead of the
+        // head-parallel broadcast path. compile_inner routes attention layers to
+        // compile_attention_layer_paged when paged=true, regardless of multi_gpu.
+        // multi_gpu_attn_boundaries will be empty → has_head_parallel=false in
+        // decode_step_p2p_inner → dispatch_head_parallel_attention is never called.
+        let mut prog = Self::compile_inner(model, true, true)?;
+        // Allocate paged-KV host-mapped page/position tables for the p2p program.
+        // decode_step_p2p_inner calls update_step_paged_no_upload which reads these.
+        let max_chunks = (model.config.max_seq_len + super::CHUNK_TOKENS - 1) / super::CHUNK_TOKENS;
+        prog.init_paged_buffers(max_chunks)?;
 
         let cfg = &model.config;
         let act = &model.activations;
@@ -1247,6 +1260,77 @@ impl MegakernelProgram {
             prog.barrier_layer_map = prog.barrier_layer_map.iter()
                 .map(|&(idx, layer)| (idx + inserted_before[idx], layer))
                 .collect();
+
+            // P2 (braidinfer-4n5.6) FIX: Pass 2 reindexed the instruction stream, but
+            // only multi_gpu_attn_boundaries + barrier_layer_map were remapped above.
+            // The p2p program is now paged=true, so update_step_paged_no_upload patches
+            // instructions through SEVERAL recorded index vectors — ALL recorded against
+            // the PRE-Pass-2 stream. Every one must shift by inserted_before, else the
+            // per-step patch writes into the WRONG instruction. (The step-3 KV-write dst
+            // patch is the dangerous one: at a stale index it overwrites an OP_ATTN_PAGED
+            // instruction's fields with a D2dCopy dst pointer → null page_table → GPU
+            // fault on address (nil).)
+            prog.embedding_inst_idx += inserted_before[prog.embedding_inst_idx];
+            prog.gqa_attn_inst_indices = prog
+                .gqa_attn_inst_indices
+                .iter()
+                .map(|&idx| idx + inserted_before[idx])
+                .collect();
+            prog.kv.kv_write_indices = prog
+                .kv
+                .kv_write_indices
+                .iter()
+                .map(|layer| {
+                    layer
+                        .iter()
+                        .map(|&(k, v)| (k + inserted_before[k], v + inserted_before[v]))
+                        .collect()
+                })
+                .collect();
+            if let Some(pk) = prog.paged_kv.as_mut() {
+                pk.attn_paged_inst_indices = pk
+                    .attn_paged_inst_indices
+                    .iter()
+                    .map(|&idx| idx + inserted_before[idx])
+                    .collect();
+                pk.attn_quant_inst_indices = pk
+                    .attn_quant_inst_indices
+                    .iter()
+                    .map(|&idx| idx + inserted_before[idx])
+                    .collect();
+            }
+
+            // CPU-side opcode verification (write-through: instructions live in host
+            // memory, so this reads them directly — no GPU dispatch, no printf). Every
+            // remapped index MUST now point at its expected opcode; a mismatch is
+            // stale-index drift that would manifest as a GPU null-fault at runtime.
+            // Panic on the CPU at compile time with the exact offending index instead.
+            let opcode_at = |i: usize| prog.instructions[i].words[0] as u32;
+            assert_eq!(
+                opcode_at(prog.embedding_inst_idx),
+                OP_EMBEDDING as u32,
+                "p2p reindex: embedding_inst_idx {} → opcode {} (expected OP_EMBEDDING)",
+                prog.embedding_inst_idx,
+                opcode_at(prog.embedding_inst_idx),
+            );
+            for layer in &prog.kv.kv_write_indices {
+                for &(k, v) in layer {
+                    assert_eq!(opcode_at(k), OP_D2D_COPY as u32,
+                        "p2p reindex: kv-write k-idx {} → opcode {} (expected OP_D2D_COPY)", k, opcode_at(k));
+                    assert_eq!(opcode_at(v), OP_D2D_COPY as u32,
+                        "p2p reindex: kv-write v-idx {} → opcode {} (expected OP_D2D_COPY)", v, opcode_at(v));
+                }
+            }
+            if let Some(pk) = prog.paged_kv.as_ref() {
+                for &i in &pk.attn_paged_inst_indices {
+                    assert_eq!(opcode_at(i), OP_ATTN_PAGED as u32,
+                        "p2p reindex: attn_paged idx {} → opcode {} (expected OP_ATTN_PAGED)", i, opcode_at(i));
+                }
+                for &i in &pk.attn_quant_inst_indices {
+                    assert_eq!(opcode_at(i), OP_ATTN_PAGED_Q as u32,
+                        "p2p reindex: attn_quant idx {} → opcode {} (expected OP_ATTN_PAGED_Q)", i, opcode_at(i));
+                }
+            }
         }
 
         // KEEP barrier_layer_map: in the unified-worker design it identifies

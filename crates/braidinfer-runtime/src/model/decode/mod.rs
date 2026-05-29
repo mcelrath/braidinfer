@@ -689,6 +689,34 @@ impl Model {
             }
         }
 
+        // P2 (braidinfer-4n5.6): GPU 0 runs the full local paged-KV attention
+        // sequence (OP_ATTN_PAGED_Q + OP_ATTN_PAGED) baked into the p2p megakernel.
+        // The p2p program now has paged=true (compile_inner_p2p uses paged=true,multi_gpu=true),
+        // so it has attn_paged_inst_indices + paged_kv.page_table that must be patched
+        // each step — identical to decode_step_persistent's update_step_paged_no_upload path.
+        //
+        // self.paged_seq and self.page_allocator are initialized by prefill (ensure_paged_decode_state
+        // called from prefill_mixed_chunk_paged) and the token was appended above in the
+        // has_head_parallel block (or we must do it here if has_head_parallel is false).
+        //
+        // NOTE: when has_head_parallel=false (empty multi_gpu_attn_boundaries in P2),
+        // self.paged_seq.append_token must be called here since the has_head_parallel
+        // block was skipped. When has_head_parallel=true, append already happened above.
+        if !has_head_parallel {
+            if let (Some(seq), Some(alloc)) = (self.paged_seq.as_mut(), self.page_allocator.as_mut()) {
+                let host_alloc = self.host_page_allocator.as_mut();
+                seq.append_token(position as i32, alloc, host_alloc).map_err(ModelError::Hip)?;
+            }
+        }
+        // Patch the p2p program's attn_paged_inst_indices + page_table buffer.
+        if self.megakernel_multi_gpu_p2p.as_ref().map(|mk| mk.paged).unwrap_or(false) {
+            if let (Some(seq), Some(alloc)) = (self.paged_seq.as_ref(), self.page_allocator.as_ref()) {
+                let mk_p2p = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
+                mk_p2p.update_step_paged_no_upload(token_id, position, seq, alloc)
+                    .map_err(ModelError::Hip)?;
+            }
+        }
+
         let mut attn_i = 0usize;
         let mut moe_i = 0usize;
         let mut i = 0usize;
