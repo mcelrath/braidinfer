@@ -166,7 +166,17 @@ __device__ __forceinline__ void watchdog_signal_exited(WatchdogState* ws) {
 __device__ __forceinline__ void watchdog_beat(WatchdogState* ws, uint32_t* local_counter) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         uint32_t c = ++(*local_counter);
-        if ((c % 100) == 0) {
+        // srg6.22 GAP-1 fix: flush on the FIRST beat (c==1), not only every
+        // 100th. The host watchdog gates no-progress enforcement on
+        // `has_started`, which only flips once it observes progress_counter
+        // advance (watchdog.rs:188-208). With flush-only-every-100, a kernel
+        // that beats once-per-batch (megakernel persistent_worker) never
+        // flushes within a <100-batch run (warmup + short decode) → has_started
+        // stays false → a wedge in the first op_attn_paged hangs for minutes
+        // with no force_exit/abort (and cascades MES degradation to other
+        // sessions). Flushing on c==1 arms the watchdog before the first
+        // compute op, converting that wedge into a ~3s abort.
+        if (c == 1 || (c % 100) == 0) {
             // 4fg.5: AGENT scope (was SYSTEM). See watchdog_init comment.
             braidinfer::rdna3::host_uc_store_agent(&ws->progress_counter, (uint64_t)c);
         }

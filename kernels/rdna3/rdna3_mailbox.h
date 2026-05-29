@@ -92,4 +92,32 @@ __device__ __forceinline__ void mailbox_store_descriptor(volatile T* dst, T valu
     *dst = value;
 }
 
+// Fresh, non-scalarized u32 load for SPIN-WAIT on a cross-GPU sentinel
+// (bd srg6.22). A spin loop that reads a peer/host sentinel with a plain
+// volatile / __atomic_load_n(ACQUIRE) on a UNIFORM address lets ROCm clang
+// scalarize it to s_load_dword, which hits the scalar K$. On gfx11 the K$ is
+// invisible to buffer_gl0_inv / buffer_gl1_inv (GFX1100_ARCH.md §11.14), so a
+// stale value latched on the first iteration is re-read forever → the worker
+// spins on a sentinel that never appears to update → kfd_wait_on_events wedge
+// (the srg6.15 multi-GPU decode intermittent wedge). This is independent of
+// the target memory type (host-mapped UC, P2P VRAM MTYPE_UC/CC) — the trap is
+// the requester-side scalar-load pipeline.
+//
+// Fix (mes-researcher co-design, bridge #3868): emit an explicit VECTOR
+// global_load_dword with glc (skip L0) + dlc (skip L1 cluster) and an
+// s_waitcnt vmcnt(0) so the load completes before the compare and is not
+// hoisted out of the loop. The "v"(p) constraint forces the address into a
+// VGPR, preventing the compiler from scalarizing to s_load_dword. glc AND dlc
+// are BOTH required — either alone leaves the staleness window open.
+__device__ __forceinline__ unsigned int sentinel_spin_load_u32(const unsigned int* p) {
+    unsigned int v;
+    asm volatile(
+        "global_load_dword %0, %1, off glc dlc\n\t"
+        "s_waitcnt vmcnt(0)"
+        : "=v"(v)
+        : "v"(p)
+        : "memory");
+    return v;
+}
+
 }} // namespace braidinfer::rdna3

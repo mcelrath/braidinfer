@@ -1735,9 +1735,16 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
     // PCIe-posted drain through host-mapped UC GART pages.
     if (i->wait_ptr != 0) {
         if (threadIdx.x == 0) {
-            while (__atomic_load_n(
-                       (volatile unsigned int*)i->wait_ptr,
-                       __ATOMIC_ACQUIRE) != (unsigned int)i->wait_seq) {
+            // srg6.22: __atomic_load_n(ACQUIRE) on the uniform wait_ptr address
+            // scalarizes to s_load_dword → scalar K$, which gfx11 cannot
+            // invalidate (§11.14). A stale value latched on iteration 0 is
+            // re-read forever → worker spins on a sentinel that never appears
+            // to update → kfd_wait_on_events wedge (the intermittent multi-GPU
+            // decode wedge). sentinel_spin_load_u32 forces a non-scalarized
+            // vector global_load with glc+dlc each iteration so every read is
+            // fresh from L2. (mes-researcher co-design, bridge #3868.)
+            while (braidinfer::rdna3::sentinel_spin_load_u32(
+                       (const unsigned int*)i->wait_ptr) != (unsigned int)i->wait_seq) {
                 /* spin */
             }
         }
