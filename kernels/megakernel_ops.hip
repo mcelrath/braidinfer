@@ -1987,9 +1987,13 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
     int q_head = local_q_head_start + q_head_local;  // absolute head index
 
     int gqa_group = num_q_heads / num_kv_heads;
-    int kv_head = q_head / gqa_group;
+    int kv_head = q_head / gqa_group;  // absolute: KV heads replicated per worker, GQA group over absolute q_head
     float scale = rsqrtf((float)head_dim);
-    const float* q_ptr = q + q_head * head_dim;
+    // srg6.15 fix: index q/output by LOCAL head. Multi-GPU workers pass local-sized
+    // (local_nqh) q/output buffers; absolute q_head would read/write past the buffer
+    // end → GPU page fault. Single-GPU: local_q_head_start=0 ⇒ q_head_local==q_head
+    // (byte-identical). kv_head stays absolute (correct GQA grouping; KV replicated).
+    const float* q_ptr = q + q_head_local * head_dim;
 
     int tid = threadIdx.x;
     int block_size = blockDim.x;  // 256
@@ -2012,7 +2016,7 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
     float v_acc = 0.0f;
     if (partial_state != nullptr) {
         int stride_per_head = 2 + head_dim;
-        const float* ps = partial_state + q_head * stride_per_head;
+        const float* ps = partial_state + q_head_local * stride_per_head;  // srg6.15: local index (see q_ptr)
         m = ps[0];
         d = ps[1];
         if (tid < head_dim) {
@@ -2125,8 +2129,11 @@ __device__ __attribute__((noinline)) void op_attn_paged(const u64* inst, u32 vbl
         }
     }
 
-    // Write normalized output
-    float* out_ptr = output + q_head * head_dim;
+    // Write normalized output. srg6.15 fix: LOCAL head index (see q_ptr above) —
+    // workers write local_nqh heads at local offset 0; the gather in
+    // dispatch_head_parallel_attention copies each worker's local block to its
+    // global slot. Single-GPU: local==absolute (byte-identical).
+    float* out_ptr = output + q_head_local * head_dim;
     if (tid < head_dim) {
         out_ptr[tid] = v_acc / d;
     }
@@ -2182,9 +2189,12 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
     int q_head = local_q_head_start + q_head_local;
 
     int gqa_group = num_q_heads / num_kv_heads;
-    int kv_head = q_head / gqa_group;
+    int kv_head = q_head / gqa_group;  // absolute (KV replicated per worker)
     float attn_scale = rsqrtf((float)head_dim);
-    const float* q_ptr = q + q_head * head_dim;
+    // srg6.15 fix (mirror of op_attn_paged): LOCAL q index — workers pass
+    // local-sized q buffers; absolute q_head → OOB → page fault. Single-GPU
+    // byte-identical (local_q_head_start=0). scratch write below also local.
+    const float* q_ptr = q + q_head_local * head_dim;
 
     int tid = threadIdx.x;
     int block_size = blockDim.x;
@@ -2326,9 +2336,10 @@ __device__ __attribute__((noinline)) void op_attn_paged_quant(const u64* inst, u
         }
     }
 
-    // Write partial state: [m, d, v_acc[0..head_dim]] per head
+    // Write partial state: [m, d, v_acc[0..head_dim]] per head.
+    // srg6.15: LOCAL index — op_attn_paged reads this scratch at q_head_local too.
     int stride_per_head = 2 + head_dim;
-    float* head_scratch = scratch + q_head * stride_per_head;
+    float* head_scratch = scratch + q_head_local * stride_per_head;
     if (tid == 0) {
         head_scratch[0] = m;
         head_scratch[1] = d_softmax;

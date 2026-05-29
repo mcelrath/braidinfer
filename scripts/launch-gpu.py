@@ -32,6 +32,13 @@ from pathlib import Path
 LOCK_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "launch-llama"
 VRAM_IN_USE_THRESHOLD_MB = 100  # Idle GPU has ~27MB used; 512 was too high
 
+# Per-launch BDF audit log: one JSONL record per reserved card per run, so a
+# later `ash-pcie events --bdf <BDF>` can be correlated to the exact PID /
+# session / command that touched a card. Requested on the agent bridge after a
+# GPU page-fault death made card attribution impossible (the prior launches.log
+# recorded HIP indices, not BDFs, and had gone stale). Append-only.
+BDF_LOG = Path.home() / ".cache" / "launch-gpu" / "bdf-launches.jsonl"
+
 # Process names that open the GPU device for monitoring but do not allocate work.
 # A held device with only these holders is treated as available.
 MONITORING_COMMS = {"btop", "nvtop", "amdgpu_top", "radeontop", "rocm-smi", "rocprof", "rocminfo"}
@@ -277,6 +284,69 @@ def _kfd_gpu_id_to_hip_index():
             entries.append((location, gpu_id))
     entries.sort(key=lambda x: x[0])
     return {gpu_id: hip_idx for hip_idx, (_, gpu_id) in enumerate(entries)}
+
+
+def _hip_index_to_bdf():
+    """Build {hip_index: "0000:bb:dd.f"} from KFD topology.
+
+    HIP index = PCI-BDF-sorted position among nodes with simd_count>0 (same
+    ordering as compute_rocr_visible_devices / _kfd_gpu_id_to_hip_index). The
+    topology location_id encodes bus/dev/func; PCI domain is 0000 on this host
+    (all cards: see braidinfer CLAUDE.md PCIe card list). Returns {} on
+    non-ROCm systems. BDF format matches `ash-pcie events --bdf`.
+    """
+    topo = Path("/sys/class/kfd/kfd/topology/nodes")
+    if not topo.exists():
+        return {}
+    entries = []  # (location_id, bdf)
+    for node_dir in sorted(topo.iterdir(), key=lambda p: int(p.name)):
+        props = node_dir / "properties"
+        if not props.exists():
+            continue
+        simd_count = 0
+        location = None
+        for line in props.read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 2:
+                if parts[0] == "simd_count":
+                    simd_count = int(parts[1])
+                elif parts[0] == "location_id":
+                    location = int(parts[1])
+        if simd_count > 0 and location is not None:
+            bus = (location >> 8) & 0xff
+            dev = (location >> 3) & 0x1f
+            func = location & 0x7
+            entries.append((location, f"0000:{bus:02x}:{dev:02x}.{func}"))
+    entries.sort(key=lambda x: x[0])
+    return {hip_idx: bdf for hip_idx, (_, bdf) in enumerate(entries)}
+
+
+def log_launch_bdfs(reserved_indices, pid, cmd_args):
+    """Append one JSONL record per reserved card to BDF_LOG for wedge auditing.
+
+    Best-effort: never raises into the launch path. Each record carries the
+    BDF so `ash-pcie events --bdf <BDF>` can be tied back to this PID/session/
+    command after a fault.
+    """
+    try:
+        hip_to_bdf = _hip_index_to_bdf()
+        BDF_LOG.parent.mkdir(parents=True, exist_ok=True)
+        session = os.environ.get("CLAUDE_SESSION_ID", "unknown")
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+        cmd = " ".join(cmd_args)
+        with open(BDF_LOG, "a") as f:
+            for idx in reserved_indices:
+                rec = {
+                    "timestamp": ts,
+                    "hip_index": idx,
+                    "bdf": hip_to_bdf.get(idx, "unknown"),
+                    "pid": pid,
+                    "session": session,
+                    "cmd": cmd,
+                }
+                f.write(json.dumps(rec) + "\n")
+    except OSError:
+        pass
 
 
 def get_held_gpus():
@@ -575,6 +645,9 @@ def main():
         if ok:
             reserved.append(idx)
             lock_fds[idx] = fd
+
+    # Per-launch BDF audit trail (best-effort, never blocks the run).
+    log_launch_bdfs(reserved, proc.pid, cmd_args)
 
     def _release():
         for gpu in reserved:

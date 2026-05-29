@@ -214,11 +214,10 @@ impl Model {
         // Must happen before MoE layer processing and before the decode persistent worker launches.
         self.ensure_moe_workers_started()?;
 
-        // bd srg6.10: single-GPU MoE uses the paged segment compile path.
-        // Multi-GPU MoE remains on the flat path until bd srg6.6 broadcasts.
-        if self.multi_gpu.is_none() {
-            return self.prefill_mixed_chunk_paged(chunk, start_pos);
-        }
+        // bd srg6.X3: MoE prefill uses paged KV segment compile path for
+        // both single-GPU and multi-GPU. The flat path is retired; paged
+        // broadcast to workers happens in prefill_batched after this returns.
+        return self.prefill_mixed_chunk_paged(chunk, start_pos);
 
         let n = chunk.len();
         let hs = self.config.hidden_size;
@@ -684,75 +683,26 @@ impl Model {
         // on GPU 0 between prefill end and decode start (persistent_worker is
         // launched lazily on first decode call).
         self.stream.synchronize().map_err(ModelError::Hip)?;
-        // Fix braidinfer-sew: multi-GPU prefill wrote K/V only to GPU 0's
-        // legacy_kv_caches; broadcast positions 0..total to each worker's
-        // attn_kv_caches so the head-parallel decode path reads valid
-        // (non-uninit) keys/values for prefill positions.
-        if let Some(mgpu) = self.multi_gpu.as_ref() {
-            let has_attn_kv = !mgpu.workers.is_empty() && !mgpu.workers[0].attn_kv_caches.is_empty();
-            if has_attn_kv {
-                if let Some(legacy_kv) = self.legacy_kv_caches.as_ref() {
-                    use crate::config::LayerType;
-                    // Build attn_i → kv_i mapping. legacy_kv_caches is indexed by
-                    // attention-layer order (kv_idx in compile_prefill); attn_kv_caches
-                    // is indexed by attention-layer occurrence in cfg.layers.
-                    let attn_to_kv: Vec<usize> = self
-                        .config
-                        .layers
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, l)| l.layer_type == LayerType::Attention)
-                        .enumerate()
-                        .map(|(_attn_i, (_layer_i, _))| _attn_i)
-                        .collect();
-                    mgpu.broadcast_prefill_kv_to_workers(
-                        legacy_kv,
-                        &attn_to_kv,
-                        self.config.num_kv_heads,
-                        self.config.head_dim,
-                        self.config.max_seq_len,
-                        total,
-                    )
+        // bd srg6.X3: broadcast paged KV chunks from GPU 0 to each worker.
+        // prefill_mixed_chunk_paged (called above) populates GPU 0's paged_seq;
+        // broadcast_paged_chunks_to_workers replicates every chunk to worker
+        // paged_seq under GQA (KV heads replicated, not sliced).
+        // The flat broadcast_prefill_kv_to_workers call is removed; decode now
+        // reads exclusively from per-worker paged KV. Function body stays until
+        // X5 deletes all attn_kv_caches sites.
+        if let Some(mgpu) = self.multi_gpu.as_mut() {
+            if !mgpu.workers.is_empty() {
+                let seq = self.paged_seq.as_ref()
+                    .expect("paged_seq must be initialized for multi-GPU MoE prefill");
+                let alloc = self.page_allocator.as_ref()
+                    .expect("page_allocator must be initialized for multi-GPU MoE prefill");
+                mgpu.broadcast_paged_chunks_to_workers(seq, alloc)
                     .map_err(ModelError::Hip)?;
-                    // kv-unify Phase 1 (pc3h.1): legacy_kv_caches is dead memory
-                    // on GPU 0 after broadcast in multi-GPU MoE — decode reads
-                    // exclusively from worker.attn_kv_caches via head-parallel.
-                    // Free to reclaim ~num_attn_layers × num_kv_heads × max_seq_len
-                    // × head_dim × 8 bytes (K+V) on GPU 0 (~320MB for 35B-A3B at
-                    // max_seq_len=8192).
-                    self.legacy_kv_caches = None;
-                    // kv-unify Phase 2 (pc3h.2): prefill_bufs scratch is dead
-                    // after prefill on the multi-GPU MoE decode path — decode
-                    // never invokes compile_prefill*. Free to reclaim per-chunk
-                    // scratch (hidden, normed, qkv, ffn_act, etc).
-                    self.prefill_bufs = None;
-                    // Also drop cached prefill megakernel programs.
-                    self.megakernel_prefill = None;
-                    self.megakernel_prefill_partial = None;
-                    self.megakernel_prefill_segments.clear();
-                }
-            }
-        }
-        // bd srg6.13: dual-write transitional. Wire broadcast_paged_chunks_to_workers
-        // alongside the existing flat broadcast. The multi-GPU MoE arm of
-        // prefill_mixed_chunk currently uses the flat path and does NOT populate
-        // GPU 0's paged_seq, so this call iterates over an empty chunks Vec and
-        // returns Ok(()) — true no-op. The decode-side switch to the paged
-        // worker caches happens in bd srg6.12b; until then this exists to make
-        // the broadcast helper a live (non-dead) symbol so it shares the build
-        // with its eventual caller.
-        {
-            let seq_alloc = self
-                .paged_seq
-                .as_ref()
-                .zip(self.page_allocator.as_ref());
-            if let (Some(mgpu), Some((seq, alloc))) = (self.multi_gpu.as_mut(), seq_alloc) {
-                let has_attn_kv =
-                    !mgpu.workers.is_empty() && !mgpu.workers[0].attn_kv_caches.is_empty();
-                if has_attn_kv {
-                    mgpu.broadcast_paged_chunks_to_workers(seq, alloc)
-                        .map_err(ModelError::Hip)?;
-                }
+                // Free prefill scratch: paged decode never re-invokes compile_prefill*.
+                self.prefill_bufs = None;
+                self.megakernel_prefill = None;
+                self.megakernel_prefill_partial = None;
+                self.megakernel_prefill_segments.clear();
             }
         }
         // Persistent worker holds GPU 0 CUs — synchronous copy_to_host would

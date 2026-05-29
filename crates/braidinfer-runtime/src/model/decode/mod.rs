@@ -834,10 +834,12 @@ impl Model {
         mk.instructions[lm_head_idx].words[1] = self.activations.logits_mapped.as_write_ptr() as u64;
 
         let _hs = self.config.hidden_size;
+        // bd srg6.X2: head-parallel is now gated on per-worker paged KV state
+        // (workers[0].paged_seq.is_some()), not on legacy attn_kv_caches.
         let has_head_parallel = self
             .multi_gpu
             .as_ref()
-            .map(|m| !m.workers[0].attn_kv_caches.is_empty())
+            .map(|m| !m.workers.is_empty() && m.workers[0].paged_seq.is_some())
             .unwrap_or(false);
         let use_distributed_qkv = has_head_parallel && {
             !self
@@ -873,6 +875,69 @@ impl Model {
             .unwrap()
             .instructions
             .len();
+
+        // bd srg6.X2: per-worker paged KV state update — append current token
+        // position to each worker's paged_seq (allocates a new chunk slot when
+        // the current chunk fills). Must run BEFORE any attention layer dispatch
+        // so that dispatch_head_parallel_attention sees the correct chunk/slot.
+        // Also update per-worker position_table (3 i32s per token) and page_table
+        // via write_volatile (MappedHostBuffer — no HIP API, safe under persistent worker).
+        if has_head_parallel {
+            // GPU 0: append to self.paged_seq + self.page_allocator (authoritative GPU 0
+            // paged state populated by prefill — broadcast_paged_chunks_to_workers skips
+            // GPU 0). Mirror chunk pointers into workers[0].paged_page_table (the host-mapped
+            // buffer the dispatch path reads).
+            {
+                let seq = self.paged_seq.as_mut()
+                    .expect("self.paged_seq must be initialized for GPU 0 head-parallel paged");
+                let alloc = self.page_allocator.as_mut()
+                    .expect("self.page_allocator must be initialized for GPU 0");
+                seq.append_token(position as i32, alloc)
+                    .map_err(ModelError::Hip)?;
+                let mgpu = self.multi_gpu.as_ref().unwrap();
+                let pt = mgpu.workers[0].paged_page_table.as_ref()
+                    .expect("workers[0].paged_page_table must be initialized");
+                let pt_host = pt.host_ptr();
+                for (ci, chunk) in seq.chunks.iter().enumerate() {
+                    let slot_ptr = alloc.slot_ptr(chunk.slot_index()) as u64;
+                    unsafe { pt_host.add(ci).write_volatile(slot_ptr); }
+                }
+            }
+            // Workers gpu_i>0: append to worker.paged_seq + update worker.paged_page_table
+            // (populated by broadcast from GPU 0's chunks). Per-worker position_table is
+            // updated for ALL workers including 0 (dispatch reads it uniformly).
+            if let Some(mgpu) = self.multi_gpu.as_mut() {
+                for gpu_i in 0..mgpu.num_devices {
+                    let worker = &mut mgpu.workers[gpu_i];
+                    let pos_table = worker.paged_position_table.as_ref()
+                        .expect("worker.paged_position_table must be initialized");
+                    let host_ptr = pos_table.host_ptr();
+                    let tok_idx = position as usize;
+                    unsafe {
+                        let base = host_ptr.add(tok_idx * 3);
+                        base.add(0).write_volatile(position as i32);
+                        base.add(1).write_volatile(position as i32);
+                        base.add(2).write_volatile(position as i32);
+                    }
+                    if gpu_i == 0 {
+                        continue;
+                    }
+                    let seq = worker.paged_seq.as_mut()
+                        .expect("worker.paged_seq must be initialized for head-parallel paged");
+                    let alloc = worker.page_allocator.as_mut()
+                        .expect("worker.page_allocator must be initialized for head-parallel paged");
+                    seq.append_token(position as i32, alloc)
+                        .map_err(ModelError::Hip)?;
+                    let page_table = worker.paged_page_table.as_ref()
+                        .expect("worker.paged_page_table must be initialized");
+                    let pt_host = page_table.host_ptr();
+                    for (ci, chunk) in seq.chunks.iter().enumerate() {
+                        let slot_ptr = alloc.slot_ptr(chunk.slot_index()) as u64;
+                        unsafe { pt_host.add(ci).write_volatile(slot_ptr); }
+                    }
+                }
+            }
+        }
 
         let mut attn_i = 0usize;
         let mut moe_i = 0usize;
@@ -1045,14 +1110,14 @@ impl Model {
         position: u32,
     ) -> Result<Vec<crate::megakernel::Instruction>, ModelError> {
         use crate::megakernel::instructions::{
-            D2dCopyInst, DeinterleaveInst, GqaAttnInst as GqaAttnInstLocal, LinearProjInst,
-            MropeInst, QkNormInst,
+            AttnPagedInst, D2dCopyInst, DeinterleaveInst, LinearProjInst,
         };
         use crate::megakernel::{
-            Instruction, OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4,
+            CHUNK_TOKENS, Instruction, OP_LINEAR_PROJ, OP_LINEAR_PROJ_PCG32, OP_LINEAR_PROJ_RNF4,
         };
         use crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS;
         use crate::quant::{LinearWeight, WeightFormat};
+        use crate::paged_kv::quantized_kv_offsets;
 
         fn emit_linear_proj_inst(
             batch: &mut Vec<Instruction>,
@@ -1100,15 +1165,52 @@ impl Model {
         let attn_out_base = self.activations.attn_out.as_write_ptr() as u64;
         let gate_attn_base = self.activations.gate_attn.as_write_ptr() as u64;
 
+        // bd srg6.X2: paged KV layout constants.
+        // Per chunk: [num_attn_layers * 2 * CHUNK_TOKENS * nkh * hd] f32s.
+        // Layer K offset: attn_i * 2 * CHUNK_TOKENS * nkh * hd * 4 bytes.
+        // Layer V offset: layer_k_offset + CHUNK_TOKENS * nkh * hd * 4 bytes.
+        let kv_stride = local_nkh * hd;
+        let paged_layer_k_offset =
+            (attn_i * 2 * CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+        let paged_layer_v_offset =
+            paged_layer_k_offset + (CHUNK_TOKENS * kv_stride * std::mem::size_of::<f32>()) as u64;
+        let chunk_head_stride = CHUNK_TOKENS * hd;
+
+        // D7-A: k_norm / inv_freq pointers from GPU 0's weight tensors are
+        // P2P-readable by all worker GPUs via gfx11 mtype-UC (kernel patch 0001 +
+        // hsa-rocr-p2p-mtype-uc-gfx11.patch). Read-only tensors → UC write-through
+        // is correct. Assert P2P is available: MultiGpuContext::init logged
+        // "P2P: GPU i→j enabled" for each pair; paged_seq.is_some() implies
+        // init_attn_buffers ran, which runs only after P2P init.
+        let layer_idx_for_attn = self
+            .config
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.layer_type == crate::config::LayerType::Attention)
+            .nth(attn_i)
+            .map(|(i, _)| i)
+            .unwrap();
+        let (k_norm_ptr_gpu0, inv_freq_ptr_gpu0) = {
+            let kn = if self.config.has_qk_norm {
+                match &self.layers[layer_idx_for_attn] {
+                    LayerWeights::Attention(w) => w.k_norm.as_ptr(),
+                    _ => panic!("expected attention layer"),
+                }
+            } else {
+                std::ptr::null()
+            };
+            (kn, self.activations.inv_freq.as_ptr())
+        };
+
         let mut seq_nums: Vec<(usize, u32)> = Vec::with_capacity(num_gpus);
 
         for gpu_i in 0..num_gpus {
             let mut batch: Vec<Instruction> = Vec::new();
 
-            // Resolve per-GPU buffer pointers
-            let (kv_k_base, kv_v_base, q_ptr, out_ptr) = {
+            // Resolve per-GPU buffer pointers (paged path — no attn_kv_caches)
+            let (q_ptr, out_ptr) = {
                 let mgpu = self.multi_gpu.as_ref().unwrap();
-                let kc = &mgpu.workers[gpu_i].attn_kv_caches[attn_i];
                 let q = if gpu_i == 0 {
                     q_attn_base
                 } else {
@@ -1117,32 +1219,57 @@ impl Model {
                 let out = if gpu_i == 0 {
                     attn_out_base
                 } else {
-                    // Worker writes via its own dev_ptr to the host-mapped buffer.
                     mgpu.workers[gpu_i].attn_out_dev_self.unwrap() as u64
                 };
-                (
-                    kc.k.as_write_ptr() as u64,
-                    kc.v.as_write_ptr() as u64,
-                    q,
-                    out,
-                )
+                (q, out)
+            };
+
+            // Resolve per-worker paged KV pointers (chunk slot + offsets within chunk).
+            // GPU 0: `broadcast_paged_chunks_to_workers` skips GPU 0, so workers[0]'s
+            // paged_seq is NOT populated with prefill chunks — only the per-decode-step
+            // append. Source paged_seq + page_allocator + page_table from `self` for gpu_i==0;
+            // pos_table stays per-worker (workers[0].paged_position_table IS updated by
+            // the per-decode-step write_volatile loop earlier in this function).
+            let (paged_chunk_k_ptr, paged_chunk_v_ptr, page_table_ptr, pos_table_ptr, chunk_offset) = {
+                let mgpu = self.multi_gpu.as_ref().unwrap();
+                if gpu_i == 0 {
+                    let seq = self.paged_seq.as_ref()
+                        .expect("self.paged_seq required for gpu_i==0 head-parallel paged dispatch");
+                    let alloc = self.page_allocator.as_ref()
+                        .expect("self.page_allocator required for gpu_i==0");
+                    let chunk_slot = seq.chunks.last()
+                        .expect("self.paged_seq must have at least one chunk after append_token")
+                        .slot_index();
+                    let chunk_base = alloc.slot_ptr(chunk_slot) as u64;
+                    let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
+                    let k_ptr = chunk_base + paged_layer_k_offset;
+                    let v_ptr = chunk_base + paged_layer_v_offset;
+                    let pt = mgpu.workers[0].paged_page_table.as_ref()
+                        .expect("workers[0].paged_page_table required for gpu_i==0 (mirrored from self.paged_seq)").as_ptr() as u64;
+                    let pos = mgpu.workers[0].paged_position_table.as_ref()
+                        .expect("workers[0].paged_position_table required").as_ptr() as u64;
+                    (k_ptr, v_ptr, pt, pos, chunk_offset)
+                } else {
+                    let worker = &mgpu.workers[gpu_i];
+                    let seq = worker.paged_seq.as_ref()
+                        .expect("worker.paged_seq required for head-parallel paged dispatch");
+                    let alloc = worker.page_allocator.as_ref()
+                        .expect("worker.page_allocator required");
+                    let chunk_slot = seq.chunks.last()
+                        .expect("paged_seq must have at least one chunk after append_token")
+                        .slot_index();
+                    let chunk_base = alloc.slot_ptr(chunk_slot) as u64;
+                    let chunk_offset = (seq.current_chunk_offset() as usize).saturating_sub(1);
+                    let k_ptr = chunk_base + paged_layer_k_offset;
+                    let v_ptr = chunk_base + paged_layer_v_offset;
+                    let pt = worker.paged_page_table.as_ref().expect("paged_page_table required").as_ptr() as u64;
+                    let pos = worker.paged_position_table.as_ref().expect("paged_position_table required").as_ptr() as u64;
+                    (k_ptr, v_ptr, pt, pos, chunk_offset)
+                }
             };
 
             if use_distributed_qkv {
                 // ── Distributed QKV mode ──────────────────────────────────────────────────
-                // GPU 0 has normed in act.normed (from megakernel RMSNorm).
-                // GPUs 1..n need normed via P2P broadcast.
-                // Get this attention layer's weights (GPU 0 VRAM, P2P-accessible from all GPUs).
-                let layer_idx_for_attn = self
-                    .config
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, l)| l.layer_type == crate::config::LayerType::Attention)
-                    .nth(attn_i)
-                    .map(|(i, _)| i)
-                    .unwrap();
-
                 let (normed_local, q_gate_ptr, k_local_ptr, v_local_ptr, gate_ptr) = {
                     let mgpu = self.multi_gpu.as_ref().unwrap();
                     if gpu_i == 0 {
@@ -1162,17 +1289,11 @@ impl Model {
                     }
                 };
 
-                // 0. Broadcast normed to GPUs 1..n
+                // 0. Broadcast normed to GPUs 1..n (β'''' sentinel wait)
                 if gpu_i > 0 {
-                    // β'''' sentinel wait (bd braidinfer-sm16): acquire-load
-                    // on act.normed_seq[attn_i] == 1 forces this D2dCopy's
-                    // peer-read of normed_stage to be ordered after the
-                    // producer's GPU 0 D2dCopy at compile_attention.rs that
-                    // writes act.normed → act.normed_stage and signals.
                     let normed_seq_slot = unsafe {
                         (self.activations.normed_seq.device_ptr() as *const u32).add(attn_i)
                     };
-                    // β'''' monotonic seq: wait for (position+1) per #3189
                     let wait_value = (position as u32) + 1;
                     batch.push(
                         D2dCopyInst::new((hs as u32 + 255) / 256, normed_local as *mut f32, normed_base as *const f32, hs as i32)
@@ -1181,75 +1302,22 @@ impl Model {
                     );
                 }
 
-                // 1-3. QKV projections.
-                // GPU 0: use original layer weights (no copy, row_start=0).
-                // GPUs 1+: use pre-copied slice in ctx.workers[gpu_i].attn_w_*.
+                // 1-3. QKV projections (unchanged from flat path).
                 if gpu_i == 0 {
                     let aw = match &self.layers[layer_idx_for_attn] {
                         LayerWeights::Attention(w) => w,
                         _ => panic!("expected attention layer"),
                     };
-                    emit_linear_proj_inst(
-                        &mut batch,
-                        &aw.w_q_gate,
-                        q_gate_ptr as *mut f32,
-                        normed_local as *const f32,
-                        local_nqh * hd * q_mult,
-                        hs,
-                    );
-                    emit_linear_proj_inst(
-                        &mut batch,
-                        &aw.w_k,
-                        k_local_ptr as *mut f32,
-                        normed_local as *const f32,
-                        local_nkh * hd,
-                        hs,
-                    );
-                    emit_linear_proj_inst(
-                        &mut batch,
-                        &aw.w_v,
-                        v_local_ptr as *mut f32,
-                        normed_local as *const f32,
-                        local_nkh * hd,
-                        hs,
-                    );
+                    emit_linear_proj_inst(&mut batch, &aw.w_q_gate, q_gate_ptr as *mut f32, normed_local as *const f32, local_nqh * hd * q_mult, hs);
+                    emit_linear_proj_inst(&mut batch, &aw.w_k, k_local_ptr as *mut f32, normed_local as *const f32, local_nkh * hd, hs);
+                    emit_linear_proj_inst(&mut batch, &aw.w_v, v_local_ptr as *mut f32, normed_local as *const f32, local_nkh * hd, hs);
                 } else {
-                    let w_q = unsafe {
-                        &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_q_gate[attn_i]
-                            as *const LinearWeight)
-                    };
-                    let w_k = unsafe {
-                        &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_k[attn_i]
-                            as *const LinearWeight)
-                    };
-                    let w_v = unsafe {
-                        &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_v[attn_i]
-                            as *const LinearWeight)
-                    };
-                    emit_linear_proj_inst(
-                        &mut batch,
-                        w_q,
-                        q_gate_ptr as *mut f32,
-                        normed_local as *const f32,
-                        local_nqh * hd * q_mult,
-                        hs,
-                    );
-                    emit_linear_proj_inst(
-                        &mut batch,
-                        w_k,
-                        k_local_ptr as *mut f32,
-                        normed_local as *const f32,
-                        local_nkh * hd,
-                        hs,
-                    );
-                    emit_linear_proj_inst(
-                        &mut batch,
-                        w_v,
-                        v_local_ptr as *mut f32,
-                        normed_local as *const f32,
-                        local_nkh * hd,
-                        hs,
-                    );
+                    let w_q = unsafe { &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_q_gate[attn_i] as *const LinearWeight) };
+                    let w_k = unsafe { &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_k[attn_i] as *const LinearWeight) };
+                    let w_v = unsafe { &*(&self.multi_gpu.as_ref().unwrap().workers[gpu_i].attn_w_v[attn_i] as *const LinearWeight) };
+                    emit_linear_proj_inst(&mut batch, w_q, q_gate_ptr as *mut f32, normed_local as *const f32, local_nqh * hd * q_mult, hs);
+                    emit_linear_proj_inst(&mut batch, w_k, k_local_ptr as *mut f32, normed_local as *const f32, local_nkh * hd, hs);
+                    emit_linear_proj_inst(&mut batch, w_v, v_local_ptr as *mut f32, normed_local as *const f32, local_nkh * hd, hs);
                 }
 
                 // 4. Deinterleave Q+gate → q_attn, gate_attn (only for gated Q)
@@ -1257,92 +1325,103 @@ impl Model {
                     let total = local_nqh * hd;
                     batch.push(DeinterleaveInst::new((total as u32 + 255) / 256, q_ptr as *mut f32, gate_ptr as *mut f32, q_gate_ptr as *const f32, local_nqh as i32, hd as i32, 1).into_inst());
                 } else {
-                    // Non-gated: q_gate IS q, just copy
                     batch.push(D2dCopyInst::new(((local_nqh * hd) as u32 + 255) / 256, q_ptr as *mut f32, q_gate_ptr as *const f32, (local_nqh * hd) as i32).into_inst());
                 }
 
-                // 5. QK-norm on local k (only for models with QK-norm weights — e.g. Qwen3, not Nemotron-H)
-                if self.config.has_qk_norm {
-                    let (q_norm_ptr, k_norm_ptr, qk_norm_eps) = {
-                        match &self.layers[layer_idx_for_attn] {
-                            LayerWeights::Attention(w) => (
-                                w.q_norm.as_ptr(),
-                                w.k_norm.as_ptr(),
-                                self.config.rms_norm_eps,
-                            ),
-                            _ => panic!("expected attention layer"),
-                        }
-                    };
-                    batch.push(QkNormInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, q_norm_ptr, k_norm_ptr, local_nqh as i32, local_nkh as i32, hd as i32, qk_norm_eps, 0).into_inst());
+                // Steps 5 (QkNorm) and 6 (mRoPE) on K REMOVED for paged path.
+                // Paged KV cache stores PRE-QKNorm, PRE-mRoPE K (for quantization quality).
+                // AttnPagedInst applies QkNorm + mRoPE internally to Q at attention time.
+
+                // 7. Paged KV write: per KV head D2D_COPY to current chunk slot.
+                // Source: k_local (pre-norm) → chunk slot at [attn_i layer, head h, chunk_offset].
+                for h in 0..local_nkh {
+                    let src_k = (k_local_ptr + (h * hd * 4) as u64) as *const f32;
+                    let src_v = (v_local_ptr + (h * hd * 4) as u64) as *const f32;
+                    let dst_k = (paged_chunk_k_ptr + (h * chunk_head_stride * 4 + chunk_offset * hd * 4) as u64) as *mut f32;
+                    let dst_v = (paged_chunk_v_ptr + (h * chunk_head_stride * 4 + chunk_offset * hd * 4) as u64) as *mut f32;
+                    batch.push(D2dCopyInst::new((hd as u32 + 255) / 256, dst_k, src_k, hd as i32).into_inst());
+                    batch.push(D2dCopyInst::new((hd as u32 + 255) / 256, dst_v, src_v, hd as i32).into_inst());
                 }
 
-                // 6. mRoPE on local Q+K — only for models that use RoPE.
-                // MUST run BEFORE the KV write so the cache stores POST-MROPE K
-                // (op_gqa_attn at step 8 reads cache K without re-applying MROPE).
-                // This also matches legacy_kv_caches's layout (post-MROPE K written
-                // by emit_attention_layer Prefill variant), so the sew prefill
-                // broadcast is consistent with what decode-time KV writes produce.
-                //
-                // CRITICAL: use the per-worker position_ids_local pointer, NOT
-                // self.activations.position_ids — the latter is a non-portable
-                // host-mapped buffer whose device_ptr is only valid on GPU 0.
-                // Workers reading via that pointer get garbage → wrong rotation
-                // → wrong K → broken attention.
-                if self.config.use_rope {
-                    let rd = self.config.rope_dim;
-                    let ms = self.config.mrope_sections();
-                    let pos_ptr = self.multi_gpu.as_ref().unwrap().workers[gpu_i]
-                        .position_ids_local
-                        .as_ptr();
-                    batch.push(MropeInst::new((local_nqh + local_nkh) as u32, q_ptr as *mut f32, k_local_ptr as *mut f32, self.activations.inv_freq.as_ptr(), pos_ptr, local_nqh as i32, local_nkh as i32, hd as i32, rd as i32, ms[0] as i32, ms[1] as i32, ms[2] as i32, 0).into_inst());
-                }
-
-                // 7. KV write (local — from local k/v to local KV cache)
-                for h_local in 0..local_nkh {
-                    let src_k = k_local_ptr + (h_local * hd * 4) as u64;
-                    let src_v = v_local_ptr + (h_local * hd * 4) as u64;
-                    let dst_k =
-                        kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    let dst_v =
-                        kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).into_inst());
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).into_inst());
-                }
-
-                // 8. GQA (same as legacy path)
-                let seq_len = (position + 1) as i32;
+                // 8. AttnPagedInst: paged attention with per-worker head slice.
+                // k_norm + inv_freq from GPU 0 (P2P-readable via mtype-UC patch 0001).
                 {
-                    let mut inst = GqaAttnInstLocal::new(local_nqh as u32, out_ptr as *mut f32, q_ptr as *const f32, kv_k_base as *const f32, kv_v_base as *const f32, nqh as i32, nkh as i32, hd as i32, seq_len, max_sl as i32);
-                    inst.q_head_start = (gpu_i * local_nqh) as u64;
+                    let rd = self.config.rope_dim;
+                    let eps = self.config.rms_norm_eps;
+                    let ms = self.config.mrope_sections();
+                    let seq_len = (position + 1) as i32;
+                    let local_q_head_start = (gpu_i * local_nqh) as u16;
+                    let local_nqh_u16 = local_nqh as u16;
+                    let mut inst = AttnPagedInst::new(
+                        local_nqh as u32,
+                        out_ptr as *mut f32,
+                        q_ptr as *const f32,
+                        inv_freq_ptr_gpu0,
+                        nqh as i32, nkh as i32, hd as i32,
+                        seq_len,
+                        CHUNK_TOKENS as i32,
+                        rd as i32,
+                        paged_layer_k_offset,
+                        paged_layer_v_offset,
+                        k_norm_ptr_gpu0,
+                        eps,
+                        ms[0] as i32,
+                        ms[1] as i32,
+                        local_q_head_start,
+                        local_nqh_u16,
+                    );
+                    inst.page_table = page_table_ptr;
+                    inst.pos_table = pos_table_ptr;
                     batch.push(inst.into_inst());
                 }
             } else {
                 // ── Legacy mode (QKV already projected on GPU 0) ─────────────────────────
-                // KV write: per KV head, from GPU 0's k/v_attn to this GPU's KV cache
-                for h_local in 0..local_nkh {
-                    let h_global = gpu_i * local_nkh + h_local;
-                    let src_k = k_attn_base + (h_global * hd * 4) as u64;
-                    let src_v = v_attn_base + (h_global * hd * 4) as u64;
-                    let dst_k =
-                        kv_k_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    let dst_v =
-                        kv_v_base + ((h_local * head_stride + position as usize * hd) * 4) as u64;
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_k as *mut f32, src_k as *const f32, hd as i32).into_inst());
-                    batch.push(D2dCopyInst::new(((hd as u32) + 255) / 256, dst_v as *mut f32, src_v as *const f32, hd as i32).into_inst());
-                }
-
                 // For GPU i > 0: copy Q slice from GPU 0's q_attn to local attn_q
                 if gpu_i > 0 {
                     let src_q = q_attn_base + (gpu_i * local_nqh * hd * 4) as u64;
                     batch.push(D2dCopyInst::new(((local_nqh * hd) as u32 + 255) / 256, q_ptr as *mut f32, src_q as *const f32, (local_nqh * hd) as i32).into_inst());
                 }
 
-                // GQA attention
-                let seq_len = (position + 1) as i32;
-                let q_src = if gpu_i == 0 { q_attn_base } else { q_ptr };
+                // Paged KV write from GPU 0's k/v_attn (pre-norm for paged path).
+                // Heads are replicated across workers (GQA: local_nkh = nkh).
+                for h in 0..local_nkh {
+                    let src_k = (k_attn_base + (h * hd * 4) as u64) as *const f32;
+                    let src_v = (v_attn_base + (h * hd * 4) as u64) as *const f32;
+                    let dst_k = (paged_chunk_k_ptr + (h * chunk_head_stride * 4 + chunk_offset * hd * 4) as u64) as *mut f32;
+                    let dst_v = (paged_chunk_v_ptr + (h * chunk_head_stride * 4 + chunk_offset * hd * 4) as u64) as *mut f32;
+                    batch.push(D2dCopyInst::new((hd as u32 + 255) / 256, dst_k, src_k, hd as i32).into_inst());
+                    batch.push(D2dCopyInst::new((hd as u32 + 255) / 256, dst_v, src_v, hd as i32).into_inst());
+                }
+
+                // AttnPagedInst for legacy path.
                 {
-                    let mut inst = GqaAttnInstLocal::new(local_nqh as u32, out_ptr as *mut f32, q_src as *const f32, kv_k_base as *const f32, kv_v_base as *const f32, nqh as i32, nkh as i32, hd as i32, seq_len, max_sl as i32);
-                    inst.q_head_start = (gpu_i * local_nqh) as u64;
+                    let rd = self.config.rope_dim;
+                    let eps = self.config.rms_norm_eps;
+                    let ms = self.config.mrope_sections();
+                    let seq_len = (position + 1) as i32;
+                    let q_src = if gpu_i == 0 { q_attn_base } else { q_ptr };
+                    let local_q_head_start = (gpu_i * local_nqh) as u16;
+                    let local_nqh_u16 = local_nqh as u16;
+                    let mut inst = AttnPagedInst::new(
+                        local_nqh as u32,
+                        out_ptr as *mut f32,
+                        q_src as *const f32,
+                        inv_freq_ptr_gpu0,
+                        nqh as i32, nkh as i32, hd as i32,
+                        seq_len,
+                        CHUNK_TOKENS as i32,
+                        rd as i32,
+                        paged_layer_k_offset,
+                        paged_layer_v_offset,
+                        k_norm_ptr_gpu0,
+                        eps,
+                        ms[0] as i32,
+                        ms[1] as i32,
+                        local_q_head_start,
+                        local_nqh_u16,
+                    );
+                    inst.page_table = page_table_ptr;
+                    inst.pos_table = pos_table_ptr;
                     batch.push(inst.into_inst());
                 }
             }
