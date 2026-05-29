@@ -216,4 +216,48 @@ fn main() {
         }
     }
     std::fs::write(out_dir.join("opcodes.rs"), &opcodes_rs).expect("failed to write opcodes.rs");
+
+    // Emit the canonical instruction-ABI constants from the kernel headers as
+    // Rust consts, so braidinfer-runtime can compile-time-assert its own
+    // INST_SIZE / MAX_BATCH_INSTRUCTIONS equal the C kernel's. A silent drift
+    // here previously shipped a stale prod_kernel_test (INST_SIZE_WORDS 18 vs 19)
+    // that read ack at the wrong offset and false-wedged. With this, a mismatch
+    // is a COMPILE error in both languages.
+    let parse_define = |path: &Path, name: &str| -> usize {
+        let txt = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("kernel-abi: read {}: {e}", path.display()));
+        for line in txt.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("#define ") {
+                let mut parts = rest.split_whitespace();
+                if parts.next() == Some(name) {
+                    let v = parts.next().unwrap_or_else(|| {
+                        panic!("kernel-abi: #define {name} has no value in {}", path.display())
+                    });
+                    return v.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("kernel-abi: #define {name} value '{v}' is not a usize")
+                    });
+                }
+            }
+        }
+        panic!("kernel-abi: #define {name} not found in {}", path.display());
+    };
+    let inst_size_words = parse_define(&kernel_dir.join("megakernel_common.h"), "INST_SIZE_WORDS");
+    let max_batch = parse_define(&kernel_dir.join("worker_queue.h"), "MAX_BATCH_INSTRUCTIONS");
+    std::fs::write(
+        out_dir.join("kernel_abi.rs"),
+        format!(
+            "// Auto-generated from kernels/megakernel_common.h + worker_queue.h — do not edit.\n\
+             #[allow(dead_code)]\npub const KERNEL_INST_SIZE_WORDS: usize = {inst_size_words};\n\
+             #[allow(dead_code)]\npub const KERNEL_MAX_BATCH_INSTRUCTIONS: usize = {max_batch};\n",
+        ),
+    )
+    .expect("failed to write kernel_abi.rs");
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("megakernel_common.h").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        kernel_dir.join("worker_queue.h").display()
+    );
 }

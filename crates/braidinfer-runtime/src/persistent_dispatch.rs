@@ -38,6 +38,13 @@ use crate::watchdog::WatchdogThread;
 
 /// Max instructions per batch dispatch (dense worker).
 pub const MAX_BATCH_INSTRUCTIONS: usize = 256;
+// Cross-language ABI guard: MUST equal the C kernel's MAX_BATCH_INSTRUCTIONS
+// (kernels/worker_queue.h), parsed by braidinfer-hip's build.rs. Drift => compile
+// error here, instead of a silent WorkerQueue inst[] size / ack-offset mismatch.
+const _: () = assert!(
+    MAX_BATCH_INSTRUCTIONS == crate::megakernel::KERNEL_MAX_BATCH_INSTRUCTIONS,
+    "ABI drift: Rust MAX_BATCH_INSTRUCTIONS != C MAX_BATCH_INSTRUCTIONS (kernels/worker_queue.h)"
+);
 
 /// Process-global flag set by SIGINT/SIGTERM handler. Polled by dispatch_batch's
 /// ack-spin-loop so an interrupt can break out and trigger Drop-time shutdown of
