@@ -41,10 +41,13 @@ __device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, 
     if (gupd == 0) gupd = hs;
 
     // Sum gupd elements per slot, slot stride = hs.
+    // P3 (braidinfer-4n5.7): GPU 0 no longer contributes an expert output to
+    // output_slots[0] (it runs no experts). Start sum at g=1 to skip the
+    // stale slot 0 and accumulate only worker outputs (slots 1..total_gpus).
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;
          idx += gridDim.x * blockDim.x) {
         float sum = 0.0f;
-        for (int g = 0; g < total_gpus; g++) {
+        for (int g = 1; g < total_gpus; g++) {
             sum += output_slots[g * hs + idx];
         }
         final_output[idx] = sum;

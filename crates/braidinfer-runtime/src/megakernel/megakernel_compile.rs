@@ -964,7 +964,8 @@ impl MegakernelProgram {
             };
             // gate_up_in_dim: expert input dimension (hs for standard MoE, moe_latent_size for Nemotron-H)
             let gupd = dist.map(|d| d.gate_up_in_dim).unwrap_or(hs);
-            let has_latent = moe.fc1_latent_proj.is_some();
+            // (has_latent was used in the now-removed gpu0 self-expert path; the
+            // barrier_idx-2 patch below accesses fc1_latent_proj directly.)
 
             // Replace D2D_COPY(normed→normed_stage) at barrier_idx-2 with:
             //   - fc1_latent_proj(normed→moe_latent) if fc1 exists, else NOP
@@ -1005,40 +1006,26 @@ impl MegakernelProgram {
                 }
             }
 
-            // bd 0hu3-b: replace OP_MOE_DISPATCH with OP_MOE_FFN_REMOTE for GPU 0.
-            // Every GPU now runs the same op for MoE expert compute in decode.
-            // activation_p2p self-points at GPU 0's own VRAM (no peer P2P).
-            // output_slot_p2p = output_slots[0] (same UC destination as old PRE).
-            // local_activation/local_output/scratch_* use the gpu0_* buffers
-            // (parallel to the worker's `workers[w].*` buffers).
-            //
-            // For Nemotron-H (has_latent): activation = moe_latent (gupd elements)
-            // For standard MoE:           activation = normed (hs)
-            // The PRE-step does NOT write `final_output` (the moe_latent /
-            // ffn_down_stage); only OP_MOE_DISPATCH_POST does, and that
-            // emission below is unchanged.
-            let activation_ptr = if has_latent {
-                act.moe_latent.as_ptr() as *const f32
-            } else {
-                act.normed.as_ptr() as *const f32
-            };
-            let relu_sq = !moe.has_gate_proj;
-
-            prog.instructions[barrier_idx] = p2p.build_ffn_remote_inst_gpu0(
-                layer_idx,
-                activation_ptr,
+            // P3 (braidinfer-4n5.7): GPU 0 no longer runs expert compute.
+            // Replace the former OP_MOE_FFN_REMOTE self-dispatch (gpu0 expert)
+            // with a NOP: D2D_COPY(output_slots[0] ← gpu0_zero_buffer, gupd).
+            // This zeroes slot 0 each step so future reads (e.g. debugging)
+            // see clean state. OP_MOE_DISPATCH_POST starts summing at slot 1,
+            // so slot 0 is never accumulated into the final output.
+            // gupd is the expert input dimension (hs for standard MoE,
+            // moe_latent_size for Nemotron-H). We zero gupd elements to match
+            // the slot stride used by POST's sum loop.
+            prog.instructions[barrier_idx] = D2dCopyInst::new(
+                div_ceil(gupd as u32, 256),
                 p2p.output_slots.dev_ptr(0) as *mut f32,
-                act.moe_expert_ids.as_ptr() as *const i32,
-                act.moe_expert_weights.as_ptr() as *const f32,
-                k,
-                eis,
-                hs,
-                gupd,
-                moe.has_gate_proj,
-                relu_sq,
-                std::ptr::null(),
-                0,
-            );
+                p2p.gpu0_zero_buffer.as_ptr() as *const f32,
+                gupd as i32,
+            )
+            .into_inst();
+
+            // Suppress dead-code warnings for variables no longer used by the
+            // (now-removed) gpu0 self-expert dispatch.
+            let _ = (k, eis, hs, gupd, moe.has_gate_proj);
 
             // bd 1hik: populate the per-layer params table consumed by
             // `dispatch_moe_workers_decode_async`. CPU worker-dispatch path
@@ -1146,10 +1133,13 @@ impl MegakernelProgram {
                         layer_k: ((layer_idx as u64) << 32) | (k as u64),
                         eis_gate: ((eis as u64) << 32) | has_gate,
                         activation: activation_ptr,
-                        layer_config_ptrs: p2p.gpu0_layer_config_ptrs.as_ptr() as u64,
-                        scratch_gate: p2p.gpu0_scratch_gate.as_ptr() as u64,
-                        scratch_up: p2p.gpu0_scratch_up.as_ptr() as u64,
-                        scratch_act: p2p.gpu0_scratch_act.as_ptr() as u64,
+                        // P3 (braidinfer-4n5.7): these fields are unused by
+                        // OP_MOE_DISPATCH_POST kernel (see megakernel_moe_dispatch.hip);
+                        // zero them now that the gpu0_* buffers are deleted.
+                        layer_config_ptrs: 0,
+                        scratch_gate: 0,
+                        scratch_up: 0,
+                        scratch_act: 0,
                         num_gpus: num_gpus as u64,
                         gate_up_in_dim: gupd as u64,
                         // OP_MOE_DISPATCH_POST doesn't use gpu0_acc, but

@@ -1210,10 +1210,12 @@ impl Model {
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
-                // Distribute experts starting at GPU 0 for all paths.
-                // Persistent path: GPU 0 runs OP_EXPERT_FFN via fat worker at OP_BARRIER.
-                // kbk path: GPU 0 runs experts via hipLaunchKernel (no cooperative kernel).
-                let start_gpu = 0usize;
+                // P3 (braidinfer-4n5.7): distribute experts starting at GPU 1.
+                // GPU 0 is SequenceAttention-only (runs attention + coordinator work).
+                // Expert workers are GPUs 1..N; GPU 0 holds no expert weights.
+                // This matches the OP_MOE_DISPATCH_POST kernel which now sums
+                // output_slots[1..total_gpus] only (slot 0 is no longer written).
+                let start_gpu = 1usize;
                 if experts_on_gpu0 {
                     let dist = crate::weights::distribute_moe_weights_from_ref(
                         moe,
