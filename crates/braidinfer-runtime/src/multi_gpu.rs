@@ -476,7 +476,8 @@ impl MultiGpuContext {
                 while worker_seq.chunks.len() <= chunk_idx {
                     let next_pos_idx = worker_seq.positions.len();
                     let pos = gpu0_paged_seq.positions[next_pos_idx];
-                    worker_seq.append_token(pos, worker_allocator)?;
+                    // Per-worker host tier is Phase D.4 (deferred). Pass None.
+                    worker_seq.append_token(pos, worker_allocator, None)?;
                 }
                 // Catch up `len` on the (possibly current) chunk so it
                 // matches GPU 0's len. append_token incremented for one
@@ -485,7 +486,8 @@ impl MultiGpuContext {
                 while worker_seq.chunks[chunk_idx].len() < gpu0_len {
                     let next_pos_idx = worker_seq.positions.len();
                     let pos = gpu0_paged_seq.positions[next_pos_idx];
-                    worker_seq.append_token(pos, worker_allocator)?;
+                    // Per-worker host tier is Phase D.4 (deferred). Pass None.
+                    worker_seq.append_token(pos, worker_allocator, None)?;
                 }
 
                 let worker_slot = worker_seq.chunks[chunk_idx].slot_index();

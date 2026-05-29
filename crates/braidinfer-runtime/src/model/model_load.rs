@@ -1103,6 +1103,7 @@ impl Model {
             megakernel_paged: None,
             page_allocator: None,
             quant_allocator: None,
+            host_page_allocator: None,
             paged_seq: None,
             prefill_paged_page_table: None,
             prefill_paged_position_table: None,

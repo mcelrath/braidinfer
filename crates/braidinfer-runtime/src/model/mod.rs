@@ -4,7 +4,7 @@ use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::stream::Stream;
 
 use crate::megakernel::{CHUNK_TOKENS, MegakernelProgram};
-use crate::paged_kv::{PageAllocator, RecurrentCheckpointPool, SequenceState};
+use crate::paged_kv::{HostPageAllocator, PageAllocator, RecurrentCheckpointPool, SequenceState};
 
 pub use crate::kernel::AllKernels;
 
@@ -56,6 +56,25 @@ pub struct Model {
     pub(crate) megakernel_paged: Option<MegakernelProgram>,
     pub(crate) page_allocator: Option<PageAllocator>,
     pub(crate) quant_allocator: Option<PageAllocator>,
+    /// Host-RAM KV tier (Phase C, braidinfer-4n5). None when
+    /// `BRAIDINFER_HOST_KV_CHUNKS` is unset or zero (default: host tier OFF,
+    /// behavior byte-identical to pre-Phase-C). Constructed lazily in
+    /// `ensure_paged_decode_state` on the first decode/prefill call that
+    /// enables paged KV, so hipHostMalloc fires before the persistent worker
+    /// is launched and the cooperative kernel holds GPU CUs.
+    ///
+    /// # Drop ordering
+    ///
+    /// `HostPageAllocator` holds a `ManuallyDrop<PinnedBuffer<u8>>` pool.
+    /// `hipHostFree` (called from `PinnedBuffer::drop`) must NOT fire while
+    /// the persistent cooperative worker is running.  The pool is explicitly
+    /// freed in `reset_state()` AFTER `drop(self.persistent_workers.take())`
+    /// — mirrors the `ManuallyDrop<DeviceBuffer>` pattern in
+    /// `PersistentDispatch::drop`.  Rust's automatic field-drop order would
+    /// run `host_page_allocator` BEFORE `persistent_workers` (fields drop
+    /// in reverse declaration order), so we rely on `reset_state` to tear
+    /// down in the correct sequence rather than declaration order.
+    pub(crate) host_page_allocator: Option<HostPageAllocator>,
     pub(crate) paged_seq: Option<SequenceState>,
     // bd srg6.7: host-mapped page/position tables for paged-prefill writer.
     // MappedHostBuffer (not DeviceBuffer) because writes happen while persistent
@@ -115,6 +134,30 @@ impl Model {
                 CHUNK_TOKENS,
                 max_chunks as u32,
             )?);
+        }
+
+        // Phase C (braidinfer-4n5): host-RAM KV tier.
+        // Construct HostPageAllocator lazily here — before the persistent worker
+        // is spawned — so hipHostMalloc fires with GPU CUs free.
+        // Default: host tier OFF (env unset or zero → current behavior unchanged).
+        if self.host_page_allocator.is_none() {
+            if let Ok(s) = std::env::var("BRAIDINFER_HOST_KV_CHUNKS") {
+                if let Ok(n) = s.parse::<u32>() {
+                    if n > 0 {
+                        let chunk_bytes = self
+                            .page_allocator
+                            .as_ref()
+                            .expect("page_allocator initialized above")
+                            .chunk_bytes();
+                        // HostPageAllocator::new returns None on hipHostMalloc
+                        // failure (ENOMEM) and logs a clear warning — graceful
+                        // disable per OQ-2.  None here means host tier stays
+                        // disabled; no hard error.
+                        self.host_page_allocator =
+                            HostPageAllocator::new(chunk_bytes, n);
+                    }
+                }
+            }
         }
         Ok(())
     }

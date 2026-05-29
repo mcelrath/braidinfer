@@ -274,12 +274,14 @@ impl Model {
         {
             let mut seq = self.paged_seq.take().unwrap();
             let mut allocator = self.page_allocator.take().unwrap();
+            let mut host_alloc = self.host_page_allocator.take();
             for t in 0..n {
                 let pos = start_pos as i32 + t as i32;
-                seq.append_token(pos, &mut allocator).map_err(ModelError::Hip)?;
+                seq.append_token(pos, &mut allocator, host_alloc.as_mut()).map_err(ModelError::Hip)?;
             }
             self.paged_seq = Some(seq);
             self.page_allocator = Some(allocator);
+            self.host_page_allocator = host_alloc;
         }
 
         // Step 2: Embed all tokens into prefill_bufs.hidden via mailbox.
@@ -638,9 +640,19 @@ impl Model {
     }
 
     pub fn reset_state(&mut self) -> Result<(), ModelError> {
-        // Persistent worker holds all GPU CUs — must shut it down before any hipMemcpy.
-        // It will be re-launched lazily on the next decode_step call.
+        // Persistent worker holds all GPU CUs — must shut it down before any hipMemcpy
+        // or hipHostFree.  It will be re-launched lazily on the next decode_step call.
         drop(self.persistent_workers.take());
+        // Phase C (braidinfer-4n5): explicitly drop the HostPageAllocator's
+        // ManuallyDrop<PinnedBuffer> pool AFTER the persistent worker has exited.
+        // The pool uses ManuallyDrop to prevent automatic drop (which would call
+        // hipHostFree while the worker held GPU CUs).  Now that the worker is
+        // torn down, we call drop_pool() to free the pinned allocation.
+        // This mirrors the ManuallyDrop<DeviceBuffer> unwrap in PersistentDispatch::drop.
+        if let Some(ha) = self.host_page_allocator.take() {
+            // SAFETY: the persistent worker is fully torn down (drop above completed).
+            ha.drop_pool();
+        }
 
         let nh = self.config.linear_num_heads;
         let kd = self.config.linear_key_head_dim;
@@ -668,8 +680,14 @@ impl Model {
             if let Some(q_alloc) = self.quant_allocator.as_mut() {
                 seq.free_quant_slots(q_alloc);
             }
+            // Phase C: pass host_page_allocator so HostPinned chunk host slots
+            // are freed back to the pool.  After this reset_state has taken the
+            // host_page_allocator above (for explicit drop), so it is None here —
+            // which is correct: we pass None, meaning HostPinned chunks won't be
+            // freed into a pool that no longer exists.  Their host slots are leaked,
+            // but the whole pool is being freed anyway via the ManuallyDrop::drop above.
             if let Some(alloc) = self.page_allocator.as_mut() {
-                seq.reset(alloc);
+                seq.reset(alloc, None);
             }
         }
         Ok(())

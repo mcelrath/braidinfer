@@ -335,9 +335,12 @@ impl MegakernelProgram {
         let eps = cfg.rms_norm_eps;
 
         // 1. Pre-allocate N paged chunks (sub-memo Q8 invariant).
+        // No host tier at compile time: host_alloc is threaded through at the
+        // decode/prefill call sites that own the HostPageAllocator.  This compile
+        // path does not have access to it; VRAM exhaustion returns OutOfMemory.
         for i in 0..n {
             let pos = start_pos as i32 + i as i32;
-            seq.append_token(pos, allocator)?;
+            seq.append_token(pos, allocator, None)?;
         }
 
         // 2. Write host-mapped page_table_buf with chunk base pointers (NOT slot

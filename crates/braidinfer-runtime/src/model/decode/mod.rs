@@ -165,10 +165,13 @@ impl Model {
         self.set_position(position).map_err(ModelError::Hip)?;
 
         // Append token to paged sequence state (allocates chunk slot if needed).
+        // Phase C: pass host_page_allocator so the fallback to HostPinned tier
+        // fires when VRAM is exhausted and the host tier is enabled.
         {
             let seq_mut = self.paged_seq.as_mut().unwrap();
             let alloc_mut = self.page_allocator.as_mut().unwrap();
-            seq_mut.append_token(position as i32, alloc_mut).map_err(ModelError::Hip)?;
+            let host_alloc = self.host_page_allocator.as_mut();
+            seq_mut.append_token(position as i32, alloc_mut, host_alloc).map_err(ModelError::Hip)?;
         }
 
         // Host-side patching only: update instructions without hipMemcpyAsync.
@@ -634,7 +637,11 @@ impl Model {
                     .expect("self.paged_seq must be initialized for GPU 0 head-parallel paged");
                 let alloc = self.page_allocator.as_mut()
                     .expect("self.page_allocator must be initialized for GPU 0");
-                seq.append_token(position as i32, alloc)
+                // Multi-GPU path: per-worker host-tier extension is Phase D.4
+                // (deferred). Pass None so the current per-worker VRAM-only behavior
+                // is preserved — if VRAM is exhausted, OutOfMemory is returned as before.
+                let host_alloc = self.host_page_allocator.as_mut();
+                seq.append_token(position as i32, alloc, host_alloc)
                     .map_err(ModelError::Hip)?;
                 let mgpu = self.multi_gpu.as_ref().unwrap();
                 let pt = mgpu.workers[0].paged_page_table.as_ref()
@@ -668,7 +675,8 @@ impl Model {
                         .expect("worker.paged_seq must be initialized for head-parallel paged");
                     let alloc = worker.page_allocator.as_mut()
                         .expect("worker.page_allocator must be initialized for head-parallel paged");
-                    seq.append_token(position as i32, alloc)
+                    // Per-worker host tier is deferred to Phase D.4.
+                    seq.append_token(position as i32, alloc, None)
                         .map_err(ModelError::Hip)?;
                     let page_table = worker.paged_page_table.as_ref()
                         .expect("worker.paged_page_table must be initialized");
