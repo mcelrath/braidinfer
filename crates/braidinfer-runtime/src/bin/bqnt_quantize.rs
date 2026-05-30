@@ -434,7 +434,7 @@ fn main() {
             drop(bf16_data); // free conversion buffer
 
             writer
-                .write_tensor(name, fmt, out_dim as u32, in_dim as u32, ndim, &packed)
+                .write_tensor(name, braidinfer_runtime::bqnt::StorageDtype::from_weight_format(fmt), out_dim as u32, in_dim as u32, ndim, &packed)
                 .unwrap_or_else(|e| panic!("Failed to write tensor {name}: {e}"));
 
             tensor_count += 1;

@@ -485,7 +485,7 @@ fn host_bf16_quantize_upload_cache(
         WeightFormat::Bf16 => host_buf.iter().flat_map(|x| x.to_le_bytes()).collect(),
     };
     if let Some(w) = writer {
-        if let Err(e) = w.write_tensor(cache_name, fmt, out_dim as u32, in_dim as u32, 2, &packed) {
+        if let Err(e) = w.write_tensor(cache_name, crate::bqnt::StorageDtype::from_weight_format(fmt), out_dim as u32, in_dim as u32, 2, &packed) {
             eprintln!("bqnt: cache write failed for {cache_name}: {e}");
         }
     }
@@ -534,7 +534,7 @@ pub fn load_linear_weight_cached(
                 WeightFormat::Bf16 => unreachable!(),
             };
             writer
-                .write_tensor(name, format, out_dim as u32, in_dim as u32, 2, &packed)
+                .write_tensor(name, crate::bqnt::StorageDtype::from_weight_format(format), out_dim as u32, in_dim as u32, 2, &packed)
                 .map_err(|e| ModelError::MissingWeight(format!("bqnt write {name}: {e}")))?;
             let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len())?;
             buf.copy_from_host(&packed)?;
@@ -558,9 +558,15 @@ pub fn load_linear_weight_bqnt(
     let entry = bqnt
         .entry(name)
         .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
-    let format = code_to_format(entry.format).ok_or_else(|| {
-        ModelError::MissingWeight(format!("{name}: unknown format code {}", entry.format))
-    })?;
+    let format = code_to_format(entry.format)
+        .and_then(|s| s.to_weight_format())
+        .ok_or_else(|| {
+            ModelError::MissingWeight(format!(
+                "{name}: not a linear-weight format code {} (bd 4ayf: F32/non-linear tensors \
+                 load via load_weight_f32_bqnt, not the linear path)",
+                entry.format
+            ))
+        })?;
     let data = bqnt
         .tensor_data(name)
         .ok_or_else(|| ModelError::MissingWeight(format!("{name}: data out of bounds")))?;
@@ -704,8 +710,10 @@ fn load_latent_proj(
     // Try BQNT first
     if let Some(b) = bqnt {
         if let Some(entry) = b.entry(&tensor_name) {
-            let fmt = crate::bqnt::code_to_format(entry.format).ok_or_else(|| {
-                ModelError::InvalidConfig(format!("{tensor_name}: unknown bqnt format"))
+            let fmt = crate::bqnt::code_to_format(entry.format)
+                .and_then(|s| s.to_weight_format())
+                .ok_or_else(|| {
+                ModelError::InvalidConfig(format!("{tensor_name}: not a linear bqnt format"))
             })?;
             let out_dim = entry.out_features as usize;
             let in_dim = entry.in_features as usize;
@@ -922,7 +930,7 @@ fn load_moe_weights_inner(
                     let data = b.tensor_data(&name)?;
                     packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
                 }
-                let fmt = code_to_format(first_entry.format)?;
+                let fmt = code_to_format(first_entry.format).and_then(|s| s.to_weight_format())?;
                 let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
                 buf.copy_from_host(&packed).ok()?;
                 Some(LinearWeight::Packed(PackedWeights {
@@ -1007,7 +1015,7 @@ fn load_moe_weights_inner(
                     let data = b.tensor_data(&name)?;
                     packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
                 }
-                let fmt = code_to_format(first_entry.format)?;
+                let fmt = code_to_format(first_entry.format).and_then(|s| s.to_weight_format())?;
                 let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
                 buf.copy_from_host(&packed).ok()?;
                 Some(LinearWeight::Packed(PackedWeights {
@@ -1464,9 +1472,9 @@ pub fn distribute_moe_weights_from_bqnt(
         let entry = bqnt
             .entry(&probe_name)
             .ok_or_else(|| ModelError::MissingWeight(probe_name.clone()))?;
-        crate::bqnt::code_to_format(entry.format).ok_or_else(|| {
+        crate::bqnt::code_to_format(entry.format).and_then(|s| s.to_weight_format()).ok_or_else(|| {
             ModelError::MissingWeight(format!(
-                "{probe_name}: unknown bqnt format code {}",
+                "{probe_name}: not a linear bqnt format code {}",
                 entry.format
             ))
         })?

@@ -12,6 +12,39 @@ use memmap2::Mmap;
 
 use crate::quant::WeightFormat;
 
+/// bd 4ayf: the dtype a tensor is STORED as in the bqnt — distinct from `WeightFormat`
+/// (the linear-kernel format). The three quantized/bf16 LINEAR formats map 1:1 to
+/// `WeightFormat`; `F32` is a raw-f32 storage dtype for non-linear tensors (norms, GDN/Mamba2
+/// recurrent state read via `load_weight_f32_bqnt`) that are NEVER a `LinearWeight` — so F32
+/// has no `WeightFormat`. This keeps F32 out of every linear-kernel match.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum StorageDtype {
+    Bf16,
+    PcG32Q4,
+    Rnf4G128,
+    F32,
+}
+
+impl StorageDtype {
+    /// Linear-kernel `WeightFormat` for the 3 linear storage dtypes; `None` for `F32`
+    /// (an F32-stored tensor is never a linear weight).
+    pub fn to_weight_format(self) -> Option<WeightFormat> {
+        match self {
+            StorageDtype::Bf16 => Some(WeightFormat::Bf16),
+            StorageDtype::PcG32Q4 => Some(WeightFormat::PcG32Q4),
+            StorageDtype::Rnf4G128 => Some(WeightFormat::Rnf4G128),
+            StorageDtype::F32 => None,
+        }
+    }
+    pub fn from_weight_format(f: WeightFormat) -> Self {
+        match f {
+            WeightFormat::Bf16 => StorageDtype::Bf16,
+            WeightFormat::PcG32Q4 => StorageDtype::PcG32Q4,
+            WeightFormat::Rnf4G128 => StorageDtype::Rnf4G128,
+        }
+    }
+}
+
 const MAGIC: u32 = 0x544E5142; // "BQNT" little-endian
 const VERSION: u32 = 1;
 const HEADER_SIZE: u64 = 32;
@@ -28,21 +61,23 @@ pub fn fnv1a_64(s: &str) -> u64 {
     hash
 }
 
-/// Format code in the file.
-fn format_to_code(f: WeightFormat) -> u8 {
+/// Storage-dtype code in the file.
+fn format_to_code(f: StorageDtype) -> u8 {
     match f {
-        WeightFormat::Bf16 => 0,
-        WeightFormat::PcG32Q4 => 1,
-        WeightFormat::Rnf4G128 => 2,
+        StorageDtype::Bf16 => 0,
+        StorageDtype::PcG32Q4 => 1,
+        StorageDtype::Rnf4G128 => 2,
+        StorageDtype::F32 => 3,
     }
 }
 
-/// Format code back to enum.
-pub fn code_to_format(code: u8) -> Option<WeightFormat> {
+/// Storage-dtype code back to enum.
+pub fn code_to_format(code: u8) -> Option<StorageDtype> {
     match code {
-        0 => Some(WeightFormat::Bf16),
-        1 => Some(WeightFormat::PcG32Q4),
-        2 => Some(WeightFormat::Rnf4G128),
+        0 => Some(StorageDtype::Bf16),
+        1 => Some(StorageDtype::PcG32Q4),
+        2 => Some(StorageDtype::Rnf4G128),
+        3 => Some(StorageDtype::F32),
         _ => None,
     }
 }
@@ -60,29 +95,34 @@ pub struct TensorEntry {
 }
 
 /// Compute packed data size for a tensor at given format.
-pub fn packed_size(format: WeightFormat, out_dim: usize, in_dim: usize) -> usize {
+pub fn packed_size(format: StorageDtype, out_dim: usize, in_dim: usize) -> usize {
     match format {
-        WeightFormat::Bf16 => out_dim * in_dim * 2,
-        WeightFormat::PcG32Q4 => {
+        StorageDtype::Bf16 => out_dim * in_dim * 2,
+        StorageDtype::F32 => out_dim * in_dim * 4,
+        StorageDtype::PcG32Q4 => {
             let groups = (in_dim + 31) / 32;
             out_dim * groups * 20
         }
-        WeightFormat::Rnf4G128 => {
+        StorageDtype::Rnf4G128 => {
             let groups = (in_dim + 127) / 128;
             out_dim * groups * 132
         }
     }
 }
 
-fn checked_packed_size(format: WeightFormat, out_dim: u32, in_dim: u32) -> io::Result<u64> {
+fn checked_packed_size(format: StorageDtype, out_dim: u32, in_dim: u32) -> io::Result<u64> {
     let out_dim = out_dim as u64;
     let in_dim = in_dim as u64;
     match format {
-        WeightFormat::Bf16 => out_dim
+        StorageDtype::Bf16 => out_dim
             .checked_mul(in_dim)
             .and_then(|x| x.checked_mul(2))
             .ok_or_else(|| invalid_data("bf16 packed size overflows")),
-        WeightFormat::PcG32Q4 => {
+        StorageDtype::F32 => out_dim
+            .checked_mul(in_dim)
+            .and_then(|x| x.checked_mul(4))
+            .ok_or_else(|| invalid_data("f32 packed size overflows")),
+        StorageDtype::PcG32Q4 => {
             let groups = in_dim
                 .checked_add(31)
                 .map(|x| x / 32)
@@ -92,7 +132,7 @@ fn checked_packed_size(format: WeightFormat, out_dim: u32, in_dim: u32) -> io::R
                 .and_then(|x| x.checked_mul(20))
                 .ok_or_else(|| invalid_data("pcg32 packed size overflows"))
         }
-        WeightFormat::Rnf4G128 => {
+        StorageDtype::Rnf4G128 => {
             let groups = in_dim
                 .checked_add(127)
                 .map(|x| x / 128)
@@ -142,7 +182,7 @@ impl BqntWriter {
     pub fn write_tensor(
         &mut self,
         name: &str,
-        format: WeightFormat,
+        format: StorageDtype,
         out_features: u32,
         in_features: u32,
         ndim: u32,
@@ -464,8 +504,8 @@ mod tests {
         // gate at bqnt.rs:402.
         let path = temp_path("dup-hash");
         let mut w = BqntWriter::create(&path, 2).unwrap();
-        w.write_tensor("a", WeightFormat::Bf16, 1, 1, 2, &[0, 0]).unwrap();
-        w.write_tensor("b", WeightFormat::Bf16, 1, 1, 2, &[0, 0]).unwrap();
+        w.write_tensor("a", StorageDtype::Bf16, 1, 1, 2, &[0, 0]).unwrap();
+        w.write_tensor("b", StorageDtype::Bf16, 1, 1, 2, &[0, 0]).unwrap();
         w.finish("{}").unwrap();
 
         let mut bytes = std::fs::read(&path).unwrap();
@@ -492,7 +532,7 @@ mod tests {
         let path = temp_path("bad-meta");
         let mut writer = BqntWriter::create(&path, 64).unwrap();
         writer
-            .write_tensor("x", WeightFormat::Bf16, 1, 1, 2, &[0, 0])
+            .write_tensor("x", StorageDtype::Bf16, 1, 1, 2, &[0, 0])
             .unwrap();
         writer.finish("{}").unwrap();
 
@@ -519,7 +559,7 @@ mod tests {
         // validation reaches the ranges_overlap gate at bqnt.rs:395.
         let path = temp_path("metadata-overlap");
         let mut w = BqntWriter::create(&path, 1).unwrap();
-        w.write_tensor("x", WeightFormat::Bf16, 1, 1, 2, &[0, 0]).unwrap();
+        w.write_tensor("x", StorageDtype::Bf16, 1, 1, 2, &[0, 0]).unwrap();
         w.finish("{}").unwrap();
 
         let mut bytes = std::fs::read(&path).unwrap();
