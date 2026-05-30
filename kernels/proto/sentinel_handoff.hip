@@ -30,6 +30,12 @@
 
 namespace cg = cooperative_groups;
 
+// braidinfer-g1wv A/B: also benchmark the PRODUCTION barrier (atomic_block_barrier,
+// ~96 cyc) — NOT just grid.sync (~5047) — so we compare the sentinel against what
+// braidinfer actually uses, not the slow cg path.
+#include "../rdna3/rdna3_barrier.h"  // braidinfer::rdna3::atomic_block_barrier + GridBarrierState
+__device__ braidinfer::rdna3::GridBarrierState g_proto_gbs;
+
 static const unsigned int SENTINEL = 0x7fc00000u; // canonical qNaN bit pattern
 
 __device__ __forceinline__ unsigned int load_agent(const unsigned int* p) {
@@ -75,6 +81,21 @@ __global__ void handoff_sentinel(float* slots, float* results, int n,
     }
 }
 
+// braidinfer's PRODUCTION barrier — the real A/B baseline (NOT grid.sync).
+// atomic_block_barrier is the per-instruction barrier dispatch_opcode emits between
+// ops, including QKV->attention. write slots[i] -> atomic_block_barrier -> read neighbor.
+__global__ void handoff_atomic_barrier(float* slots, float* results, int n,
+                                       unsigned long long* span) {
+    int b = blockIdx.x;
+    unsigned long long t0 = wall_clock64();
+    if (threadIdx.x == 0) ((volatile float*)slots)[b] = (float)(b + 1);
+    braidinfer::rdna3::atomic_block_barrier(&g_proto_gbs);
+    if (threadIdx.x == 0) {
+        results[b] = ((volatile float*)slots)[(b + 1) % n];
+        span[b] = wall_clock64() - t0;
+    }
+}
+
 #define CHECK(x) do { hipError_t e = (x); if (e != hipSuccess) { \
     printf("HIP error %s at %s:%d\n", hipGetErrorString(e), __FILE__, __LINE__); \
     return 2; } } while (0)
@@ -100,7 +121,7 @@ int main(int argc, char** argv) {
     std::vector<unsigned long long> h_span(N);
     { float f; __builtin_memcpy(&f, &SENTINEL, 4); std::fill(h_nan.begin(), h_nan.end(), f); }
 
-    auto run = [&](bool sentinel, const char* name) -> int {
+    auto run = [&](void* kern, bool sentinel, const char* name) -> int {
         int total_err = 0;
         std::vector<unsigned long long> means; means.reserve(TRIALS);
         unsigned long long worst = 0;
@@ -111,7 +132,7 @@ int main(int argc, char** argv) {
             CHECK(hipMemcpy(d_results, h_zero.data(), N * sizeof(float), hipMemcpyHostToDevice));
             void* args[] = { &d_slots, &d_results, &N, &d_span };
             CHECK(hipLaunchCooperativeKernel(
-                sentinel ? (void*)handoff_sentinel : (void*)handoff_barrier,
+                kern,
                 dim3(N), dim3(THREADS), args, 0, 0));
             CHECK(hipDeviceSynchronize());
             CHECK(hipMemcpy(h_results.data(), d_results, N * sizeof(float), hipMemcpyDeviceToHost));
@@ -134,8 +155,10 @@ int main(int argc, char** argv) {
     };
 
     printf("--- handoff: ring producer→consumer, N cold trials ---\n");
-    int eb = run(false, "barrier");
-    int es = run(true,  "sentinel");
+    int eb = run((void*)handoff_barrier,        false, "grid.sync");
+    int ea = run((void*)handoff_atomic_barrier, false, "atomic_barr");  // braidinfer's real barrier
+    int es = run((void*)handoff_sentinel,       true,  "sentinel");
+    (void)ea;
 
     hipFree(d_slots); hipFree(d_results); hipFree(d_span);
     if (es == 0 && eb == 0) { printf("PASS — both correct; sentinel handoff works without a barrier on gfx1100\n"); return 0; }
