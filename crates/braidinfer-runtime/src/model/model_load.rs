@@ -279,6 +279,17 @@ impl Model {
             }
             crate::weights::load_weight_bf16(&st, name, device, len)
         };
+        // bd 4ayf A3.2: bqnt-first f32 loader (mirrors load_weight_f32's dtype-flexibility:
+        // F32 storage direct, Bf16 storage widened). For the GDN/Mamba2 recurrent-state +
+        // f32-read norm tensors A2 stores in the bqnt. st = legacy fallback.
+        let load_f32 = |name: &str, len: usize| -> Result<DeviceBuffer<f32>, ModelError> {
+            if let Some(ref b) = bqnt {
+                if let Ok(w) = crate::weights::load_weight_f32_bqnt(b, name, device, len) {
+                    return Ok(w);
+                }
+            }
+            crate::weights::load_weight_f32(&st, name, device, len)
+        };
         let embed_weight = load_bf16(&embed_name, config.vocab_size * config.hidden_size)?;
         let lm_head_weight = if config.tie_word_embeddings {
             // Weight-tied: reuse embed_weight pointer (allocate a dummy — the megakernel uses embed_weight)
@@ -395,29 +406,14 @@ impl Model {
                     ],
                 )?;
                 let w = Mamba2LayerWeights {
-                    input_norm: load_weight_bf16(&st, &norm_name, device, hs)?,
+                    input_norm: load_bf16(&norm_name, hs)?,
                     in_proj: load_lw(&format!("{p}mixer.in_proj.weight"), in_proj_size, hs)?,
-                    conv1d_weight: load_weight_bf16(
-                        &st,
-                        &format!("{p}mixer.conv1d.weight"),
-                        device,
-                        cd * ck,
-                    )?,
-                    conv1d_bias: load_weight_f32(
-                        &st,
-                        &format!("{p}mixer.conv1d.bias"),
-                        device,
-                        cd,
-                    )?,
-                    dt_bias: load_weight_f32(&st, &format!("{p}mixer.dt_bias"), device, nh)?,
-                    a_log: load_weight_f32(&st, &format!("{p}mixer.A_log"), device, nh)?,
-                    d: load_weight_f32(&st, &format!("{p}mixer.D"), device, nh)?,
-                    norm_weight: load_weight_f32(
-                        &st,
-                        &format!("{p}mixer.norm.weight"),
-                        device,
-                        intermediate,
-                    )?,
+                    conv1d_weight: load_bf16(&format!("{p}mixer.conv1d.weight"), cd * ck)?,
+                    conv1d_bias: load_f32(&format!("{p}mixer.conv1d.bias"), cd)?,
+                    dt_bias: load_f32(&format!("{p}mixer.dt_bias"), nh)?,
+                    a_log: load_f32(&format!("{p}mixer.A_log"), nh)?,
+                    d: load_f32(&format!("{p}mixer.D"), nh)?,
+                    norm_weight: load_f32(&format!("{p}mixer.norm.weight"), intermediate)?,
                     out_proj: load_lw(&format!("{p}mixer.out_proj.weight"), hs, intermediate)?,
                 };
                 layers.push(LayerWeights::Mamba2(w));
@@ -432,7 +428,7 @@ impl Model {
                     ],
                 )?;
                 let w = MoeFfnLayerWeights {
-                    input_norm: load_weight_bf16(&st, &norm_name, device, hs)?,
+                    input_norm: load_bf16(&norm_name, hs)?,
                 };
                 layers.push(LayerWeights::MoeFfn(w));
                 // Load MoE weights — Nemotron uses mixer.gate/mixer.experts instead of mlp.gate/mlp.experts
@@ -495,8 +491,7 @@ impl Model {
                 let hs = config.hidden_size;
                 let q_mult = if has_output_gate { 2 } else { 1 };
                 let w = AttentionLayerWeights {
-                    input_norm: load_weight_bf16(
-                        &st,
+                    input_norm: load_bf16(
                         &find_weight_name(
                             &st,
                             &[
@@ -504,7 +499,6 @@ impl Model {
                                 format!("{p}norm.weight"),
                             ],
                         )?,
-                        device,
                         hs,
                     )?,
                     w_q_gate: load_lw(
@@ -556,7 +550,7 @@ impl Model {
                         let raw = st
                             .tensor_data(&name)
                             .map_err(|_| ModelError::MissingWeight(name.clone()))?;
-                        load_weight_bf16(&st, &name, device, raw.len() / 2)?
+                        load_bf16(&name, raw.len() / 2)?
                     } else {
                         DeviceBuffer::<u16>::alloc(device, 0)?
                     },
@@ -565,7 +559,7 @@ impl Model {
                         let raw = st
                             .tensor_data(&name)
                             .map_err(|_| ModelError::MissingWeight(name.clone()))?;
-                        load_weight_bf16(&st, &name, device, raw.len() / 2)?
+                        load_bf16(&name, raw.len() / 2)?
                     } else {
                         DeviceBuffer::<u16>::alloc(device, 0)?
                     },
@@ -573,7 +567,7 @@ impl Model {
                         let name =
                             find_weight_name(&st, &[format!("{p}post_attention_layernorm.weight")]);
                         if let Ok(n) = name {
-                            load_weight_bf16(&st, &n, device, hs)?
+                            load_bf16(&n, hs)?
                         } else {
                             DeviceBuffer::<u16>::alloc(device, 0)?
                         } // no post-norm (Nemotron * layers)
@@ -687,12 +681,7 @@ impl Model {
                 conv_w_v_buf.copy_from_host(&conv_raw[2 * q_dim * ck..])?;
                 let hs = config.hidden_size;
                 let w = GdnLayerWeights {
-                    input_norm: load_weight_bf16(
-                        &st,
-                        &format!("{p}input_layernorm.weight"),
-                        device,
-                        hs,
-                    )?,
+                    input_norm: load_bf16(&format!("{p}input_layernorm.weight"), hs)?,
                     w_qkv: load_lw(&format!("{p}linear_attn.in_proj_qkv.weight"), qkv_out, hs)?,
                     w_a: load_lw(&format!("{p}linear_attn.in_proj_a.weight"), nvh, hs)?,
                     w_b: load_lw(&format!("{p}linear_attn.in_proj_b.weight"), nvh, hs)?,
@@ -700,26 +689,11 @@ impl Model {
                     conv1d_weight_q: conv_w_q_buf,
                     conv1d_weight_k: conv_w_k_buf,
                     conv1d_weight_v: conv_w_v_buf,
-                    a_log: load_weight_f32(&st, &format!("{p}linear_attn.A_log"), device, nvh)?,
-                    dt_bias: load_weight_bf16(
-                        &st,
-                        &format!("{p}linear_attn.dt_bias"),
-                        device,
-                        nvh,
-                    )?,
-                    output_norm: load_weight_f32(
-                        &st,
-                        &format!("{p}linear_attn.norm.weight"),
-                        device,
-                        vd,
-                    )?, // normalizes [nvh, vd] output
+                    a_log: load_f32(&format!("{p}linear_attn.A_log"), nvh)?,
+                    dt_bias: load_bf16(&format!("{p}linear_attn.dt_bias"), nvh)?,
+                    output_norm: load_f32(&format!("{p}linear_attn.norm.weight"), vd)?, // normalizes [nvh, vd] output
                     w_out: load_lw(&format!("{p}linear_attn.out_proj.weight"), hs, z_out)?,
-                    post_norm: load_weight_bf16(
-                        &st,
-                        &format!("{p}post_attention_layernorm.weight"),
-                        device,
-                        hs,
-                    )?,
+                    post_norm: load_bf16(&format!("{p}post_attention_layernorm.weight"), hs)?,
                     w_gate: if !is_moe {
                         load_lw(
                             &format!("{p}mlp.gate_proj.weight"),
