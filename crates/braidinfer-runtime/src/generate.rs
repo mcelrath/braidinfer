@@ -97,6 +97,70 @@ impl TokenConfig {
         }
     }
 
+    /// bd 4ayf A3.2.3b: token config from the bqnt's embedded metadata (model_config for
+    /// eos/bos, chat_template, tokenizer_config) — no HF dir needed. Mirrors from_model_dir.
+    pub fn from_bqnt(bqnt: &crate::bqnt::MmapBqnt, tokenizer: &Tokenizer) -> Self {
+        let meta: serde_json::Value = bqnt
+            .metadata()
+            .ok()
+            .and_then(|m| serde_json::from_str(&m).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let cfg = meta.get("model_config").cloned().unwrap_or(serde_json::Value::Null);
+
+        let im_start_id = tokenizer.token_to_id("<|im_start|>");
+        let im_end_id = tokenizer.token_to_id("<|im_end|>");
+        let endoftext_id = tokenizer.token_to_id("<|endoftext|>");
+        let mut eos_token_ids = Vec::new();
+        if let Some(id) = im_end_id {
+            eos_token_ids.push(id);
+        }
+        if let Some(id) = endoftext_id {
+            eos_token_ids.push(id);
+        }
+        if let Some(val) = cfg
+            .pointer("/text_config/eos_token_id")
+            .or_else(|| cfg.get("eos_token_id"))
+        {
+            let ids: Vec<u32> = if let Some(n) = val.as_u64() {
+                vec![n as u32]
+            } else if let Some(arr) = val.as_array() {
+                arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect()
+            } else {
+                vec![]
+            };
+            for eos in ids {
+                if !eos_token_ids.contains(&eos) {
+                    eos_token_ids.push(eos);
+                }
+            }
+        }
+        // chat_template: A2 stores it as a top-level metadata field; else tokenizer_config.
+        let chat_template = meta
+            .get("chat_template")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                meta.get("tokenizer_config")
+                    .and_then(|tc| tc.get("chat_template"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+        let bos_token_id = cfg
+            .get("bos_token_id")
+            .and_then(|v| v.as_u64().map(|n| n as u32))
+            .or_else(|| {
+                cfg.pointer("/text_config/bos_token_id")
+                    .and_then(|v| v.as_u64().map(|n| n as u32))
+            });
+        TokenConfig {
+            im_start_id,
+            im_end_id,
+            eos_token_ids,
+            bos_token_id,
+            chat_template,
+        }
+    }
+
     pub fn is_stop_token(&self, token: u32) -> bool {
         self.eos_token_ids.contains(&token)
     }
@@ -114,6 +178,22 @@ pub fn load_tokenizer(model_dir: &Path) -> Result<Tokenizer, Box<dyn std::error:
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| format!("failed to load tokenizer from {:?}: {}", tokenizer_path, e))?;
     Ok(tokenizer)
+}
+
+/// bd 4ayf A3.2.3b: load the tokenizer from the bqnt's embedded `tokenizer_json` metadata
+/// (no HF dir). Returns an error if the bqnt predates the v2 self-contained format.
+pub fn load_tokenizer_from_bqnt(
+    bqnt: &crate::bqnt::MmapBqnt,
+) -> Result<Tokenizer, Box<dyn std::error::Error>> {
+    let meta = bqnt.metadata()?;
+    let v: serde_json::Value = serde_json::from_str(&meta)?;
+    let tj = v
+        .get("tokenizer_json")
+        .filter(|x| !x.is_null())
+        .ok_or("bqnt has no embedded tokenizer_json (regenerate with the v2 quantizer)")?;
+    let tj_str = serde_json::to_string(tj)?;
+    Tokenizer::from_bytes(tj_str.as_bytes())
+        .map_err(|e| format!("failed to parse embedded tokenizer: {e}").into())
 }
 
 /// Apply chat template using the model's Jinja2 template.
