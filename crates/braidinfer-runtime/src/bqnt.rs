@@ -681,6 +681,16 @@ impl MmapBqnt {
         }
     }
 
+    /// bd 4ayf A3.2.3: all tensor names, from the bd-6n01 name_table. Empty if the bqnt
+    /// predates the name_table (v1) — callers then fall back to the HF safetensors dir.
+    /// Lets model_load discover prefixes + features without `st.tensor_names()`.
+    pub fn tensor_names(&self) -> Vec<String> {
+        self.name_table
+            .as_ref()
+            .map(|t| t.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
     /// Look up a tensor entry by name.
     pub fn entry(&self, name: &str) -> Option<&TensorEntry> {
         self.header.get(name)

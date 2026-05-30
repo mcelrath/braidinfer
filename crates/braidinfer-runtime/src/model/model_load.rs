@@ -185,7 +185,13 @@ impl Model {
         // Discover tensor name prefix by finding "layers.0." in tensor names.
         // Prefer prefixes containing "model" to avoid matching MTP/draft heads.
         let prefix = {
-            let names = st.tensor_names();
+            // bd 4ayf A3.2.3: discover names from the bqnt name_table (no HF dir needed);
+            // fall back to safetensors for old (pre-name_table) bqnts or no bqnt.
+            let names: Vec<String> = bqnt
+                .as_ref()
+                .map(|b| b.tensor_names())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| st.tensor_names().iter().map(|s| s.to_string()).collect());
             let candidates: Vec<&str> = names
                 .iter()
                 .filter(|n| n.contains("layers.0."))
@@ -203,8 +209,12 @@ impl Model {
         let stream = Stream::new(device)?;
         let kernels = AllKernels::load(device)?;
 
-        // Discover model features from tensor names
-        let names = st.tensor_names();
+        // Discover model features from tensor names (bd 4ayf A3.2.3: bqnt name_table first).
+        let names: Vec<String> = bqnt
+            .as_ref()
+            .map(|b| b.tensor_names())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| st.tensor_names().iter().map(|s| s.to_string()).collect());
         let has_qk_norm = names.iter().any(|n| n.contains("q_norm.weight"));
         config.has_qk_norm = has_qk_norm;
 
