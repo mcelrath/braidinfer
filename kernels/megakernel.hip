@@ -36,7 +36,6 @@ __device__ static uint32_t g_shutdown_seen;
 // Main megakernel entry point
 // ============================================================
 
-#define INST_SIZE 18  // 18 u64s per instruction = 144 bytes
 
 // ---- persistent_worker entry point (zqw merge) ----
 // Persistent cooperative worker kernel: polls host-mapped WorkerQueue for
