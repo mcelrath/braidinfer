@@ -9,7 +9,7 @@ use std::time::Instant;
 use safetensors::{Dtype, SafeTensors};
 use serde_json::json;
 
-use braidinfer_runtime::bqnt::BqntWriter;
+use braidinfer_runtime::bqnt::{BqntWriter, StorageDtype};
 use braidinfer_runtime::quant::{self, WeightFormat};
 
 /// Convert FP8_E4M3 byte to f32.
@@ -108,10 +108,14 @@ fn bf16_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Patterns for tensors that must stay bf16 (router weights).
+/// Patterns for tensors stored bf16 (not quantized): router weights, and (bd 4ayf)
+/// embeddings + lm_head — the loader reads these via `load_weight_bf16`, so storing them
+/// bf16 (instead of Q4) lets the loader source them from the bqnt with no Q4-embed path.
 const BF16_PATTERNS: &[&str] = &[
     "gate.weight",             // MoE router gate
     "e_score_correction_bias", // Nemotron router bias
+    "embed_tokens.weight",     // bd 4ayf: embeddings read bf16 by the loader
+    "lm_head.weight",          // bd 4ayf: untied lm_head read bf16 by the loader
 ];
 
 /// Patterns for tensors to skip (not weight matrices).
@@ -281,13 +285,14 @@ fn main() {
             let tensor = safetensors.tensor(name).unwrap();
             let shape = tensor.shape();
 
-            if shape.len() < 2 || should_skip(name) {
-                continue;
-            }
-
             let ndim = shape.len() as u32;
+            if ndim == 0 {
+                continue; // 0-D scalar: not a loaded model weight
+            }
             // For 3D fused expert tensors [ne, inner, hidden], reshape to [ne*inner, hidden]
             // so quantization groups align with per-row dequantization in GPU kernels.
+            // For 1D tensors (norms, biases, recurrent state), out=numel, in=1 (bd 4ayf:
+            // empty shape[1..].product() == 1, matching the entry-check convention).
             let (out_dim, in_dim) = if ndim == 3 {
                 (shape[0] * shape[1], shape[2])
             } else {
@@ -296,8 +301,31 @@ fn main() {
             let n_elements = out_dim * in_dim;
             total_params += n_elements as u64;
 
-            // Determine format for this tensor
-            let fmt = if should_bf16(name) {
+            // bd 4ayf A2: non-quantized tensors (1D, or SKIP_PATTERNS — norms / recurrent state /
+            // scales) are STORED, not skipped, so the loader sources every weight from the bqnt.
+            // F32-source ones are stored F32 (lossless; read by load_weight_f32_bqnt). bf16/f16/fp8
+            // ones fall through to the bf16 path below (forced to fmt=Bf16, not quantized).
+            let non_quantized = ndim < 2 || should_skip(name);
+            if non_quantized && tensor.dtype() == Dtype::F32 {
+                let raw = tensor.data();
+                writer
+                    .write_tensor(
+                        name,
+                        StorageDtype::F32,
+                        out_dim as u32,
+                        in_dim as u32,
+                        ndim,
+                        &raw[..n_elements * 4],
+                    )
+                    .unwrap_or_else(|e| panic!("Failed to write F32 tensor {name}: {e}"));
+                bf16_params += n_elements as u64;
+                tensor_count += 1;
+                continue;
+            }
+
+            // Determine format for this tensor. bd 4ayf: non-quantized (norm/recurrent/1D,
+            // non-F32) tensors are stored bf16 (forced here), reusing the bf16 conversion below.
+            let fmt = if should_bf16(name) || non_quantized {
                 WeightFormat::Bf16
             } else if is_mixed {
                 // Mixed: MLP/experts at Q4, attention/GDN at Q8 (RNF4)
@@ -465,11 +493,36 @@ fn main() {
         })
         .unwrap_or(serde_json::Value::Null);
 
+    // bd 4ayf A2: embed tokenizer + chat_template + tokenizer_config so the bqnt is
+    // self-contained for inference (no HF dir). The loader (A3) reads these from metadata
+    // first; HF dir is the legacy fallback. tokenizer.json is embedded as nested JSON
+    // (parsed back + Tokenizer::from_str at load).
+    let tokenizer_json: serde_json::Value =
+        std::fs::read_to_string(model_dir.join("tokenizer.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+    let tokenizer_config: serde_json::Value =
+        std::fs::read_to_string(model_dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+    // chat_template: prefer the standalone .jinja, else tokenizer_config.json's field.
+    let chat_template: serde_json::Value =
+        std::fs::read_to_string(model_dir.join("chat_template.jinja"))
+            .ok()
+            .map(serde_json::Value::String)
+            .or_else(|| tokenizer_config.get("chat_template").cloned())
+            .unwrap_or(serde_json::Value::Null);
+
     let metadata = json!({
         "model_name": model_name,
-        "quantizer_version": "braidinfer-bqnt-v1",
+        "quantizer_version": "braidinfer-bqnt-v2", // bd 4ayf: self-contained (weights+tokenizer+config)
         "default_format": format_str,
         "model_config": config_json,
+        "tokenizer_json": tokenizer_json,
+        "tokenizer_config": tokenizer_config,
+        "chat_template": chat_template,
         "quantization_stats": {
             "total_params": total_params,
             "quantized_params": quantized_params,
