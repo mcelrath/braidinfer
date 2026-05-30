@@ -164,7 +164,11 @@ __device__ __forceinline__ void watchdog_signal_exited(WatchdogState* ws) {
 // K=100 at s_sleep(1) ≈ 1µs/iteration → one SYSTEM-scope store per 100µs.
 // Host thread declares no-progress if counter unchanged for WATCHDOG_NO_PROGRESS_MS (default 2s).
 __device__ __forceinline__ void watchdog_beat(WatchdogState* ws, uint32_t* local_counter) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
+    // Null-safe per the documented contract ("pass nullptr to disable"): guard the
+    // ws write on ws != null. Callers in megakernel.hip already gate on `if(watchdog)`,
+    // but am-rs (2026-05-30) hit a write-to-VA-0 driving persistent_worker with a null
+    // watchdog kernarg — so make the primitive itself null-safe (matches watchdog_init).
+    if (ws && threadIdx.x == 0 && blockIdx.x == 0) {
         uint32_t c = ++(*local_counter);
         // srg6.22 GAP-1 fix: flush on the FIRST beat (c==1), not only every
         // 100th. The host watchdog gates no-progress enforcement on
