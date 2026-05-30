@@ -387,7 +387,30 @@ impl Model {
                             );
                         }
                     }
-                    load_linear_weight(&st, name, device, out_dim, in_dim, wq)
+                    // use_quant==false (WEIGHT_QUANT_LAYERS-excluded, wants bf16) or the bqnt
+                    // lacked the tensor: load from st. bd 4ayf.6: if st can't provide it
+                    // (empty-HF_HOME), fall back to the bqnt's stored (quantized) copy — an
+                    // excluded layer then loads quantized instead of bf16, so warn.
+                    match load_linear_weight(&st, name, device, out_dim, in_dim, wq) {
+                        Ok(lw) => Ok(lw),
+                        Err(e) => {
+                            if let Some(ref b) = bqnt {
+                                if let Ok(lw) =
+                                    crate::weights::load_linear_weight_bqnt(b, name, device)
+                                {
+                                    if !use_quant {
+                                        eprintln!(
+                                            "WARNING (bd 4ayf.6): {name} is WEIGHT_QUANT_LAYERS-\
+                                             excluded (wanted bf16) but no HF dir is available — \
+                                             loading the bqnt's quantized copy instead."
+                                        );
+                                    }
+                                    return Ok(lw);
+                                }
+                            }
+                            Err(e)
+                        }
+                    }
                 };
             let layer_type = &config.layers[i].layer_type;
             if *layer_type == LayerType::Mamba2 {
