@@ -354,6 +354,32 @@ impl Model {
         let mut moe_weights_vec: Vec<Option<MoeWeights>> =
             (0..config.num_layers).map(|_| None).collect();
         let is_caching = save_bqnt_path.is_some() && bqnt_writer.borrow().is_some();
+
+        // bd 4ayf B1: bulk-load arena (single-GPU + bqnt present). One VRAM block = the bqnt
+        // data section, filled by a SINGLE hipMemcpy; quantized linear weights (via load_lw)
+        // become non-owning views into it (arena_view = (base_ptr, data_start)). Multi-GPU (B2,
+        // deferred) + quantize-at-load keep per-tensor copies (arena_view = None). The arena is
+        // moved into Model below — the VRAM pointer survives the struct move — and outlives the
+        // views (which are non-owning, Drop no-op).
+        let (weight_arena, arena_view): (Option<DeviceBuffer<u8>>, Option<(*const u8, u64)>) =
+            if !multi_gpu {
+                match bqnt.as_ref().and_then(|b| b.data_section()) {
+                    Some((data_start, span)) => {
+                        let mut arena = DeviceBuffer::<u8>::alloc(device, span.len())?;
+                        arena.copy_from_host(span)?;
+                        let ptr = arena.as_ptr();
+                        eprintln!(
+                            "bd 4ayf B1: weight arena {} MiB, single bulk copy",
+                            span.len() / (1024 * 1024)
+                        );
+                        (Some(arena), Some((ptr, data_start)))
+                    }
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
         for i in 0..config.num_layers {
             if is_caching {
                 eprint!("\rQuantizing layer {}/{} ...", i + 1, config.num_layers);
@@ -369,7 +395,7 @@ impl Model {
                 |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
                     if use_quant {
                         if let Some(ref b) = bqnt {
-                            if let Ok(lw) = crate::weights::load_linear_weight_bqnt(b, name, device)
+                            if let Ok(lw) = crate::weights::load_linear_weight_bqnt(b, name, device, arena_view)
                             {
                                 return Ok(lw);
                             }
@@ -396,7 +422,7 @@ impl Model {
                         Err(e) => {
                             if let Some(ref b) = bqnt {
                                 if let Ok(lw) =
-                                    crate::weights::load_linear_weight_bqnt(b, name, device)
+                                    crate::weights::load_linear_weight_bqnt(b, name, device, arena_view)
                                 {
                                     if !use_quant {
                                         eprintln!(
@@ -1167,6 +1193,7 @@ impl Model {
             final_norm_weight,
             layers,
             moe_weights: moe_weights_vec,
+            weight_arena, // bd 4ayf B1: owns the bulk-load arena; outlives the weight views
             activations,
             gdn_conv_states,
             prefill_bufs: None,

@@ -756,6 +756,26 @@ impl MmapBqnt {
             })
     }
 
+    /// bd 4ayf B1: the contiguous tensor-data span `[data_start, data_end)` for bulk-loading
+    /// into a VRAM arena, plus `data_start`. `data_start` = min `entry.data_offset`;
+    /// `data_end` = max(`data_offset` + `data_bytes`) — excludes the trailing metadata JSON
+    /// (review C3). A weight at `entry.data_offset` maps to arena byte `data_offset - data_start`.
+    pub fn data_section(&self) -> Option<(u64, &[u8])> {
+        let start = self.header.entries.values().map(|e| e.data_offset).min()?;
+        let end = self
+            .header
+            .entries
+            .values()
+            .map(|e| e.data_offset + e.data_bytes)
+            .max()?;
+        let (s, e) = (start as usize, end as usize);
+        if s <= e && e <= self.mmap.len() {
+            Some((start, &self.mmap[s..e]))
+        } else {
+            None
+        }
+    }
+
     /// Read JSON metadata.
     pub fn metadata(&self) -> io::Result<String> {
         let start = self.header.metadata_offset as usize;

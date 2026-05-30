@@ -559,6 +559,10 @@ pub fn load_linear_weight_bqnt(
     bqnt: &MmapBqnt,
     name: &str,
     device: DeviceId,
+    // bd 4ayf B1: (arena_base_ptr, data_start). When present, a Packed weight becomes a
+    // non-owning VIEW into the bulk-load arena at arena_base + (data_offset - data_start) —
+    // no per-tensor copy. None = per-tensor alloc+copy (multi-GPU/fused/quantize-at-load).
+    arena: Option<(*const u8, u64)>,
 ) -> Result<LinearWeight, ModelError> {
     let entry = bqnt
         .entry(name)
@@ -586,10 +590,20 @@ pub fn load_linear_weight_bqnt(
             Ok(LinearWeight::Bf16(buf))
         }
         _ => {
-            let mut buf = DeviceBuffer::<u8>::alloc(device, data.len())?;
-            buf.copy_from_host(data)?;
+            // bd 4ayf B1: non-owning view into the bulk-load arena when present (no copy),
+            // else per-tensor alloc + copy_from_host.
+            let data_buf = if let Some((arena_ptr, data_start)) = arena {
+                let off = (entry.data_offset - data_start) as usize;
+                unsafe {
+                    DeviceBuffer::<u8>::view(device, arena_ptr.add(off), entry.data_bytes as usize)
+                }
+            } else {
+                let mut buf = DeviceBuffer::<u8>::alloc(device, data.len())?;
+                buf.copy_from_host(data)?;
+                buf
+            };
             Ok(LinearWeight::Packed(PackedWeights {
-                data: buf,
+                data: data_buf,
                 format,
                 out_dim: entry.out_features as usize,
                 in_dim: entry.in_features as usize,
@@ -833,7 +847,7 @@ fn load_moe_weights_inner(
     let writer_cell = std::cell::RefCell::new(writer);
     let load_lw = |name: &str, out_dim: usize, in_dim: usize| -> Result<LinearWeight, ModelError> {
         if let Some(b) = bqnt {
-            if let Ok(lw) = load_linear_weight_bqnt(b, name, device) {
+            if let Ok(lw) = load_linear_weight_bqnt(b, name, device, None) {
                 return Ok(lw);
             }
         }
@@ -904,7 +918,7 @@ fn load_moe_weights_inner(
     } else {
         // Expert gate+up: try bqnt fused, then safetensors fused, else per-expert fuse on host
         let fused_name = format!("{prefix}mlp.experts.gate_up_proj");
-        let bqnt_fused = bqnt.and_then(|b| load_linear_weight_bqnt(b, &fused_name, device).ok());
+        let bqnt_fused = bqnt.and_then(|b| load_linear_weight_bqnt(b, &fused_name, device, None).ok());
         let expert_gate_up = if let Some(lw) = bqnt_fused {
             lw
         } else if st.tensor_data(&fused_name).is_ok() {
@@ -1043,7 +1057,7 @@ fn load_moe_weights_inner(
 
         // --- Expert down ---
         let down_name = format!("{prefix}mlp.experts.down_proj");
-        let bqnt_down = bqnt.and_then(|b| load_linear_weight_bqnt(b, &down_name, device).ok());
+        let bqnt_down = bqnt.and_then(|b| load_linear_weight_bqnt(b, &down_name, device, None).ok());
         let expert_down = if let Some(lw) = bqnt_down {
             lw
         } else if st.tensor_data(&down_name).is_ok() {

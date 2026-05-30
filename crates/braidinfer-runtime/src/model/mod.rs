@@ -46,6 +46,16 @@ pub struct Model {
     // gpu0_gate_up_base would dangle. Drop order = declaration order in Rust structs.
     pub(crate) distributed_moe: Vec<Option<crate::weights::DistributedMoeWeights>>,
     pub(crate) moe_weights: Vec<Option<MoeWeights>>, // per-layer MoE FFN (None for dense FFN layers)
+    // bd 4ayf B1: bulk-load arena — one VRAM block holding the bqnt data section, filled by a
+    // single hipMemcpy; quantized LinearWeights are non-owning VIEWS into it (DeviceBuffer::view,
+    // AllocClass::View). The arena owns the backing VRAM and must outlive the views. Declared
+    // after the weight fields (drops last); views are non-owning (Drop no-op) so order is moot
+    // for safety but this matches the struct's drop-order discipline. None for the multi-GPU
+    // (B2, deferred) and quantize-at-load (no-bqnt) paths, which keep per-tensor owned buffers.
+    // Held for its Drop only (owns the arena VRAM; frees on Model drop). Never read after
+    // construction — the weight views hold the pointers. (Same pattern as `watchdog`.)
+    #[allow(dead_code)]
+    pub(crate) weight_arena: Option<DeviceBuffer<u8>>,
     pub(crate) activations: ActivationBuffers,
     pub(crate) gdn_conv_states: Vec<DeviceBuffer<f32>>, // [6144, 3] per GDN layer
     pub(crate) gdn_states: Vec<GdnState>,
