@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::cli::{apply_auto_modes, extract_cli_flags, resolve_model_arg};
 use braidinfer_runtime::generate::{
-    ChatMessage, TokenConfig, apply_chat_template_thinking, load_tokenizer,
+    ChatMessage, apply_chat_template_thinking, load_tokenizer_and_config,
 };
 use braidinfer_runtime::model::Model;
 
@@ -25,8 +25,9 @@ async fn main() {
     let resolved = resolve_model_arg(model_arg);
     let model_dir = resolved.model_dir.as_path();
 
-    let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
-    let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
+    let (tokenizer, token_config) =
+        load_tokenizer_and_config(model_dir, resolved.bqnt_override.as_deref())
+            .expect("load tokenizer/config");
     if token_config.chat_template().is_none() {
         eprintln!(
             "Error: {} has no chat_template — base model, not instruction-tuned.",

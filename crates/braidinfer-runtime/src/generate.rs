@@ -196,6 +196,25 @@ pub fn load_tokenizer_from_bqnt(
         .map_err(|e| format!("failed to parse embedded tokenizer: {e}").into())
 }
 
+/// bd 4ayf A3.2.3b: load the tokenizer + token config, preferring the bqnt's embedded copies
+/// (self-contained, no HF dir) and falling back to the model_dir files. The 4 bins call this.
+pub fn load_tokenizer_and_config(
+    model_dir: &Path,
+    bqnt_path: Option<&str>,
+) -> Result<(Tokenizer, TokenConfig), Box<dyn std::error::Error>> {
+    if let Some(bp) = bqnt_path {
+        if let Ok(b) = crate::bqnt::MmapBqnt::open(Path::new(bp)) {
+            if let Ok(tok) = load_tokenizer_from_bqnt(&b) {
+                let tc = TokenConfig::from_bqnt(&b, &tok);
+                return Ok((tok, tc));
+            }
+        }
+    }
+    let tok = load_tokenizer(model_dir)?;
+    let tc = TokenConfig::from_model_dir(model_dir, &tok);
+    Ok((tok, tc))
+}
+
 /// Apply chat template using the model's Jinja2 template.
 pub fn apply_chat_template(
     tokenizer: &Tokenizer,

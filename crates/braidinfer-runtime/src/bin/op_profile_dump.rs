@@ -15,7 +15,7 @@
 use std::path::Path;
 
 use braidinfer_core::types::DeviceId;
-use braidinfer_runtime::generate::{TokenConfig, greedy_generate, load_tokenizer};
+use braidinfer_runtime::generate::{greedy_generate, load_tokenizer_and_config};
 use braidinfer_runtime::model::Model;
 use braidinfer_runtime::op_profile;
 
@@ -61,8 +61,10 @@ fn main() {
     eprintln!("[op_profile] installed counter buffer on GPU 0 ({} slots)", op_profile::NUM_SLOTS);
 
     let model_dir = Path::new(&model_dir_path);
-    let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
-    let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
+    let bqnt_path = std::env::var("BQNT_PATH").ok();
+    let (tokenizer, token_config) =
+        load_tokenizer_and_config(model_dir, bqnt_path.as_deref())
+            .expect("load tokenizer/config");
     let mut model = Model::load(model_dir, device).expect("load model");
 
     eprintln!("[op_profile] running greedy_generate, max_tokens={max_tokens}");

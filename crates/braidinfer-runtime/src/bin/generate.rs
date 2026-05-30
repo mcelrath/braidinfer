@@ -6,7 +6,7 @@ const SIG_A_MIN_BANG_RUN: usize = 3;
 use braidinfer_runtime::cli::{
     apply_auto_modes, extract_cli_flags, resolve_model_arg, vram_usage_mb,
 };
-use braidinfer_runtime::generate::{TokenConfig, chat_generate, greedy_generate, load_tokenizer};
+use braidinfer_runtime::generate::{chat_generate, greedy_generate, load_tokenizer_and_config};
 use braidinfer_runtime::model::Model;
 use std::time::Instant;
 
@@ -49,8 +49,9 @@ fn main() {
     let resolved = resolve_model_arg(env_model.or(positional_model));
     let model_dir = resolved.model_dir.as_path();
 
-    let tokenizer = load_tokenizer(model_dir).expect("load tokenizer");
-    let token_config = TokenConfig::from_model_dir(model_dir, &tokenizer);
+    let (tokenizer, token_config) =
+        load_tokenizer_and_config(model_dir, resolved.bqnt_override.as_deref())
+            .expect("load tokenizer/config");
     let device = DeviceId(0);
     let max_seq_len: Option<usize> = std::env::var("MAX_SEQ_LEN")
         .ok()

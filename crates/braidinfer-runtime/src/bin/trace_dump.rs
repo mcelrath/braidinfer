@@ -1,6 +1,6 @@
 use braidinfer_core::types::DeviceId;
 use braidinfer_runtime::cli::{apply_auto_modes, resolve_model_arg, vram_usage_mb};
-use braidinfer_runtime::generate::load_tokenizer;
+use braidinfer_runtime::generate::load_tokenizer_and_config;
 use braidinfer_runtime::model::Model;
 use braidinfer_runtime::tracer::Probe;
 use std::borrow::Cow;
@@ -75,7 +75,9 @@ fn main() {
     let (used, total) = vram_usage_mb();
     println!("VRAM after load: {used:.0}/{total:.0} MB");
 
-    let tokenizer = load_tokenizer(&resolved.model_dir).expect("tokenizer");
+    let tokenizer = load_tokenizer_and_config(&resolved.model_dir, resolved.bqnt_override.as_deref())
+        .expect("tokenizer/config")
+        .0;
     let tokens: Vec<u32> = tokenizer
         .encode(prompt.as_str(), false)
         .expect("tokenize")

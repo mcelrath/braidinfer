@@ -197,14 +197,23 @@ pub fn resolve_model_arg(model_arg: Option<String>) -> ResolvedModel {
 /// True if any layer of the model at `model_dir` is MoE.
 pub fn detect_moe(model_dir: &Path) -> bool {
     let config_path = model_dir.join("config.json");
-    if !config_path.exists() {
-        return false;
-    }
-    ModelConfig::from_config_json(&config_path)
-        .ok()
-        .map_or(false, |c| {
-            c.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }))
-        })
+    let cfg = if config_path.exists() {
+        ModelConfig::from_config_json(&config_path).ok()
+    } else {
+        // bd 4ayf: a self-contained .bqnt carries model_config in its metadata (no config.json
+        // on disk). Read it via BQNT_PATH so auto-modes detect MoE without the HF dir.
+        std::env::var("BQNT_PATH")
+            .ok()
+            .and_then(|p| MmapBqnt::open(Path::new(&p)).ok())
+            .and_then(|b| b.metadata().ok())
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .and_then(|v| v.get("model_config").cloned())
+            .filter(|v| !v.is_null())
+            .and_then(|v| ModelConfig::from_config_value(&v).ok())
+    };
+    cfg.map_or(false, |c| {
+        c.layers.iter().any(|l| matches!(l.ffn_type, FfnType::MoE { .. }))
+    })
 }
 
 /// Size in bytes of the `.bqnt` file associated with `model_dir`. Uses
