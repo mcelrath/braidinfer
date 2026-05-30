@@ -87,6 +87,18 @@ pub struct SafeTensorSet {
 }
 
 impl SafeTensorSet {
+    /// bd 4ayf A3.2.3b: an empty set (no shards). Used when a self-contained `.bqnt`
+    /// supplies every weight/name and there is no HF safetensors dir. All accessors
+    /// degrade gracefully: `tensor_names()` -> empty, `tensor_data()` -> TensorNotFound,
+    /// `tensor_info()` -> None, `shard_mmaps()` -> empty. The bqnt-first load paths never
+    /// hit this fallback for a complete bqnt.
+    pub fn empty() -> Self {
+        SafeTensorSet {
+            shards: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
     pub fn open_directory(dir: &Path) -> Result<Self, SafeTensorsError> {
         let index_path = dir.join("model.safetensors.index.json");
         if index_path.exists() {

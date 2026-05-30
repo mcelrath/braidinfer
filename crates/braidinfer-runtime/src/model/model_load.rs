@@ -95,7 +95,11 @@ impl Model {
 
         let multi_gpu = std::env::var("MULTI_GPU").is_ok();
 
-        let st = SafeTensorSet::open_directory(model_dir)?;
+        // bd 4ayf A3.2.3b: tolerate a missing/empty safetensors dir — a self-contained .bqnt
+        // supplies every weight + name, so st is the legacy fallback only. Empty st degrades
+        // gracefully (bqnt-first load paths never hit it for a complete bqnt); an INCOMPLETE
+        // bqnt (or no bqnt) + empty st surfaces as MissingWeight at the specific tensor.
+        let st = SafeTensorSet::open_directory(model_dir).unwrap_or_else(|_| SafeTensorSet::empty());
 
         // Locate .bqnt file: BQNT_PATH env var takes priority; else auto-derive from model_dir.
         // Auto path: sibling to model_dir named "{model_dir_name}.q4.bqnt"
@@ -226,10 +230,13 @@ impl Model {
             .position(|l| l.layer_type == LayerType::Attention);
         let has_output_gate = if let Some(ai) = first_attn_idx {
             let q_name = format!("{prefix}layers.{ai}.self_attn.q_proj.weight");
-            if let Ok(raw) = st.tensor_data(&q_name) {
-                let expected_gated =
-                    config.num_q_heads * config.head_dim * 2 * config.hidden_size * 2; // bf16
-                raw.len() == expected_gated
+            let gated_out = config.num_q_heads * config.head_dim * 2;
+            // bd 4ayf A3.2.3b: prefer the bqnt entry's out_features — the q_proj is QUANTIZED
+            // in the bqnt, so its raw byte length is NOT bf16*shape. Fall back to st bf16 length.
+            if let Some(e) = bqnt.as_ref().and_then(|b| b.entry(&q_name)) {
+                e.out_features as usize == gated_out
+            } else if let Ok(raw) = st.tensor_data(&q_name) {
+                raw.len() == gated_out * config.hidden_size * 2 // bf16
             } else {
                 false
             }
@@ -410,6 +417,7 @@ impl Model {
                 // Try Nemotron weight names first, then generic
                 let norm_name = find_weight_name(
                     &st,
+                    bqnt.as_ref(),
                     &[
                         format!("{p}norm.weight"),
                         format!("{p}input_layernorm.weight"),
@@ -432,6 +440,7 @@ impl Model {
                 let hs = config.hidden_size;
                 let norm_name = find_weight_name(
                     &st,
+                    bqnt.as_ref(),
                     &[
                         format!("{p}norm.weight"),
                         format!("{p}input_layernorm.weight"),
@@ -443,7 +452,14 @@ impl Model {
                 layers.push(LayerWeights::MoeFfn(w));
                 // Load MoE weights — Nemotron uses mixer.gate/mixer.experts instead of mlp.gate/mlp.experts
                 // Try Nemotron naming first by checking if mixer.gate.weight exists
-                let moe_prefix = if st.tensor_data(&format!("{p}mixer.gate.weight")).is_ok() {
+                let gate_name = format!("{p}mixer.gate.weight");
+                // bd 4ayf A3.2.3b: MoE-prefix probe — bqnt entry first, st fallback.
+                let has_mixer_gate = bqnt
+                    .as_ref()
+                    .map(|b| b.entry(&gate_name).is_some())
+                    .unwrap_or(false)
+                    || st.tensor_data(&gate_name).is_ok();
+                let moe_prefix = if has_mixer_gate {
                     format!("{p}mixer.")
                 } else {
                     format!("{p}mlp.")
@@ -504,6 +520,7 @@ impl Model {
                     input_norm: load_bf16(
                         &find_weight_name(
                             &st,
+                            bqnt.as_ref(),
                             &[
                                 format!("{p}input_layernorm.weight"),
                                 format!("{p}norm.weight"),
@@ -514,6 +531,7 @@ impl Model {
                     w_q_gate: load_lw(
                         &find_weight_name(
                             &st,
+                            bqnt.as_ref(),
                             &[
                                 format!("{p}self_attn.q_proj.weight"),
                                 format!("{p}mixer.q_proj.weight"),
@@ -525,6 +543,7 @@ impl Model {
                     w_k: load_lw(
                         &find_weight_name(
                             &st,
+                            bqnt.as_ref(),
                             &[
                                 format!("{p}self_attn.k_proj.weight"),
                                 format!("{p}mixer.k_proj.weight"),
@@ -536,6 +555,7 @@ impl Model {
                     w_v: load_lw(
                         &find_weight_name(
                             &st,
+                            bqnt.as_ref(),
                             &[
                                 format!("{p}self_attn.v_proj.weight"),
                                 format!("{p}mixer.v_proj.weight"),
@@ -547,6 +567,7 @@ impl Model {
                     w_o: load_lw(
                         &find_weight_name(
                             &st,
+                            bqnt.as_ref(),
                             &[
                                 format!("{p}self_attn.o_proj.weight"),
                                 format!("{p}mixer.o_proj.weight"),
@@ -575,7 +596,7 @@ impl Model {
                     },
                     post_norm: {
                         let name =
-                            find_weight_name(&st, &[format!("{p}post_attention_layernorm.weight")]);
+                            find_weight_name(&st, bqnt.as_ref(), &[format!("{p}post_attention_layernorm.weight")]);
                         if let Ok(n) = name {
                             load_bf16(&n, hs)?
                         } else {

@@ -284,9 +284,14 @@ impl std::error::Error for ModelError {}
 // ---- Helper: load a tensor by name, convert to f32, upload to GPU ----
 
 /// Try multiple name patterns, return first that exists in safetensors.
-pub fn find_weight_name(st: &SafeTensorSet, candidates: &[String]) -> Result<String, ModelError> {
+pub fn find_weight_name(
+    st: &SafeTensorSet,
+    bqnt: Option<&MmapBqnt>,
+    candidates: &[String],
+) -> Result<String, ModelError> {
     for name in candidates {
-        if st.tensor_data(name).is_ok() {
+        // bd 4ayf A3.2.3b: a self-contained bqnt has the names; st is the legacy fallback.
+        if bqnt.map(|b| b.entry(name).is_some()).unwrap_or(false) || st.tensor_data(name).is_ok() {
             return Ok(name.clone());
         }
     }
@@ -1133,6 +1138,7 @@ fn load_moe_weights_inner(
         // Try multiple naming patterns for shared expert weights
         let se_up_name = find_weight_name(
             st,
+            bqnt,
             &[
                 format!("{prefix}mlp.shared_expert.up_proj.weight"),
                 format!("{prefix}shared_experts.up_proj.weight"),
@@ -1140,6 +1146,7 @@ fn load_moe_weights_inner(
         )?;
         let se_down_name = find_weight_name(
             st,
+            bqnt,
             &[
                 format!("{prefix}mlp.shared_expert.down_proj.weight"),
                 format!("{prefix}shared_experts.down_proj.weight"),
@@ -1147,6 +1154,7 @@ fn load_moe_weights_inner(
         )?;
         let se_gate_name = find_weight_name(
             st,
+            bqnt,
             &[
                 format!("{prefix}mlp.shared_expert.gate_proj.weight"),
                 format!("{prefix}shared_experts.gate_proj.weight"),
@@ -1178,6 +1186,7 @@ fn load_moe_weights_inner(
     // Score correction bias (Nemotron): added to scores before top-k selection
     let bias_name = find_weight_name(
         st,
+        bqnt,
         &[
             format!("{prefix}gate.e_score_correction_bias"),
             format!("{prefix}mlp.gate.e_score_correction_bias"),
