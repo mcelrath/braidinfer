@@ -619,6 +619,64 @@ pub fn load_weight_bf16_bqnt(
     }
 }
 
+/// bd 4ayf A3: load an F32-loaded tensor (GDN/Mamba2 recurrent state, norms read as f32)
+/// from the bqnt. Mirrors `load_weight_f32`'s dtype-flexibility: a tensor stored `F32` is
+/// read direct; a tensor stored `Bf16` is widened bf16->f32. Used for every `load_weight_f32`
+/// call site when the bqnt is present (safetensors is the legacy fallback).
+pub fn load_weight_f32_bqnt(
+    bqnt: &MmapBqnt,
+    name: &str,
+    device: DeviceId,
+    expected_len: usize,
+) -> Result<DeviceBuffer<f32>, ModelError> {
+    let entry = bqnt
+        .entry(name)
+        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    let sdt = crate::bqnt::code_to_format(entry.format).ok_or_else(|| {
+        ModelError::MissingWeight(format!("{name}: unknown bqnt storage code {}", entry.format))
+    })?;
+    let data = bqnt
+        .tensor_data(name)
+        .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    let f32_data: Vec<f32> = match sdt {
+        crate::bqnt::StorageDtype::F32 => {
+            assert_eq!(
+                data.len(),
+                expected_len * 4,
+                "bqnt f32 weight {name}: expected {} bytes, got {}",
+                expected_len * 4,
+                data.len()
+            );
+            data.chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        }
+        crate::bqnt::StorageDtype::Bf16 => {
+            assert_eq!(
+                data.len(),
+                expected_len * 2,
+                "bqnt bf16->f32 weight {name}: expected {} bytes, got {}",
+                expected_len * 2,
+                data.len()
+            );
+            data.chunks_exact(2)
+                .map(|b| {
+                    let bits = u16::from_le_bytes(b.try_into().unwrap());
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()
+        }
+        other => {
+            return Err(ModelError::MissingWeight(format!(
+                "{name}: bqnt storage {other:?} is not f32-loadable"
+            )));
+        }
+    };
+    let mut buf = DeviceBuffer::<f32>::alloc(device, expected_len)?;
+    buf.copy_from_host(&f32_data)?;
+    Ok(buf)
+}
+
 /// Load all MoE weights for a single layer (gate, experts, shared expert).
 pub fn load_moe_weights(
     st: &SafeTensorSet,

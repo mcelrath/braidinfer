@@ -43,10 +43,42 @@ impl Model {
         }
 
         let config_path = model_dir.join("config.json");
-        let mut config = if config_path.exists() {
+        // bd b77g: prefer the .bqnt's embedded `model_config` over the HF config.json so
+        // a model's architecture does not depend on the HF cache, and to avoid the silent
+        // (wrong) qwen35_0_8b() fallback. (Weights still load from the safetensors dir —
+        // full HF-independence is follow-on braidinfer-4ayf.) The bqnt is re-opened for
+        // weights below; this metadata-only open is cheap (mmap, no tensor read).
+        let bqnt_model_config: Option<serde_json::Value> = {
+            let explicit = std::env::var("BQNT_PATH").ok().map(std::path::PathBuf::from);
+            let auto = model_dir.file_name().map(|n| {
+                model_dir
+                    .parent()
+                    .unwrap_or(model_dir)
+                    .join(format!("{}.q4.bqnt", n.to_string_lossy()))
+            });
+            explicit
+                .or(auto)
+                .filter(|p| p.exists())
+                .and_then(|p| crate::bqnt::MmapBqnt::open(&p).ok())
+                .and_then(|b| b.metadata().ok())
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+                .and_then(|v| v.get("model_config").cloned())
+                .filter(|v| !v.is_null())
+        };
+        let mut config = if let Some(v) = &bqnt_model_config {
+            ModelConfig::from_config_value(v)
+                .map_err(|e| ModelError::MissingWeight(format!("bqnt model_config: {e}")))?
+        } else if config_path.exists() {
             ModelConfig::from_config_json(&config_path)
                 .map_err(|e| ModelError::MissingWeight(format!("config.json: {e}")))?
         } else {
+            eprintln!(
+                "WARNING (bd b77g): the .bqnt has no embedded model_config AND there is no \
+                 config.json at {} — falling back to hardcoded ModelConfig::qwen35_0_8b(), \
+                 which is WRONG for any non-0.8B model (dim mismatch). Re-quantize with a \
+                 config-embedding bqnt_quantize, or provide config.json.",
+                model_dir.display()
+            );
             ModelConfig::qwen35_0_8b()
         };
         // Cap max_seq_len: model may claim 262144 but flat KV can't afford that.

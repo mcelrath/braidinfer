@@ -184,7 +184,13 @@ impl ModelConfig {
     pub fn from_config_json(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let data = std::fs::read_to_string(path)?;
         let v: serde_json::Value = serde_json::from_str(&data)?;
+        Self::from_config_value(&v)
+    }
 
+    /// bd b77g: build from an already-parsed config-JSON Value — e.g. a `.bqnt`'s
+    /// embedded `model_config` metadata, so a model's architecture does not depend
+    /// on the HF cache. `from_config_json` reads the file then delegates here.
+    pub fn from_config_value(v: &serde_json::Value) -> Result<Self, Box<dyn std::error::Error>> {
         // Flatten: text_config fields override top-level
         let tc = v.get("text_config");
         let get = |key: &str| -> Option<&serde_json::Value> {
