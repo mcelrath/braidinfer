@@ -18,6 +18,10 @@ enum AllocClass {
     UncachedDeviceLocal,
     /// portable / peer-visible coarse-grained.
     CoarseGrainedPeer,
+    /// bd 4ayf B1: a NON-OWNING view into another (coarse-grained-local) buffer — e.g. a
+    /// weight pointing into the bulk-loaded VRAM arena. `Drop` does NOT free; the backing
+    /// buffer (the arena) owns the memory and must outlive every view into it.
+    View,
 }
 
 /// GPU device memory buffer. Encodes device ID to prevent cross-device misuse.
@@ -67,6 +71,21 @@ impl<T> DeviceBuffer<T> {
             alloc_class: AllocClass::UncachedDeviceLocal,
             _marker: PhantomData,
         })
+    }
+
+    /// bd 4ayf B1: a NON-OWNING view into an existing coarse-grained-local buffer (an arena)
+    /// at `ptr` for `len` elements. `Drop` does NOT free. SAFETY: `ptr` must point into a
+    /// live coarse-grained-local `DeviceBuffer` (the arena) on `device` that outlives this
+    /// view, with at least `len` valid elements. `as_ptr()`/`as_typed_local()` are valid
+    /// (the arena memory is coarse-grained-local).
+    pub unsafe fn view(device: DeviceId, ptr: *const T, len: usize) -> Self {
+        DeviceBuffer {
+            ptr: ptr as *mut T,
+            len,
+            device,
+            alloc_class: AllocClass::View,
+            _marker: PhantomData,
+        }
     }
 
     /// Typed-pointer accessor for coarse-grained device-local buffers
@@ -234,6 +253,11 @@ pub fn memcpy_d2d(dst: *mut u8, src: *const u8, len: usize) -> HipResult<()> {
 
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
+        // bd 4ayf B1: a View is a non-owning borrow into an arena — the arena owns the
+        // memory and frees it; never free through a view.
+        if self.alloc_class == AllocClass::View {
+            return;
+        }
         if !self.ptr.is_null() {
             // braidinfer-4fg: if THIS GPU still has a (possibly leaked)
             // persistent worker, hipFree blocks on SyncAllStreams which
