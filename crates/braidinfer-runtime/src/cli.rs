@@ -123,6 +123,20 @@ pub struct ResolvedModel {
     pub bqnt_override: Option<String>,
 }
 
+/// bd 4ayf: true if a `.bqnt` embeds its own `model_config` + `tokenizer_json` (the v2
+/// self-contained format), so inference needs no HF dir.
+fn bqnt_is_self_contained(path: &str) -> bool {
+    MmapBqnt::open(Path::new(path))
+        .ok()
+        .and_then(|b| b.metadata().ok())
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+        .map(|v| {
+            v.get("model_config").map(|x| !x.is_null()).unwrap_or(false)
+                && v.get("tokenizer_json").map(|x| !x.is_null()).unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 /// Resolve `model_arg` (typically `MODEL` env or positional arg). Exits the
 /// process with a clear error if the `.bqnt` cannot be located in HF cache.
 ///
@@ -131,11 +145,27 @@ pub struct ResolvedModel {
 pub fn resolve_model_arg(model_arg: Option<String>) -> ResolvedModel {
     let (model_path, bqnt_override) = match model_arg {
         Some(ref p) if p.ends_with(".bqnt") => {
-            let hf_dir = resolve_hf_dir(p).unwrap_or_else(|| {
-                eprintln!("Could not resolve HF cache dir for {p}");
-                std::process::exit(1);
-            });
-            (hf_dir, Some(p.clone()))
+            // bd 4ayf: prefer the HF dir (legacy), but a self-contained .bqnt needs none —
+            // use the .bqnt's own dir so the loader + bins source everything from the bqnt.
+            let dir = resolve_hf_dir(p)
+                .or_else(|| {
+                    if bqnt_is_self_contained(p) {
+                        Some(
+                            Path::new(p)
+                                .parent()
+                                .map(|d| d.to_string_lossy().into_owned())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| ".".to_string()),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| {
+                    eprintln!("Could not resolve HF dir for {p}, and it is not a self-contained .bqnt");
+                    std::process::exit(1);
+                });
+            (dir, Some(p.clone()))
         }
         Some(p) => (p, None),
         None => {
