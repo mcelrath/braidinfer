@@ -754,8 +754,14 @@ impl Model {
                 let v_dim = nvh * vd;
                 let conv_total = qkv_out * ck;
                 let conv_name = format!("{p}linear_attn.conv1d.weight");
-                // bd 4ayf A3.2.3b: conv1d raw bytes bqnt-first (stored Bf16), st fallback.
-                let conv_raw_bytes = match bqnt.as_ref().and_then(|b| b.tensor_data(&conv_name)) {
+                // bd 4ayf A3.2.3b (+v1 backward-compat fix): conv1d raw bytes bqnt-first ONLY if
+                // present at the expected bf16 size; a v1 bqnt may store it quantized/differently,
+                // so size-mismatch falls back to st (was: use any bqnt data -> assert/panic).
+                let conv_raw_bytes = match bqnt
+                    .as_ref()
+                    .and_then(|b| b.tensor_data(&conv_name))
+                    .filter(|d| d.len() == conv_total * 2)
+                {
                     Some(d) => d,
                     None => st
                         .tensor_data(&conv_name)

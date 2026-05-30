@@ -620,22 +620,27 @@ pub fn load_weight_bf16_bqnt(
     device: DeviceId,
     expected_len: usize,
 ) -> Result<DeviceBuffer<u16>, ModelError> {
-    if let Some(data) = bqnt.tensor_data(name) {
-        assert_eq!(
-            data.len(),
-            expected_len * 2,
-            "bqnt weight {name}: expected {} bytes, got {}",
-            expected_len * 2,
-            data.len()
-        );
-        let bf16_data: &[u16] =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, expected_len) };
-        let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
-        buf.copy_from_host(bf16_data)?;
-        Ok(buf)
-    } else {
-        Err(ModelError::MissingWeight(name.to_string()))
+    // bd 4ayf (multi-GPU regression fix): only read if the tensor is actually Bf16-stored at
+    // the expected size. A v1 bqnt may carry this tensor QUANTIZED — e.g. embed_tokens.weight
+    // as Q4, a dead pre-A2 copy the loader never used. The caller (load_bf16) wants bf16, so
+    // return Err to fall back to safetensors rather than misreading Q4 bytes as bf16 (was an
+    // assert -> panic on the v1 qwen35_35b_a3b -g2 load).
+    let entry = match bqnt.entry(name) {
+        Some(e) => e,
+        None => return Err(ModelError::MissingWeight(name.to_string())),
+    };
+    if crate::bqnt::code_to_format(entry.format) != Some(crate::bqnt::StorageDtype::Bf16) {
+        return Err(ModelError::MissingWeight(name.to_string()));
     }
+    let data = match bqnt.tensor_data(name) {
+        Some(d) if d.len() == expected_len * 2 => d,
+        _ => return Err(ModelError::MissingWeight(name.to_string())),
+    };
+    let bf16_data: &[u16] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, expected_len) };
+    let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
+    buf.copy_from_host(bf16_data)?;
+    Ok(buf)
 }
 
 /// bd 4ayf A3: load an F32-loaded tensor (GDN/Mamba2 recurrent state, norms read as f32)
@@ -659,25 +664,19 @@ pub fn load_weight_f32_bqnt(
         .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
     let f32_data: Vec<f32> = match sdt {
         crate::bqnt::StorageDtype::F32 => {
-            assert_eq!(
-                data.len(),
-                expected_len * 4,
-                "bqnt f32 weight {name}: expected {} bytes, got {}",
-                expected_len * 4,
-                data.len()
-            );
+            // bd 4ayf: size mismatch (e.g. a v1 bqnt) -> Err -> st fallback (was assert/panic).
+            if data.len() != expected_len * 4 {
+                return Err(ModelError::MissingWeight(name.to_string()));
+            }
             data.chunks_exact(4)
                 .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                 .collect()
         }
         crate::bqnt::StorageDtype::Bf16 => {
-            assert_eq!(
-                data.len(),
-                expected_len * 2,
-                "bqnt bf16->f32 weight {name}: expected {} bytes, got {}",
-                expected_len * 2,
-                data.len()
-            );
+            // bd 4ayf: size mismatch (e.g. a v1 bqnt) -> Err -> st fallback (was assert/panic).
+            if data.len() != expected_len * 2 {
+                return Err(ModelError::MissingWeight(name.to_string()));
+            }
             data.chunks_exact(2)
                 .map(|b| {
                     let bits = u16::from_le_bytes(b.try_into().unwrap());
@@ -1207,8 +1206,13 @@ fn load_moe_weights_inner(
         ],
     );
     let score_correction_bias = if let Ok(name) = bias_name {
-        // bd 4ayf A3.2.3b: bias raw bytes bqnt-first (1D f32 -> stored F32), st fallback.
-        let raw = match bqnt.and_then(|b| b.tensor_data(&name)) {
+        // bd 4ayf A3.2.3b (+v1 backward-compat fix): bias raw bytes bqnt-first ONLY if present
+        // at the expected f32 size (ne*4); a v1 bqnt may store it bf16/differently, so a
+        // size-mismatch falls back to st rather than misreading the bytes as f32.
+        let raw = match bqnt
+            .and_then(|b| b.tensor_data(&name))
+            .filter(|d| d.len() == ne * 4)
+        {
             Some(d) => d,
             None => st
                 .tensor_data(&name)
