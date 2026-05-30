@@ -1800,3 +1800,66 @@ pub fn distribute_moe_weights_from_bqnt(
         gpu0_down_base: gpu0_d,
     })
 }
+
+#[cfg(test)]
+mod bqnt_reader_compat_tests {
+    use super::*;
+    use crate::bqnt::{BqntWriter, MmapBqnt, StorageDtype, packed_size};
+
+    // bd 4ayf v1-compat regression (found by the multi-GPU test, fixed in 067e11a): a tensor
+    // stored QUANTIZED (Q4) in a (v1) bqnt — e.g. embed_tokens, a dead pre-A2 copy — must make
+    // load_weight_bf16_bqnt return Err so the loader falls back to safetensors, NOT panic by
+    // misreading the Q4 bytes as bf16 (the original assert at weights.rs:624). CPU-only: the
+    // Err path returns before any DeviceBuffer allocation, so no GPU is required to run this.
+    #[test]
+    fn bf16_reader_rejects_quantized_tensor() {
+        let path = std::env::temp_dir().join("braidinfer_test_bf16_reject_q4.bqnt");
+        {
+            let mut w = BqntWriter::create(&path, 1).unwrap();
+            let packed = vec![0u8; packed_size(StorageDtype::PcG32Q4, 4, 32)];
+            w.write_tensor("embed", StorageDtype::PcG32Q4, 4, 32, 2, &packed)
+                .unwrap();
+            w.finish("{}").unwrap();
+        }
+        let bqnt = MmapBqnt::open(&path).unwrap();
+        let r = load_weight_bf16_bqnt(&bqnt, "embed", DeviceId(0), 4 * 32);
+        assert!(
+            r.is_err(),
+            "a Q4-stored tensor must Err from the bf16 reader (-> safetensors fallback), not panic"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // bd 4ayf: a bf16 tensor present at the WRONG size must Err (-> st fallback), not OOB/panic.
+    #[test]
+    fn bf16_reader_rejects_size_mismatch() {
+        let path = std::env::temp_dir().join("braidinfer_test_bf16_size.bqnt");
+        {
+            let mut w = BqntWriter::create(&path, 1).unwrap();
+            w.write_tensor("norm", StorageDtype::Bf16, 8, 1, 1, &vec![0u8; 16])
+                .unwrap();
+            w.finish("{}").unwrap();
+        }
+        let bqnt = MmapBqnt::open(&path).unwrap();
+        let r = load_weight_bf16_bqnt(&bqnt, "norm", DeviceId(0), 999);
+        assert!(r.is_err(), "a bf16 size-mismatch must Err, not OOB/panic");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // bd 4ayf: the f32 reader rejects a quantized tensor (-> st fallback), not panic.
+    #[test]
+    fn f32_reader_rejects_quantized_tensor() {
+        let path = std::env::temp_dir().join("braidinfer_test_f32_reject_q4.bqnt");
+        {
+            let mut w = BqntWriter::create(&path, 1).unwrap();
+            let packed = vec![0u8; packed_size(StorageDtype::PcG32Q4, 4, 32)];
+            w.write_tensor("a_log", StorageDtype::PcG32Q4, 4, 32, 2, &packed)
+                .unwrap();
+            w.finish("{}").unwrap();
+        }
+        let bqnt = MmapBqnt::open(&path).unwrap();
+        let r = load_weight_f32_bqnt(&bqnt, "a_log", DeviceId(0), 4 * 32);
+        assert!(r.is_err(), "a Q4-stored tensor must Err from the f32 reader, not panic");
+        let _ = std::fs::remove_file(&path);
+    }
+}
