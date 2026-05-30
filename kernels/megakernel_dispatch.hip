@@ -127,6 +127,13 @@ __device__ __forceinline__ void dispatch_opcode(
     // default-case "unknown opcode" printf doesn't fire on every batch.
     if (opcode == OP_NOP) {
         braidinfer::rdna3::atomic_block_barrier(gbs);
+        // bd yh8z (narrow fix): force reload of any pointer held live across the
+        // barrier (dump_base/dump_count/op_profile loaded once per batch) so a
+        // register clobbered across the barrier body isn't dereferenced. NARROW —
+        // placed at the use site, NOT inside atomic_block_barrier — so it does NOT
+        // re-emit s_waitcnt_vscnt(0) on the ack's host-UC store (a global barrier
+        // 'memory' clobber did, re-introducing the §11.4 vscnt ack-stall: am-rs c9).
+        asm volatile("" ::: "memory");
         OP_PROFILE_END(opcode, op_profile);
         return;
     }
@@ -181,10 +188,12 @@ __device__ __forceinline__ void dispatch_opcode(
     }
 
     braidinfer::rdna3::atomic_block_barrier(gbs);
+    asm volatile("" ::: "memory");  // bd yh8z narrow: reload dump_base/op_profile after barrier (not on barrier -> no ack vscnt)
 
     if (dump_base) {
         dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
         braidinfer::rdna3::atomic_block_barrier(gbs);
+        asm volatile("" ::: "memory");  // bd yh8z narrow
     }
     OP_PROFILE_END(opcode, op_profile);
 }

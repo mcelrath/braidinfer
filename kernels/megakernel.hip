@@ -88,6 +88,17 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
     // is §11.4-hazardous before atomic_block_barrier.
 
     while (true) {
+        // bd yh8z: rematerialize the queue pointer at the round boundary so the
+        // queue-derived stores (progress_pc / ack inside persistent_iter_poll_barrier
+        // and below) recompute their address from the clean base each round. am-rs's
+        // static disasm: round-2 faults at queue+(last_seq<<32) because the compiler
+        // carries a queue-pointer HIGH-DWORD register across the poll barrier and
+        // reconstructs it using a register that happens to hold last_seq (1 on round-2)
+        // — a runtime register-allocation artifact, not source arithmetic. A REGISTER
+        // in-out clobber (note: NO "memory" clobber) forces the recompute WITHOUT
+        // re-emitting s_waitcnt_vscnt(0) on the ack's host-UC store (a barrier-wide
+        // "memory" clobber fixed the fault but re-introduced the §11.4 ack vscnt stall).
+        asm volatile("" : "+r"(queue));
         // Mark idle BEFORE the canonical poll/barrier.
         if (watchdog) watchdog_signal_exited(watchdog);
 
