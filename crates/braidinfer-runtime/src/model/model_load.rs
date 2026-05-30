@@ -268,12 +268,18 @@ impl Model {
             .ok_or_else(|| ModelError::MissingWeight("final norm tensor not found".into()))?
             .to_string();
 
-        let embed_weight = load_weight_bf16(
-            &st,
-            &embed_name,
-            device,
-            config.vocab_size * config.hidden_size,
-        )?;
+        // bd 4ayf A3.2: bqnt-first bf16 loader (st = legacy fallback) for the embeds / norms /
+        // lm_head tensors A2 now stores in the bqnt. (load_f32 counterpart + per-layer routing
+        // are A3.2 continuation.)
+        let load_bf16 = |name: &str, len: usize| -> Result<DeviceBuffer<u16>, ModelError> {
+            if let Some(ref b) = bqnt {
+                if let Ok(w) = crate::weights::load_weight_bf16_bqnt(b, name, device, len) {
+                    return Ok(w);
+                }
+            }
+            crate::weights::load_weight_bf16(&st, name, device, len)
+        };
+        let embed_weight = load_bf16(&embed_name, config.vocab_size * config.hidden_size)?;
         let lm_head_weight = if config.tie_word_embeddings {
             // Weight-tied: reuse embed_weight pointer (allocate a dummy — the megakernel uses embed_weight)
             DeviceBuffer::<u16>::alloc(device, 0)? // placeholder, megakernel will use embed_weight
@@ -283,14 +289,9 @@ impl Model {
                 .find(|n| n.contains("lm_head.weight"))
                 .ok_or_else(|| ModelError::MissingWeight("lm_head.weight not found".into()))?
                 .to_string();
-            load_weight_bf16(
-                &st,
-                &lm_head_name,
-                device,
-                config.vocab_size * config.hidden_size,
-            )?
+            load_bf16(&lm_head_name, config.vocab_size * config.hidden_size)?
         };
-        let final_norm_weight = load_weight_bf16(&st, &norm_name, device, config.hidden_size)?;
+        let final_norm_weight = load_bf16(&norm_name, config.hidden_size)?;
 
         // Per-layer quantization control: WEIGHT_QUANT_LAYERS=0-11,20-31 restricts Q4 to those layers
         let quant_layers: Option<std::collections::HashSet<usize>> =
