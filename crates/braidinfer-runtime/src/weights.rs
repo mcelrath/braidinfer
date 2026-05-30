@@ -1193,9 +1193,13 @@ fn load_moe_weights_inner(
         ],
     );
     let score_correction_bias = if let Ok(name) = bias_name {
-        let raw = st
-            .tensor_data(&name)
-            .map_err(|_| ModelError::MissingWeight(name.clone()))?;
+        // bd 4ayf A3.2.3b: bias raw bytes bqnt-first (1D f32 -> stored F32), st fallback.
+        let raw = match bqnt.and_then(|b| b.tensor_data(&name)) {
+            Some(d) => d,
+            None => st
+                .tensor_data(&name)
+                .map_err(|_| ModelError::MissingWeight(name.clone()))?,
+        };
         // f32 tensor: 4 bytes per element
         let data: Vec<f32> =
             unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, ne) }.to_vec();

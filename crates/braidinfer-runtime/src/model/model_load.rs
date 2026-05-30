@@ -578,19 +578,27 @@ impl Model {
                     )?,
                     q_norm: if has_qk_norm {
                         let name = format!("{p}self_attn.q_norm.weight");
-                        let raw = st
-                            .tensor_data(&name)
-                            .map_err(|_| ModelError::MissingWeight(name.clone()))?;
-                        load_bf16(&name, raw.len() / 2)?
+                        // bd 4ayf A3.2.3b: element count bqnt-first (entry out*in), st len/2 fallback.
+                        let len = bqnt
+                            .as_ref()
+                            .and_then(|b| b.entry(&name))
+                            .map(|e| e.out_features as usize * e.in_features as usize)
+                            .or_else(|| st.tensor_data(&name).ok().map(|r| r.len() / 2))
+                            .ok_or_else(|| ModelError::MissingWeight(name.clone()))?;
+                        load_bf16(&name, len)?
                     } else {
                         DeviceBuffer::<u16>::alloc(device, 0)?
                     },
                     k_norm: if has_qk_norm {
                         let name = format!("{p}self_attn.k_norm.weight");
-                        let raw = st
-                            .tensor_data(&name)
-                            .map_err(|_| ModelError::MissingWeight(name.clone()))?;
-                        load_bf16(&name, raw.len() / 2)?
+                        // bd 4ayf A3.2.3b: element count bqnt-first (entry out*in), st len/2 fallback.
+                        let len = bqnt
+                            .as_ref()
+                            .and_then(|b| b.entry(&name))
+                            .map(|e| e.out_features as usize * e.in_features as usize)
+                            .or_else(|| st.tensor_data(&name).ok().map(|r| r.len() / 2))
+                            .ok_or_else(|| ModelError::MissingWeight(name.clone()))?;
+                        load_bf16(&name, len)?
                     } else {
                         DeviceBuffer::<u16>::alloc(device, 0)?
                     },
@@ -697,9 +705,13 @@ impl Model {
                 let v_dim = nvh * vd;
                 let conv_total = qkv_out * ck;
                 let conv_name = format!("{p}linear_attn.conv1d.weight");
-                let conv_raw_bytes = st
-                    .tensor_data(&conv_name)
-                    .map_err(|_| ModelError::MissingWeight(conv_name.clone()))?;
+                // bd 4ayf A3.2.3b: conv1d raw bytes bqnt-first (stored Bf16), st fallback.
+                let conv_raw_bytes = match bqnt.as_ref().and_then(|b| b.tensor_data(&conv_name)) {
+                    Some(d) => d,
+                    None => st
+                        .tensor_data(&conv_name)
+                        .map_err(|_| ModelError::MissingWeight(conv_name.clone()))?,
+                };
                 assert_eq!(conv_raw_bytes.len(), conv_total * 2);
                 let conv_raw: &[u16] = unsafe {
                     std::slice::from_raw_parts(conv_raw_bytes.as_ptr() as *const u16, conv_total)
