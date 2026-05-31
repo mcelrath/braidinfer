@@ -365,14 +365,37 @@ impl Model {
             if !multi_gpu {
                 match bqnt.as_ref().and_then(|b| b.data_section()) {
                     Some((data_start, span)) => {
-                        let mut arena = DeviceBuffer::<u8>::alloc(device, span.len())?;
-                        arena.copy_from_host(span)?;
-                        let ptr = arena.as_ptr();
-                        eprintln!(
-                            "bd 4ayf B1: weight arena {} MiB, single bulk copy",
-                            span.len() / (1024 * 1024)
-                        );
-                        (Some(arena), Some((ptr, data_start)))
+                        // bd 4ayf.11 (nemotron -g1 OOM fix): the arena holds the WHOLE data
+                        // section, but non-Packed weights (embed/norms/F32/latent_proj) are ALSO
+                        // loaded separately — their bytes are duplicated. On a big single-GPU
+                        // load that duplication can tip a borderline-fitting model over (nemotron
+                        // 30B: arena 19.5GB + dup + activations/KV > 24GB -> hipErrorOutOfMemory).
+                        // Gate: build the arena only if it fits with ~50% headroom for the dup +
+                        // activations + KV; else fall back to the proven per-tensor path (no
+                        // arena, no duplication). Big models run multi-GPU (no arena) regardless.
+                        let free = crate::cli::vram_free_per_gpu()
+                            .get(device.0 as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        let needed = (span.len() as u64).saturating_mul(3) / 2;
+                        if free == 0 || needed <= free as u64 {
+                            let mut arena = DeviceBuffer::<u8>::alloc(device, span.len())?;
+                            arena.copy_from_host(span)?;
+                            let ptr = arena.as_ptr();
+                            eprintln!(
+                                "bd 4ayf B1: weight arena {} MiB, single bulk copy",
+                                span.len() / (1024 * 1024)
+                            );
+                            (Some(arena), Some((ptr, data_start)))
+                        } else {
+                            eprintln!(
+                                "bd 4ayf B1: skipping weight arena ({} MiB data section vs {} MiB \
+                                 free) — per-tensor load to avoid OOM (arena duplicates non-Packed)",
+                                span.len() / (1024 * 1024),
+                                free / (1024 * 1024)
+                            );
+                            (None, None)
+                        }
                     }
                     None => (None, None),
                 }
