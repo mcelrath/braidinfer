@@ -59,14 +59,25 @@ fn main() {
 
     let multi_gpu = apply_auto_modes(model_dir);
 
+    let _t_load = Instant::now();
     let mut model =
         Model::load_with_max_seq_len(model_dir, device, max_seq_len).expect("load model");
+    eprintln!(
+        "LOAD PROFILE: Model::load (base + non-expert weights) = {} ms",
+        _t_load.elapsed().as_millis()
+    );
 
     // bd 174k Phase A: always call enable_multi_gpu when model has MoE — for
     // single-GPU MoE this populates distributed_moe with a 1-device layout
     // (no VRAM duplication) so the unified mailbox prefill path can read it.
     if multi_gpu || model.has_moe() {
-        if let Err(e) = model.enable_distributed_moe() {
+        let _t_dist = Instant::now();
+        let _dist_result = model.enable_distributed_moe();
+        eprintln!(
+            "LOAD PROFILE: enable_distributed_moe (expert distribute/scatter) = {} ms",
+            _t_dist.elapsed().as_millis()
+        );
+        if let Err(e) = _dist_result {
             let per_gpu_free_mb: Vec<f64> =
                 braidinfer_runtime::cli::vram_free_per_gpu()
                     .iter()
