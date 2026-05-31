@@ -285,12 +285,61 @@ impl Model {
             .ok_or_else(|| ModelError::MissingWeight("final norm tensor not found".into()))?
             .to_string();
 
+        // bd 4ayf B1 + 4ayf.12: build the bulk-load arena BEFORE the weight-load closures so that
+        // EVERY weight — embed/norms/recurrent/latent_proj AND the Packed linears — becomes a
+        // non-owning VIEW into it (no per-tensor copies, no duplication). One VRAM block = the
+        // bqnt data section, filled by a single bulk hipMemcpy. Single-GPU + bqnt only (multi-GPU
+        // + quantize-at-load keep per-tensor; arena_view = None). The arena is moved into Model
+        // below (the VRAM pointer survives the struct move) and outlives the views (Drop no-op).
+        // Gate: skip if the data section won't fit with ~2GB headroom (activations/KV + the few
+        // Bf16->f32 widened tensors that still copy); per-tensor fallback then.
+        // bd 4ayf.12: skip the arena for MoE models — experts are FUSED (gate_up from 2 tensors
+        // into one buffer), so they can't be arena views; the arena would hold their bytes AND the
+        // fused copies (huge duplication -> OOM, e.g. nemotron 30B). MoE loads per-tensor (big
+        // ones run multi-GPU). Dense models view ALL weights (no fusion -> no duplication).
+        let has_moe = config
+            .layers
+            .iter()
+            .any(|l| matches!(l.ffn_type, FfnType::MoE { .. }));
+        let (weight_arena, arena_view): (Option<DeviceBuffer<u8>>, Option<(*const u8, u64)>) =
+            if !multi_gpu && !has_moe {
+                match bqnt.as_ref().and_then(|b| b.data_section()) {
+                    Some((data_start, span)) => {
+                        let free = crate::cli::vram_free_per_gpu()
+                            .get(device.0 as usize)
+                            .copied()
+                            .unwrap_or(0);
+                        let needed = span.len() as u64 + 2 * 1024 * 1024 * 1024;
+                        if free == 0 || needed <= free as u64 {
+                            let mut arena = DeviceBuffer::<u8>::alloc(device, span.len())?;
+                            arena.copy_from_host(span)?;
+                            let ptr = arena.as_ptr();
+                            eprintln!(
+                                "bd 4ayf B1: weight arena {} MiB, single bulk copy (all weights are views)",
+                                span.len() / (1024 * 1024)
+                            );
+                            (Some(arena), Some((ptr, data_start)))
+                        } else {
+                            eprintln!(
+                                "bd 4ayf B1: skipping weight arena ({} MiB data section vs {} MiB free) \
+                                 — per-tensor load",
+                                span.len() / (1024 * 1024),
+                                free / (1024 * 1024)
+                            );
+                            (None, None)
+                        }
+                    }
+                    None => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
         // bd 4ayf A3.2: bqnt-first bf16 loader (st = legacy fallback) for the embeds / norms /
-        // lm_head tensors A2 now stores in the bqnt. (load_f32 counterpart + per-layer routing
-        // are A3.2 continuation.)
+        // lm_head tensors A2 now stores in the bqnt. Arena views when present (bd 4ayf.12).
         let load_bf16 = |name: &str, len: usize| -> Result<DeviceBuffer<u16>, ModelError> {
             if let Some(ref b) = bqnt {
-                if let Ok(w) = crate::weights::load_weight_bf16_bqnt(b, name, device, len) {
+                if let Ok(w) = crate::weights::load_weight_bf16_bqnt(b, name, device, len, arena_view) {
                     return Ok(w);
                 }
             }
@@ -301,7 +350,7 @@ impl Model {
         // f32-read norm tensors A2 stores in the bqnt. st = legacy fallback.
         let load_f32 = |name: &str, len: usize| -> Result<DeviceBuffer<f32>, ModelError> {
             if let Some(ref b) = bqnt {
-                if let Ok(w) = crate::weights::load_weight_f32_bqnt(b, name, device, len) {
+                if let Ok(w) = crate::weights::load_weight_f32_bqnt(b, name, device, len, arena_view) {
                     return Ok(w);
                 }
             }
@@ -355,53 +404,8 @@ impl Model {
             (0..config.num_layers).map(|_| None).collect();
         let is_caching = save_bqnt_path.is_some() && bqnt_writer.borrow().is_some();
 
-        // bd 4ayf B1: bulk-load arena (single-GPU + bqnt present). One VRAM block = the bqnt
-        // data section, filled by a SINGLE hipMemcpy; quantized linear weights (via load_lw)
-        // become non-owning views into it (arena_view = (base_ptr, data_start)). Multi-GPU (B2,
-        // deferred) + quantize-at-load keep per-tensor copies (arena_view = None). The arena is
-        // moved into Model below — the VRAM pointer survives the struct move — and outlives the
-        // views (which are non-owning, Drop no-op).
-        let (weight_arena, arena_view): (Option<DeviceBuffer<u8>>, Option<(*const u8, u64)>) =
-            if !multi_gpu {
-                match bqnt.as_ref().and_then(|b| b.data_section()) {
-                    Some((data_start, span)) => {
-                        // bd 4ayf.11 (nemotron -g1 OOM fix): the arena holds the WHOLE data
-                        // section, but non-Packed weights (embed/norms/F32/latent_proj) are ALSO
-                        // loaded separately — their bytes are duplicated. On a big single-GPU
-                        // load that duplication can tip a borderline-fitting model over (nemotron
-                        // 30B: arena 19.5GB + dup + activations/KV > 24GB -> hipErrorOutOfMemory).
-                        // Gate: build the arena only if it fits with ~50% headroom for the dup +
-                        // activations + KV; else fall back to the proven per-tensor path (no
-                        // arena, no duplication). Big models run multi-GPU (no arena) regardless.
-                        let free = crate::cli::vram_free_per_gpu()
-                            .get(device.0 as usize)
-                            .copied()
-                            .unwrap_or(0);
-                        let needed = (span.len() as u64).saturating_mul(3) / 2;
-                        if free == 0 || needed <= free as u64 {
-                            let mut arena = DeviceBuffer::<u8>::alloc(device, span.len())?;
-                            arena.copy_from_host(span)?;
-                            let ptr = arena.as_ptr();
-                            eprintln!(
-                                "bd 4ayf B1: weight arena {} MiB, single bulk copy",
-                                span.len() / (1024 * 1024)
-                            );
-                            (Some(arena), Some((ptr, data_start)))
-                        } else {
-                            eprintln!(
-                                "bd 4ayf B1: skipping weight arena ({} MiB data section vs {} MiB \
-                                 free) — per-tensor load to avoid OOM (arena duplicates non-Packed)",
-                                span.len() / (1024 * 1024),
-                                free / (1024 * 1024)
-                            );
-                            (None, None)
-                        }
-                    }
-                    None => (None, None),
-                }
-            } else {
-                (None, None)
-            };
+        // (bd 4ayf.12: the weight arena is built earlier — before the load_bf16/load_f32
+        // closures — so embed/norms/recurrent/latent_proj + Packed linears are ALL arena views.)
 
         for i in 0..config.num_layers {
             if is_caching {

@@ -619,6 +619,9 @@ pub fn load_weight_bf16_bqnt(
     name: &str,
     device: DeviceId,
     expected_len: usize,
+    // bd 4ayf.12: (arena_base_ptr, data_start). When present, return a non-owning VIEW into the
+    // bulk-load arena (no copy, no duplication) — bf16 bytes are stored as-is, so a u16 view works.
+    arena: Option<(*const u8, u64)>,
 ) -> Result<DeviceBuffer<u16>, ModelError> {
     // bd 4ayf (multi-GPU regression fix): only read if the tensor is actually Bf16-stored at
     // the expected size. A v1 bqnt may carry this tensor QUANTIZED — e.g. embed_tokens.weight
@@ -636,6 +639,12 @@ pub fn load_weight_bf16_bqnt(
         Some(d) if d.len() == expected_len * 2 => d,
         _ => return Err(ModelError::MissingWeight(name.to_string())),
     };
+    // bd 4ayf.12: arena view (no copy) when present — bf16 stored as-is, u16 view at the offset.
+    if let Some((arena_base, data_start)) = arena {
+        let off = (entry.data_offset - data_start) as usize;
+        let ptr = unsafe { arena_base.add(off) } as *const u16;
+        return Ok(unsafe { DeviceBuffer::<u16>::view(device, ptr, expected_len) });
+    }
     let bf16_data: &[u16] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u16, expected_len) };
     let mut buf = DeviceBuffer::<u16>::alloc(device, expected_len)?;
@@ -652,6 +661,10 @@ pub fn load_weight_f32_bqnt(
     name: &str,
     device: DeviceId,
     expected_len: usize,
+    // bd 4ayf.12: (arena_base_ptr, data_start). An F32-stored tensor can be a non-owning VIEW
+    // into the arena (no copy). A Bf16-stored tensor is WIDENED bf16->f32 (a conversion, not a
+    // reinterpret), so it cannot be a view — it always copies.
+    arena: Option<(*const u8, u64)>,
 ) -> Result<DeviceBuffer<f32>, ModelError> {
     let entry = bqnt
         .entry(name)
@@ -662,6 +675,14 @@ pub fn load_weight_f32_bqnt(
     let data = bqnt
         .tensor_data(name)
         .ok_or_else(|| ModelError::MissingWeight(name.to_string()))?;
+    // bd 4ayf.12: F32-stored + arena -> direct f32 view (no copy).
+    if let (crate::bqnt::StorageDtype::F32, Some((arena_base, data_start))) = (sdt, arena) {
+        if data.len() == expected_len * 4 {
+            let off = (entry.data_offset - data_start) as usize;
+            let ptr = unsafe { arena_base.add(off) } as *const f32;
+            return Ok(unsafe { DeviceBuffer::<f32>::view(device, ptr, expected_len) });
+        }
+    }
     let f32_data: Vec<f32> = match sdt {
         crate::bqnt::StorageDtype::F32 => {
             // bd 4ayf: size mismatch (e.g. a v1 bqnt) -> Err -> st fallback (was assert/panic).
@@ -780,6 +801,9 @@ fn load_latent_proj(
     bqnt: Option<&MmapBqnt>,
     st: &SafeTensorSet,
     wq: WeightQuantMode,
+    // bd 4ayf.12: (arena_base_ptr, data_start) — Packed latent_proj becomes a non-owning arena
+    // view (no copy) when present.
+    arena: Option<(*const u8, u64)>,
 ) -> Result<Option<LinearWeight>, ModelError> {
     let tensor_name = format!("{prefix}{proj_name}.weight");
 
@@ -794,9 +818,16 @@ fn load_latent_proj(
             let out_dim = entry.out_features as usize;
             let in_dim = entry.in_features as usize;
             if let Some(data) = b.tensor_data(&tensor_name) {
-                let mut buf = DeviceBuffer::<u8>::alloc(device, data.len())?;
-                buf.copy_from_host(data)?;
-                return Ok(Some(LinearWeight::Packed(PackedWeights { data: buf, format: fmt, out_dim, in_dim })));
+                // bd 4ayf.12: arena view (no copy) when present; else alloc + copy.
+                let data_buf = if let Some((arena_base, data_start)) = arena {
+                    let off = (entry.data_offset - data_start) as usize;
+                    unsafe { DeviceBuffer::<u8>::view(device, arena_base.add(off), data.len()) }
+                } else {
+                    let mut buf = DeviceBuffer::<u8>::alloc(device, data.len())?;
+                    buf.copy_from_host(data)?;
+                    buf
+                };
+                return Ok(Some(LinearWeight::Packed(PackedWeights { data: data_buf, format: fmt, out_dim, in_dim })));
             }
         }
     }
@@ -1242,8 +1273,10 @@ fn load_moe_weights_inner(
 
     // fc1_latent_proj / fc2_latent_proj: optional projections between hidden↔latent space.
     // Present on models with moe_latent_size (e.g. Nemotron-H: fc1=[1024,4096], fc2=[4096,1024]).
-    let fc1_latent_proj = load_latent_proj(prefix, "fc1_latent_proj", device, bqnt, st, wq)?;
-    let fc2_latent_proj = load_latent_proj(prefix, "fc2_latent_proj", device, bqnt, st, wq)?;
+    // bd 4ayf.12: MoE models skip the arena (experts are fused, can't be views — see model_load
+    // gate), so latent_proj loads per-tensor (arena=None).
+    let fc1_latent_proj = load_latent_proj(prefix, "fc1_latent_proj", device, bqnt, st, wq, None)?;
+    let fc2_latent_proj = load_latent_proj(prefix, "fc2_latent_proj", device, bqnt, st, wq, None)?;
 
     Ok(MoeWeights {
         gate,
@@ -1822,7 +1855,7 @@ mod bqnt_reader_compat_tests {
             w.finish("{}").unwrap();
         }
         let bqnt = MmapBqnt::open(&path).unwrap();
-        let r = load_weight_bf16_bqnt(&bqnt, "embed", DeviceId(0), 4 * 32);
+        let r = load_weight_bf16_bqnt(&bqnt, "embed", DeviceId(0), 4 * 32, None);
         assert!(
             r.is_err(),
             "a Q4-stored tensor must Err from the bf16 reader (-> safetensors fallback), not panic"
@@ -1841,7 +1874,7 @@ mod bqnt_reader_compat_tests {
             w.finish("{}").unwrap();
         }
         let bqnt = MmapBqnt::open(&path).unwrap();
-        let r = load_weight_bf16_bqnt(&bqnt, "norm", DeviceId(0), 999);
+        let r = load_weight_bf16_bqnt(&bqnt, "norm", DeviceId(0), 999, None);
         assert!(r.is_err(), "a bf16 size-mismatch must Err, not OOB/panic");
         let _ = std::fs::remove_file(&path);
     }
@@ -1858,7 +1891,7 @@ mod bqnt_reader_compat_tests {
             w.finish("{}").unwrap();
         }
         let bqnt = MmapBqnt::open(&path).unwrap();
-        let r = load_weight_f32_bqnt(&bqnt, "a_log", DeviceId(0), 4 * 32);
+        let r = load_weight_f32_bqnt(&bqnt, "a_log", DeviceId(0), 4 * 32, None);
         assert!(r.is_err(), "a Q4-stored tensor must Err from the f32 reader, not panic");
         let _ = std::fs::remove_file(&path);
     }
