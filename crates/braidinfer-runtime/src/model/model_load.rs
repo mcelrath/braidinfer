@@ -1340,6 +1340,29 @@ impl Model {
         };
         print_vram("init");
 
+        // bd 4ayf.13: pin the bqnt data section (PORTABLE, so every GPU can DMA from it) so the
+        // thousands of per-expert h2d copies in distribute_moe_weights_from_bqnt DMA directly
+        // instead of bounce-buffering through a staging copy. The multi-GPU expert distribute is
+        // ~82% of load (measured 33.8s on qwen35_35b_a3b -g2) and dominated by these copies from
+        // the (otherwise-unpinned) mmap — pinning is the primary win. Unregistered before return.
+        const HIP_HOST_REGISTER_PORTABLE: u32 = 0x1;
+        let pinned_bqnt: Option<*mut std::ffi::c_void> = bqnt.as_ref().and_then(|b| {
+            b.data_section().and_then(|(_, span)| {
+                let ptr = span.as_ptr() as *mut std::ffi::c_void;
+                let rc = unsafe { ffi::hipHostRegister(ptr, span.len(), HIP_HOST_REGISTER_PORTABLE) };
+                if rc == 0 {
+                    eprintln!(
+                        "bd 4ayf.13: pinned bqnt data section ({} MiB) for direct h2d DMA",
+                        span.len() / (1024 * 1024)
+                    );
+                    Some(ptr)
+                } else {
+                    eprintln!("bd 4ayf.13: hipHostRegister(bqnt) rc={rc} — unpinned (slower) DMA");
+                    None
+                }
+            })
+        });
+
         let mut distributed = Vec::with_capacity(self.config.num_layers);
         for i in 0..self.config.num_layers {
             if let Some(ref moe) = self.moe_weights[i] {
@@ -1440,6 +1463,14 @@ impl Model {
         // guard if deferred until first prefill (after warmup spawned the
         // GPU 0 worker). This is safe here because enable_multi_gpu runs
         // immediately after Model::load on the binary side.
+        // bd 4ayf.13: unregister the pinned bqnt data section NOW — after the distribute +
+        // attn-split copies (the last bqnt uses) but BEFORE the persistent worker launches. Once
+        // the cooperative worker holds the GPU's CUs, ANY HIP call (incl hipHostUnregister)
+        // deadlocks (CLAUDE.md "What Causes Hangs in Persistent Mode"); placing it after the
+        // worker launch was exit 247 (SIGKILL of the deadlocked process).
+        if let Some(ptr) = pinned_bqnt {
+            unsafe { ffi::hipHostUnregister(ptr) };
+        }
         if self.has_moe {
             self.ensure_moe_workers_started()?;
         }
