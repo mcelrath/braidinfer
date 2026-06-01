@@ -186,9 +186,15 @@ impl Model {
                     rmsnorm_op, 1, normed_slot, token_input, norm_weight, hs as i32, eps,
                 ).into_inst());
             }
-            // gate_proj reads from VRAM scratch (same-GPU cached, fast).
+            // gate_proj (MoE router) reads the HIDDEN-dim normed — gate.weight is [ne, hs].
+            // bd 4ayf.20: in the Nemotron-H latent case, `normed_slot` holds the fc1 LATENT
+            // output (moe_latent_size, e.g. 1024), NOT the hidden normed (hs=4096). Reading it
+            // with in_dim=hs over-reads into adjacent tokens' latent slots -> garbage routing ->
+            // degenerate logits -> immediate EOS (0 tokens). Read `normed_dev` (the hs-dim rmsnorm
+            // output for this token) instead. Non-latent: normed_slot IS the hs normed (unchanged).
+            let gate_input = if fc1_ptr.is_some() { normed_dev } else { normed_slot };
             insts.push(LinearProjInst::new(
-                gate_proj_op, ne as u32, scores_dev, gate_proj_data, normed_slot as *const f32,
+                gate_proj_op, ne as u32, scores_dev, gate_proj_data, gate_input as *const f32,
                 ne as i32, hs as i32, 0,
             ).into_inst());
             insts.push(MoeGateInst::new(
