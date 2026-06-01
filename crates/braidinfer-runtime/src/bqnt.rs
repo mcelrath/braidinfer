@@ -406,9 +406,14 @@ impl BqntFile {
             let out_features = u32::from_le_bytes(buf[12..16].try_into().unwrap());
             let in_features = u32::from_le_bytes(buf[16..20].try_into().unwrap());
             let original_ndim = u32::from_le_bytes(buf[20..24].try_into().unwrap());
-            if !(1..=4).contains(&original_ndim) {
+            // Sanity canary against a misaligned/corrupt entry parse only. Real tensor ranks span
+            // 1..=5 across the fleet (MoE expert + conv tensors reach 3-5); a misread yields a huge
+            // value. The bound is deliberately generous so it can NEVER reject a valid bqnt — the
+            // load-bearing corruption checks are the data_offset/data_bytes bounds below.
+            if original_ndim > 16 {
                 return Err(invalid_data(format!(
-                    "tensor {name_hash:#x} has invalid original_ndim {original_ndim} (expected 1..=4)"
+                    "tensor {name_hash:#x} has implausible original_ndim {original_ndim} \
+                     (>16 — likely a corrupt or misaligned entry table)"
                 )));
             }
             let data_offset = u64::from_le_bytes(buf[24..32].try_into().unwrap());
