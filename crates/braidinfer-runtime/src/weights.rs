@@ -4,8 +4,7 @@
 use braidinfer_core::safetensors::SafeTensorSet;
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
-use braidinfer_hip::stream::Stream;
-use braidinfer_hip::{HipResult, ffi};
+use braidinfer_hip::ffi;
 use safetensors::Dtype;
 
 use crate::config::*;
@@ -847,6 +846,35 @@ fn load_latent_proj(
     Ok(None)
 }
 
+/// Concatenate per-expert packed bytes from bqnt into a single fused LinearWeight.
+/// `first_name` must be the name of expert 0's weight (e.g. "...experts.0.up_proj.weight").
+/// All expert names are derived by replacing ".0." with ".{e}.".
+/// Returns None if any expert's data is missing or format is non-linear.
+fn concat_per_expert_bqnt(
+    b: &MmapBqnt,
+    first_name: &str,
+    ne: usize,
+    device: DeviceId,
+) -> Option<LinearWeight> {
+    let first_entry = b.entry(first_name)?;
+    let per_expert_bytes = first_entry.data_bytes as usize;
+    let mut packed = vec![0u8; ne * per_expert_bytes];
+    for e in 0..ne {
+        let name = first_name.replace(".0.", &format!(".{e}."));
+        let data = b.tensor_data(&name)?;
+        packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
+    }
+    let fmt = code_to_format(first_entry.format).and_then(|s| s.to_weight_format())?;
+    let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
+    buf.copy_from_host(&packed).ok()?;
+    Some(LinearWeight::Packed(PackedWeights {
+        data: buf,
+        format: fmt,
+        out_dim: ne * first_entry.out_features as usize,
+        in_dim: first_entry.in_features as usize,
+    }))
+}
+
 fn load_moe_weights_inner(
     st: &SafeTensorSet,
     prefix: &str,
@@ -898,6 +926,7 @@ fn load_moe_weights_inner(
     };
 
     // Router gate: try mlp.gate, gate (Nemotron), block_sparse_moe.gate, mlp.router (always bf16)
+    // Probe both bqnt (name existence only) and safetensors — gate weight stays bf16.
     let gate_name = [
         format!("{prefix}mlp.gate.weight"),
         format!("{prefix}gate.weight"),
@@ -905,7 +934,7 @@ fn load_moe_weights_inner(
         format!("{prefix}mlp.router.weight"),
     ]
     .into_iter()
-    .find(|n| st.tensor_data(n).is_ok())
+    .find(|n| bqnt.map(|b| b.entry(n).is_some()).unwrap_or(false) || st.tensor_data(n).is_ok())
     .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.gate.weight (or variants)")))?;
     let gate = load_weight_bf16(st, &gate_name, device, ne * hs)?;
 
@@ -1022,30 +1051,13 @@ fn load_moe_weights_inner(
             .into_iter()
             .find(|n| bqnt.map_or(false, |b| b.entry(n).is_some()) || st.tensor_data(n).is_ok());
             let bqnt_per_expert = first_up_name.as_ref().and_then(|_| bqnt).and_then(|b| {
-                // Try to concatenate per-expert packed bytes from bqnt
                 let first_name = [
                     format!("{prefix}experts.0.up_proj.weight"),
                     format!("{prefix}mlp.experts.0.up_proj.weight"),
                 ]
                 .into_iter()
                 .find(|n| b.entry(n).is_some())?;
-                let first_entry = b.entry(&first_name)?;
-                let per_expert_bytes = first_entry.data_bytes as usize;
-                let mut packed = vec![0u8; ne * per_expert_bytes];
-                for e in 0..ne {
-                    let name = first_name.replace(".0.", &format!(".{e}."));
-                    let data = b.tensor_data(&name)?;
-                    packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
-                }
-                let fmt = code_to_format(first_entry.format).and_then(|s| s.to_weight_format())?;
-                let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
-                buf.copy_from_host(&packed).ok()?;
-                Some(LinearWeight::Packed(PackedWeights {
-                    data: buf,
-                    format: fmt,
-                    out_dim: ne * first_entry.out_features as usize,
-                    in_dim: first_entry.in_features as usize,
-                }))
+                concat_per_expert_bqnt(b, &first_name, ne, device)
             });
             if let Some(lw) = bqnt_per_expert {
                 lw
@@ -1114,23 +1126,7 @@ fn load_moe_weights_inner(
                 ]
                 .into_iter()
                 .find(|n| b.entry(n).is_some())?;
-                let first_entry = b.entry(&first_name)?;
-                let per_expert_bytes = first_entry.data_bytes as usize;
-                let mut packed = vec![0u8; ne * per_expert_bytes];
-                for e in 0..ne {
-                    let name = first_name.replace(".0.", &format!(".{e}."));
-                    let data = b.tensor_data(&name)?;
-                    packed[e * per_expert_bytes..(e + 1) * per_expert_bytes].copy_from_slice(data);
-                }
-                let fmt = code_to_format(first_entry.format).and_then(|s| s.to_weight_format())?;
-                let mut buf = DeviceBuffer::<u8>::alloc(device, packed.len()).ok()?;
-                buf.copy_from_host(&packed).ok()?;
-                Some(LinearWeight::Packed(PackedWeights {
-                    data: buf,
-                    format: fmt,
-                    out_dim: ne * first_entry.out_features as usize,
-                    in_dim: first_entry.in_features as usize,
-                }))
+                concat_per_expert_bqnt(b, &first_name, ne, device)
             });
             if let Some(lw) = bqnt_per_expert_down {
                 lw
@@ -1330,28 +1326,6 @@ pub fn load_weight_f32(
     let mut buf = DeviceBuffer::<f32>::alloc(device, expected_len)?;
     buf.copy_from_host(&data)?;
     Ok(buf)
-}
-
-// D2D memcpy: copy `count` u16 elements from src at offset src_off to dst at offset dst_off
-pub unsafe fn d2d_copy_u16(
-    dst: &mut DeviceBuffer<u16>,
-    dst_off: usize,
-    src: &DeviceBuffer<u16>,
-    src_off: usize,
-    count: usize,
-    stream: &Stream,
-) -> HipResult<()> {
-    unsafe {
-        let dst_ptr = dst.as_mut_ptr().add(dst_off) as *mut std::ffi::c_void;
-        let src_ptr = src.as_ptr().add(src_off) as *const std::ffi::c_void;
-        braidinfer_hip::error::check(ffi::hipMemcpyAsync(
-            dst_ptr,
-            src_ptr,
-            count * 2,
-            ffi::hipMemcpyDeviceToDevice,
-            stream.raw(),
-        ))
-    }
 }
 
 // ---- Precompute inv_freq ----

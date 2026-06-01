@@ -111,34 +111,33 @@ pub fn packed_size(format: StorageDtype, out_dim: usize, in_dim: usize) -> usize
 }
 
 fn checked_packed_size(format: StorageDtype, out_dim: u32, in_dim: u32) -> io::Result<u64> {
-    let out_dim = out_dim as u64;
-    let in_dim = in_dim as u64;
+    // Overflow-safe: promote to u64 and use checked arithmetic.
+    let out = out_dim as u64;
+    let inp = in_dim as u64;
     match format {
-        StorageDtype::Bf16 => out_dim
-            .checked_mul(in_dim)
+        StorageDtype::Bf16 => out
+            .checked_mul(inp)
             .and_then(|x| x.checked_mul(2))
             .ok_or_else(|| invalid_data("bf16 packed size overflows")),
-        StorageDtype::F32 => out_dim
-            .checked_mul(in_dim)
+        StorageDtype::F32 => out
+            .checked_mul(inp)
             .and_then(|x| x.checked_mul(4))
             .ok_or_else(|| invalid_data("f32 packed size overflows")),
         StorageDtype::PcG32Q4 => {
-            let groups = in_dim
+            let groups = inp
                 .checked_add(31)
                 .map(|x| x / 32)
                 .ok_or_else(|| invalid_data("pcg32 packed group count overflows"))?;
-            out_dim
-                .checked_mul(groups)
+            out.checked_mul(groups)
                 .and_then(|x| x.checked_mul(20))
                 .ok_or_else(|| invalid_data("pcg32 packed size overflows"))
         }
         StorageDtype::Rnf4G128 => {
-            let groups = in_dim
+            let groups = inp
                 .checked_add(127)
                 .map(|x| x / 128)
                 .ok_or_else(|| invalid_data("rnf4 packed group count overflows"))?;
-            out_dim
-                .checked_mul(groups)
+            out.checked_mul(groups)
                 .and_then(|x| x.checked_mul(132))
                 .ok_or_else(|| invalid_data("rnf4 packed size overflows"))
         }
@@ -407,6 +406,11 @@ impl BqntFile {
             let out_features = u32::from_le_bytes(buf[12..16].try_into().unwrap());
             let in_features = u32::from_le_bytes(buf[16..20].try_into().unwrap());
             let original_ndim = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+            if !(1..=4).contains(&original_ndim) {
+                return Err(invalid_data(format!(
+                    "tensor {name_hash:#x} has invalid original_ndim {original_ndim} (expected 1..=4)"
+                )));
+            }
             let data_offset = u64::from_le_bytes(buf[24..32].try_into().unwrap());
             let data_bytes = u64::from_le_bytes(buf[32..40].try_into().unwrap());
             let format = code_to_format(format).ok_or_else(|| {
