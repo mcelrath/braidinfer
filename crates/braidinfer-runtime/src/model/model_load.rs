@@ -1,7 +1,7 @@
 //! Model weight loading and initialization.
 //! Extracted from model.rs for maintainability.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use braidinfer_core::safetensors::SafeTensorSet;
 use braidinfer_core::types::DeviceId;
@@ -14,7 +14,36 @@ use crate::config::*;
 use crate::kernel::AllKernels;
 use crate::weights::*;
 
+/// Resolve the .bqnt file path: BQNT_PATH env var takes priority; else auto-derive
+/// from `model_dir` as `{parent}/{model_dir_name}.q4.bqnt`. Returns `Some(path)` only
+/// when the resolved path exists on disk. Returns `None` when neither env nor auto path
+/// resolves to an existing file.
+///
+/// This is the single source of truth for bqnt path resolution, shared between
+/// `Model::load_with_max_seq_len` and `Model::enable_distributed_moe` so that a model
+/// loaded via auto-derived path can be run multi-GPU without setting BQNT_PATH
+/// (bd braidinfer-abuf).
+pub(super) fn resolve_bqnt_path(model_dir: &Path) -> Option<PathBuf> {
+    resolve_bqnt_path_with_env(std::env::var("BQNT_PATH").ok(), model_dir)
+}
+
+/// Inner helper that takes the env value as a parameter for deterministic unit testing.
+fn resolve_bqnt_path_with_env(bqnt_path_env: Option<String>, model_dir: &Path) -> Option<PathBuf> {
+    let explicit = bqnt_path_env.map(PathBuf::from);
+    let auto = model_dir.file_name().map(|n| {
+        model_dir
+            .parent()
+            .unwrap_or(model_dir)
+            .join(format!("{}.q4.bqnt", n.to_string_lossy()))
+    });
+    explicit.or(auto).filter(|p| p.exists())
+}
+
 impl Model {
+    /// VRAM headroom reserved above the bqnt data-section size when deciding whether to
+    /// build the weight arena (activations + KV cache + the few Bf16->f32 widened tensors).
+    const ARENA_VRAM_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
     /// Default max_seq_len cap for flat KV cache (limits VRAM usage).
     /// Override with `load_with_max_seq_len`. Paged KV grows dynamically.
     const DEFAULT_MAX_SEQ_LEN: usize = 8192;
@@ -101,44 +130,43 @@ impl Model {
         // bqnt (or no bqnt) + empty st surfaces as MissingWeight at the specific tensor.
         let st = SafeTensorSet::open_directory(model_dir).unwrap_or_else(|_| SafeTensorSet::empty());
 
-        // Locate .bqnt file: BQNT_PATH env var takes priority; else auto-derive from model_dir.
-        // Auto path: sibling to model_dir named "{model_dir_name}.q4.bqnt"
-        let explicit_bqnt_path = std::env::var("BQNT_PATH")
-            .ok()
-            .map(std::path::PathBuf::from);
-        let auto_bqnt_path = model_dir.file_name().map(|n| {
-            model_dir
-                .parent()
-                .unwrap_or(model_dir)
-                .join(format!("{}.q4.bqnt", n.to_string_lossy()))
-        });
-        let bqnt_path_to_try = explicit_bqnt_path.as_ref().or(auto_bqnt_path.as_ref());
+        // Locate .bqnt file via resolve_bqnt_path (single source of truth shared with
+        // enable_distributed_moe — fixes auto-derived-path multi-GPU failure bd abuf).
+        let resolved_bqnt_path: Option<PathBuf> = resolve_bqnt_path(model_dir);
+        let is_explicit_bqnt = std::env::var("BQNT_PATH").is_ok();
 
-        let bqnt = bqnt_path_to_try.and_then(|path| {
-            if path.exists() {
-                match crate::bqnt::MmapBqnt::open(path) {
-                    Ok(b) => {
-                        eprintln!(
-                            "Loaded pre-quantized weights from {} ({} tensors)",
-                            path.display(),
-                            b.n_tensors()
-                        );
-                        Some(b)
-                    }
-                    Err(e) => {
-                        eprintln!("WARNING: Failed to open {}: {e}", path.display());
-                        None
-                    }
+        let bqnt = resolved_bqnt_path.as_deref().and_then(|path| {
+            match crate::bqnt::MmapBqnt::open(path) {
+                Ok(b) => {
+                    eprintln!(
+                        "Loaded pre-quantized weights from {} ({} tensors)",
+                        path.display(),
+                        b.n_tensors()
+                    );
+                    Some(b)
                 }
-            } else {
-                None
+                Err(e) => {
+                    eprintln!("WARNING: Failed to open {}: {e}", path.display());
+                    None
+                }
             }
         });
 
         // If no bqnt found and quantizing, create a writer to cache for next launch.
         // Only create writer when BQNT_PATH is not explicitly set (avoid overwriting user files).
+        // auto_bqnt_path: only needed as the writer-destination when no bqnt exists yet.
+        let auto_bqnt_path = if !is_explicit_bqnt {
+            model_dir.file_name().map(|n| {
+                model_dir
+                    .parent()
+                    .unwrap_or(model_dir)
+                    .join(format!("{}.q4.bqnt", n.to_string_lossy()))
+            })
+        } else {
+            None
+        };
         let save_bqnt_path = if bqnt.is_none()
-            && explicit_bqnt_path.is_none()
+            && !is_explicit_bqnt
             && config.weight_quant != WeightQuantMode::Bf16
         {
             auto_bqnt_path.clone()
@@ -309,7 +337,7 @@ impl Model {
                             .get(device.0 as usize)
                             .copied()
                             .unwrap_or(0);
-                        let needed = span.len() as u64 + 2 * 1024 * 1024 * 1024;
+                        let needed = span.len() as u64 + Self::ARENA_VRAM_HEADROOM_BYTES;
                         if free == 0 || needed <= free as u64 {
                             let mut arena = DeviceBuffer::<u8>::alloc(device, span.len())?;
                             arena.copy_from_host(span)?;
@@ -1246,6 +1274,7 @@ impl Model {
             has_moe,
             debug_p2p_hidden: std::env::var("DEBUG_P2P_HIDDEN").is_ok(),
             weight_prefix: prefix.clone(),
+            bqnt_path: resolved_bqnt_path,
             multi_gpu: None,
             distributed_moe: Vec::new(),
             moe_p2p: None,
@@ -1325,9 +1354,11 @@ impl Model {
             })
         });
 
-        let bqnt = std::env::var("BQNT_PATH")
-            .ok()
-            .and_then(|p| crate::bqnt::MmapBqnt::open(std::path::Path::new(&p)).ok());
+        // bd abuf: use self.bqnt_path (set at load time via resolve_bqnt_path, which
+        // considers both BQNT_PATH env and the auto-derived sibling path) so that a model
+        // loaded via auto-derived path works multi-GPU without requiring BQNT_PATH to be set.
+        let bqnt = self.bqnt_path.as_deref()
+            .and_then(|p| crate::bqnt::MmapBqnt::open(p).ok());
 
         // VRAM diagnostic helper: prints per-GPU free MB.
         let print_vram = |label: &str| {
@@ -1607,5 +1638,52 @@ impl Model {
             num_gpus
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_bqnt_path_with_env;
+    use std::path::Path;
+
+    fn defer_rm(p: std::path::PathBuf) -> impl Drop {
+        struct D(std::path::PathBuf);
+        impl Drop for D { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+        D(p)
+    }
+
+    /// explicit BQNT_PATH env value wins over auto-derive.
+    #[test]
+    fn resolve_explicit_env_wins() {
+        let explicit = std::env::temp_dir().join("braidinfer_abuf_explicit.q4.bqnt");
+        std::fs::write(&explicit, b"").unwrap();
+        let _rm = defer_rm(explicit.clone());
+        let result = resolve_bqnt_path_with_env(
+            Some(explicit.to_str().unwrap().to_string()),
+            Path::new("/nonexistent/model_dir"),
+        );
+        assert_eq!(result.as_deref(), Some(explicit.as_path()));
+    }
+
+    /// no env → auto-derives {parent}/{model_dir_name}.q4.bqnt when it exists.
+    #[test]
+    fn resolve_auto_derive_when_no_env() {
+        let parent = std::env::temp_dir();
+        let model_dir = parent.join("mymodel_abuf_test");
+        let expected = parent.join("mymodel_abuf_test.q4.bqnt");
+        std::fs::write(&expected, b"").unwrap();
+        let _rm = defer_rm(expected.clone());
+        let result = resolve_bqnt_path_with_env(None, &model_dir);
+        assert_eq!(result.as_deref(), Some(expected.as_path()));
+    }
+
+    /// returns None when neither env nor auto path resolves to an existing file.
+    #[test]
+    fn resolve_none_when_no_file() {
+        let result = resolve_bqnt_path_with_env(
+            None,
+            Path::new("/nonexistent/no_bqnt_here"),
+        );
+        assert_eq!(result, None);
     }
 }

@@ -98,6 +98,11 @@ pub struct Model {
     pub(crate) has_moe: bool,          // cached at load time: any layer has FfnType::MoE
     pub(crate) debug_p2p_hidden: bool, // cached from DEBUG_P2P_HIDDEN env var at load time
     pub(crate) weight_prefix: String, // tensor name prefix (e.g. "model.language_model.")
+    /// Resolved .bqnt path used at load time (BQNT_PATH env or auto-derived from model_dir).
+    /// Stored so enable_distributed_moe can reopen the same file without requiring the caller
+    /// to re-set BQNT_PATH — fixes the auto-derived-path multi-GPU failure (bd braidinfer-abuf).
+    /// None when no bqnt was found at load time.
+    pub(crate) bqnt_path: Option<std::path::PathBuf>,
     // Multi-GPU expert parallel (None for single-GPU)
     pub(crate) multi_gpu: Option<crate::multi_gpu::MultiGpuContext>,
     // Multi-GPU megakernel programs
