@@ -76,8 +76,14 @@ impl<T> DeviceBuffer<T> {
     /// bd 4ayf B1: a NON-OWNING view into an existing coarse-grained-local buffer (an arena)
     /// at `ptr` for `len` elements. `Drop` does NOT free. SAFETY: `ptr` must point into a
     /// live coarse-grained-local `DeviceBuffer` (the arena) on `device` that outlives this
-    /// view, with at least `len` valid elements. `as_ptr()`/`as_typed_local()` are valid
-    /// (the arena memory is coarse-grained-local).
+    /// view, with at least `len` valid elements.
+    ///
+    /// Access via `as_ptr()` (raw read) ONLY. The `as_typed_*` accessors assert
+    /// `alloc_class` and will PANIC on a `View` (its class is `AllocClass::View`, not
+    /// `CoarseGrainedLocal`). This is correct, not a gap: views are read-only weight references
+    /// and are NEVER hardware-atomic targets — atomics hit output/reduction buffers, which are
+    /// real `CoarseGrainedLocal` allocations, not arena views. The host-side `DevPtr` typed-
+    /// pointer wiring for those atomic-target buffers is tracked in bd 77r.2.19.
     pub unsafe fn view(device: DeviceId, ptr: *const T, len: usize) -> Self {
         DeviceBuffer {
             ptr: ptr as *mut T,
