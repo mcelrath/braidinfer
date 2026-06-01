@@ -1027,7 +1027,7 @@ impl MegakernelProgram {
                         // were copied.
                         prog.instructions[barrier_idx - 2] = D2dCopyInst::new(
                             div_ceil(hs as u32, 256),
-                            p2p.moe_act_uc_handoff.dev_ptr(0),
+                            p2p.moe_act_uc_handoff.typed_dev_ptr(0).as_raw(),
                             act.normed.as_ptr(),
                             hs as i32,
                         )
@@ -1111,7 +1111,7 @@ impl MegakernelProgram {
                         new_instructions.push(
                             D2dCopyInst::new(
                                 div_ceil(gupd_stage as u32, 256),
-                                p2p.moe_act_uc_handoff.dev_ptr(0),
+                                p2p.moe_act_uc_handoff.typed_dev_ptr(0).as_raw(),
                                 act.moe_latent.as_ptr(),
                                 gupd_stage as i32,
                             )

@@ -1349,7 +1349,9 @@ impl Model {
             let gpu_id = w + 1;
             let out_slot = unsafe { output_slots.add(gpu_id * hs) };
             // Per-worker device pointer to the host-mapped activation handoff.
-            let activation = p2p.moe_act_uc_handoff.dev_ptr(gpu_id) as *const f32;
+            // .as_raw() at FFI boundary: typed_dev_ptr returns HostMapped — enforces
+            // that workers P2P-read from portable-coherent host-UC memory.
+            let activation = p2p.moe_act_uc_handoff.typed_dev_ptr(gpu_id).as_raw() as *const f32;
             // bd el1f: decode is single-token; the multi-token Step 1 drain
             // race doesn't apply, so wait_ptr=null (no acquire). The decode
             // path uses OP_MOE_DISPATCH (megakernel-internal) which handles

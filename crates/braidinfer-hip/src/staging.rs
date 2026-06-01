@@ -37,6 +37,7 @@
 //!   (one alloc, sliced by worker) would reduce GART page-table pressure but
 //!   requires reshuffling the `GpuWorker` field layout and is out of scope.
 
+use crate::dev_ptr::{DevPtr, tags};
 use crate::device::DeviceGuard;
 use crate::memory::MappedHostBuffer;
 use crate::{HipResult, error, ffi};
@@ -108,6 +109,25 @@ impl<T> CrossGpuStaging<T> {
     /// dispatch batches).
     pub fn zero(&mut self) {
         unsafe { ptr::write_bytes(self.host.host_ptr(), 0, self.host.len()) };
+    }
+
+    /// Per-GPU typed device pointer tagged `HostMapped`. The backing
+    /// allocation is `alloc_portable_coherent` (MTYPE_UC host-mapped
+    /// fine-grained), so the correct tag is `HostMapped`.  Pass
+    /// `.as_raw()` at the FFI/instruction-packing boundary; the type
+    /// enforces that callers expecting cross-GPU signaling/mailbox memory
+    /// cannot accidentally receive a VRAM pointer.
+    ///
+    /// `gpu_idx` is the position in the `devices` slice passed at construction.
+    #[track_caller]
+    pub fn typed_dev_ptr(&self, gpu_idx: usize) -> DevPtr<T, tags::HostMapped> {
+        let ptr = self.dev_ptrs[gpu_idx];
+        // SAFETY: `ptr` was resolved via hipHostGetDevicePointer from an
+        // alloc_portable_coherent host-mapped allocation, which maps to
+        // MTYPE_UC on every GPU — matching the `HostMapped` tag contract.
+        // The pointer outlives this `CrossGpuStaging` (the host buffer owns the
+        // underlying allocation and both have the same lifetime).
+        unsafe { DevPtr::from_raw(ptr, self.host.len()) }
     }
 
     /// Borrow the underlying host buffer. Use for the rare case where a

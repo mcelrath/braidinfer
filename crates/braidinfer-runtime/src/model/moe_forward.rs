@@ -123,7 +123,8 @@ impl Model {
             let p2p = self.moe_p2p.as_mut().expect("moe_p2p not initialized for prefill batched");
             // Host-mapped portable_coherent staging. Workers read via per-worker
             // per-context device_ptr (activation_staging_dev_ptr_for(w)).
-            let act_staging_dev = p2p.activation_staging.dev_ptr(0);
+            // .as_raw() at FFI boundary: GPU 0 D2D-copy destination (HostMapped activation staging).
+            let act_staging_dev = p2p.activation_staging.typed_dev_ptr(0).as_raw();
             let per_token_ids_host = p2p.per_token_expert_ids.host_ptr();
             let per_token_wts_host = p2p.per_token_expert_weights.host_ptr();
             let per_token_ids_dev = p2p.per_token_expert_ids.as_mut_ptr();
@@ -132,8 +133,10 @@ impl Model {
             let gpu0_out_dev = p2p.output_slots.dev_ptr(0);
             let num_workers = p2p.workers.len();
             let num_gpus = p2p.num_gpus;
+            // Collect typed activation staging ptrs; .as_raw() at the FFI
+            // boundary below (build_ffn_remote_inst / add offset).
             let worker_act_bases: Vec<*mut f32> = (0..num_workers)
-                .map(|w| p2p.activation_staging_dev_ptr_for(w)).collect();
+                .map(|w| p2p.activation_staging_dev_ptr_for(w).as_raw()).collect();
             (
                 act_staging_dev,
                 per_token_ids_host, per_token_wts_host,
@@ -291,7 +294,9 @@ impl Model {
             // class (SDMA, not compute-engine PCIe), avoiding the hazard.
             for w in 0..num_workers {
                 let gpu_id = w + 1;
-                let out_target = p2p.local_output_ptr_for(w);
+                // .as_raw() at FFI boundary: typed DevPtr<f32, CoarseGrainedLocal>
+                // enforces that workers write to their own VRAM (SDMA-D2H copies out).
+                let out_target: *mut f32 = p2p.local_output_ptr_for(w).as_raw();
                 let act_p2p = unsafe { worker_act_bases[w].add(t * latent_size) as *const f32 };
                 // bd el1f: wait_ptr infrastructure is in place but PASS NULL.
                 // The acquire-on-VRAM-sentinel pattern (Phase A as designed)
@@ -339,7 +344,8 @@ impl Model {
                     let stream = pd.sdma_stream(gpu_id);
                     let off = (t * num_gpus + gpu_id) * hs;
                     let dst = host_outs.add(off) as *mut std::ffi::c_void;
-                    let src = p2p.local_output_ptr_for(w) as *const std::ffi::c_void;
+                    // .as_raw() then cast: typed ptr enforces CoarseGrainedLocal VRAM source.
+                    let src = p2p.local_output_ptr_for(w).as_raw() as *const std::ffi::c_void;
                     let _guard = braidinfer_hip::device::DeviceGuard::switch_to(device)
                         .expect("DeviceGuard");
                     braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpyAsync(

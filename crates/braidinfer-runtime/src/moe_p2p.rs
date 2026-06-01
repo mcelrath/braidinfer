@@ -21,6 +21,7 @@
 
 use braidinfer_core::types::DeviceId;
 use braidinfer_hip::HipResult;
+use braidinfer_hip::dev_ptr::{DevPtr, tags};
 use braidinfer_hip::device::DeviceGuard;
 use braidinfer_hip::memory::{DeviceBuffer, MappedHostBuffer};
 use braidinfer_hip::staging::CrossGpuStaging;
@@ -543,18 +544,36 @@ impl MoeP2pContext {
         })
     }
 
-    /// Worker-specific device pointer to the activation staging buffer.
-    /// Use this when building OP_MOE_FFN_REMOTE for `worker_idx` (0-based —
-    /// 0 = GPU 1). See field doc on `activation_staging_dev_ptrs`.
-    pub fn activation_staging_dev_ptr_for(&self, worker_idx: usize) -> *mut f32 {
+    /// Worker-specific typed device pointer to the activation staging buffer.
+    ///
+    /// Tagged [`tags::HostMapped`]: `activation_staging` is a
+    /// [`CrossGpuStaging<f32>`] backed by `alloc_portable_coherent`
+    /// (MTYPE_UC host-mapped fine-grained memory — staging.rs:68).
+    /// Workers P2P-read this cross-GPU; host-UC is the ONLY correct medium
+    /// for that (el1f: a VRAM staging ptr is L2-cached on GPU 0 and
+    /// invisible to peer MTYPE-UC reads). The type ensures call sites
+    /// cannot substitute a VRAM pointer by mistake.
+    ///
+    /// Call `.as_raw()` when packing the pointer into an instruction word.
+    ///
+    /// `worker_idx` is 0-based (0 = GPU 1) under the gpu_idx == gpu_id convention.
+    /// 
+    pub fn activation_staging_dev_ptr_for(&self, worker_idx: usize) -> DevPtr<f32, tags::HostMapped> {
         // worker_idx 0 = GPU 1 (gpu_id 1) under gpu_idx == gpu_id convention.
-        self.activation_staging.dev_ptr(worker_idx + 1)
+        self.activation_staging.typed_dev_ptr(worker_idx + 1)
     }
 
     /// Worker's local_output VRAM pointer (worker-local addressable).
-    /// Used by the BRAIDINFER_MOE_NO_P2P_WRITE diagnostic probe.
-    pub fn local_output_ptr_for(&self, worker_idx: usize) -> *mut f32 {
-        self.workers[worker_idx].local_output.as_ptr() as *mut f32
+    ///
+    /// Tagged [`tags::CoarseGrainedLocal`]: `local_output` is allocated by
+    /// `DeviceBuffer::<f32>::alloc(device, hidden_size)` — standard hipMalloc
+    /// coarse-grained VRAM on the worker's own GPU (moe_p2p.rs:503).
+    /// Workers write their FFN output here; GPU 0 copies via SDMA
+    /// (not cross-GPU peer-write, which would trigger the §11.4 hazard).
+    ///
+    /// Call `.as_raw()` when packing into an instruction word or hipMemcpyAsync call.
+    pub fn local_output_ptr_for(&self, worker_idx: usize) -> DevPtr<f32, tags::CoarseGrainedLocal> {
+        self.workers[worker_idx].local_output.as_typed_local()
     }
 
     /// Build an OP_MOE_FFN_REMOTE instruction for one token on `worker_idx`
@@ -747,4 +766,30 @@ fn build_layer_configs(
     let mut ptr_buf = DeviceBuffer::<u64>::alloc(device, num_layers)?;
     ptr_buf.copy_from_host(&ptr_array)?;
     Ok((ptr_buf, config_storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use braidinfer_hip::dev_ptr::{DevPtr, tags::{HostMapped, CoarseGrainedLocal}};
+
+    /// Positive test: a fn requiring DevPtr<f32, HostMapped> accepts one.
+    /// The compile_fail doctest on activation_staging_dev_ptr_for proves
+    /// it REJECTS DevPtr<f32, CoarseGrainedLocal> (the el1f mismatch class).
+    #[test]
+    fn activation_staging_accessor_tag_accepts_host_mapped() {
+        fn requires_host_mapped(_p: DevPtr<f32, HostMapped>) {}
+        let host_uc: DevPtr<f32, HostMapped> =
+            unsafe { DevPtr::from_raw(std::ptr::null_mut(), 0) };
+        requires_host_mapped(host_uc);
+    }
+
+    /// Positive test: a fn requiring DevPtr<f32, CoarseGrainedLocal> accepts one.
+    /// Companion to the local_output_ptr_for accessor (workers write to local VRAM).
+    #[test]
+    fn local_output_accessor_tag_accepts_coarse_grained_local() {
+        fn requires_local(_p: DevPtr<f32, CoarseGrainedLocal>) {}
+        let vram: DevPtr<f32, CoarseGrainedLocal> =
+            unsafe { DevPtr::from_raw(std::ptr::null_mut(), 0) };
+        requires_local(vram);
+    }
 }
