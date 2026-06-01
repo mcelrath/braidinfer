@@ -105,6 +105,12 @@ __device__ __forceinline__ float tree_reduce_sum_256(float val, float* shared) {
 // OP_RMSNORM: y = x * rsqrt(mean(x²)+eps) * (1+weight)
 // args: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
 // grid_x = batch (default 1). vblock = batch index. Each block normalizes one row.
+//
+// Single-pass register cache (bd 77r.2.16): each thread caches its strided input
+// elements in a small register array during sum_sq accumulation, then reuses them
+// in the apply pass — no second global load. Falls back to the 2-pass path if
+// elements_per_thread > RMSNORM_REG_CAP (spill would defeat the optimization).
+#define RMSNORM_REG_CAP 16
 __device__ __attribute__((noinline)) void op_rmsnorm(const u64* inst, u32 vblock) {
     const RmsNormInst* i = (const RmsNormInst*)inst;
     float* output_base = i->output;
@@ -121,15 +127,34 @@ __device__ __attribute__((noinline)) void op_rmsnorm(const u64* inst, u32 vblock
 
     extern __shared__ float shared[];
 
-    float sum_sq = 0.0f;
-    for (int i = tid; i < hidden_size; i += stride) {
-        float v = input[i];
-        sum_sq += v * v;
-    }
-    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
+    int elems_per_thread = (hidden_size + stride - 1) / stride;
 
-    for (int i = tid; i < hidden_size; i += stride) {
-        output[i] = input[i] * rms * (1.0f + bf16_to_f32(weight[i]));
+    if (elems_per_thread <= RMSNORM_REG_CAP) {
+        // Single-pass: cache input in registers during sum_sq accumulation.
+        float reg[RMSNORM_REG_CAP];
+        int n = 0;
+        float sum_sq = 0.0f;
+        for (int j = tid; j < hidden_size; j += stride) {
+            float v = input[j];
+            reg[n++] = v;
+            sum_sq += v * v;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
+        n = 0;
+        for (int j = tid; j < hidden_size; j += stride) {
+            output[j] = reg[n++] * rms * (1.0f + bf16_to_f32(weight[j]));
+        }
+    } else {
+        // Fallback 2-pass path for large hidden_size / small blockDim.x.
+        float sum_sq = 0.0f;
+        for (int j = tid; j < hidden_size; j += stride) {
+            float v = input[j];
+            sum_sq += v * v;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
+        for (int j = tid; j < hidden_size; j += stride) {
+            output[j] = input[j] * rms * (1.0f + bf16_to_f32(weight[j]));
+        }
     }
 }
 
@@ -810,6 +835,7 @@ __device__ __attribute__((noinline)) void op_linear_proj_pcg32(const u64* inst, 
 
 // OP_RMSNORM_WX: y = x * w / sqrt(mean(x^2) + eps) — standard w*x variant (Llama, OLMoE)
 // Same args as OP_RMSNORM: [1]=output, [2]=input, [3]=weight, [4]=hidden_size, [5]=eps_bits
+// Single-pass register cache (bd 77r.2.16): same RMSNORM_REG_CAP guard as op_rmsnorm.
 __device__ __attribute__((noinline)) void op_rmsnorm_wx(const u64* inst, u32 vblock) {
     const RmsNormInst* i = (const RmsNormInst*)inst;
     float* output_base = i->output;
@@ -818,24 +844,40 @@ __device__ __attribute__((noinline)) void op_rmsnorm_wx(const u64* inst, u32 vbl
     int hidden_size = (int)i->dim;
     float eps; uint32_t eps_bits32 = (uint32_t)i->eps_bits; __builtin_memcpy(&eps, &eps_bits32, 4);
 
-    // DEBUG: print input[0] to track hidden state evolution
-    // vblock = batch index (same as op_rmsnorm)
     float* output = output_base + (long long)vblock * hidden_size;
     const float* input = input_base + (long long)vblock * hidden_size;
 
     const int tid = threadIdx.x;
     const int stride = blockDim.x;
 
-    float sum_sq = 0.0f;
-    for (int i = tid; i < hidden_size; i += stride) {
-        float val = input[i];
-        sum_sq += val * val;
-    }
     extern __shared__ float shared[];
-    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
 
-    for (int i = tid; i < hidden_size; i += stride) {
-        output[i] = input[i] * rms * bf16_to_f32(weight[i]);
+    int elems_per_thread = (hidden_size + stride - 1) / stride;
+
+    if (elems_per_thread <= RMSNORM_REG_CAP) {
+        float reg[RMSNORM_REG_CAP];
+        int n = 0;
+        float sum_sq = 0.0f;
+        for (int j = tid; j < hidden_size; j += stride) {
+            float val = input[j];
+            reg[n++] = val;
+            sum_sq += val * val;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
+        n = 0;
+        for (int j = tid; j < hidden_size; j += stride) {
+            output[j] = reg[n++] * rms * bf16_to_f32(weight[j]);
+        }
+    } else {
+        float sum_sq = 0.0f;
+        for (int j = tid; j < hidden_size; j += stride) {
+            float val = input[j];
+            sum_sq += val * val;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)hidden_size + eps);
+        for (int j = tid; j < hidden_size; j += stride) {
+            output[j] = input[j] * rms * bf16_to_f32(weight[j]);
+        }
     }
     // §11.18 (a): producer-side agent-scope fence before persistent_iter_ack
     // so worker-GPU peer reads of `output` (alloc_portable_coherent
@@ -1057,6 +1099,9 @@ __device__ __attribute__((noinline)) void op_gdn_recurrent(const u64* inst, u32 
 
 // OP_RMSNORM_GATE: RMSNorm(x) * SiLU(z) with direct weight multiply (no 1+w)
 // args: [1]=output, [2]=x, [3]=z, [4]=weight, [5]=num_heads, [6]=value_dim, [7]=eps
+// Single-pass register cache (bd 77r.2.16): cache xh[i] and zh[i] in registers during
+// sum_sq accumulation to avoid the second global read. Fallback when elems_per_thread
+// exceeds RMSNORM_REG_CAP (each of x and z arrays separately).
 __device__ __attribute__((noinline)) void op_rmsnorm_gated(const u64* inst, u32 vblock) {
     const RmsNormGateInst* i = (const RmsNormGateInst*)inst;
     float* output = i->output;
@@ -1075,14 +1120,39 @@ __device__ __attribute__((noinline)) void op_rmsnorm_gated(const u64* inst, u32 
     float* oh = output + h * value_dim;
 
     extern __shared__ float shared[];
-    float sum_sq = 0.0f;
-    for (int i = tid; i < value_dim; i += stride) { float v = xh[i]; sum_sq += v * v; }
-    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
 
-    for (int i = tid; i < value_dim; i += stride) {
-        float normed = xh[i] * rms * weight[i];
-        float zi = zh[i];
-        oh[i] = normed * zi / (1.0f + expf(-zi));
+    int elems_per_thread = (value_dim + stride - 1) / stride;
+
+    if (elems_per_thread <= RMSNORM_REG_CAP) {
+        float xreg[RMSNORM_REG_CAP];
+        float zreg[RMSNORM_REG_CAP];
+        int n = 0;
+        float sum_sq = 0.0f;
+        for (int j = tid; j < value_dim; j += stride) {
+            float v = xh[j];
+            float zi = zh[j];
+            xreg[n] = v;
+            zreg[n] = zi;
+            n++;
+            sum_sq += v * v;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
+        n = 0;
+        for (int j = tid; j < value_dim; j += stride) {
+            float normed = xreg[n] * rms * weight[j];
+            float zi = zreg[n];
+            n++;
+            oh[j] = normed * zi / (1.0f + expf(-zi));
+        }
+    } else {
+        float sum_sq = 0.0f;
+        for (int j = tid; j < value_dim; j += stride) { float v = xh[j]; sum_sq += v * v; }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
+        for (int j = tid; j < value_dim; j += stride) {
+            float normed = xh[j] * rms * weight[j];
+            float zi = zh[j];
+            oh[j] = normed * zi / (1.0f + expf(-zi));
+        }
     }
 }
 
@@ -1272,19 +1342,39 @@ __device__ __attribute__((noinline)) void op_mamba2_norm_gated(const u64* inst, 
 
     extern __shared__ float shared[];
 
-    float sum_sq = 0.0f;
-    for (int i = tid; i < value_dim; i += stride) {
-        float zi = zh[i];
-        float silu_z = zi / (1.0f + expf(-zi));
-        float v = xh[i] * silu_z;
-        sum_sq += v * v;
-    }
-    float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
+    // Single-pass register cache (bd 77r.2.16): cache xh[i]*silu(zh[i]) products
+    // during sum_sq accumulation to avoid re-reading xh and zh in the apply pass.
+    int elems_per_thread = (value_dim + stride - 1) / stride;
 
-    for (int i = tid; i < value_dim; i += stride) {
-        float zi = zh[i];
-        float silu_z = zi / (1.0f + expf(-zi));
-        oh[i] = xh[i] * silu_z * rms * wh[i];
+    if (elems_per_thread <= RMSNORM_REG_CAP) {
+        float vreg[RMSNORM_REG_CAP];
+        int n = 0;
+        float sum_sq = 0.0f;
+        for (int j = tid; j < value_dim; j += stride) {
+            float zi = zh[j];
+            float v = xh[j] * (zi / (1.0f + expf(-zi)));
+            vreg[n++] = v;
+            sum_sq += v * v;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
+        n = 0;
+        for (int j = tid; j < value_dim; j += stride) {
+            oh[j] = vreg[n++] * rms * wh[j];
+        }
+    } else {
+        float sum_sq = 0.0f;
+        for (int j = tid; j < value_dim; j += stride) {
+            float zi = zh[j];
+            float silu_z = zi / (1.0f + expf(-zi));
+            float v = xh[j] * silu_z;
+            sum_sq += v * v;
+        }
+        float rms = rsqrtf(block_reduce_sum(sum_sq, shared) / (float)value_dim + eps);
+        for (int j = tid; j < value_dim; j += stride) {
+            float zi = zh[j];
+            float silu_z = zi / (1.0f + expf(-zi));
+            oh[j] = xh[j] * silu_z * rms * wh[j];
+        }
     }
 }
 
@@ -1675,6 +1765,9 @@ __device__ __attribute__((noinline)) void op_lm_head(const u64* inst, u32 grid_x
 
 // OP_QK_NORM: per-head RMSNorm on Q and K with (1+weight)
 // args: [1]=q, [2]=k, [3]=q_weight, [4]=k_weight, [5]=num_q_heads, [6]=num_kv_heads, [7]=head_dim, [8]=eps
+// Single-pass register cache (bd 77r.2.16): cache head_ptr[i] during sum_sq
+// accumulation, reuse in apply pass. For head_dim=256, stride=256 → 1 element/thread
+// (always fits). Uses tree_reduce_sum_256 (bz0 fix: no __shfl_down).
 __device__ __attribute__((noinline)) void op_qk_norm(const u64* inst, u32 vblock) {
     const QkNormInst* i = (const QkNormInst*)inst;
     float* q = i->q;
@@ -1706,15 +1799,33 @@ __device__ __attribute__((noinline)) void op_qk_norm(const u64* inst, u32 vblock
     const int stride = blockDim.x;
     extern __shared__ float shared[];
 
-    float sum_sq = 0.0f;
-    for (int i = tid; i < head_dim; i += stride) { float v = head_ptr[i]; sum_sq += v * v; }
-    // bz0 fix #1: match op_attn_paged / op_attn_paged_quant K-rms which use
-    // tree_reduce_sum_256 (block_reduce_sum is shfl-based, produces different
-    // float-rounded sums due to non-associativity; broke paged-vs-flat coherence).
-    float rms = rsqrtf(tree_reduce_sum_256(sum_sq, shared) / (float)head_dim + eps);
+    int elems_per_thread = (head_dim + stride - 1) / stride;
 
-    for (int i = tid; i < head_dim; i += stride) {
-        head_ptr[i] = head_ptr[i] * rms * (1.0f + bf16_to_f32(weight_ptr[i]));
+    if (elems_per_thread <= RMSNORM_REG_CAP) {
+        float reg[RMSNORM_REG_CAP];
+        int n = 0;
+        float sum_sq = 0.0f;
+        for (int j = tid; j < head_dim; j += stride) {
+            float v = head_ptr[j];
+            reg[n++] = v;
+            sum_sq += v * v;
+        }
+        // bz0 fix #1: tree reduction (no __shfl_down). Must match op_attn_paged K-rms.
+        float rms = rsqrtf(tree_reduce_sum_256(sum_sq, shared) / (float)head_dim + eps);
+        n = 0;
+        for (int j = tid; j < head_dim; j += stride) {
+            head_ptr[j] = reg[n++] * rms * (1.0f + bf16_to_f32(weight_ptr[j]));
+        }
+    } else {
+        float sum_sq = 0.0f;
+        for (int j = tid; j < head_dim; j += stride) { float v = head_ptr[j]; sum_sq += v * v; }
+        // bz0 fix #1: match op_attn_paged / op_attn_paged_quant K-rms which use
+        // tree_reduce_sum_256 (block_reduce_sum is shfl-based, produces different
+        // float-rounded sums due to non-associativity; broke paged-vs-flat coherence).
+        float rms = rsqrtf(tree_reduce_sum_256(sum_sq, shared) / (float)head_dim + eps);
+        for (int j = tid; j < head_dim; j += stride) {
+            head_ptr[j] = head_ptr[j] * rms * (1.0f + bf16_to_f32(weight_ptr[j]));
+        }
     }
 }
 
