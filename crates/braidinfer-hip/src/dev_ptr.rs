@@ -1,57 +1,72 @@
 //! Typed device pointers — compile-time-enforced memory-type preconditions.
 //!
-//! The RDNA3 hardware atomic family (`global_atomic_add_f32` and friends,
-//! exposed via `unsafeAtomicAdd` in HIP) is 46–955× faster than the default
-//! atomicAdd CAS-loop fallback (see `kernels/rdna3_compute.h`). The catch:
-//! `unsafeAtomicAdd` only has defined behavior on **coarse-grained,
-//! device-local** memory. Using it on:
-//!   - MTYPE=UC memory (allocated via `DeviceBuffer::alloc_uncached`),
-//!   - host-mapped fine-grained memory (`hipHostMalloc` / `MappedHostBuffer`),
-//!   - peer-mapped memory (peer cache may not propagate the atomic),
-//! is undefined and silently wrong.
+//! PRIMARY USE — cross-GPU coherence. On gfx11 multi-GPU, whether a
+//! producer→consumer handoff is CORRECT depends on the memory class of the
+//! buffer, and getting it wrong is a silent coherence bug. Every major
+//! multi-GPU bug in this engine was a memory-class mismatch:
+//!   - **el1f**: a sentinel in coarse-grained-local VRAM is L2-cached and is
+//!     NOT seen by peers' MTYPE-UC PCIe reads → a cross-GPU spin deadlocks.
+//!   - **§11.20**: a host-mapped-UC `signal_ptr` to `op_d2d_copy` wedges 5/5
+//!     (the working medium there is VRAM).
+//!   - **9gmh**: a worker compute-PCIe-write to a peer's VRAM corrupts its L2.
+//! A function that takes `DevPtr<T, HostMapped>` (the cross-GPU signaling /
+//! mailbox / sentinel medium) cannot be handed a VRAM pointer, and an
+//! `op_d2d_copy` signal taking `DevPtr<T, CoarseGrainedLocal>` cannot be handed
+//! a host-UC one — so these mismatches become compile errors instead of
+//! multi-hour wedges.
 //!
 //! `DevPtr<T, Tag>` is a `repr(transparent)` newtype around `*mut T` carrying
 //! a phantom tag describing the memory class. Functions that require a
 //! particular class take `DevPtr<T, ConcreteTag>`, so passing the wrong kind
 //! of memory is a compile-time error.
 //!
-//! # Tags
+//! SECONDARY USE — hardware atomics. `unsafeAtomicAdd` (`global_atomic_add_f32`)
+//! is 46–955× faster than the CAS fallback but has defined behavior ONLY on
+//! coarse-grained-local memory (undefined on UC / host-mapped / peer). DevPtr
+//! can guard this too — but note it is currently **policy-rejected** for LLM
+//! shapes (measured negative vs block-cooperative reductions; see
+//! `kernels/rdna3_compute.h` and bd 77r.2.4), so it is a latent guard, not an
+//! active call path. The cross-GPU coherence use above is the load-bearing one.
 //!
-//! | Tag | Allocator | Hardware atomics |
+//! # Tags (memory class → cross-GPU role; HW-atomic safety in parens)
+//!
+//! | Tag | Allocator | Cross-GPU role (atomics) |
 //! |---|---|---|
-//! | [`tags::CoarseGrainedLocal`] | `DeviceBuffer::alloc` (default `hipMalloc`) | **Safe** |
-//! | [`tags::CoarseGrainedPeer`] | (future portable VRAM allocator) | Safe within owning GPU only |
-//! | [`tags::UncachedDeviceLocal`] | `DeviceBuffer::alloc_uncached` (MTYPE=UC) | **Undefined** |
-//! | [`tags::HostMapped`] | `MappedHostBuffer::alloc` (host fine-grained) | **Undefined** |
-//! | [`tags::WorkgroupShared`] | `__shared__` / LDS (kernel-side) | Per-CU only |
+//! | [`tags::CoarseGrainedLocal`] | `DeviceBuffer::alloc` (`hipMalloc`) | device-local VRAM; L2-cached, NOT peer-visible w/o fence (atomics: **safe**) |
+//! | [`tags::CoarseGrainedPeer`] | (portable VRAM allocator) | peer-readable for non-atomic loads (atomics: owning-GPU only) |
+//! | [`tags::UncachedDeviceLocal`] | `DeviceBuffer::alloc_uncached` (MTYPE=UC) | cross-GPU-coherent VRAM, no launch fence (atomics: **undefined**) |
+//! | [`tags::HostMapped`] | `MappedHostBuffer::alloc` (host fine-grained) | CPU↔GPU + cross-GPU signaling / mailbox / sentinels (atomics: **undefined**) |
+//! | [`tags::WorkgroupShared`] | `__shared__` / LDS (kernel-side) | per-CU only (atomics: per-CU) |
 //!
 //! # Misuse caught at compile time
 //!
-//! A function that takes `DevPtr<T, CoarseGrainedLocal>` will not accept a
-//! `DevPtr<T, UncachedDeviceLocal>`:
+//! A cross-GPU sentinel-write function takes `DevPtr<u32, HostMapped>` (the
+//! host-UC signaling medium). Handing it a VRAM (`CoarseGrainedLocal`) pointer
+//! — the el1f bug — is a type error, not a silent cross-GPU deadlock:
 //!
 //! ```compile_fail
-//! use braidinfer_hip::dev_ptr::{DevPtr, tags::{CoarseGrainedLocal, UncachedDeviceLocal}};
-//! use std::marker::PhantomData;
+//! use braidinfer_hip::dev_ptr::{DevPtr, tags::{HostMapped, CoarseGrainedLocal}};
 //!
-//! fn use_hw_atomic_add(_p: DevPtr<f32, CoarseGrainedLocal>, _v: f32) {}
+//! // The cross-GPU sentinel MUST live in host-mapped UC (el1f: a VRAM sentinel
+//! // is L2-cached and missed by peers' MTYPE-UC reads). This signature enforces it.
+//! fn cross_gpu_sentinel_write(_p: DevPtr<u32, HostMapped>, _seq: u32) {}
 //!
 //! // SAFETY: doctest only — never construct DevPtr from a dangling pointer in real code.
-//! let bad: DevPtr<f32, UncachedDeviceLocal> =
+//! let vram: DevPtr<u32, CoarseGrainedLocal> =
 //!     unsafe { DevPtr::from_raw(std::ptr::null_mut(), 0) };
-//! use_hw_atomic_add(bad, 1.0); // <-- type error: tag mismatch
+//! cross_gpu_sentinel_write(vram, 1); // <-- type error: VRAM sentinel IS the el1f bug
 //! ```
 //!
-//! And the matching call compiles:
+//! And the correct host-mapped call compiles:
 //!
 //! ```
-//! use braidinfer_hip::dev_ptr::{DevPtr, tags::CoarseGrainedLocal};
+//! use braidinfer_hip::dev_ptr::{DevPtr, tags::HostMapped};
 //!
-//! fn use_hw_atomic_add(_p: DevPtr<f32, CoarseGrainedLocal>, _v: f32) {}
+//! fn cross_gpu_sentinel_write(_p: DevPtr<u32, HostMapped>, _seq: u32) {}
 //!
-//! let ok: DevPtr<f32, CoarseGrainedLocal> =
+//! let host_uc: DevPtr<u32, HostMapped> =
 //!     unsafe { DevPtr::from_raw(std::ptr::null_mut(), 0) };
-//! use_hw_atomic_add(ok, 1.0);
+//! cross_gpu_sentinel_write(host_uc, 1);
 //! ```
 
 use std::marker::PhantomData;
