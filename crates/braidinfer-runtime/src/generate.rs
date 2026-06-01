@@ -20,6 +20,10 @@ pub struct TokenConfig {
     pub im_end_id: Option<u32>,
     pub eos_token_ids: Vec<u32>,
     pub bos_token_id: Option<u32>,
+    /// bd 4ayf.20: the tokenizer's `add_bos_token`. `Some(false)` means do NOT prepend a BOS
+    /// (NemotronH sets bos_token_id but add_bos_token=False). `None` = unspecified → preserve the
+    /// legacy "prepend if bos_token_id is set" behavior.
+    pub add_bos_token: Option<bool>,
     chat_template: Option<String>,
 }
 
@@ -88,11 +92,18 @@ impl TokenConfig {
                     })
             });
 
+        // bd 4ayf.20: respect tokenizer_config.json's add_bos_token (NemotronH sets it False).
+        let add_bos_token = std::fs::read_to_string(model_dir.join("tokenizer_config.json"))
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .and_then(|cfg| cfg.get("add_bos_token").and_then(|v| v.as_bool()));
+
         TokenConfig {
             im_start_id,
             im_end_id,
             eos_token_ids,
             bos_token_id,
+            add_bos_token,
             chat_template,
         }
     }
@@ -152,11 +163,23 @@ impl TokenConfig {
                 cfg.pointer("/text_config/bos_token_id")
                     .and_then(|v| v.as_u64().map(|n| n as u32))
             });
+        // bd 4ayf.20: respect the embedded tokenizer_config's add_bos_token. The field may be a
+        // JSON object or a JSON-encoded string, so handle both.
+        let add_bos_token = meta.get("tokenizer_config").and_then(|tc| {
+            if let Some(s) = tc.as_str() {
+                serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| v.get("add_bos_token").and_then(|b| b.as_bool()))
+            } else {
+                tc.get("add_bos_token").and_then(|b| b.as_bool())
+            }
+        });
         TokenConfig {
             im_start_id,
             im_end_id,
             eos_token_ids,
             bos_token_id,
+            add_bos_token,
             chat_template,
         }
     }
@@ -454,10 +477,14 @@ pub fn greedy_generate(
         ))
     })?;
     let mut prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-    // Prepend BOS if the model has one and the tokenizer didn't add it
-    if let Some(bos) = token_config.bos_token_id {
-        if prompt_ids.first() != Some(&bos) {
-            prompt_ids.insert(0, bos);
+    // Prepend BOS if the model has one and the tokenizer didn't add it — but ONLY when the
+    // tokenizer config wants a BOS. bd 4ayf.20: NemotronH sets bos_token_id=1 yet add_bos_token
+    // =False; a spurious BOS makes it emit immediate EOS (0 tokens). Skip when explicitly false.
+    if token_config.add_bos_token != Some(false) {
+        if let Some(bos) = token_config.bos_token_id {
+            if prompt_ids.first() != Some(&bos) {
+                prompt_ids.insert(0, bos);
+            }
         }
     }
     generate_from_ids(model, tokenizer, token_config, &prompt_ids, max_tokens)
