@@ -383,6 +383,7 @@ impl MegakernelProgram {
         let mut mamba2_idx = 0usize;
         let mut attn_layer_idx = 0usize;
         let mut attn_paged_inst_indices: Vec<usize> = Vec::new();
+        let mut trace_probe_map_pp: Vec<(usize, crate::tracer::Probe)> = Vec::new();
 
         for layer_i in 0..cfg.num_layers {
             use crate::config::LayerType;
@@ -412,7 +413,12 @@ impl MegakernelProgram {
                         &mut attn_paged_inst_indices,
                         &mut Vec::new(),
                     );
+                    // PostMixer probe at last instruction of attention block.
+                    trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                    if matches!(cfg.layers[layer_i].ffn_type, crate::config::FfnType::Dense) {
+                        trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
+                    }
                     attn_layer_idx += 1;
                 }
                 LayerType::Gdn => {
@@ -461,7 +467,12 @@ impl MegakernelProgram {
                         instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), hidden_t, act.out_proj.as_ptr(), hidden_t, hs as i32).into_inst());
                     }
 
+                    // PostMixer probe at last token ResidualAdd (end of GDN mixer, before FFN).
+                    trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                    if matches!(cfg.layers[layer_i].ffn_type, crate::config::FfnType::Dense) {
+                        trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
+                    }
                     gdn_idx += 1;
                 }
                 LayerType::Mamba2 => {
@@ -473,6 +484,8 @@ impl MegakernelProgram {
                         Self::compile_mamba2_layer(cfg, &model.layers[layer_i], act, state, &mut instructions);
                         instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), hidden_t_w, act.hidden.as_ptr(), hs as i32).into_inst());
                     }
+                    // PostMixer probe at last token D2D copy back to prefill_hidden.
+                    trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -503,6 +516,7 @@ impl MegakernelProgram {
             act.hidden.as_write_ptr(), act.normed.as_ptr(),
             model.final_norm_weight.as_ptr(), hs as i32, eps,
         ).into_inst());
+        trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::FinalNorm));
         {
             let lm_w_ptr = if cfg.tie_word_embeddings {
                 model.embed_weight.as_ptr() as *const u8
@@ -551,7 +565,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
-            trace_probe_map: Vec::new(),
+            trace_probe_map: trace_probe_map_pp,
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             _watchdog: watchdog,
@@ -667,6 +681,7 @@ impl MegakernelProgram {
         let position_table_ptr_u64 = position_table_buf.as_ptr() as u64;
 
         let mut attn_paged_inst_indices: Vec<usize> = Vec::new();
+        let mut trace_probe_map_seg: Vec<(usize, crate::tracer::Probe)> = Vec::new();
 
         for layer_i in layer_start..layer_end {
             use crate::config::LayerType;
@@ -696,7 +711,12 @@ impl MegakernelProgram {
                         &mut attn_paged_inst_indices,
                         &mut Vec::new(),
                     );
+                    // PostMixer probe at last instruction of attention block.
+                    trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                    if matches!(cfg.layers[layer_i].ffn_type, crate::config::FfnType::Dense) {
+                        trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
+                    }
                     attn_layer_idx += 1;
                 }
                 LayerType::Gdn => {
@@ -745,7 +765,12 @@ impl MegakernelProgram {
                         instructions.push(ResidualAddInst::new(div_ceil(hs as u32, 256), hidden_t, act.out_proj.as_ptr(), hidden_t, hs as i32).into_inst());
                     }
 
+                    // PostMixer probe at last token ResidualAdd (end of GDN mixer, before FFN).
+                    trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
+                    if matches!(cfg.layers[layer_i].ffn_type, crate::config::FfnType::Dense) {
+                        trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
+                    }
                     gdn_idx += 1;
                 }
                 LayerType::Mamba2 => {
@@ -757,6 +782,8 @@ impl MegakernelProgram {
                         Self::compile_mamba2_layer(cfg, &model.layers[layer_i], act, state, &mut instructions);
                         instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), hidden_t_w, act.hidden.as_ptr(), hs as i32).into_inst());
                     }
+                    // PostMixer probe at last token D2D copy back to prefill_hidden.
+                    trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -786,6 +813,7 @@ impl MegakernelProgram {
                 act.hidden.as_write_ptr(), act.normed.as_ptr(),
                 model.final_norm_weight.as_ptr(), hs as i32, eps,
             ).into_inst());
+            trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::FinalNorm));
             {
                 let lm_w_ptr = if cfg.tie_word_embeddings {
                     model.embed_weight.as_ptr() as *const u8
@@ -835,7 +863,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
-            trace_probe_map: Vec::new(),
+            trace_probe_map: trace_probe_map_seg,
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             _watchdog: watchdog,
@@ -872,6 +900,8 @@ impl MegakernelProgram {
         instructions.push(RmsNormInst::new(rmsnorm_opcode(cfg.rms_norm_one_plus_w), 1,
             act.hidden.as_write_ptr(), act.normed.as_ptr(),
             model.final_norm_weight.as_ptr(), hs as i32, eps).into_inst());
+        let mut trace_probe_map_fn: Vec<(usize, crate::tracer::Probe)> = Vec::new();
+        trace_probe_map_fn.push((instructions.len() - 1, crate::tracer::Probe::FinalNorm));
         let lm_w_ptr = if cfg.tie_word_embeddings {
             model.embed_weight.as_ptr() as *const u8
         } else {
@@ -907,7 +937,7 @@ impl MegakernelProgram {
             dump_buffer: None,
             dump_counter: None,
             dump_capacity: 0,
-            trace_probe_map: Vec::new(),
+            trace_probe_map: trace_probe_map_fn,
             barrier_layer_map: Vec::new(),
             multi_gpu_attn_boundaries: Vec::new(),
             _watchdog: watchdog,

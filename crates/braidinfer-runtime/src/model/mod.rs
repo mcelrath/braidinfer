@@ -196,6 +196,10 @@ impl Model {
         &self.tracer
     }
 
+    pub fn tracer_mut(&mut self) -> &mut crate::tracer::Tracer {
+        &mut self.tracer
+    }
+
     /// SDMA-capture all GDN/Mamba2 recurrent SSM state buffers into the tracer.
     /// Safe under the persistent cooperative worker (SDMA engine is independent
     /// of CUs). Probes are named `gdn_state_{layer_idx}`. No-op if tracer is

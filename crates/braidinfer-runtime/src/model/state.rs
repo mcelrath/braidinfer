@@ -150,10 +150,24 @@ impl Model {
             self.paged_seq = Some(seq);
             self.page_allocator = Some(allocator);
 
+            // Enable dump buffer for tracing (no-op when tracer disabled).
+            if self.tracer.enabled() && !mk.dump_active() {
+                let max_slots = (mk.instructions.len() as i32).min(4096);
+                if let Ok(()) = mk.enable_dump_persistent(max_slots) {
+                    let dispatch = self.persistent_workers.as_mut().unwrap();
+                    dispatch.set_trace_dump_ptrs(self.device.0 as usize, &mk);
+                }
+            }
             let dispatch = self.persistent_workers.as_mut()
                 .expect("persistent_workers must be initialized in Model::prefill");
             mk.dispatch_via_worker(dispatch, self.device.0 as usize)
                 .map_err(ModelError::Hip)?;
+            // Drain trace dump after dispatch completes.
+            if self.tracer.enabled() {
+                let gpu_idx = self.device.0 as usize;
+                let dispatch = self.persistent_workers.as_mut().unwrap();
+                let _ = dispatch.drain_trace_dump(gpu_idx, &mk, &mut self.tracer);
+            }
 
             offset = end;
         }
@@ -314,6 +328,14 @@ impl Model {
                 self.moe_ffn_forward_prefill_batched(layer_i, &mut bufs.hidden, n)
                     .map_err(ModelError::Hip)?;
                 self.prefill_bufs = Some(bufs);
+                // MoE Option-A: capture end-of-layer hidden (last token row) for MoeFfn layers.
+                if self.tracer.enabled() {
+                    let hs = self.config.hidden_size;
+                    if let Some(ref bufs) = self.prefill_bufs {
+                        let ptr = unsafe { bufs.hidden.as_ptr().add((n - 1) * hs) } as *const u8;
+                        let _ = self.tracer.capture(0, crate::tracer::Probe::PostFfn { layer: layer_i }, ptr, hs * 4);
+                    }
+                }
                 layer_i += 1;
             } else if matches!(self.config.layers[layer_i].ffn_type, FfnType::MoE { .. })
                 && (lt == LayerType::Attention || lt == LayerType::Gdn)
@@ -346,10 +368,22 @@ impl Model {
                 self.page_allocator = Some(allocator);
 
                 {
+                    if self.tracer.enabled() && !mk.dump_active() {
+                        let max_slots = (mk.instructions.len() as i32).min(4096);
+                        if let Ok(()) = mk.enable_dump_persistent(max_slots) {
+                            let dispatch = self.persistent_workers.as_mut().unwrap();
+                            dispatch.set_trace_dump_ptrs(self.device.0 as usize, &mk);
+                        }
+                    }
                     let dispatch = self.persistent_workers.as_mut()
                         .expect("persistent_workers must be initialized in Model::prefill");
                     mk.dispatch_via_worker(dispatch, self.device.0 as usize)
                         .map_err(ModelError::Hip)?;
+                    if self.tracer.enabled() {
+                        let gpu_idx = self.device.0 as usize;
+                        let dispatch = self.persistent_workers.as_mut().unwrap();
+                        let _ = dispatch.drain_trace_dump(gpu_idx, &mk, &mut self.tracer);
+                    }
                 }
 
                 // CPU MoE FFN dispatch.
@@ -358,16 +392,36 @@ impl Model {
                     .map_err(ModelError::Hip)?;
                 self.prefill_bufs = Some(bufs);
 
+                // MoE Option-A: capture end-of-MoE-layer hidden (last token row).
+                if self.tracer.enabled() {
+                    let hs = self.config.hidden_size;
+                    if let Some(ref bufs) = self.prefill_bufs {
+                        let ptr = unsafe { bufs.hidden.as_ptr().add((n - 1) * hs) } as *const u8;
+                        let _ = self.tracer.capture(0, crate::tracer::Probe::PostFfn { layer: layer_i }, ptr, hs * 4);
+                    }
+                }
                 if is_truly_last {
                     let bufs = self.prefill_bufs.take().unwrap();
                     let mut mk = MegakernelProgram::compile_final_norm_lm_head(
                         self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
                     ).map_err(ModelError::Hip)?;
                     self.prefill_bufs = Some(bufs);
+                    if self.tracer.enabled() && !mk.dump_active() {
+                        let max_slots = (mk.instructions.len() as i32).min(4096);
+                        if let Ok(()) = mk.enable_dump_persistent(max_slots) {
+                            let dispatch = self.persistent_workers.as_mut().unwrap();
+                            dispatch.set_trace_dump_ptrs(self.device.0 as usize, &mk);
+                        }
+                    }
                     let dispatch = self.persistent_workers.as_mut()
                         .expect("persistent_workers must be initialized in Model::prefill");
                     mk.dispatch_via_worker(dispatch, self.device.0 as usize)
                         .map_err(ModelError::Hip)?;
+                    if self.tracer.enabled() {
+                        let gpu_idx = self.device.0 as usize;
+                        let dispatch = self.persistent_workers.as_mut().unwrap();
+                        let _ = dispatch.drain_trace_dump(gpu_idx, &mk, &mut self.tracer);
+                    }
                 }
                 layer_i += 1;
             } else {
@@ -404,24 +458,57 @@ impl Model {
                 self.paged_seq = Some(seq);
                 self.page_allocator = Some(allocator);
 
+                if self.tracer.enabled() && !mk.dump_active() {
+                    let max_slots = (mk.instructions.len() as i32).min(4096);
+                    if let Ok(()) = mk.enable_dump_persistent(max_slots) {
+                        let dispatch = self.persistent_workers.as_mut().unwrap();
+                        dispatch.set_trace_dump_ptrs(self.device.0 as usize, &mk);
+                    }
+                }
                 let dispatch = self.persistent_workers.as_mut()
                     .expect("persistent_workers must be initialized in Model::prefill");
                 mk.dispatch_via_worker(dispatch, self.device.0 as usize)
                     .map_err(ModelError::Hip)?;
+                if self.tracer.enabled() {
+                    let gpu_idx = self.device.0 as usize;
+                    let dispatch = self.persistent_workers.as_mut().unwrap();
+                    let _ = dispatch.drain_trace_dump(gpu_idx, &mk, &mut self.tracer);
+                }
             }
         }
 
         // If last layer is standalone MoeFfn, emit final norm + LM head now.
         if self.config.layers[num_layers - 1].layer_type == LayerType::MoeFfn {
+            // MoE Option-A: capture end-of-layer hidden for the last MoeFfn layer.
+            if self.tracer.enabled() {
+                let hs = self.config.hidden_size;
+                let last_moe_layer = num_layers - 1;
+                if let Some(ref bufs) = self.prefill_bufs {
+                    let ptr = unsafe { bufs.hidden.as_ptr().add((n - 1) * hs) } as *const u8;
+                    let _ = self.tracer.capture(0, crate::tracer::Probe::PostFfn { layer: last_moe_layer }, ptr, hs * 4);
+                }
+            }
             let bufs = self.prefill_bufs.take().unwrap();
             let mut mk = MegakernelProgram::compile_final_norm_lm_head(
                 self, std::sync::Arc::clone(&megakernel_module), &bufs, n,
             ).map_err(ModelError::Hip)?;
             self.prefill_bufs = Some(bufs);
+            if self.tracer.enabled() && !mk.dump_active() {
+                let max_slots = (mk.instructions.len() as i32).min(4096);
+                if let Ok(()) = mk.enable_dump_persistent(max_slots) {
+                    let dispatch = self.persistent_workers.as_mut().unwrap();
+                    dispatch.set_trace_dump_ptrs(self.device.0 as usize, &mk);
+                }
+            }
             let dispatch = self.persistent_workers.as_mut()
                 .expect("persistent_workers must be initialized in Model::prefill");
             mk.dispatch_via_worker(dispatch, self.device.0 as usize)
                 .map_err(ModelError::Hip)?;
+            if self.tracer.enabled() {
+                let gpu_idx = self.device.0 as usize;
+                let dispatch = self.persistent_workers.as_mut().unwrap();
+                let _ = dispatch.drain_trace_dump(gpu_idx, &mk, &mut self.tracer);
+            }
         }
 
         Ok(())
