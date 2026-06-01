@@ -367,6 +367,10 @@ __device__ __attribute__((noinline)) void op_linear_proj_2x(const u64* inst, u32
 
 // OP_SILU_MUL: output[i] = silu(gate[i]) * up[i]
 // args: [1]=output, [2]=gate, [3]=up, [4]=size
+// 77r.2.18: float4 vectorized path when size%4==0 and all pointers 16-byte aligned.
+// Grid_x = ceil(size/256) (unchanged); float4 path: flat thread index 0..size/4-1 each
+// handles 4 contiguous floats. Threads size/4..size-1 are idle (correct, no OOB).
+// Scalar fallback when size%4!=0 or any pointer is not 16-byte aligned.
 __device__ __attribute__((noinline)) void op_silu_mul(const u64* inst, u32 vblock) {
     const SiluMulInst* i = (const SiluMulInst*)inst;
     float* output = i->output;
@@ -374,12 +378,31 @@ __device__ __attribute__((noinline)) void op_silu_mul(const u64* inst, u32 vbloc
     const float* up = i->up;
     int size = (int)i->size;
 
-    // vblock indexes chunks of blockDim.x elements
-    int base = vblock * blockDim.x + threadIdx.x;
-    if (base < size) {
-        float g = gate[base];
-        float silu_g = g / (1.0f + expf(-g));
-        output[base] = silu_g * up[base];
+    int flat = vblock * blockDim.x + threadIdx.x;
+
+    // float4 path: requires size multiple of 4 and all pointers 16-byte aligned
+    if ((size & 3) == 0
+        && ((uintptr_t)output % 16) == 0
+        && ((uintptr_t)gate   % 16) == 0
+        && ((uintptr_t)up     % 16) == 0) {
+        int n4 = size >> 2;
+        if (flat < n4) {
+            float4 g4 = reinterpret_cast<const float4*>(gate)[flat];
+            float4 u4 = reinterpret_cast<const float4*>(up)[flat];
+            float4 o4;
+            o4.x = (g4.x / (1.0f + expf(-g4.x))) * u4.x;
+            o4.y = (g4.y / (1.0f + expf(-g4.y))) * u4.y;
+            o4.z = (g4.z / (1.0f + expf(-g4.z))) * u4.z;
+            o4.w = (g4.w / (1.0f + expf(-g4.w))) * u4.w;
+            reinterpret_cast<float4*>(output)[flat] = o4;
+        }
+    } else {
+        // scalar fallback
+        if (flat < size) {
+            float g = gate[flat];
+            float silu_g = g / (1.0f + expf(-g));
+            output[flat] = silu_g * up[flat];
+        }
     }
 }
 
@@ -1158,6 +1181,7 @@ __device__ __attribute__((noinline)) void op_rmsnorm_gated(const u64* inst, u32 
 
 // OP_RESIDUAL_ADD: output = a + b
 // args: [1]=output, [2]=a, [3]=b, [4]=size
+// 77r.2.18: float4 path when size%4==0 and all pointers 16-byte aligned.
 __device__ __attribute__((noinline)) void op_residual_add(const u64* inst, u32 vblock) {
     const ResidualAddInst* i = (const ResidualAddInst*)inst;
     float* output = i->output;
@@ -1165,8 +1189,26 @@ __device__ __attribute__((noinline)) void op_residual_add(const u64* inst, u32 v
     const float* b = i->residual;
     int size = (int)i->n;
 
-    int idx = vblock * blockDim.x + threadIdx.x;
-    if (idx < size) output[idx] = a[idx] + b[idx];
+    int flat = vblock * blockDim.x + threadIdx.x;
+
+    if ((size & 3) == 0
+        && ((uintptr_t)output % 16) == 0
+        && ((uintptr_t)a      % 16) == 0
+        && ((uintptr_t)b      % 16) == 0) {
+        int n4 = size >> 2;
+        if (flat < n4) {
+            float4 a4 = reinterpret_cast<const float4*>(a)[flat];
+            float4 b4 = reinterpret_cast<const float4*>(b)[flat];
+            float4 o4;
+            o4.x = a4.x + b4.x;
+            o4.y = a4.y + b4.y;
+            o4.z = a4.z + b4.z;
+            o4.w = a4.w + b4.w;
+            reinterpret_cast<float4*>(output)[flat] = o4;
+        }
+    } else {
+        if (flat < size) output[flat] = a[flat] + b[flat];
+    }
 }
 
 // OP_SIGMOID_WEIGHTED_ADD: output[i] += sigmoid(scalar[0]) * input[i]
@@ -1225,6 +1267,7 @@ __device__ __attribute__((noinline)) void op_dot_sigmoid_scale_add(const u64* in
 
 // OP_SCALE_ADD: output[i] += scale * src[i]
 // args: [1]=output (float*), [2]=src (float*), [3]=scale (f32 bits packed as u32), [4]=size
+// 77r.2.18: float4 path when size%4==0 and all pointers 16-byte aligned.
 __device__ __attribute__((noinline)) void op_scale_add(const u64* inst, u32 vblock) {
     const ScaleAddInst* i = (const ScaleAddInst*)inst;
     float* output = i->output;
@@ -1232,8 +1275,25 @@ __device__ __attribute__((noinline)) void op_scale_add(const u64* inst, u32 vblo
     u32 scale_bits = (u32)i->scale_bits;
     float scale; __builtin_memcpy(&scale, &scale_bits, sizeof(float));
     int size = (int)i->size;
-    int idx = vblock * blockDim.x + threadIdx.x;
-    if (idx < size) output[idx] += scale * src[idx];
+
+    int flat = vblock * blockDim.x + threadIdx.x;
+
+    if ((size & 3) == 0
+        && ((uintptr_t)output % 16) == 0
+        && ((uintptr_t)src    % 16) == 0) {
+        int n4 = size >> 2;
+        if (flat < n4) {
+            float4 s4 = reinterpret_cast<const float4*>(src)[flat];
+            float4 o4 = reinterpret_cast<float4*>(output)[flat];
+            o4.x += scale * s4.x;
+            o4.y += scale * s4.y;
+            o4.z += scale * s4.z;
+            o4.w += scale * s4.w;
+            reinterpret_cast<float4*>(output)[flat] = o4;
+        }
+    } else {
+        if (flat < size) output[flat] += scale * src[flat];
+    }
 }
 
 // OP_MAMBA2_CONV1D: causal conv1d with f32 bias + SiLU activation (Mamba2)
@@ -1380,13 +1440,31 @@ __device__ __attribute__((noinline)) void op_mamba2_norm_gated(const u64* inst, 
 
 // OP_RELU_SQ: output[i] = relu(input[i])^2
 // args: [1]=output (float*), [2]=input (float*), [3]=size
+// 77r.2.18: float4 path when size%4==0 and all pointers 16-byte aligned.
 __device__ __attribute__((noinline)) void op_relu_sq(const u64* inst, u32 vblock) {
     const ReluSqInst* i = (const ReluSqInst*)inst;
     float* output = i->output;
     const float* input = i->input;
     int size = (int)i->size;
-    int idx = vblock * blockDim.x + threadIdx.x;
-    if (idx < size) { float x = input[idx]; float r = x > 0.0f ? x : 0.0f; output[idx] = r * r; }
+
+    int flat = vblock * blockDim.x + threadIdx.x;
+
+    if ((size & 3) == 0
+        && ((uintptr_t)output % 16) == 0
+        && ((uintptr_t)input  % 16) == 0) {
+        int n4 = size >> 2;
+        if (flat < n4) {
+            float4 in4 = reinterpret_cast<const float4*>(input)[flat];
+            float4 o4;
+            float rx = in4.x > 0.0f ? in4.x : 0.0f; o4.x = rx * rx;
+            float ry = in4.y > 0.0f ? in4.y : 0.0f; o4.y = ry * ry;
+            float rz = in4.z > 0.0f ? in4.z : 0.0f; o4.z = rz * rz;
+            float rw = in4.w > 0.0f ? in4.w : 0.0f; o4.w = rw * rw;
+            reinterpret_cast<float4*>(output)[flat] = o4;
+        }
+    } else {
+        if (flat < size) { float x = input[flat]; float r = x > 0.0f ? x : 0.0f; output[flat] = r * r; }
+    }
 }
 
 // OP_FFN_GATE_UP / OP_FFN_GATE_UP_WX: fused RMSNorm + gate_proj + up_proj + SiLU*up
@@ -2038,6 +2116,7 @@ __device__ __attribute__((noinline)) void op_gqa_attn(const u64* inst, u32 vbloc
 
 // OP_OUTPUT_GATE: output = attn_output * sigmoid(gate)
 // args: [1]=output, [2]=attn_output, [3]=gate, [4]=size
+// 77r.2.18: float4 path when size%4==0 and all pointers 16-byte aligned.
 __device__ __attribute__((noinline)) void op_output_gate(const u64* inst, u32 vblock) {
     const OutputGateInst* i = (const OutputGateInst*)inst;
     float* output = i->output;
@@ -2045,10 +2124,28 @@ __device__ __attribute__((noinline)) void op_output_gate(const u64* inst, u32 vb
     const float* gate = i->gate;
     int size = (int)i->size;
 
-    int idx = vblock * blockDim.x + threadIdx.x;
-    if (idx < size) {
-        float g = gate[idx];
-        output[idx] = attn_output[idx] / (1.0f + expf(-g));
+    int flat = vblock * blockDim.x + threadIdx.x;
+
+    if ((size & 3) == 0
+        && ((uintptr_t)output     % 16) == 0
+        && ((uintptr_t)attn_output % 16) == 0
+        && ((uintptr_t)gate       % 16) == 0) {
+        int n4 = size >> 2;
+        if (flat < n4) {
+            float4 a4 = reinterpret_cast<const float4*>(attn_output)[flat];
+            float4 g4 = reinterpret_cast<const float4*>(gate)[flat];
+            float4 o4;
+            o4.x = a4.x / (1.0f + expf(-g4.x));
+            o4.y = a4.y / (1.0f + expf(-g4.y));
+            o4.z = a4.z / (1.0f + expf(-g4.z));
+            o4.w = a4.w / (1.0f + expf(-g4.w));
+            reinterpret_cast<float4*>(output)[flat] = o4;
+        }
+    } else {
+        if (flat < size) {
+            float g = gate[flat];
+            output[flat] = attn_output[flat] / (1.0f + expf(-g));
+        }
     }
 }
 
