@@ -17,6 +17,29 @@ This host runs **custom-patched** kernel and ROCm. Behaviors may differ from ups
 
 > **Maintenance**: kernel/ROCm patch work happens in `../exterior_algebra/` (authoritative source for this section). When a patch is permanently added/removed/falsified there, this section MUST be re-mirrored from `../exterior_algebra/AGENTS.md` (or `CLAUDE.md` — same file via symlink) to keep agents aligned. Do not edit the manifest here directly without also updating the other two project CLAUDE.md files (`../exterior_algebra/` and `../llama.cpp/`).
 
+### GPU / PCIe Operations — `~/ash-pcie` Is the Primary Tool
+
+For ANY of the following on this host, use `~/ash-pcie` (Python; run `~/ash-pcie --help`). If the operation you need isn't covered, **EDIT `~/ash-pcie` to add it** — do not write ad-hoc shell or one-off Python. Re-mirror this section to the other two project CLAUDE.md files after editing.
+
+**Inspection** — `aer [report|clear|--raw]` · `watch [interval]` (live AER monitor with auto-baseline) · `info <c>` (full per-card: link, AER, hwmon, UID, PM) · `decode <c>` (LnkSta / SltSta / LnkCtl bit breakdown).
+
+**PCIe link control** — `retrain <c>` · `gen1`…`gen5 <c>` (force Target Link Speed + retrain) · `gen-auto <c>` (restore LnkCap2 max).
+
+**Recovery (escalating)** — `reset <c>` (driver-mediated remove + rescan) · `kick <c> [--sbr] [--really-i-know]` (sticky-bit clear + link disable cycle + retrain; `--sbr` adds Secondary Bus Reset). **REFUSED on bd-a3l-wedged cards** — use `amdgpu-bind <c>` instead (kick corrupts PSP on-die SRAM on bd-a3l class, validated 2026-05-28 on c0). `--really-i-know` bypasses the bd-a3l guard for non-bd-a3l link-down classes only.
+
+**Driver binding** —
+- `amdgpu-unbind <c>` / `amdgpu-bind <c>` — for am-rs and userspace amdgpu work. `amdgpu-unbind` refuses if a KFD/DRI holder is present and auto-kills `btop` / `nvtop` (always-safe user observers). NEVER use raw `tee /sys/bus/pci/drivers/amdgpu/unbind` — host hard-locks if a holder exists (2026-05-25 incident: dmesg `VM memory stats ... is non-zero when fini`).
+- `release <c> [--force]` / `reclaim <c>` — for vfio-pci binding (hands the GPU to userspace via VFIO).
+- `reload` — `rmmod amdgpu && modprobe amdgpu` then re-apply Gen3. Refuses on any wedged card or open handle.
+
+**Power / hwmon** — `hwmon` (8-card summary) · `hwmon fan <c> <pct|auto>` · `hwmon fanall <pct|auto>` · `hwmon powercap <c> <watts>` · `wake [<c>|all]` (disable PCIe runtime PM so hwmon reads work) · `sleep [<c>|all]` (restore).
+
+**Diagnostics** — `airflow-sweep` (intake-fan sweep with RPM + ΔT_jc per card) · `psu-diag` (voltages idle vs load + IPMI SEL deltas) · `identify [--once]` (DRM-connector watch to locate cards physically by DP plug).
+
+`<c>` is GPU index 0-7 (matches `rocm-smi GPU[N]` and `btop`) or full BDF; `all` is accepted where it makes sense. Most ops auto-elevate via sudo. `--force-wedged` is required on `release` / `reclaim` / `reset` / `sleep` / `reload` for cards classified wedged.
+
+**Related discipline**: CPU-only systemd services (`llama-embed-qwen3-8b`, `llama-qwen3:4b`) carry `InaccessiblePaths=/dev/kfd /dev/dri` (or `PrivateDevices=true`) so they never register as KFD holders. Never set `*_VISIBLE_DEVICES=-1` alone — it hides devices from selection but ROCm still opens KFD at startup.
+
 ### Kernel — `linux-p2p` package at `/home/mcelrath/builds/linux-p2p/`
 
 Source tree at `src/linux-7.0.9/`. PKGBUILD lists active `source+=('NNNN-...patch')` entries. Quick map:
@@ -49,6 +72,45 @@ Module is auto-loaded with `amdgpu.mes_log_enable=1` (modprobe.d): exposes per-c
 - Production cold-start cure: userspace warmup-discard + mailbox-only default. The race is "MES μC private cache / memory-hub state, identified-but-unreachable from userspace" per bd memory `gfx1100-cold-start-race-bd-4e2m-final-state`. Kernel patches 0016/0017 close upstream-visible portions but do NOT fix the userspace symptom.
 - `bd 6gv` epic (in exterior_algebra project) is the cumulative reinvestigation record. Search `bd memories 6gv` and `bd list --parent=exterior_algebra-6gv` for current status.
 - `rocgdb` package is **`rocm-gdb`** in Arch repos (extra), NOT `rocgdb`.
+
+## gfx11 Cross-GPU / L2 Coherence — Systematized Playbook
+
+We have re-hit RDNA3/gfx1100 L2 coherence repeatedly (bd el1f, §11.20, 9gmh, yef5.2). The root
+constraint: **gfx1100 has NO L2 invalidate** — `buffer_gl2_inv`/`buffer_wbl2` don't exist (rejected by
+`llvm-mc --mcpu=gfx1100`; only `buffer_gl0_inv`=L0 and `buffer_gl1_inv`=L1 exist; gfx12 adds
+`global_inv scope:SYS`). **A consumer GPU cannot flush its own L2.** Everything below follows.
+Full detail: `GFX1100_ARCH.md §5.x` (cache) + `§11.x` (multi-GPU).
+
+### Decision table — pick the medium/primitive by access pattern
+
+| Pattern | USE | NOT |
+|---|---|---|
+| CPU↔GPU mailbox/signal (one GPU's view) | host-UC `MappedHostBuffer` (`alloc_portable_coherent`) | — |
+| Cross-GPU SENTINEL (small, hot spin-wait) | host-UC + `sentinel_spin_load_u32` (vector `glc+dlc`, VGPR addr — `rdna3/rdna3_mailbox.h`) | plain or scalar load (latches stale K$, §11.14) |
+| **Cross-GPU BULK DATA (a peer GPU reads what a producer GPU wrote)** | **peer-UC VRAM**: `DeviceBuffer` on the producer GPU, MTYPE_UC-mapped to peers via kernel patch 0001 (in-tree example: `MoeP2pContext::activation_staging_vram`) | **host-UC `MappedHostBuffer`** — ASYMMETRIC-stale (see trap below) |
+| Producer ordering before releasing a sentinel | payload write → `__threadfence()` (agent) → PCIe drain-probe readback (`volatile x = dst[0]`) → RELEASE-store the sentinel | SYSTEM-scope store/fence (wedges, §11.4 vscnt-drain) |
+| Consumer staleness WITHIN one GPU (L0/L1, cross-CU) | `buffer_gl0_inv`+`buffer_gl1_inv` BEFORE the load, then `s_waitcnt vmcnt(0)` | invalidate-AFTER-load (re-reads stale every iteration) |
+
+### The asymmetric-host-UC trap (§11.19(x)) — the one we keep re-hitting
+
+`alloc_portable_coherent` / host-mapped UC resolves to **write-back + CPU-snoop (MTYPE 0x40000001)**,
+NOT true device-UC — and **there is no GPU→GPU snoop path over PCIe**. So a NON-allocator GPU reading
+the allocator GPU's host-UC buffer sees **stale** data *even after the sentinel passes and after
+CPU/allocator reads succeed*, and with no gl2_inv there is no consumer-side cure. It's silent: a
+bounded ~1/5 wrong-data race, and **MoE/routing amplifies it** (a slightly-stale activation → a
+different top-k expert → large output divergence; attention averages it out and looks fine).
+**RULE: any buffer a PEER GPU bulk-reads must live in peer-UC VRAM (patch-0001), never host-UC.**
+(Documented at `moe_p2p.rs:166-172`; this was the yef5.2 Step-A divergence — fixed by pointing the
+decode handoff at `activation_staging_vram` instead of the host-UC `moe_act_uc_handoff`.)
+
+### Falsified / forbidden — do NOT propose these as L2 fixes
+
+- `buffer_gl2_inv` / `buffer_wbl2` — don't exist on gfx1100.
+- `s_buffer_gl0_inv`/`s_buffer_gl1_inv` (scalar K$) — silently no-op for host-UC scalar loads (§11.14). Escape: force a vector `glc+dlc` load with a VGPR address.
+- `glc+dlc` to "bypass L2" — they only bypass L0/L1, NOT L2; can still read a stale L2 line (am-rs-dev, bridge #4483). Fine for a small hot sentinel re-fetch; insufficient for bulk data.
+- L2-eviction by working-set pressure (large strided dummy read) — FALSIFIED, fragile, set-mapping-dependent (`l2_evict_bench_v2`: 64 MiB scratch = 11× L2, 0% fresh). Never rely on it for correctness.
+- `__threadfence_system()` / SYSTEM-scope atomics on a live spin-wait — HANG (no L2 sys-invalidate to back them; `rdna3/rdna3_barrier.h:102-113`).
+- Host-mediated SDMA invalidation (`hipMemcpyAsync` 4-byte poke) — real flush, but a ~1-2µs CPU round-trip: launch-boundary only, useless inside a persistent kernel.
 
 ## GPU Binary Launch Requirements
 
