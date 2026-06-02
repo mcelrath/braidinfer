@@ -16,4 +16,5 @@ pub mod quant;
 pub mod sampling;
 pub mod tracer;
 pub mod watchdog;
+pub mod moe_weights;
 pub mod weights;
