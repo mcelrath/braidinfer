@@ -31,6 +31,7 @@ __device__ static uint32_t g_shutdown_seen;
 #include "op_kv_write_paged_batch.hip"  // bd srg6.4 Phase 3b: OP_KV_WRITE_PAGED_BATCH
 #include "worker_queue.h"               // struct WorkerQueue (persistent_worker entry)
 #include "megakernel_dispatch.hip"  // unified dispatch_opcode helper (zqw)
+#include "megakernel_test_entries.hip"  // bd w1li P3: per-op standalone test entries (am-rs vfio-loadable)
 
 // ============================================================
 // Main megakernel entry point

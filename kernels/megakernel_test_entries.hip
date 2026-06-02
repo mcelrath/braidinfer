@@ -1,0 +1,43 @@
+// bd w1li P3: per-op megakernel TEST ENTRIES.
+//
+// Standalone __global__ symbols that each run ONE op via the SAME __device__
+// op_core production's dispatch_opcode uses, so am-rs codeobj parse_kernel(symbol)
+// can load + validate each op independently on VFIO. One source of truth: these
+// entries and dispatch_opcode call the identical op_<name>; there is no second
+// implementation to drift (the false-confidence trap w1li closes).
+//
+// LOCKED ABI (am-rs-dev bridge #4565):
+//   - Symbol: op_<name>_test_entry  (extern "C", one per op, distinct so
+//     parse_kernel(symbol) loads each standalone).
+//   - Args (kernarg segment; native rsrc2, not inlined USER_DATA):
+//       (const u64* inst, void* out)
+//     inst = ONE packed instruction — INST_SIZE_WORDS u64, byte-identical to a
+//            WorkerQueue mailbox slot. The Rust/am-rs side builds it via the same
+//            *Inst -> into_inst() encode the mailbox uses.
+//     out  = the op output buffer (host-mapped coherent or VRAM). The encoder sets
+//            the instruction's output pointer = out, so the op writes its result
+//            there; am-rs reads it back byte-exact vs a CPU reference.
+//   - Launch: UNIFORM cooperative for ALL entries (one launch path matching
+//     persistent_worker). grid_x = num_rows (op-defined). Vblock ops that need no
+//     cross-block sync simply never call grid.sync().
+//   - Body: decode grid_x -> virtual-block loop -> op_core(inst, vb).
+//
+// MUST be #included AFTER megakernel_ops.hip (defines op_rmsnorm et al.) and the
+// inst-field helpers (inst_grid_x). See megakernel.hip include order.
+#ifndef BRAIDINFER_MEGAKERNEL_TEST_ENTRIES_HIP
+#define BRAIDINFER_MEGAKERNEL_TEST_ENTRIES_HIP
+
+// op_rmsnorm (OP_RMSNORM, the y = x·rms·(1+w) variant). Self-contained vblock op:
+// each virtual block normalizes one row. op_rmsnorm's reduction uses
+// `extern __shared__ float[]`, so the launch must provide dynamic shared memory
+// >= blockDim.x floats. No grid.sync (per-row independent) — cooperative launch
+// only for ABI uniformity with the ops that do need it.
+extern "C" __global__ void op_rmsnorm_test_entry(const u64* inst, void* out) {
+    (void)out;  // op_rmsnorm writes to inst->output, which the encoder sets = out.
+    u32 grid_x = inst_grid_x(inst);
+    for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
+        op_rmsnorm(inst, vb);
+    }
+}
+
+#endif  // BRAIDINFER_MEGAKERNEL_TEST_ENTRIES_HIP
