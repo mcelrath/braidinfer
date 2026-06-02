@@ -250,16 +250,7 @@ fn load_moe_weights_inner(
     .into_iter()
     .find(|n| bqnt.map(|b| b.entry(n).is_some()).unwrap_or(false) || st.tensor_data(n).is_ok())
     .ok_or_else(|| ModelError::MissingWeight(format!("{prefix}mlp.gate.weight (or variants)")))?;
-    // bd-2kgw fix: the router gate IS stored in the bqnt (bf16), but this previously loaded it
-    // ONLY from safetensors (st). For a self-contained .bqnt (empty st) that is a guaranteed
-    // spurious MissingWeight even though gate_name was just found in the bqnt. Load from the
-    // bqnt first (load_weight_bf16_bqnt), fall back to st. (Every other MoE weight already goes
-    // bqnt-first via load_lw / load_linear_weight_bqnt; the gate was the lone st-only loader.)
-    let gate = match bqnt {
-        Some(b) => crate::weights::load_weight_bf16_bqnt(b, &gate_name, device, ne * hs, None)
-            .or_else(|_| load_weight_bf16(st, &gate_name, device, ne * hs))?,
-        None => load_weight_bf16(st, &gate_name, device, ne * hs)?,
-    };
+    let gate = load_weight_bf16(st, &gate_name, device, ne * hs)?;
 
     // Detect whether experts have gate_proj (SwiGLU) or just up_proj (relu²)
     // Check per-expert gate_proj OR fused gate_up_proj (which implies SwiGLU)
