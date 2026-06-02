@@ -273,7 +273,7 @@ fn load_moe_weights_inner(
             format!("{prefix}block_sparse_moe.experts.0.w1.weight"),
         ]
         .iter()
-        .any(|n| st.tensor_data(n).is_ok());
+        .any(|n| st.tensor_data(n).is_ok() || bqnt.map_or(false, |b| b.entry(n).is_some()));
 
     let expert_fmt = if has_gate_proj {
         weight_format_for(&format!("{prefix}mlp.experts.0.gate_proj.weight"), wq)
@@ -538,10 +538,19 @@ fn load_moe_weights_inner(
         None
     };
 
-    // Shared expert gate (optional)
+    // Shared expert gate (optional). bd-2kgw: presence + load must be bqnt-aware — previously
+    // decided presence via st.tensor_data ONLY, so for a self-contained .bqnt (empty st) it was
+    // silently None even when the gate IS in the bqnt (another 4ayf empty-st gap, like the router
+    // gate above). Probe bqnt OR st for presence; load bqnt-first with st fallback.
     let shared_gate_name = format!("{prefix}mlp.shared_expert_gate.weight");
-    let shared_expert_gate = if st.tensor_data(&shared_gate_name).is_ok() {
-        Some(load_weight_bf16(st, &shared_gate_name, device, hs)?)
+    let shared_gate_present = bqnt.map_or(false, |b| b.entry(&shared_gate_name).is_some())
+        || st.tensor_data(&shared_gate_name).is_ok();
+    let shared_expert_gate = if shared_gate_present {
+        Some(match bqnt {
+            Some(b) => crate::weights::load_weight_bf16_bqnt(b, &shared_gate_name, device, hs, None)
+                .or_else(|_| load_weight_bf16(st, &shared_gate_name, device, hs))?,
+            None => load_weight_bf16(st, &shared_gate_name, device, hs)?,
+        })
     } else {
         None
     };
