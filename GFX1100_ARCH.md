@@ -79,6 +79,14 @@ TOC entries below are tagged with status flags:
 | 11.18 | host-mapped portable-coherent + multi-GPU GART — producer L2 staleness — Rule 10 producer-fence hypothesis | [FALSIFIED-by-§11.19] (MERGED-to-§11.19) | Rule 10 producer-fence hypothesis tested and refuted by Exp 3 (10/30 PASS = baseline). Do not re-propose. Content merged into §11.19 (w)-(aa); §11.18 header is a stub |
 | 11.19 | Cold-start mailbox visibility race + production cure | [CURRENT] | The canonical account of bd 4e2m; read before any multi-GPU warmup work |
 | 11.20 | op_d2d_copy `signal_ptr` on host-mapped UC wedges — mechanism uncertain | [PARTIALLY-FALSIFIED, rule survives] | Empirical: signal_ptr to host-UC wedges 5/5; to VRAM works. Mechanism narrative in original write-up FALSIFIED by disassembly; new candidates listed. Rule: signal target must be VRAM, never host-mapped UC. |
+| **12** | **MES SCH v0x88 firmware — role, API surface, what it does NOT do** | [CURRENT] | Before diagnosing any queue-scheduler or IB-ordering hypothesis |
+| **13** | **SDMA F32 / CTL ucode — 107-page host-read cap** | [CURRENT] | Before any SDMA H2D/P2P workload; before diagnosing SDMA stalls |
+| **14** | **Kernel patch manifest (0001-0018 + 0032.x)** | [CURRENT] | Understanding what the running kernel has applied on this host |
+| **15** | **HIP captured-graph + ROCclr P2P fixes (f48beea2, 35fbb4c4)** | [CURRENT] | Any HIP graph capture involving P2P SDMA copies |
+| **16** | **GPU isolation + KFD enumeration — HIP_VISIBLE_DEVICES limits** | [CURRENT] | Watchdog/recovery architecture; multi-process GPU sharing |
+| **17** | **Wedge class taxonomy + recovery decision tree** | [CURRENT] | First read when a GPU wedge occurs on this host |
+| Appendix A | Falsified hypotheses (do not retry) | [HISTORICAL-RECORD] | Before proposing any hypothesis that touches bd 4e2m or §11.13 |
+| **Appendix B** | **RDNA3/gfx11 Practical Implementor's Guide** | [CURRENT] | Single-page onboarding reference for new implementors |
 
 **For agents**: if you are debugging a `"deterministic for N steps, then divergent"` bug or writing any new cross-agent buffer, jump directly to **§5.5 Rule 4** (diagnostic) and **§5.5 Rule 1** (allocation method decision tree). Those two are the highest-yield entry points.
 
@@ -116,6 +124,9 @@ This is the "tractor squashing grape" failsafe — if you go through this cascad
 | **Caches** | On RX 7900 XTX (gfx1100), ROCm reports **L1=32 KB**, **L2=6 MB**, **L3=96 MB** and **128 B cache lines** via `rocminfo` (L3 corresponds to the 96 MB Infinity Cache capacity). RDNA3 also has additional per-WGP caches (instruction/scalar/texture) that are not surfaced as HSA cache levels. | Prefer 128-bit vector loads/stores, keep base pointers aligned, and design tiles to reuse within L2/L3. Use Radeon Memory Visualizer/RGP for cache behavior; rocprofiler counter availability varies by tool/version. |
 | **Memory** | gfx1100 (Navi 31) uses up to a 384-bit GDDR6 interface delivering ~960 GB/s; Infinity Cache supplies up to 96 MB of on-package bandwidth amplification (RDNA3 specs). Peak compute is 61.4 TFLOP/s FP32 / 122.8 TFLOP/s FP16. | Base roofline targets on these published numbers and capture real bandwidth with `roofline_analysis_gfx1100`/Radeon Memory Visualizer, not datacenter/HBM peak numbers. |
 | **Scheduler** | RDNA3 introduces dual-issue shader ALUs capable of issuing two instructions per cycle (RDNA3 architecture overview; RDNA3 ISA §4.4). WMMA/VALU ops still monopolize vector lanes if latency hiding is insufficient. | Adaptive scheduler heuristics (Sprint 2 Task 1) should consider dual-issue pairing opportunities and rely on AMD counters (SQ_INSTS_VALU, SQ_WAVES, etc.) collected via GPU Perf API. |
+| **MES SCH (gc_11_0_0_mes_2.bin v0x88)** | [CURRENT] Pure queue scheduler with 19 API opcodes (AMD MES Spec April 2024 pp 4-17; bd exterior_algebra-9w7y.6; kb-20260530-161329-a474e3). Maps user queues onto HQDs, manages preemption/scheduling. NEVER parses PM4 packets in IBs — CP/MEC HW reads IBs directly. mes_sch_v088_decompiled.c (23,112 lines) has zero PM4 opcode dispatch table. See §12. | Refutes any "MES elides fence packets" hypothesis. Cross-engine ordering bugs are in ROCclr graph-capture (submitCopyMemoryP2P), not firmware. |
+| **SDMA CTL ucode (sdma_6_0_0.bin)** | [CURRENT] CTL firmware (file[0x4600:0x8800]) hardcodes 107 (0x6b) at 8 instruction sites; reg 0x6b in undocumented gap 0x0064-0x006f of gc_11_0_0_offset.h. NOT cleared by TLB inval or GRBM_SOFT_RESET (SRAM survives soft reset; bridge #4250). 107 is NOT a translation-slot count (single 2MB huge-page still caps at 115, bridge #4252). Current hypothesis: outstanding-host-read-burst FIFO. See §13. | SDMA submissions >107 pages from VA range start silently return 0xffffffff, then wedge the endpoint (all-ones MMIO; reboot required). Workaround: contiguous staging buffer. |
+| **mode1_reset on Navi 3x** | [CURRENT] SMU-driven (PPSMC_MSG_Mode1Reset). Hardware-resets gfx-domain SRAM including MES uC private RAM. Requires AMDGPU_NEED_FULL_RESET in reset_context for amdgpu_device_fw_loading to re-upload UCODE_ID_CP_MES + UCODE_ID_CP_MES_DATA. Without it, soft-reset path skips FW reload. MES SCH has no boot-time data-section memset (bd 9w7y.3 Phase C; patch 0032.5). | MES wedge recovery only works with NEED_FULL_RESET. patch 0032.2 was dead code on gfx11 before 0032.5 fixed this. |
 
 ### 2.1 Validated Target (This System)
 The following values are **directly observed on this machine’s RX 7900 XTX cards** (gfx1100) using `rocminfo`, `rocm-smi`, and a small HIP `hipGetDeviceProperties` query:
@@ -2201,6 +2212,368 @@ incorrect.
 commits `fd350a9` (broken signal_ptr attempt) → `16aeb25` (VRAM sentinel
 fix), bridge thread 2026-05-24 #3420 (braidinfer report), #3421 (udi
 incorrect mechanism narrative), #3422+ (disassembly correction).
+
+---
+
+---
+
+## 12. MES SCH v0x88 — Firmware Role, API Surface, What It Does NOT Do
+[CURRENT] Source: AMD MES Specification April 2024 (AMD_MES_specification_April2024.pdf); mes_sch_v088_decompiled.c (23,112 lines); bd exterior_algebra-9w7y.6; kb-20260530-161329-a474e3.
+
+### 12.1 What MES IS
+
+MES (Micro Engine Scheduler) is a **pure queue scheduler** running on the gfx11 CP auxiliary RISC-V core. Firmware image: `gc_11_0_0_mes_2.bin` (scheduler pipe, v0x88 as of ROCm 7.2.3). Its entire API surface consists of **19 opcodes** (MES Spec pp 4-17):
+
+| Opcode | Name | Purpose |
+|--------|------|---------|
+| 2 | ADD_QUEUE | Map a user queue (MQD) onto an HQD |
+| 3 | REMOVE_QUEUE | Unmap a queue |
+| 4 | SUSPEND | Suspend a queue (preemption) |
+| 5 | RESUME | Resume a suspended queue |
+| 6 | RESET | Reset a queue HW state |
+| 7 | SET_GANG_SUBMIT | Configure gang-submission parameters |
+| 8 | PROGRAM_GDS | Allocate GDS region to a queue |
+| 9 | SET_HW_RSRC | Set hardware resource limits |
+| 10 | SET_SE_MODE | Set shader engine mode |
+| 11-14 | MISC subops | WRITE_REG, INV_GART (broken on gfx11), WAIT_REG_MEM, READ_REG |
+
+MES operates entirely at the **queue-object level**: mqd_addr, wptr_addr, gang_context_addr, doorbell page offsets, and VMID assignments. It has NO visibility into the content of IBs.
+
+### 12.2 What MES Does NOT Do (PROVEN by disassembly + spec)
+
+MES NEVER parses PM4 packets inside IBs. CP/MEC hardware reads IBs directly.
+
+**Evidence (bd 9w7y.6; kb-20260530-161329-a474e3):**
+- mes_sch_v088_decompiled.c (23,112 lines) contains zero instances of PM4 opcode constants 0x3C (WAIT_REG_MEM) or 0x49 (RELEASE_MEM) as comparison targets. The only 0x58 occurrences are struct field offsets, not opcode comparisons.
+- There is no packet-opcode dispatch table (no switch on packet header bits 15:8).
+- The 739 `andi` instructions are for coop-bit (0x200), per-PASID slot indexing, and integer arithmetic, not PM4 opcode masking.
+- MESAPI_MISC__WAIT_REG_MEM (MES Spec p44) is a driver-initiated API to make MES poll an MMIO register, not a PM4 stream parser.
+
+**Critical implication:** Any hypothesis that "MES elides fence packets" or "MES batches IB replay and drops inter-engine ordering constraints" is REFUTED. The llama.cpp SDMA P2P graph-capture bug (workaround: 5ff84a40a SDMA_IN_CAPTURE=OFF) was NOT a MES issue. See §15.
+
+### 12.3 Per-PASID Slot and Cooperative-Bit Internals
+
+Discovered during mes_sch_v088_decompiled.c forensics (bd 9w7y.1-2; kb-20260530-102019-120df1; kb-20260530-103816-ca1872):
+
+- ADD_QUEUE maintains a per-PASID slot at offset -0x3dc in the queue context struct. All 4 `sw -0x3dc` sites use OR-merge (lw/ori/sw), never assignment. Slots are NOT zeroed on REMOVE_QUEUE. Prior-PASID state can persist across PASID reuse.
+- The cooperative-bit mirror at queue_ctx[0x114] is OR-merged (bit 0x40) on ADD_QUEUE. Any prior cooperative-queue state survives into the new queue's coop evaluation.
+- `skip_process_ctx_clear` flag (bit 12 of ADD_QUEUE flags, mes_v11_api_def.h:304-321) allows explicit skip of the slot-clearing path. [HYPOTHESIS] Requires audit of mes_v11_0.c packet-construction sites to confirm the kernel never sets this inadvertently.
+
+### 12.4 MES v0x88 vs v0x86: No Firmware Regression
+
+The earlier claim in v086_to_v088_diff.txt that "v0x88 removed sfence.vma" was a stale grep artifact. Both versions contain sfence.vma at the same enclosing PTE-writer helper (v0x86: f0021002, f0021246; v0x88: f0021422, f0021666; +0x420 offset matches new code inserted earlier in image). All firmware versions v0x34 through v0x88 contain sfence.vma. (kb-20260530-132534-a8a69d Phase 3 verdict)
+
+---
+
+## 13. SDMA F32 / CTL Ucode: 107-Page Host-Read Cap
+[CURRENT] Source: sdma_6_0_0.bin / sdma_6_0_1.bin disasm; bd exterior_algebra-imez (CLOSED); bd exterior_algebra-9w7y.7 (OPEN); bridge #4231-#4252.
+
+### 13.1 Observed Behavior
+
+SDMA COPY_LINEAR on gfx1100 caps at **107 pages from the start of the source VA range** for host-sourced (H2D) copies. Beyond page 107:
+- SDMA silently returns 0xffffffff for reads from those pages
+- No GMC fault (GCVM_L2_PROTECTION_FAULT_STATUS=0x0)
+- Cap is range-relative: varied base alignment, cap stays at +0x6b000 from range start
+- Persistent across separate copy calls: chunking into <=100-page separate ops + TLB inval still fails for pages >=107 (kb-20260530-161423-5f5f03)
+- Confirmed universal: cards 4a, c6, c9 (all RX 7900 XTX)
+
+**Wedge escalation:** After 0xffffffff fault response, SDMA endpoint goes fully off-bus: all-ones MMIO, subsequent SDMA ops timeout, reboot required.
+
+### 13.2 Where 107 Lives in the Firmware
+
+The constant 107 (0x6b) appears in the **CTL context-switch ucode** of sdma_6_0_0.bin (file[0x4600:0x8800]):
+- ctl+0x00a4: 0xcdc0006b WRITE (init)
+- ctl+0x00c4: 0xcc00006b READ
+- ctl+0x07cc: 0xd840006b POLL
+- ctl+0x0a50, ctl+0x1364, ctl+0x1390: POLL variants
+- ctl+0x190c, ctl+0x193c: POLL
+
+Pattern: one WRITE init, POLLs, READ loop-bounds. Identical offsets in sdma_6_0_1.bin. Register 0x6b is in the **undocumented gap** 0x0064-0x006f of gc_11_0_0_offset.h (between regSDMA0_TILING_CONFIG=0x63 and regSDMA0_INT_STATUS=0x70). This is F32-private SRAM, not host-visible MMIO.
+
+### 13.3 Refuted Hypotheses
+
+| Hypothesis | Refutation |
+|---|---|
+| Per-translation-slot table | Single 2MB huge-page (1 PTE translation) still caps at 115 (bridge #4252) |
+| UTCL1_CNTL.REQL2_CREDIT | REQL2_CREDIT=44, not 107 |
+| UTCL1_PAGE.DMA_PAGE_SIZE | DMA_PAGE_SIZE=12, not 107 |
+| GART 4K TLB limit | GART caps at ~114 (separate UTCL2 HW limit, different constant) |
+| Cleared by TLB inval | Does not drain the table (kb-20260530-161423-5f5f03) |
+| Cleared by QUEUE_RESET_REQ (0x007b) | Self-clears to 0 immediately but cap unchanged (bd 9w7y.7 empirical) |
+| Cleared by GRBM_SOFT_RESET | Reboots F32 but F32 SRAM survives soft reset (bridge #4250) |
+| Cleared by F32 HALT+unhalt | [UNVERIFIED; open in bd 9w7y.7] |
+
+### 13.4 Current Best Hypothesis [HYPOTHESIS]
+
+107 = capacity of an **outstanding-host-data-read-burst FIFO** in the SDMA F32 engine managed by CTL firmware during context switches. Each pending 4K page of host-sourced data in flight occupies one slot. When all 107 slots are full, new host reads are blocked. Consistent with: (a) per-range behavior, (b) SRAM survives GRBM_SOFT_RESET, (c) single 2MB translation uses many burst-read slots. Closing this gap requires AMD-confidential microarchitecture docs. [UNVERIFIED beyond this point]
+
+### 13.5 Workaround
+
+Use **contiguous staging buffers**. tinygrad's `am` driver issues one SDMA COPY_LINEAR over a single contiguous host buffer; 16 MiB H2D roundtrip = MATCH=True on card 4a (kb-20260530-161317-79edd1).
+
+For am-rs the underlying cause was different: VFIO device via sysfs BAR with no VFIO container sits in iommu=pt IDENTITY domain, capping at ~466 KB per IOMMU mapping. Fix: VFIO NO-IOMMU container mirroring tinygrad's PCIIface with enable_unsafe_noiommu_mode=1.
+
+---
+
+## 14. Kernel Patch Manifest: linux-p2p Active Patches
+[CURRENT] Source: exterior_algebra/CLAUDE.md "System Software Deviates From Stock"; ~/builds/linux-p2p/.
+
+| Patch | File | Purpose |
+|---|---|---|
+| 0001 | amdgpu_amdkfd_gpuvm.c:kfd_mem_attach | MTYPE_UC for peer GPU VRAM on gfx11. Workaround for missing buffer_wbl2: peer VRAM mapped uncached so writes bypass writer's L2 |
+| 0002 | smu13_0_0 | if_version bump to 0x40 for newer SMU firmware |
+| 0003, 0007, 0009 | PCIe error handling | coredump+bail, dedup PCI-error coredump, dedup in ASIC reset |
+| 0005, 0008, 0010 | SMU mailbox | skip on channel failure, prefail markers, ratelimit bus errors |
+| 0006 | halt_activities | Skip on non-hive frozen recovery (NULL deref guard) |
+| 0012 | kfd_process_queue_manager.c:386 | HDP flush after CPU memset of proc_ctx_bo. Closes multi-GPU MES coherence gap |
+| 0013 | kfd_process_queue_manager.c per-queue | HDP flush after CPU memset of gang_ctx_bo. Companion to 0012 |
+| 0016 | kfd_device_queue_manager.c:add_queue_mes | HDP flush on worker adev before MES ADD_QUEUE. Eliminates WALKER_ERROR:0x6/MAPPING_ERROR:0x1 |
+| 0017 | amdgpu_amdkfd_gpuvm.c:2119 | PTE-update fence synchronous wait in MAP_MEMORY_TO_GPU. Closes PERMISSION_FAULTS:0x3 race |
+| 0018 | kfd_debug.c:372 | HDP flush after debug-trap proc_ctx memset. Mirror of 0012 for debug-trap path |
+| 0032 series | mes_v11_0.c, amdgpu_mes.h | MES wedge: detect (REMOVE_QUEUE probe), recover (mode1_reset + NEED_FULL_RESET per 0032.5), sysfs gates, debugfs hook |
+
+**Reverted/falsified (DO NOT REAPPLY):** 0014 and 0014v2 (broke HIQ privilege bits, REGRESSED to 0-3/10), 0015 and 0015v2 (disrupted MES on concurrent compute), 0016-stb-log.FALSIFIED, 0019-peer-adevs.FALSIFIED_DEADLOCK.
+
+**Why 0012/0013/0016/0017/0018 are necessary:** On gfx1100 the HDP cache is not automatically flushed between CPU writes and GPU reads of page-table BOs, process/gang context BOs, or MQDs. Without explicit HDP flush, GPU reads stale values. Manifests as WALKER_ERROR, MAPPING_ERROR, PERMISSION_FAULTS.
+
+**Why 0001 + hsa-rocr-p2p-mtype-uc-gfx11.patch are necessary:** gfx1100 lacks buffer_wbl2 and s_buffer_gl0/gl1_inv are silently no-op on gfx11+ for host-mapped UC scalar loads (§11.14). Without MTYPE_UC on peer mappings, compute writes to peer VRAM stay in the writer's L2.
+
+**The 0032.x series detail:**
+- 0032 Phase 1: mes_v11_0_probe_alive() primitive. Sends benign MISC__WRITE_REG, returns true if MES responds within timeout.
+- 0032.1 Phase 2: wires probe into REMOVE_QUEUE completion paths; sets atomic_t wedged on struct amdgpu_mes on failure.
+- 0032.2 Phase 3: schedules delayed mes_v11_0_wedge_recover_work calling amdgpu_device_gpu_recover.
+- 0032.3 Phase 4: sysfs mes_wedged file; new-queue admission gates on flag.
+- 0032.4: debugfs test hook.
+- **0032.5 CRITICAL:** sets AMDGPU_NEED_FULL_RESET in recovery reset_context. Without this, mode1_reset clears MES uC SRAM but firmware is NOT reloaded (soft-reset path at amdgpu_device.c:5919 skips fw_loading). 0032.2 was dead code on gfx11 before 0032.5. (bd 9w7y.3 Phase C; patch text: 0032.5-drm-amdgpu-mes-wedge-recover-need-full-reset-gfx11.patch)
+
+**Scope limitation of 0032.x:** Probe fires on REMOVE_QUEUE timeout only. Does NOT detect Class B cold-start MES uC private cache wedge (sysfs mes_wedged=0 in that class; see §17).
+
+---
+
+## 15. HIP Captured-Graph + ROCclr P2P Fixes
+[CURRENT] Source: bridge #4208-#4229; bd exterior_algebra-9w7y.6; rocm-clr commits f48beea2, 35fbb4c4.
+
+### 15.1 The Bug
+
+When a HIP graph containing `hipMemcpyPeerAsync` P2P SDMA copies is captured via hipStreamBeginCapture/End, those copies were **never recorded into the captured graph**. The async path was missing the CHECK_STREAM_CAPTURING / STREAM_CAPTURE flow that the synchronous path had. Graph replay submitted the SDMA copy with stale src-completion signal state.
+
+Symptom: wrong hash 434fd9c... consistently across 4 trials with different compute-layer mitigations — all failed because the bug was below the compute layer (bd 9w7y.6 verdict (b)).
+
+### 15.2 The Fix (rocm-clr branch)
+
+| Commit | Change |
+|---|---|
+| f48beea2 | Add STREAM_CAPTURE path to hipMemcpyPeerAsync — was entirely missing; async copies were never recorded |
+| 35fbb4c4 | Add BLIT preference for captured P2P copies — avoids signal-pool reassignment on graph replay |
+
+Upstream PR pending as of 2026-05-30.
+
+### 15.3 Workaround Until Fix Ships
+
+SDMA_IN_CAPTURE=OFF (llama.cpp commit 5ff84a40a). Disables SDMA submission during graph capture/replay; routes P2P copies through compute instead.
+
+### 15.4 Captured-Graph Per-CU vL1 Staleness (Adjacent Bug Class)
+
+[CURRENT; kb-20260529-163406-1677aa; bridge #3980-#3983]
+
+Captured-graph dispatch chains on gfx11 can produce per-CU vL1 staleness. Between live dispatches, CP emits ACQUIRE_MEM GL1_INV+GLV_INV. Captured-graph replay submits a batched IB where inter-node cache packets may be elided (MES treats graph-internal stream-order edges as same-pipe FIFO; cudaStreamCaptureModeRelaxed amplifies this).
+
+Symptom: kernel A writes arg_slots[i]=NEW_VA into GL2; reader CU's vL1 holds OLD_VA from prior graph node. Produces 1000x+ magnitude wrong values (not subtle numerical drift).
+
+Fix: declare pointer types `const volatile` for any slot written by an earlier captured kernel or live kernel just before cudaGraphLaunch. On gfx11, `volatile` compiles to `flat_load_dword glc+dlc` (bypasses vL1 and GL2). This is the reader-side analog of §11.14's scalar-cache no-op.
+
+---
+
+## 16. GPU Isolation + KFD Enumeration: HIP_VISIBLE_DEVICES Limits
+[CURRENT] Source: empirical findings from am-rs and braidinfer; exterior_algebra/CLAUDE.md.
+
+### 16.1 Isolation Mechanism Status on ROCm 7.2.3
+
+| Mechanism | Status | Notes |
+|---|---|---|
+| HIP_VISIBLE_DEVICES=0,1,2,3 (integer index) | WORKS | Restricts compute targets. Integer index matches rocminfo Agent ordering. |
+| ROCR_VISIBLE_DEVICES=0000:47:00.0,... (BDF format) | SILENTLY FAILS | ROCm 7.2.3 rejects BDF-format values; process sees 0 GPUs. |
+| HIP_VISIBLE_DEVICES=-1 | Partial only | Hides from HIP selection but ROCm still opens all /dev/kfd and /dev/dri/renderD at init. |
+| bwrap / Linux namespace isolation of /dev/kfd | FAILS | Breaks ROCm init; hipInit requires real /dev/kfd for device discovery and PASID allocation. |
+
+### 16.2 KFD Holder Problem
+
+Any process that calls hipInit() opens /dev/kfd and every /dev/dri/renderD<N> for all amdgpu cards visible to the kernel. This makes the process a **KFD holder for ALL cards**, not just the ones it computes on.
+
+ash-pcie amdgpu-unbind will refuse to unbind any card if ANY process holds KFD for it. A single runaway HIP process can block unbind of all 8 cards.
+
+**Correct isolation for CPU-only services:** systemd unit directives:
+```
+InaccessiblePaths=/dev/kfd /dev/dri
+```
+or `PrivateDevices=true`. The llama-embed-qwen3-8b and llama-qwen3:4b services on this host use this pattern.
+
+NEVER set HIP_VISIBLE_DEVICES=-1 alone for a CPU-only service. ROCm still opens KFD at startup.
+
+### 16.3 Design Implication for Watchdog/Recovery
+
+Assume any running HIP/ROCm process holds KFD for ALL amdgpu cards. Recovery flow must be: kill the process, then amdgpu-unbind/bind. ash-pcie amdgpu-unbind auto-kills safe user observers (btop, nvtop) but refuses if a real KFD holder process is open.
+
+---
+
+## 17. Wedge Class Taxonomy + Recovery Decision Tree
+[CURRENT] Based on: bd 4e2m, bd exterior_algebra-a3l, bd exterior_algebra-2s26 (patch 0032 design), mes/MES_PROBE_ARCHIVE.md.
+
+This host has four operationally distinct GPU wedge classes. Using the wrong recovery wastes hours.
+
+### Class A: MES SCH REMOVE_QUEUE Timeout
+
+**Detection:** dmesg: `amdgpu 0000:XX:00.0: [mes-wedge] detect: probe failed post-REMOVE_QUEUE; adev=N marked wedged`.
+With 0032.3: `cat /sys/class/drm/card<N>/device/mes_wedged` returns 1.
+
+**Recovery:**
+1. Auto (0032.2 + 0032.5): mode1_reset with AMDGPU_NEED_FULL_RESET, hardware-resets gfx-domain SRAM, re-uploads MES firmware.
+2. Manual: `ash-pcie amdgpu-unbind <card>`, then `ash-pcie amdgpu-bind <card>`.
+3. Last resort: host reboot.
+
+IMPORTANT: mode1_reset only works with AMDGPU_NEED_FULL_RESET (patch 0032.5). Without it, soft-reset skips FW reload.
+
+---
+
+### Class B: Cold-Start MES uC Private Cache Wedge (bd-4e2m terminal class)
+
+**Detection:**
+- sysfs mes_wedged=0, rocm-smi shows card healthy, no dmesg errors
+- Every cold-start HIP process on the card hangs at early init
+- Pattern: warm cards succeed; cold/recently-rebooted cards fail ~40% of cold trials
+- kb-20260529-185218-acbdac captures forensic evidence
+
+**Root cause:** MES uC private SRAM/cache state degradation across process startups. Identified-but-unreachable from userspace. NOT self-healing within a boot.
+
+**Recovery (in order):**
+1. `ash-pcie amdgpu-unbind <card>`, then `ash-pcie amdgpu-bind <card>`. [VERIFIED cure]
+2. Wait 60+ seconds (unreliable).
+3. Host reboot (+ power cycle for extreme cases).
+
+NEVER use raw `tee /sys/bus/pci/drivers/amdgpu/unbind` — host hard-locks if any KFD holder exists (2026-05-25 incident).
+
+---
+
+### Class C: CPC Page-Fault Burst (WALKER_ERROR + PERMISSION_FAULTS)
+
+**Detection:** dmesg: `[gfxhub0] retry page fault (WALKER_ERROR code=0x6)`, `UTCL2 TCP PERMISSION_FAULT=0x3 MAPPING_ERROR=0x0`.
+
+**Recovery:** Kernel TDR handles automatically (MODE1 GPU reset). No manual action needed. If frequent: verify patches 0012/0013/0016/0017 are active.
+
+---
+
+### Class D: HIP Runtime Cold-Start Hang (Process-Level)
+
+**Detection:**
+- Specific process hangs at HIP init; other processes run fine; GPU appears healthy
+- llama.cpp: hangs at model load, exit 241 (SIGTERM timeout)
+- No GPU fault in dmesg
+
+**Root cause:** MES uC state from prior process not reset. New process inherits stale PASID slot or coop state (H1 per-PASID slot-leak, §12.3).
+
+**Recovery:** Kill hung process, perform Class B recovery (unbind/bind), retry.
+
+**kfd_process_wq_release wedge (bd exterior_algebra-a3l):** When ANY MES MISC op times out, kfd_process_wq_release can deadlock on drm_gem_handle_delete lock (GEM idr lock) while another CPU waits on GPU work that cannot complete. Produces CPU soft lockup (CPU#N stuck 26s+, recurring every ~28s). Recovery requires reboot. Capture `/proc/PID/stack` and gdb backtrace BEFORE killing. Patch 0030 covers vm->status_lock variant; drm_gem_handle_delete site needs separate fix (bd a3l v2 pending).
+
+---
+
+### Quick Decision Tree
+
+```
+GPU workload hangs or fails?
+  |
+  +-- dmesg: [mes-wedge] probe failed?
+  |     YES -> Class A: amdgpu-unbind/bind (0032.x auto-handles)
+  |
+  +-- dmesg: WALKER_ERROR / PERMISSION_FAULTS?
+  |     YES -> Class C: kernel TDR auto-handles; verify patches 0012-0017
+  |
+  +-- sysfs mes_wedged=0, no dmesg errors, GPU appears healthy?
+  |   |
+  |   +-- Cold card, recently rebooted or freshly freed?
+  |   |     YES -> Class B: amdgpu-unbind/bind
+  |   |
+  |   +-- Only one process hangs, others run fine?
+  |         YES -> Class D: kill process + amdgpu-unbind/bind + retry
+  |
+  +-- kfd_process_wq_release + CPU soft lockup?
+        YES -> bd a3l class: reboot; capture /proc/PID/stack FIRST
+```
+
+---
+
+## Appendix B: RDNA3/gfx11 Practical Implementor's Guide
+[CURRENT] Single-page onboarding for new implementors on this hardware. Read this first; dive into numbered sections for evidence.
+
+### B.1 This Hardware Is Not a Datacenter GPU
+
+gfx1100 (Navi 31 / RX 7900 XTX) is a **consumer RDNA3 GPU**. Key differences from CDNA2/CDNA3:
+
+| Feature | gfx1100 (RDNA3) | CDNA2/CDNA3 |
+|---|---|---|
+| Peer-GPU L2 coherence | NO. MTYPE_UC workaround required. | Yes (xGMI fabric) |
+| buffer_wbl2 (writer-side L2 writeback) | ABSENT | Present |
+| s_buffer_gl0_inv on host-mapped UC scalars | SILENTLY NO-OP (§11.14) | Works |
+| __threadfence_system() in persistent kernels | HANGS (§5.3) | Works |
+| Infinity Cache (L3, 96 MB) | Present (on-package bandwidth amplifier) | Absent |
+| SDMA per-range host-read FIFO | 107-entry limit (§13) | [UNVERIFIED on CDNA] |
+
+**Key mental model:** On RDNA3 you cannot rely on hardware coherence for cross-GPU data visibility. §5.5 rules are the documented workaround list for missing hardware coherence. They are not optional.
+
+### B.2 Multi-GPU Coherence Pitfalls
+
+1. **Never use hipMalloc (cached) for cross-GPU-shared buffers.** Use Rule 1 methods (§5.5). Cached buffers silently return stale data on peer reads.
+
+2. **Peer VRAM writes go through writer's L2 by default.** On this host, patch 0001 + hsa-rocr-p2p-mtype-uc-gfx11.patch apply MTYPE_UC automatically. On an unpatched host, peer writes may silently fail to propagate.
+
+3. **host-mapped portable-coherent is NOT cross-GPU write-through.** hipHostMallocCoherent guarantees CPU-GPU coherence (hardware snoops), not GPU-to-GPU coherence through the GART (§11.18).
+
+4. **Per-WGP vL1 is NOT coherent across CUs in captured graphs.** Pointer slots written by one captured kernel and read by a later one need `const volatile` (compiles to flat_load_dword glc+dlc on gfx11). See §15.4.
+
+5. **s_buffer_gl0_inv / s_buffer_gl1_inv are no-ops for host-mapped UC scalar loads on gfx11** (§11.14). Use global_load with glc+dlc for scalar-addressed host-mapped UC polls.
+
+### B.3 SDMA Usage Envelope
+
+- **Local D2D (same GPU):** ROCm 7.2.3 routes through compute kernels, NOT SDMA (verified by rocprofv3; kb-20260527-142228-da4482). Stream name does NOT select engine.
+- **H2D / D2H crossing PCIe:** Uses SDMA hardware.
+- **Peer D2D above ROC_P2P_SDMA_SIZE (default 1 MB):** Uses SDMA.
+
+**The 107-page cap (§13):** SDMA H2D >107 pages from VA range start silently returns 0xffffffff then wedges the endpoint. Workaround: contiguous staging buffer.
+
+### B.4 HIP Graph Capture Pitfalls
+
+1. **hipMemcpyPeerAsync in captured graphs:** Before ROCclr fix f48beea2, not recorded into the graph. Workaround: SDMA_IN_CAPTURE=OFF (§15).
+2. **Captured-kernel argument pointers that change per-replay:** Must be `const volatile` if written by an earlier captured kernel (§15.4).
+3. **cudaStreamCaptureModeRelaxed:** Drops ordering constraints. Avoid unless capture is fully self-contained.
+
+### B.5 Wedge Class Quick Map
+
+| Symptom | Likely class | Recovery |
+|---|---|---|
+| [mes-wedge] probe failed in dmesg | A | auto (0032.x) or unbind/bind |
+| WALKER_ERROR / PERMISSION_FAULTS in dmesg | C | auto (TDR); verify patches 0012-0017 |
+| Card healthy, process hangs at HIP init, cold card | B | unbind/bind cycle |
+| Card healthy, only one process hangs | D | kill + unbind/bind + retry |
+| CPU soft lockup, kfd_process_wq_release stuck | a3l | reboot; capture stack first |
+
+### B.6 Cold-Start Hygiene
+
+1. **Use launch-gpu:** serializes GPU allocation, prevents cold-starting the same card simultaneously.
+2. **Do not disable warmup dispatch:** braidinfer and llama.cpp warmup clears MES uC cache state (§11.19 production cure).
+3. **Do not use launch-gpu --kill --all-sessions:** simultaneous kill of many processes triggers simultaneous REMOVE_QUEUE burst that can wedge MES uC. Kill individual processes one at a time.
+4. **Tinygrad am path avoids Class B entirely:** Programs HQDs directly via MMIO, bypassing MES. Empirical: 50/50 PASS cold-start (Wilson CI [0.0, 0.071]) vs ~40% fail rate on MES path (kb-20260523-175653-d036a1).
+
+### B.7 Which AMD Docs to Trust
+
+| Document | Location | Authoritative for |
+|---|---|---|
+| RDNA3 ISA | ~/Projects/ai/composable_kernel/rdna3-*.pdf (.txt in same dir) | Instruction encodings, cache flush opcodes, WMMA layout, wave mechanics |
+| AMD MES Spec April 2024 | ~/Projects/ai/exterior_algebra/mes/AMD_MES_specification_April2024.pdf | MES API opcodes, ADD_QUEUE/REMOVE_QUEUE formats, MISC subop definitions (pp 4-17) |
+| MES firmware disasm | ~/Projects/ai/exterior_algebra/mes/mes_sch_v088_decompiled.c + mes1_disasm.s | Ground truth for v0x88 behavior. Read README.txt for Ghidra/RVV caveats. |
+| linux-p2p patch tree | ~/builds/linux-p2p/src/linux-7.0.9/ | Host kernel behavior. KFD, MES driver, SDMA driver, HDP flush sites. |
+| gc_11_0_0_offset.h | ~/builds/linux-p2p/src/linux-7.0.9/drivers/gpu/drm/amd/include/asic_reg/gc/ | gfx11 register map. Note: gap 0x0064-0x006f is UNDOCUMENTED (SDMA F32 private). |
+
+**Be skeptical of:** ROCm docs for features that "should work" but conflict with empirical observations here. Consumer RDNA3 with a custom kernel; datacenter-GPU docs for CDNA/MI300 do not apply directly.
 
 ---
 
