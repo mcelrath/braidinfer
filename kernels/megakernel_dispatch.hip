@@ -200,8 +200,11 @@ __device__ __forceinline__ void dispatch_opcode(
     // inside op_d2d_copy's vblock body (vblock==0), which only guaranteed vblock==0's
     // writes drained — leaving dst[blockDim.x..count-1] potentially in-flight when
     // the worker woke up and read act_p2p → intermittent ~2/8 divergence (yef5.2).
-    // After this barrier, every block has called __threadfence() as part of the UC-VRAM
-    // write path, and the full activation is in VRAM before the sentinel fires.
+    // After this barrier all blocks have ISSUED their UC-VRAM stores (UC bypasses L2 →
+    // straight to VRAM; op_d2d_copy no longer calls __threadfence). The drain-probe below
+    // confirms the last element. NOTE: formalizing all-blocks-DRAINED (not just issued)
+    // before the sentinel — vs the current barrier+last-elem-probe, validated 10/10
+    // empirically — is tracked as a yef5.2 follow-up (restore agent-fence or prove sufficiency).
     if (opcode == OP_D2D_COPY) {
         const D2dCopyInst* d2d = (const D2dCopyInst*)inst;
         if (d2d->signal_ptr != 0) {

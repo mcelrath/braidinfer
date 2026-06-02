@@ -393,8 +393,9 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
     //
     // §11.18 (b) consumer-side cache invalidation (mirrors op_d2d_copy,
-    // megakernel_ops.hip:1949-1955): act_p2p is moe_act_uc_handoff, a
-    // host-mapped UC buffer overwritten every decode step. Our L0 and WGP
+    // megakernel_ops.hip:1949-1955): act_p2p is activation_staging_vram, a
+    // peer-UC VRAM buffer (GPU 0 VRAM, alloc_uncached, MTYPE_UC peer-mapped
+    // via kernel patch 0001) overwritten every decode step. Our L0 and WGP
     // L1 may hold stale cached lines from the prior step (buffer is reused;
     // no automatic invalidation occurs). gl0_inv+gl1_inv discard those
     // stale lines before the coop_copy loads them. gl2_inv is not available
