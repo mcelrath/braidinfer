@@ -275,8 +275,13 @@ pub mod srg6_4_test_api {
     pub use super::INST_SIZE;
     pub use super::Instruction;
     pub use super::SHARED_LPROJ_TOTAL;
-    pub use super::instructions::{D2dCopyInst, KvWritePagedBatchInst};
+    pub use super::instructions::{D2dCopyInst, KvWritePagedBatchInst, RmsNormInst};
     pub use super::OP_HALT;
+    // bd w1li.1: per-op rmsnorm harness targets the SHIPPING op_rmsnorm
+    // (replacing the deprecated RmsNormKernel drift-test). Per compile_common.rs
+    // rmsnorm_opcode(one_plus_w): OP_RMSNORM = y=x·rms·(1+w) (one_plus_w=true,
+    // the Qwen3.x shipping variant); OP_RMSNORM_WX = y=x·rms·w (one_plus_w=false).
+    pub use super::{OP_RMSNORM, OP_RMSNORM_WX};
 
     impl Instruction {
         #[doc(hidden)]
@@ -318,6 +323,22 @@ pub mod srg6_4_test_api {
                 head_dim,
                 chunk_tokens,
             )
+        }
+    }
+
+    impl RmsNormInst {
+        #[doc(hidden)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn test_new(
+            opcode: u32,
+            grid_x: u32,
+            output: *mut f32,
+            input: *const f32,
+            weight: *const u16,
+            dim: i32,
+            eps: f32,
+        ) -> Self {
+            Self::new(opcode, grid_x, output, input, weight, dim, eps)
         }
     }
 }

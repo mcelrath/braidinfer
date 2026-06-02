@@ -86,7 +86,9 @@ impl_inst!(NopInst);
 // words[1]=output, [2]=input, [3]=weight, [4]=dim(i32), [5]=eps(f32 bits)
 // ─────────────────────────────────────────────────────────────────────────────
 #[repr(C)]
-pub(crate) struct RmsNormInst {
+// bd w1li.1: `pub` (not pub(crate)) so srg6_4_test_api can re-export it for the
+// per-op rmsnorm harness — matches D2dCopyInst / KvWritePagedBatchInst.
+pub struct RmsNormInst {
     pub opcode_gridx: u64,
     pub output: *mut f32,
     pub input: *const f32,
