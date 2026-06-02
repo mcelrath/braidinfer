@@ -129,24 +129,6 @@ pub struct MoeP2pContext {
     /// ...]` passed to `CrossGpuStaging::alloc`). `.host_ptr()` is the CPU
     /// view used for CPU-side zero init and post-step readback.
     pub output_slots: CrossGpuStaging<f32>,
-    /// Host-mapped UC staging buffer for the MoE activation input
-    /// (`act.normed` for standard MoE, `act.moe_latent` for Nemotron-H).
-    ///
-    /// **Input-side companion to `output_slots`** (snl 2026-05-15 follow-up).
-    /// Workers previously P2P-READ from GPU 0's cached `act.normed` (cross-
-    /// GPU peer-VRAM read of cached memory). At 4+ GPUs concurrent worker
-    /// reads pressure GPU 0's L2 and the PCIe root-complex non-posted-read
-    /// path (ea bridge #242 mechanism: posted-write congestion in the
-    /// upstream port stalls non-posted MMIO reads → MES driver-side
-    /// timeout). Moving the read source to host-mapped UC removes the
-    /// cross-GPU peer path entirely.
-    ///
-    /// Sized `MAX_PREFILL_BATCH × hidden_size`. Decode uses only first hs.
-    ///
-    /// Owned as a [`CrossGpuStaging<f32>`]: indexing convention `gpu_idx ==
-    /// gpu_id` (slice order `[gpu0, worker0, worker1, ...]`), same as
-    /// [`Self::output_slots`].
-    pub moe_act_uc_handoff: CrossGpuStaging<f32>,
     /// GPU 0 per-layer config pointer array on GPU 0 VRAM: `MoeWorkerConfig*[num_layers]`.
     pub gpu0_layer_config_ptrs: DeviceBuffer<u64>,
     /// GPU 0 per-layer config blobs on GPU 0 VRAM (kept alive).
@@ -312,16 +294,6 @@ impl MoeP2pContext {
             &gpu_id_devices,
         )?;
 
-        // Input-side companion (snl 2026-05-15): host-mapped UC for the
-        // MoE activation handoff. Sized for max prefill batch × hidden_size
-        // (decode uses first hs only). Same allocator + per-GPU dev-ptr
-        // pattern as output_slots.
-        let mut moe_act_uc_handoff = CrossGpuStaging::<f32>::alloc(
-            MAX_PREFILL_BATCH * hidden_size,
-            &gpu_id_devices,
-        )?;
-
-
         // GPU 0 per-layer config pointer array — always allocated (both single-GPU and
         // multi-GPU). For multi-GPU (num_workers > 0), GPU0 has no experts (start_gpu=1),
         // so expert_buffers[0].slot_map is all-None and build_layer_configs produces
@@ -440,7 +412,6 @@ impl MoeP2pContext {
         shared_expert_gate_scratch.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * 32])?;
         // Zero host-mapped UC buffers via CPU writes.
         output_slots.zero();
-        moe_act_uc_handoff.zero();
         activation_staging.zero();
         unsafe {
             std::ptr::write_bytes(per_token_expert_ids.host_ptr(), 0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS);
@@ -458,12 +429,10 @@ impl MoeP2pContext {
             let gpu_id = (w_idx + 1) as u32;
             let _worker_guard = DeviceGuard::switch_to(device)?;
             // Per-worker peer-views resolved by CrossGpuStaging::alloc above.
-            // gpu_id indexing: output_slots/moe_act_uc_handoff use slice
-            // `[gpu0, worker0, ...]` (so `gpu_id` directly). activation_staging
-            // uses `worker_devices` only (so `w_idx`).
+            // gpu_id indexing: output_slots uses slice `[gpu0, worker0, ...]`
+            // (so `gpu_id` directly). activation_staging uses `worker_devices` only (so `w_idx`).
             let act_dev_ptr = activation_staging.dev_ptr(gpu_id as usize) as *mut std::ffi::c_void;
             let out_dev_ptr = output_slots.dev_ptr(gpu_id as usize) as *mut std::ffi::c_void;
-            let handoff_dev = moe_act_uc_handoff.dev_ptr(gpu_id as usize) as *mut std::ffi::c_void;
 
             // §11.18 (d-buffers) per udi #2619: peer-side UTCL2 TLB warm-up.
             // hipHostGetDevicePointer only resolves the peer's virtual
@@ -484,7 +453,7 @@ impl MoeP2pContext {
                 let vram_peer_view = activation_staging_vram.as_ptr() as *const std::ffi::c_void;
                 let mut scratch: u32 = 0;
                 let scratch_ptr = &mut scratch as *mut u32 as *mut std::ffi::c_void;
-                for &peer_view in &[act_dev_ptr, out_dev_ptr, handoff_dev, vram_peer_view] {
+                for &peer_view in &[act_dev_ptr, out_dev_ptr, vram_peer_view] {
                     unsafe {
                         braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpy(
                             scratch_ptr,
@@ -549,7 +518,6 @@ impl MoeP2pContext {
         let moe_act_sentinel: Vec<Option<MappedHostBuffer<u32>>> = (0..num_total_layers).map(|_| None).collect();
 
         Ok(MoeP2pContext {
-            moe_act_uc_handoff,
             work_queue,
             output_slots,
             gpu0_layer_config_ptrs,

@@ -723,20 +723,10 @@ impl Model {
                     c.extend_from_slice(mk_insts);
                     c
                 };
-                // snl 2026-05-15 ordering fix: workers P2P-read from the
-                // host-mapped `moe_act_uc_handoff` buffer; the D2D copy that
-                // populates it runs inside GPU 0's PRE batch. If workers
-                // fire concurrently with GPU 0 (via dispatch_batch_fire),
-                // they can race the D2D and read uninitialized/stale data
-                // → NaN propagation. Force GPU 0's batch to ack BEFORE
-                // dispatching workers. Sacrifices the PRE/worker overlap
-                // documented above but is required for correctness; the
-                // overlap optimization can be restored once an in-megakernel
-                // signal-then-fire mechanism replaces CPU-side fan-out.
-                // yef5.2 Step A: fire PRE async (workers spin on sentinel);
-                // workers acquire-spin on moe_act_sentinel so they cannot
-                // race the D2D into moe_act_uc_handoff. Capture GPU0 PRE ack-seq
-                // and include it in try_wait_acks_many (reverse ack unchanged).
+                // yef5.2 Step A: fire PRE async (workers spin on moe_act_sentinel);
+                // workers acquire-spin on activation_staging_vram sentinel so they
+                // cannot race the D2D copy. Capture GPU0 PRE ack-seq and include it
+                // in try_wait_acks_many (reverse ack unchanged).
                 let gpu0_pre_seq: u32;
                 {
                     let dispatch: &mut dyn BatchDispatcher =
@@ -751,7 +741,7 @@ impl Model {
                 self.probe_hidden_after_segment(&format!("moe-pre L{}", layer_idx));
                 let gpu0_seq: Option<u32> = Some(gpu0_pre_seq);
                 // Dispatch OP_MOE_FFN_REMOTE on each worker. Workers acquire-spin
-                // on the activation sentinel before reading moe_act_uc_handoff.
+                // on moe_act_sentinel before reading activation_staging_vram.
                 self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq, seq_value)?;
                 // MoE mirror: snapshot output_slots + worker FFN outputs after ack.
                 if self.tracer.enabled() {
