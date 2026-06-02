@@ -297,6 +297,7 @@ impl MegakernelProgram {
             multi_gpu_attn_boundaries,
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
+            moe_act_d2d_indices: Vec::new(),
         })
     }
 
@@ -570,6 +571,7 @@ impl MegakernelProgram {
             multi_gpu_attn_boundaries: Vec::new(),
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
+            moe_act_d2d_indices: Vec::new(),
         })
     }
 
@@ -868,6 +870,7 @@ impl MegakernelProgram {
             multi_gpu_attn_boundaries: Vec::new(),
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
+            moe_act_d2d_indices: Vec::new(),
         })
     }
 
@@ -942,6 +945,7 @@ impl MegakernelProgram {
             multi_gpu_attn_boundaries: Vec::new(),
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
+            moe_act_d2d_indices: Vec::new(),
         })
     }
 
@@ -974,6 +978,8 @@ impl MegakernelProgram {
         let hs = cfg.hidden_size;
 
         // Collect: (barrier_idx → layer_idx) for all MoE barriers
+        // yef5.2 Step A: track D2D indices before Pass 2 reindexing.
+        let mut moe_act_d2d_indices_pre_pass2: Vec<(usize, usize)> = Vec::new();
         let barrier_map: std::collections::HashMap<usize, usize> = prog
             .barrier_layer_map
             .iter()
@@ -1014,24 +1020,43 @@ impl MegakernelProgram {
                             gupd as i32, hs as i32, 0,
                         ).into_inst();
                     } else {
-                        // snl input-side fix (2026-05-15): stage `act.normed`
-                        // into the host-mapped UC handoff buffer so workers
-                        // P2P-read from host memory, not from GPU 0 cached
-                        // VRAM. Eliminates the cross-GPU peer-VRAM-cached
-                        // read pressure that wedges PCIe at 4+ GPUs (per
-                        // ea bridge #242). Companion to commit 7c97069 which
-                        // moved output_slots the same way. grid_x = ceil(hs/256)
-                        // so the kernel covers all `hs` elements with the
-                        // 256-thread block; earlier UC handoff attempt with
-                        // grid_x=1 failed because only the first 256 elements
-                        // were copied.
+                        // yef5.2 Step A H1 fix: stage `act.normed` into the
+                        // GPU-0 VRAM staging buffer `activation_staging_vram`
+                        // (NOT the host-mapped UC `moe_act_uc_handoff`). The
+                        // host-UC handoff is ASYMMETRIC-STALE on gfx1100
+                        // multi-GPU (GFX1100_ARCH.md §11.19(x)): GPU 0's vector
+                        // stores enter GPU 0's L2 as write-back dirty lines; a
+                        // worker GPU's GART read of that host-mapped page hits
+                        // host DRAM before the dirty lines land — there is no
+                        // GPU->GPU snoop path on gfx1100. Symptom: ~1/5 decode
+                        // forward-pass divergence (MoE routing amplifies the
+                        // stale activation). activation_staging_vram is GPU-0
+                        // VRAM, and kernel patch 0001 maps it MTYPE_UC for peer
+                        // contexts — worker reads bypass GPU 0's L2 and see
+                        // fresh VRAM. Mirrors the proven cross-GPU UC-VRAM
+                        // pattern documented at moe_p2p.rs:166-172 (bd 9gmh
+                        // Phase 1). grid_x = ceil(hs/256) covers all `hs` elems.
+                        // The sentinel stays host-UC (small hot glc+dlc read;
+                        // only the BULK activation read suffered the asymmetry).
+                        // yef5.2 Step A: allocate per-layer host-UC sentinel (if not yet done),
+                        // then emit D2D with_signal so workers acquire-spin on it.
+                        if p2p.moe_act_sentinel[layer_idx].is_none() {
+                            let s = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(1)
+                                .expect("yef5.2: moe_act_sentinel alloc failed");
+                            unsafe { s.host_ptr().write_volatile(0u32); }
+                            p2p.moe_act_sentinel[layer_idx] = Some(s);
+                        }
+                        let sentinel_ptr = p2p.moe_act_sentinel[layer_idx].as_ref().unwrap().host_ptr() as *mut u32;
                         prog.instructions[barrier_idx - 2] = D2dCopyInst::new(
                             div_ceil(hs as u32, 256),
-                            p2p.moe_act_uc_handoff.typed_dev_ptr(0).as_raw(),
+                            p2p.activation_staging_vram.as_ptr() as *mut f32,
                             act.normed.as_ptr(),
                             hs as i32,
                         )
+                        .with_signal(sentinel_ptr, 1) // seq patched per-step to (position+1)
                         .into_inst();
+                        // Record pre-Pass-2 index; shifted after Pass 2 reindex.
+                        moe_act_d2d_indices_pre_pass2.push((barrier_idx - 2, layer_idx));
                     }
                 }
             }
@@ -1109,9 +1134,12 @@ impl MegakernelProgram {
                         let gupd_stage = dist.map(|d| d.gate_up_in_dim)
                             .unwrap_or(hs);
                         new_instructions.push(
+                            // yef5.2 Step A H1 fix: latent path stages into GPU-0
+                            // VRAM activation_staging_vram (peer-UC via patch 0001),
+                            // not host-UC moe_act_uc_handoff (§11.19(x) asymmetric-stale).
                             D2dCopyInst::new(
                                 div_ceil(gupd_stage as u32, 256),
-                                p2p.moe_act_uc_handoff.typed_dev_ptr(0).as_raw(),
+                                p2p.activation_staging_vram.as_ptr() as *mut f32,
                                 act.moe_latent.as_ptr(),
                                 gupd_stage as i32,
                             )
@@ -1351,6 +1379,12 @@ impl MegakernelProgram {
                         "p2p reindex: attn_quant idx {} → opcode {} (expected OP_ATTN_PAGED_Q)", i, opcode_at(i));
                 }
             }
+
+            // yef5.2 Step A: remap D2D sentinel indices after Pass 2 insertion shifts.
+            prog.moe_act_d2d_indices = moe_act_d2d_indices_pre_pass2
+                .into_iter()
+                .map(|(idx, layer)| (idx + inserted_before[idx], layer))
+                .collect();
         }
 
         // KEEP barrier_layer_map: in the unified-worker design it identifies

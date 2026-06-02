@@ -1965,28 +1965,16 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
     int idx = vblock * blockDim.x + threadIdx.x;
     if (idx < count) dst[idx] = src[idx];
 
-    // β'''' sentinel signal (bd braidinfer-sm16, udi #2810):
-    // 1. __threadfence (agent-scope) orders the prior dst-writes ahead.
-    // 2. Single thread does non-posted PCIe readback of its own dst write
-    //    to force this requester's posted writes to drain through PCIe
-    //    (megakernel_moe.hip:435-439 pattern). Empirically reaches
-    //    ~60% worker-K PASS plateau at N=5; per-thread readback variant
-    //    (every idx reads back its own write) achieved coherent decode
-    //    on 2/5 trials including "The quick brown" full output but
-    //    triggered intermittent host-mapped page-fault under contention.
-    //    Reverted to single-thread for stability.
-    // 3. Release-store of signal_seq.
-    if (i->signal_ptr != 0) {
-        __threadfence();
-        if (vblock == 0 && threadIdx.x == 0) {
-            volatile float drain_probe = dst[0];
-            (void)drain_probe;
-            __atomic_store_n(
-                (volatile unsigned int*)i->signal_ptr,
-                (unsigned int)i->signal_seq,
-                __ATOMIC_RELEASE);
-        }
-    }
+    // yef5.2 fix: sentinel signal is emitted AFTER the outer atomic_block_barrier
+    // in dispatch_opcode (megakernel_dispatch.hip), NOT here inside the vblock loop.
+    // Reason: the vblock loop runs across ALL grid blocks; vblock==0 is just one
+    // physical block and its __threadfence() + drain_probe only covers that block's
+    // writes (indices [0..blockDim.x-1]). The last elements (dst[count-1]) are
+    // written by later vblocks. Firing the sentinel from vblock==0 before those
+    // stores complete means the worker acquire-spins wake up and P2P-read a
+    // PARTIALLY-written activation → intermittent forward-pass divergence (~2/8).
+    // The outer barrier guarantees ALL blocks have stored their chunk; the
+    // signal fires there instead (see dispatch_opcode for OP_D2D_COPY).
 }
 
 // OP_MROPE: multimodal rotary position embedding (one block per head)

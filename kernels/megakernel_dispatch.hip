@@ -44,6 +44,8 @@ __device__ __forceinline__ void dispatch_opcode(
 ) {
     u32 opcode = inst_opcode(inst);
     u32 grid_x = inst_grid_x(inst);
+    // yef5.2: local beat counter for sub-op spins (op_moe_ffn_remote wait loop).
+    uint32_t local_watchdog_beat_ctr = 0;
 
     OP_PROFILE_BEGIN(opcode, op_profile);
 
@@ -67,7 +69,7 @@ __device__ __forceinline__ void dispatch_opcode(
     // OP_MOE_FFN_REMOTE — per-worker P2P FFN dispatch on workers GPUs 1..N-1.
     // Manages its own grid.sync() internally.
     if (opcode == OP_MOE_FFN_REMOTE) {
-        op_moe_ffn_remote(inst, grid, gbs);
+        op_moe_ffn_remote(inst, grid, gbs, watchdog, &local_watchdog_beat_ctr);
         if (dump_base) {
             dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);
             braidinfer::rdna3::atomic_block_barrier(gbs);
@@ -139,6 +141,8 @@ __device__ __forceinline__ void dispatch_opcode(
     }
 
     // Virtual block loop: each physical block handles multiple virtual blocks.
+    // yef5.2: OP_D2D_COPY sentinel signal is fired AFTER the outer barrier below
+    // (not inside the vblock body) so all blocks' writes are complete first.
     for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
         switch (opcode) {
             case OP_RMSNORM:      op_rmsnorm(inst, vb); break;
@@ -189,6 +193,40 @@ __device__ __forceinline__ void dispatch_opcode(
 
     braidinfer::rdna3::atomic_block_barrier(gbs);
     asm volatile("" ::: "memory");  // bd yh8z narrow: reload dump_base/op_profile after barrier (not on barrier -> no ack vscnt)
+
+    // yef5.2 fix: OP_D2D_COPY sentinel signal. Fired HERE (after the outer
+    // atomic_block_barrier above) so that ALL blocks have completed their vblock
+    // stores before the RELEASE sentinel wakes the worker. The signal was previously
+    // inside op_d2d_copy's vblock body (vblock==0), which only guaranteed vblock==0's
+    // writes drained — leaving dst[blockDim.x..count-1] potentially in-flight when
+    // the worker woke up and read act_p2p → intermittent ~2/8 divergence (yef5.2).
+    // After this barrier, every block has called __threadfence() as part of the UC-VRAM
+    // write path, and the full activation is in VRAM before the sentinel fires.
+    if (opcode == OP_D2D_COPY) {
+        const D2dCopyInst* d2d = (const D2dCopyInst*)inst;
+        if (d2d->signal_ptr != 0) {
+            // All blocks have completed their vblock stores (outer barrier above).
+            // UC-VRAM writes bypass L2, so no additional __threadfence needed here:
+            // each block's stores already went directly to VRAM as they executed.
+            // A single drain-probe of dst[n_elems-1] confirms the last written
+            // element is visible (UC-VRAM read returns only after VRAM is reached).
+            if (blockIdx.x == 0 && threadIdx.x == 0) {
+                // Drain-probe: read the LAST element to confirm the full payload is in VRAM.
+                // With UC-VRAM dst, a read returning correct data means the write reached VRAM.
+                volatile float drain_probe = d2d->dst[(int)d2d->n_elems - 1];
+                (void)drain_probe;
+                __atomic_store_n(
+                    (volatile unsigned int*)d2d->signal_ptr,
+                    (unsigned int)d2d->signal_seq,
+                    __ATOMIC_RELEASE);
+            }
+            // Single-block barrier: all other blocks wait for block 0 to finish the
+            // sentinel store. This prevents a stale signal_ptr read on the next iteration
+            // of the mailbox loop (same barrier as the dump_base path below uses).
+            braidinfer::rdna3::atomic_block_barrier(gbs);
+            asm volatile("" ::: "memory");
+        }
+    }
 
     if (dump_base) {
         dump_instruction_output(dump_base, dump_capacity, dump_count, inst, opcode, pc);

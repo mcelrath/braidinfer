@@ -151,6 +151,12 @@ pub struct MegakernelProgram {
     /// / compile_gdn_layer / compile_ffn / compile_embedding sites. Drained by
     /// PersistentDispatch::drain_trace_dump.
     pub(crate) trace_probe_map: Vec<(usize, crate::tracer::Probe)>,
+    /// yef5.2 Step A: instruction indices of the D2D copies that populate
+    /// `moe_act_uc_handoff` (one per MoE layer, in layer order). These are
+    /// emitted with `with_signal` referencing the per-layer activation sentinel.
+    /// `signal_seq` in these instructions is patched per-step to `(position+1)`.
+    /// Populated by `compile_inner_p2p`; empty for non-MoE programs.
+    pub(crate) moe_act_d2d_indices: Vec<(usize, usize)>, // (inst_idx, layer_idx)
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,

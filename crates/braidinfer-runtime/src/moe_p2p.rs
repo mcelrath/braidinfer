@@ -226,6 +226,13 @@ pub struct MoeP2pContext {
     /// `Some(...)` populated by `compile_multi_gpu_p2p` from the same source
     /// of truth used to emit OP_MOE_DISPATCH. Lookup is by `layer_idx`.
     pub(crate) decode_params: Vec<Option<DecodeMoeParams>>,
+    /// Per-MoE-layer activation sentinel (host-UC, one u32 slot per MoE layer).
+    /// yef5.2 Step A: GPU0's decode-PRE D2D writes `with_signal` to this sentinel
+    /// after copying normed→moe_act_uc_handoff. Workers acquire-spin on it
+    /// (via `wait_ptr` in OP_MOE_FFN_REMOTE) before P2P-reading the activation.
+    /// Monotonic seq = (position+1) each step — no per-step reset needed.
+    /// Indexed by MoE layer index (same as `decode_params`); `None` if layer is not MoE.
+    pub(crate) moe_act_sentinel: Vec<Option<MappedHostBuffer<u32>>>,
 }
 
 /// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache[] tail.
@@ -363,11 +370,19 @@ impl MoeP2pContext {
             MAX_PREFILL_BATCH * gate_up_in_dim,
             &gpu_id_devices,
         )?;
-        // bd 9gmh Phase 1: GPU 0 VRAM staging — destination for Step 1's final D2D-copy.
-        // Workers P2P-read; kernel patch 0001 forces MTYPE_UC for the peer-VRAM mapping
-        // so worker reads bypass GPU 0's L2. Local alloc is cached (default) — fast
-        // for GPU 0's own writes in Step 1 + reads in Step 3.
-        let mut activation_staging_vram = DeviceBuffer::<f32>::alloc(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // bd 9gmh Phase 1 + yef5.2 H1: GPU 0 VRAM staging — destination for the per-step
+        // activation D2D that worker GPUs P2P-read. MUST be alloc_uncached (MTYPE=UC).
+        // WHY (yef5.2 root cause): gfx11 has NO buffer_wbl2, so a CACHED GPU-0 write stays
+        // in GPU 0's L2 and never reaches VRAM. The worker reads GPU 0's VRAM via the
+        // patch-0001 UC peer mapping (which bypasses the WORKER's L2) — so it reads STALE
+        // VRAM one decode step behind → consistent forward-pass divergence (Step A: 10/10
+        // wrong). The old "cached is fast / patch-0001 lets worker bypass GPU 0's L2" comment
+        // was exactly backwards: bypassing GPU 0's L2 MISSES the write that lives there. UC
+        // write bypasses GPU 0's L2 → straight to VRAM → worker reads fresh. (Cross-GPU
+        // UC-VRAM rule, see CLAUDE.md L2-coherence playbook + GFX1100_ARCH §5.x; 2-GPU proven.
+        // GPU 0 writes its OWN VRAM here, not a peer write, so the 4-GPU peer-store wedge
+        // caveat does not apply.)
+        let mut activation_staging_vram = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
 
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim). Used by workers.
@@ -457,10 +472,19 @@ impl MoeP2pContext {
             // 4-byte D2H read via hipMemcpy from each peer-view dev_ptr forces
             // that TLB commit during init, before the first decode-time read
             // would otherwise PERMISSION_FAULT or read stale.
+            //
+            // yef5.2 Step A H1 fix: activation_staging_vram is a GPU-0 VRAM
+            // buffer (hipMalloc, CoarseGrainedLocal). Workers P2P-read it via
+            // the raw GPU-0 VA. Without this warm-up the worker's UTCL2 TLB
+            // has no entry for the VA → first-access PERMISSION_FAULT or stale
+            // read on gfx1100 (§11.18). Add it alongside the host-UC peers;
+            // hipMemcpy DeviceToHost on a peer VRAM VA forces the TLB commit
+            // identically to the host-UC peers above.
             {
+                let vram_peer_view = activation_staging_vram.as_ptr() as *const std::ffi::c_void;
                 let mut scratch: u32 = 0;
                 let scratch_ptr = &mut scratch as *mut u32 as *mut std::ffi::c_void;
-                for &peer_view in &[act_dev_ptr, out_dev_ptr, handoff_dev] {
+                for &peer_view in &[act_dev_ptr, out_dev_ptr, handoff_dev, vram_peer_view] {
                     unsafe {
                         braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpy(
                             scratch_ptr,
@@ -517,6 +541,13 @@ impl MoeP2pContext {
             eprintln!("  MoE worker state allocated on GPU {} (no separate kernel — runs via persistent_worker)", gpu_id);
         }
 
+        // yef5.2 Step A: per-MoE-layer activation sentinels (host-UC, one u32 per layer).
+        // Allocated as portable coherent (MTYPE_UC) so GPU0 writes are immediately
+        // visible to worker GPUs without L2 caching. Initialized to 0; monotonic
+        // (position+1) written each decode step via op_d2d_copy with_signal.
+        // Indexed by layer_idx; None for non-MoE layers (filled by compile_multi_gpu_p2p).
+        let moe_act_sentinel: Vec<Option<MappedHostBuffer<u32>>> = (0..num_total_layers).map(|_| None).collect();
+
         Ok(MoeP2pContext {
             moe_act_uc_handoff,
             work_queue,
@@ -541,6 +572,7 @@ impl MoeP2pContext {
             hidden_size,
             // bd 1hik: populated by compile_multi_gpu_p2p; None until then.
             decode_params: vec![None; num_total_layers],
+            moe_act_sentinel,
         })
     }
 

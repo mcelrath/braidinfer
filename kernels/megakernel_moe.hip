@@ -327,7 +327,9 @@ __device__ __attribute__((noinline)) void op_moe_ffn(const u64* inst, GridGroup&
 // moe_worker_kernel — that whole kernel becomes redundant once Phase 4 lands.
 template<typename GridGroup>
 __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, GridGroup& grid,
-                                                              braidinfer::rdna3::GridBarrierState* gbs) {
+                                                              braidinfer::rdna3::GridBarrierState* gbs,
+                                                              WatchdogState* watchdog,
+                                                              uint32_t* watchdog_beat_ctr) {
     const MoeFfnRemoteInst* i = (const MoeFfnRemoteInst*)inst;
     const float* act_p2p = i->activation_p2p;
     float* out_p2p = i->output_slot_p2p;
@@ -368,15 +370,48 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     // op_d2d_copy fix already closed.
     if (i->wait_ptr != nullptr) {
         if (threadIdx.x == 0) {
+            // yef5.2 Step A: acquire-spin on the per-layer activation sentinel.
+            // HAZARD (§11.4 / V7): do NOT call watchdog_beat() inside this spin
+            // loop. watchdog_beat emits an AGENT-scope RELEASE store (host-mapped
+            // UC) on every iteration; under multi-GPU PCIe pressure that triggers
+            // the vscnt-drain stall — the intermittent wedge seen at 2/3 rate.
+            // op_d2d_copy's proven spin (megakernel_ops.hip:1935) is bare (no
+            // stores). Mirror it exactly: spin with s_sleep(1) for MES fairness,
+            // then beat ONCE after the sentinel is satisfied to arm the watchdog.
             while (braidinfer::rdna3::sentinel_spin_load_u32(
                        (const unsigned int*)i->wait_ptr) != (unsigned int)i->wait_seq) {
-                /* spin */
+                __builtin_amdgcn_s_sleep(1);
             }
+            // Single beat after sentinel clears: tells host watchdog we're alive
+            // and entering FFN compute, which can take >100ms per expert on large
+            // MoE models (within the 2s no-progress window).
+            if (watchdog) watchdog_beat(watchdog, watchdog_beat_ctr);
         }
         __syncthreads();
     }
 
     // 1. P2P-read single-token activation from GPU 0 VRAM into local VRAM.
+    //
+    // §11.18 (b) consumer-side cache invalidation (mirrors op_d2d_copy,
+    // megakernel_ops.hip:1949-1955): act_p2p is moe_act_uc_handoff, a
+    // host-mapped UC buffer overwritten every decode step. Our L0 and WGP
+    // L1 may hold stale cached lines from the prior step (buffer is reused;
+    // no automatic invalidation occurs). gl0_inv+gl1_inv discard those
+    // stale lines before the coop_copy loads them. gl2_inv is not available
+    // on gfx11 (§5.4), but the sentinel_spin_load_u32 above (glc+dlc
+    // global_load) already confirmed the producer's write reached memory
+    // before this point, so gl0_inv+gl1_inv alone close the staleness window.
+    // Without this: 2/5 decode steps diverged (coherent-but-wrong token from
+    // prior-step hidden state). With the sentinel alone but no inv: the
+    // sentinel confirms the write happened, but L0/L1 can still serve the
+    // OLD cached line for the activation load — the race survived.
+    if ((threadIdx.x & 63) == 0) {
+        asm volatile("buffer_gl0_inv" ::: "memory");
+    }
+    if (threadIdx.x == 0) {
+        asm volatile("buffer_gl1_inv" ::: "memory");
+    }
+    __syncthreads();
     coop_copy(la, act_p2p, gupd, grid, gbs);
 
     // 2. Zero accumulator.

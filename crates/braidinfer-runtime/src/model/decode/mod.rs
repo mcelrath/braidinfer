@@ -566,6 +566,12 @@ impl Model {
             // D2dCopyInst layout: words[7] = signal_seq (see instructions.rs).
             mk.instructions[*flush_idx].words[7] = seq_value;
         }
+        // yef5.2 Step A: patch moe_act D2D signal_seq to (position+1).
+        // D2dCopyInst layout: words[7] = signal_seq.
+        let moe_act_d2d: Vec<usize> = mk.moe_act_d2d_indices.iter().map(|(i, _)| *i).collect();
+        for d2d_idx in &moe_act_d2d {
+            mk.instructions[*d2d_idx].words[7] = seq_value;
+        }
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
         mk.update_step_host_only(token_id, position)?;
@@ -727,17 +733,26 @@ impl Model {
                 // documented above but is required for correctness; the
                 // overlap optimization can be restored once an in-megakernel
                 // signal-then-fire mechanism replaces CPU-side fan-out.
-                let dispatch: &mut dyn BatchDispatcher =
-                    self.persistent_workers.as_mut().unwrap();
-                for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
-                    dispatch.dispatch_batch(0, chunk);
+                // yef5.2 Step A: fire PRE async (workers spin on sentinel);
+                // workers acquire-spin on moe_act_sentinel so they cannot
+                // race the D2D into moe_act_uc_handoff. Capture GPU0 PRE ack-seq
+                // and include it in try_wait_acks_many (reverse ack unchanged).
+                let gpu0_pre_seq: u32;
+                {
+                    let dispatch: &mut dyn BatchDispatcher =
+                        self.persistent_workers.as_mut().unwrap();
+                    // Fire all chunks; last chunk's seq is the one to wait on.
+                    let mut last_seq = 0u32;
+                    for chunk in combined.chunks(crate::persistent_dispatch::MAX_BATCH_INSTRUCTIONS) {
+                        last_seq = dispatch.dispatch_batch_fire(0, chunk);
+                    }
+                    gpu0_pre_seq = last_seq;
                 }
                 self.probe_hidden_after_segment(&format!("moe-pre L{}", layer_idx));
-                let gpu0_seq: Option<u32> = None;
-                // Dispatch OP_MOE_FFN_REMOTE on each worker. Workers run in
-                // parallel with each other (their dispatches are still async)
-                // but only after GPU 0's PRE has completed.
-                self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq)?;
+                let gpu0_seq: Option<u32> = Some(gpu0_pre_seq);
+                // Dispatch OP_MOE_FFN_REMOTE on each worker. Workers acquire-spin
+                // on the activation sentinel before reading moe_act_uc_handoff.
+                self.dispatch_moe_workers_decode_async(layer_idx, gpu0_seq, seq_value)?;
                 // MoE mirror: snapshot output_slots + worker FFN outputs after ack.
                 if self.tracer.enabled() {
                     self.decode_mirror_moe_snapshot(layer_idx);
@@ -1317,7 +1332,7 @@ impl Model {
     /// before returning. After return, the caller fires the next GPU 0 batch
     /// starting with OP_MOE_DISPATCH_POST (sum), which runs only after this
     /// wait completes — guaranteeing all output_slots are populated and visible.
-    fn dispatch_moe_workers_decode_async(&mut self, layer_idx: usize, gpu0_seq: Option<u32>) -> Result<(), ModelError> {
+    fn dispatch_moe_workers_decode_async(&mut self, layer_idx: usize, gpu0_seq: Option<u32>, seq_value: u64) -> Result<(), ModelError> {
         // bd 1hik: per-layer routing parameters are populated by
         // `compile_multi_gpu_p2p` into `MoeP2pContext::decode_params[layer_idx]`
         // from the same source of truth used to emit OP_MOE_DISPATCH. The
@@ -1348,14 +1363,27 @@ impl Model {
         let insts: Vec<(usize, crate::megakernel::Instruction)> = (0..num_workers).map(|w| {
             let gpu_id = w + 1;
             let out_slot = unsafe { output_slots.add(gpu_id * hs) };
-            // Per-worker device pointer to the host-mapped activation handoff.
-            // .as_raw() at FFI boundary: typed_dev_ptr returns HostMapped — enforces
-            // that workers P2P-read from portable-coherent host-UC memory.
-            let activation = p2p.moe_act_uc_handoff.typed_dev_ptr(gpu_id).as_raw() as *const f32;
+            // yef5.2 Step A H1 fix: workers P2P-read the activation from GPU-0
+            // VRAM `activation_staging_vram` (peer-mapped MTYPE_UC via kernel
+            // patch 0001) instead of host-mapped UC `moe_act_uc_handoff`, which
+            // is asymmetric-stale on gfx1100 multi-GPU (§11.19(x): no GPU->GPU
+            // snoop; worker GART read hits host DRAM before GPU-0 L2 dirty lines
+            // land -> ~1/5 forward-pass divergence). The GPU-0 VRAM VA is
+            // directly peer-readable from each worker context (same raw-ptr
+            // handoff as k_norm_ptr_gpu0 / normed_base in
+            // dispatch_head_parallel_attention). Single source buffer at offset
+            // 0; no per-gpu peer-view accessor or gpu_id offset needed.
+            let activation = p2p.activation_staging_vram.as_ptr() as *const f32;
             // bd el1f: decode is single-token; the multi-token Step 1 drain
             // race doesn't apply, so wait_ptr=null (no acquire). The decode
             // path uses OP_MOE_DISPATCH (megakernel-internal) which handles
             // its own ordering.
+            // yef5.2 Step A: acquire-spin on the per-layer activation sentinel.
+            // sentinel_ptr is host-UC (MappedHostBuffer<u32>); wait_seq = (position+1).
+            let sentinel_ptr: *const u32 = p2p.moe_act_sentinel[layer_idx]
+                .as_ref()
+                .map(|s| s.host_ptr() as *const u32)
+                .unwrap_or(std::ptr::null());
             let inst = p2p.build_ffn_remote_inst(
                 w,
                 layer_idx,
@@ -1364,8 +1392,8 @@ impl Model {
                 expert_ids,
                 expert_weights,
                 k, eis, hs, gupd, has_gate, relu_sq,
-                std::ptr::null(),
-                0,
+                sentinel_ptr,
+                seq_value,
             );
             (gpu_id, inst)
         }).collect();
