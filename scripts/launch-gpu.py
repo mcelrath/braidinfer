@@ -395,6 +395,31 @@ def get_held_gpus():
     return held
 
 
+def _rocm_smi_bdf_map():
+    """{rocm-smi GPU index: '0000:bb:dd.f' bus id} via `rocm-smi --showbus`.
+
+    SAME index space as get_gpu_vram() (both parse rocm-smi GPU[N]), so a
+    BRAIDINFER_AVOID_GPUS BDF-substring token resolves to the exact index
+    find_free_gpus() filters. _hip_index_to_bdf() reads KFD topology, whose
+    enumeration can diverge from rocm-smi's (a dead card absent from the
+    topology shifts indices), so using it for the avoid set silently mis-targets
+    (braidinfer-oaj2). _hip_index_to_bdf stays for the BDF audit log only.
+    """
+    m = {}
+    try:
+        result = subprocess.run(
+            ["/opt/rocm/bin/rocm-smi", "--showbus"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            mm = re.search(r"GPU\[(\d+)\].*PCI Bus:\s*([0-9a-fA-F:.]+)", line)
+            if mm:
+                m[int(mm.group(1))] = mm.group(2).lower()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return m
+
+
 def _parse_avoid_gpus():
     """HIP indices to exclude from selection, from BRAIDINFER_AVOID_GPUS
     (comma-separated). Each token is a HIP index (e.g. "1") or a BDF substring
@@ -404,17 +429,31 @@ def _parse_avoid_gpus():
     raw = os.environ.get("BRAIDINFER_AVOID_GPUS", "").strip()
     if not raw:
         return set()
-    hip_to_bdf = _hip_index_to_bdf()
+    # braidinfer-oaj2: resolve BDF-substring tokens in rocm-smi's index space
+    # (the one find_free_gpus filters), NOT _hip_index_to_bdf's KFD-topology
+    # space — the two desync (a dead card absent from KFD topology shifts
+    # indices), which silently mis-targeted the avoid set.
+    bdf_map = _rocm_smi_bdf_map()
+    # PCI bus id per index, e.g. {3: '83'} from '0000:83:00.0'.
+    buses = {idx: bdf.split(":")[1] for idx, bdf in bdf_map.items() if bdf.count(":") >= 2}
     avoid = set()
     for tok in (t.strip() for t in raw.split(",")):
         if not tok:
             continue
-        if tok.isdigit():
+        tl = tok.lower()
+        bus_hits = [idx for idx, bus in buses.items() if bus == tl]
+        if bus_hits:
+            # Exact PCI bus id (e.g. "83", "4a") — checked BEFORE the digit path
+            # so an all-decimal bus ("83","47") is NOT mis-read as a (nonexistent)
+            # HIP index. This was the primary braidinfer-oaj2 bug: "83"/"47" are
+            # isdigit() and silently took the index path, avoiding nothing.
+            avoid.update(bus_hits)
+        elif ":" in tl or "." in tl:
+            # Full/partial BDF (e.g. "47:00.0", "0000:83:00.0") — substring match.
+            avoid.update(idx for idx, bdf in bdf_map.items() if tl in bdf)
+        elif tok.isdigit():
+            # HIP index (rocm-smi GPU[N]).
             avoid.add(int(tok))
-        else:
-            for idx, bdf in hip_to_bdf.items():
-                if tok in bdf:
-                    avoid.add(idx)
     return avoid
 
 
