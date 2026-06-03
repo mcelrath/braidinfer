@@ -152,6 +152,15 @@ pub struct MoeP2pContext {
     /// see stale data even after CPU/allocator-GPU reads succeed. GPU 0 VRAM with
     /// peer-VRAM-UC mapping fixes this. Sized [MAX_PREFILL_BATCH × gate_up_in_dim].
     pub activation_staging_vram: DeviceBuffer<f32>,
+    /// xl4o: peer-UC-VRAM staging for the DECODE MoE routing (expert_ids / expert_weights).
+    /// The decode gate (OP_MOE_GATE) GPU-writes act.moe_expert_ids/weights into host-UC pages;
+    /// a worker GPU's P2P read of that GPU-written host-UC is §11.19(x) asymmetric-stale (no
+    /// GPU->GPU snoop), causing the deterministic -g2 decode divergence (prefill is fine — its
+    /// routing is CPU-written). Stage the routing into GPU-0 VRAM (patch-0001 peer-UC) like
+    /// activation_staging_vram, sentinel-gated, and point decode_params at these. Sized
+    /// [MAX_PREFILL_BATCH × MAX_ACTIVE_EXPERTS].
+    pub routing_ids_staging_vram: DeviceBuffer<i32>,
+    pub routing_weights_staging_vram: DeviceBuffer<f32>,
     /// GPU 0 scratch buffers for expert computation.
     pub gpu0_scratch_gate: DeviceBuffer<f32>,
     pub gpu0_scratch_up: DeviceBuffer<f32>,
@@ -355,6 +364,10 @@ impl MoeP2pContext {
         // GPU 0 writes its OWN VRAM here, not a peer write, so the 4-GPU peer-store wedge
         // caveat does not apply.)
         let mut activation_staging_vram = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * gate_up_in_dim)?;
+        // xl4o: peer-UC-VRAM staging for the decode MoE routing (alloc_uncached => patch-0001
+        // MTYPE_UC peer mapping, so the worker P2P-reads fresh, not the §11.19(x)-stale host-UC).
+        let mut routing_ids_staging_vram = DeviceBuffer::<i32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS)?;
+        let mut routing_weights_staging_vram = DeviceBuffer::<f32>::alloc_uncached(gpu0, MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS)?;
 
         // scratch_gate is reused for gate output (eis elements) AND down output (gupd elements).
         // Must be max(eis, gupd) = max(expert_intermediate_size, gate_up_in_dim). Used by workers.
@@ -405,6 +418,8 @@ impl MoeP2pContext {
         // return 0.0 deterministically — finite, safe.
         let zeros_big = vec![0.0f32; MAX_PREFILL_BATCH * gate_up_in_dim];
         activation_staging_vram.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * gate_up_in_dim])?;
+        routing_ids_staging_vram.copy_from_host(&vec![0i32; MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS])?;
+        routing_weights_staging_vram.copy_from_host(&zeros_big[..MAX_PREFILL_BATCH * MAX_ACTIVE_EXPERTS])?;
         gpu0_scratch_gate.copy_from_host(&zeros_big[..scratch_gate_size])?;
         gpu0_scratch_up.copy_from_host(&zeros_big[..expert_intermediate_size])?;
         gpu0_scratch_act.copy_from_host(&zeros_big[..expert_intermediate_size])?;
@@ -524,6 +539,8 @@ impl MoeP2pContext {
             _gpu0_config_storage: gpu0_config_storage,
             activation_staging,
             activation_staging_vram,
+            routing_ids_staging_vram,
+            routing_weights_staging_vram,
             gpu0_scratch_gate,
             gpu0_scratch_up,
             gpu0_scratch_act,

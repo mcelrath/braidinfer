@@ -241,6 +241,15 @@ impl MegakernelProgram {
         let bias_ptr = moe.score_correction_bias_gpu.as_ref().map(|b| b.as_ptr() as *const u8).unwrap_or(std::ptr::null());
         instructions.push(MoeGateInst::new(act.moe_scores.as_ptr(), act.moe_expert_ids.as_write_ptr(), act.moe_expert_weights.as_write_ptr(), ne as i32, k as i32, gate_mode, rsf, bias_ptr).into_inst());
 
+        // xl4o: two routing-staging placeholders, emitted AFTER the gate (so they read the
+        // freshly-written act.moe_expert_ids/weights) and BEFORE the barrier. compile_inner_p2p
+        // patches these (barrier_idx-2/-1) to D2dCopy(act.moe_expert_ids/weights ->
+        // routing_*_staging_vram) so the worker P2P-reads peer-UC-VRAM routing, not the
+        // §11.19(x)-stale GPU-written host-UC act.moe_expert_ids. Self-copy placeholders are
+        // harmless if a path leaves them unpatched. ids are i32 bit-copied via the float D2D.
+        instructions.push(D2dCopyInst::new(div_ceil(k as u32, 256), act.moe_expert_ids.as_write_ptr() as *mut f32, act.moe_expert_ids.as_ptr() as *const f32, k as i32).into_inst());
+        instructions.push(D2dCopyInst::new(div_ceil(k as u32, 256), act.moe_expert_weights.as_write_ptr(), act.moe_expert_weights.as_ptr(), k as i32).into_inst());
+
         // OP_BARRIER: grid_x=1: only block 0 runs op_barrier
         let barrier_inst_idx = instructions.len();
         instructions.push(BarrierInst::new(layer_idx as i32).into_inst());

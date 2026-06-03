@@ -1022,18 +1022,20 @@ impl MegakernelProgram {
             // (has_latent was used in the now-removed gpu0 self-expert path; the
             // barrier_idx-2 patch below accesses fc1_latent_proj directly.)
 
-            // Replace D2D_COPY(normed→normed_stage) at barrier_idx-2 with:
-            //   - fc1_latent_proj(normed→moe_latent) if fc1 exists, else NOP
-            // compile_moe_ffn_multi_gpu order: ..., D2D_COPY(normed→normed_stage), OP_MOE_GATE, OP_BARRIER
-            if barrier_idx >= 2 {
-                let prev2 = &prog.instructions[barrier_idx - 2];
-                let prev2_opcode = prev2.words[0] as u32;
+            // xl4o: compile_moe_ffn_multi_gpu now emits 2 routing placeholders AFTER the gate,
+            // so the order is [..., D2D(normed→normed_stage)=barrier_idx-4, OP_MOE_GATE=barrier_idx-3,
+            // routing_ids_ph=barrier_idx-2, routing_weights_ph=barrier_idx-1, OP_BARRIER].
+            // The activation/fc1 staging patches barrier_idx-4 (normed_stage); the routing staging
+            // patches barrier_idx-2/-1 (below, unconditional). (Guard read moved -2 → -4.)
+            if barrier_idx >= 4 {
+                let prev4 = &prog.instructions[barrier_idx - 4];
+                let prev4_opcode = prev4.words[0] as u32;
                 let normed_stage_ptr = act.normed_stage.as_ptr() as u64;
-                if prev2_opcode == OP_D2D_COPY && prev2.words[1] == normed_stage_ptr {
+                if prev4_opcode == OP_D2D_COPY && prev4.words[1] == normed_stage_ptr {
                     if let Some(ref fc1) = moe.fc1_latent_proj {
                         // Emit fc1: normed(hs) → moe_latent(gupd)
                         let (lp_op, lp_w) = linear_proj_opcode_ptr(fc1);
-                        prog.instructions[barrier_idx - 2] = LinearProjInst::new(
+                        prog.instructions[barrier_idx - 4] = LinearProjInst::new(
                             lp_op, gupd as u32,
                             act.moe_latent.as_write_ptr(), lp_w, act.normed.as_ptr(),
                             gupd as i32, hs as i32, 0,
@@ -1065,18 +1067,49 @@ impl MegakernelProgram {
                             unsafe { s.host_ptr().write_volatile(0u32); }
                             p2p.moe_act_sentinel[layer_idx] = Some(s);
                         }
-                        let sentinel_ptr = p2p.moe_act_sentinel[layer_idx].as_ref().unwrap().host_ptr() as *mut u32;
-                        prog.instructions[barrier_idx - 2] = D2dCopyInst::new(
+                        // xl4o: activation copy moves to barrier_idx-4; the sentinel is REMOVED
+                        // here — it now lives on the routing_weights copy below (the last-executing
+                        // staged copy), so the worker's acquire sees activation + both routing
+                        // buffers staged. The sentinel is still ALLOCATED above (non-latent arm)
+                        // and re-fetched by the routing patch.
+                        prog.instructions[barrier_idx - 4] = D2dCopyInst::new(
                             div_ceil(hs as u32, 256),
                             p2p.activation_staging_vram.as_ptr() as *mut f32,
                             act.normed.as_ptr(),
                             hs as i32,
                         )
-                        .with_signal(sentinel_ptr, 1) // seq patched per-step to (position+1)
                         .into_inst();
-                        // Record pre-Pass-2 index; shifted after Pass 2 reindex.
-                        moe_act_d2d_indices_pre_pass2.push((barrier_idx - 2, layer_idx));
                     }
+                    // xl4o: routing staging — UNCONDITIONAL (both fc1-latent + non-latent arms; the
+                    // gate writes act.moe_expert_ids/weights regardless). Patch the 2 routing
+                    // placeholders (barrier_idx-2/-1) to D2dCopy into peer-UC-VRAM so the worker
+                    // P2P-reads fresh routing, not the §11.19(x)-stale GPU-written host-UC.
+                    debug_assert_eq!(prog.instructions[barrier_idx - 2].words[0] as u32, OP_D2D_COPY,
+                        "xl4o: barrier_idx-2 is not the routing_ids placeholder");
+                    debug_assert_eq!(prog.instructions[barrier_idx - 1].words[0] as u32, OP_D2D_COPY,
+                        "xl4o: barrier_idx-1 is not the routing_weights placeholder");
+                    prog.instructions[barrier_idx - 2] = D2dCopyInst::new(
+                        div_ceil(k as u32, 256),
+                        p2p.routing_ids_staging_vram.as_ptr() as *mut f32,
+                        act.moe_expert_ids.as_ptr() as *const f32,
+                        k as i32,
+                    ).into_inst();
+                    let mut weights_copy = D2dCopyInst::new(
+                        div_ceil(k as u32, 256),
+                        p2p.routing_weights_staging_vram.as_ptr() as *mut f32,
+                        act.moe_expert_weights.as_ptr() as *const f32,
+                        k as i32,
+                    );
+                    // option (b): sentinel only when allocated (non-latent arm); Nemotron-H routing
+                    // stays unsignaled. The signal moved OFF the activation copy onto this
+                    // routing_weights copy (last staged); record THIS index for the per-step seq
+                    // bump (decode/mod.rs:571-574). barrier_idx-4 (activation) needs no record:
+                    // signal_ptr==0 -> seq bump is a guarded no-op; Pass-2 in-order clone carries it.
+                    if let Some(s) = p2p.moe_act_sentinel[layer_idx].as_ref() {
+                        weights_copy = weights_copy.with_signal(s.host_ptr() as *mut u32, 1);
+                        moe_act_d2d_indices_pre_pass2.push((barrier_idx - 1, layer_idx));
+                    }
+                    prog.instructions[barrier_idx - 1] = weights_copy.into_inst();
                 }
             }
 
@@ -1107,8 +1140,10 @@ impl MegakernelProgram {
             let has_gate_bool = moe.has_gate_proj;
             p2p.decode_params[layer_idx] = Some(crate::moe_p2p::DecodeMoeParams {
                 output_slots: p2p.output_slots.dev_ptr(0),
-                expert_ids: act.moe_expert_ids.as_ptr() as *const i32,
-                expert_weights: act.moe_expert_weights.as_ptr() as *const f32,
+                // xl4o: worker reads routing from peer-UC-VRAM (staged above by the routing copies),
+                // NOT the §11.19(x)-stale GPU-written host-UC act.moe_expert_ids/weights.
+                expert_ids: p2p.routing_ids_staging_vram.as_ptr() as *const i32,
+                expert_weights: p2p.routing_weights_staging_vram.as_ptr() as *const f32,
                 hs: hs as u32,
                 gupd: gupd as u32,
                 k: k as u32,
