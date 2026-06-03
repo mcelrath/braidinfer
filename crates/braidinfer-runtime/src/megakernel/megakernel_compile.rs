@@ -487,15 +487,21 @@ impl MegakernelProgram {
                 }
                 LayerType::Mamba2 => {
                     let state = &model.mamba2_states[mamba2_idx];
+                    let mut mamba_out_idx = 0usize;
                     for t in 0..n {
                         let hidden_t = unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) };
                         let hidden_t_w = unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) };
                         instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), hidden_t, hs as i32).into_inst());
                         Self::compile_mamba2_layer(cfg, &model.layers[layer_i], act, state, &mut instructions);
+                        // ov5m.4: compile_mamba2_layer ends on OP_SCALE_ADD -> act.hidden (hs,
+                        // dump-eligible per dump.h:57). Probe THAT (last token), NOT the wrapping
+                        // D2D copy-back below — OP_D2D_COPY isn't dump-eligible (and a blanket
+                        // dump.h add hangs the GPU reading bad D2D dsts), so these Mamba2 layers
+                        // were silently absent (~half the nemotron prefill trace).
+                        mamba_out_idx = instructions.len() - 1;
                         instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), hidden_t_w, act.hidden.as_ptr(), hs as i32).into_inst());
                     }
-                    // PostMixer probe at last token D2D copy back to prefill_hidden.
-                    trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
+                    trace_probe_map_pp.push((mamba_out_idx, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
@@ -786,15 +792,19 @@ impl MegakernelProgram {
                 }
                 LayerType::Mamba2 => {
                     let state = &model.mamba2_states[mamba2_idx];
+                    let mut mamba_out_idx = 0usize;
                     for t in 0..n {
                         let hidden_t = unsafe { prefill_bufs.hidden.as_ptr().add(t * hs) };
                         let hidden_t_w = unsafe { prefill_bufs.hidden.as_write_ptr().add(t * hs) };
                         instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), act.hidden.as_write_ptr(), hidden_t, hs as i32).into_inst());
                         Self::compile_mamba2_layer(cfg, &model.layers[layer_i], act, state, &mut instructions);
+                        // ov5m.4: probe the OP_SCALE_ADD that ends compile_mamba2_layer (act.hidden,
+                        // hs, dump-eligible per dump.h:57), NOT the wrapping D2D copy-back below
+                        // (OP_D2D_COPY isn't dump-eligible -> these Mamba2 layers were missing).
+                        mamba_out_idx = instructions.len() - 1;
                         instructions.push(D2dCopyInst::new(div_ceil(hs as u32, 256), hidden_t_w, act.hidden.as_ptr(), hs as i32).into_inst());
                     }
-                    // PostMixer probe at last token D2D copy back to prefill_hidden.
-                    trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
+                    trace_probe_map_seg.push((mamba_out_idx, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     mamba2_idx += 1;
                 }
                 LayerType::MoeFfn => {
