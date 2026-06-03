@@ -40,4 +40,18 @@ extern "C" __global__ void op_rmsnorm_test_entry(const u64* inst, void* out) {
     }
 }
 
+// op_residual_add (OP_RESIDUAL_ADD, out[i] = src[i] + residual[i]). bd w1li.3 /
+// am-rs-dev #4572(4): MINIMAL NON-SPILLING isolation entry. op_rmsnorm SPILLS
+// (priv_seg=80 — register-cached reduction); residual_add is pure elementwise
+// (no reduction, no dynamic LDS, priv_seg≈0). If THIS retires-with-EOP but
+// op_rmsnorm hangs -> the bug is am-rs's spill/scratch retire-ABI; if it ALSO
+// hangs -> the kernarg/USER_DATA ABI. Same single-source pattern.
+extern "C" __global__ void op_residual_add_test_entry(const u64* inst, void* out) {
+    (void)out;  // op_residual_add writes to inst->output, which the encoder sets = out.
+    u32 grid_x = inst_grid_x(inst);
+    for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
+        op_residual_add(inst, vb);
+    }
+}
+
 #endif  // BRAIDINFER_MEGAKERNEL_TEST_ENTRIES_HIP
