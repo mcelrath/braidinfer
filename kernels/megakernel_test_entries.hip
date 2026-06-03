@@ -66,4 +66,32 @@ extern "C" __global__ void op_silu_mul_test_entry(const u64* inst, void* out) {
     }
 }
 
+// bd w1li.3 batch (am-rs #4595/#4596): next vblock ops. scale_add + relu_sq are pure elementwise
+// (priv_seg=0, validate out-of-the-box); qk_norm has a per-head reduction so MAY spill (priv_seg>0,
+// then it waits for am-rs's .11 wave-offset-SGPR spill-retire fix, like op_rmsnorm). All call the
+// SAME production op_core dispatch_opcode uses.
+extern "C" __global__ void op_scale_add_test_entry(const u64* inst, void* out) {
+    (void)out;
+    u32 grid_x = inst_grid_x(inst);
+    for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
+        op_scale_add(inst, vb);
+    }
+}
+
+extern "C" __global__ void op_relu_sq_test_entry(const u64* inst, void* out) {
+    (void)out;
+    u32 grid_x = inst_grid_x(inst);
+    for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
+        op_relu_sq(inst, vb);
+    }
+}
+
+extern "C" __global__ void op_qk_norm_test_entry(const u64* inst, void* out) {
+    (void)out;
+    u32 grid_x = inst_grid_x(inst);
+    for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
+        op_qk_norm(inst, vb);
+    }
+}
+
 #endif  // BRAIDINFER_MEGAKERNEL_TEST_ENTRIES_HIP
