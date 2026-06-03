@@ -275,13 +275,13 @@ pub mod srg6_4_test_api {
     pub use super::INST_SIZE;
     pub use super::Instruction;
     pub use super::SHARED_LPROJ_TOTAL;
-    pub use super::instructions::{D2dCopyInst, KvWritePagedBatchInst, RmsNormInst};
+    pub use super::instructions::{D2dCopyInst, KvWritePagedBatchInst, RmsNormInst, ResidualAddInst, SiluMulInst};
     pub use super::OP_HALT;
     // bd w1li.1: per-op rmsnorm harness targets the SHIPPING op_rmsnorm
     // (replacing the deprecated RmsNormKernel drift-test). Per compile_common.rs
     // rmsnorm_opcode(one_plus_w): OP_RMSNORM = y=x·rms·(1+w) (one_plus_w=true,
     // the Qwen3.x shipping variant); OP_RMSNORM_WX = y=x·rms·w (one_plus_w=false).
-    pub use super::{OP_RMSNORM, OP_RMSNORM_WX};
+    pub use super::{OP_RMSNORM, OP_RMSNORM_WX, OP_RESIDUAL_ADD, OP_SILU_MUL};
 
     impl Instruction {
         #[doc(hidden)]
@@ -339,6 +339,20 @@ pub mod srg6_4_test_api {
             eps: f32,
         ) -> Self {
             Self::new(opcode, grid_x, output, input, weight, dim, eps)
+        }
+    }
+
+    impl ResidualAddInst {
+        #[doc(hidden)]
+        pub fn test_new(grid_x: u32, output: *mut f32, src: *const f32, residual: *const f32, n: i32) -> Self {
+            Self::new(grid_x, output, src, residual, n)
+        }
+    }
+
+    impl SiluMulInst {
+        #[doc(hidden)]
+        pub fn test_new(grid_x: u32, output: *mut f32, gate: *const f32, up: *const f32, size: i32) -> Self {
+            Self::new(grid_x, output, gate, up, size)
         }
     }
 }

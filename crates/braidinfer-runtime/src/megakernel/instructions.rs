@@ -295,7 +295,8 @@ impl RmsNormGateInst {
 // words[1]=output(w), [2]=src, [3]=residual, [4]=n(i32)
 // ─────────────────────────────────────────────────────────────────────────────
 #[repr(C)]
-pub(crate) struct ResidualAddInst {
+// bd w1li.1: pub for the srg6_4_test_api per-op harness (like RmsNormInst).
+pub struct ResidualAddInst {
     pub opcode_gridx: u64,
     pub output: *mut f32,
     pub src: *const f32,
@@ -1134,7 +1135,8 @@ impl SsmUpdateInst {
 // output[i] = silu(gate[i]) * up[i]; args: [1]=output, [2]=gate, [3]=up, [4]=size
 // ─────────────────────────────────────────────────────────────────────────────
 #[repr(C)]
-pub(crate) struct SiluMulInst {
+// bd w1li.1: pub for the srg6_4_test_api per-op harness (like RmsNormInst).
+pub struct SiluMulInst {
     pub opcode_gridx: u64,
     pub output: *mut f32,
     pub gate: *const f32,
