@@ -32,7 +32,7 @@ struct WorkerQueue {
     volatile uint32_t ack;          // worker writes seq_num when done
     volatile uint32_t done;         // kernel writes 1 when exiting (for Drop polling)
     volatile uint32_t progress_pc;  // worker writes pc before each instruction (for timeout diagnosis)
-    uint32_t _pad2;
+    uint32_t pc_base;  // ov5m.5: global instruction offset of this batch; trace dump records pc+pc_base
     // op_profile: GPU-resident DeviceBuffer<u64> base pointer, size 2 *
     // BRAIDINFER_OP_PROFILE_NUM_SLOTS. Null when -DBRAIDINFER_OP_PROFILE
     // is unset. See kernels/op_profile.h.

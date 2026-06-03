@@ -171,15 +171,25 @@ fn main() {
         for step in 0..decode_steps {
             let step_logits = model.decode_step(tok, pos).expect("decode_step");
             let tracer = model.tracer();
+            let mut dbg_wrote = 0usize;
+            let mut dbg_first_none: Option<usize> = None;
             for layer_i in 0..num_layers {
                 let hidden = tracer
                     .read_f32(Probe::PostFfn { layer: layer_i })
                     .or_else(|| tracer.read_f32(Probe::PostMixer { layer: layer_i }));
-                if let (Some(data), Some(s)) = (hidden, sink.as_mut()) {
-                    s.write_checkpoint(&format!("S{step}_L{layer_i}_hidden"), data)
-                        .expect("write decode-step layer checkpoint");
+                match (hidden, sink.as_mut()) {
+                    (Some(data), Some(s)) => {
+                        s.write_checkpoint(&format!("S{step}_L{layer_i}_hidden"), data)
+                            .expect("write decode-step layer checkpoint");
+                        dbg_wrote += 1;
+                    }
+                    (None, _) => {
+                        if dbg_first_none.is_none() { dbg_first_none = Some(layer_i); }
+                    }
+                    _ => {}
                 }
             }
+            eprintln!("[drv] step {step}: wrote {dbg_wrote}/{num_layers} first_none={dbg_first_none:?}");
             let next = step_logits
                 .iter()
                 .enumerate()

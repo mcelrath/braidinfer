@@ -137,6 +137,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
         int dump_capacity = (int)queue->dump_capacity;
         int* dump_count = (int*)queue->dump_count;
         uint64_t* op_profile = (uint64_t*)queue->op_profile;
+        uint32_t pc_base = queue->pc_base;  // ov5m.5: global inst offset of this batch (trace dump uses pc+pc_base)
 
         if (threadIdx.x == 0 && blockIdx.x == 0)
             braidinfer::rdna3::host_uc_store_agent(&queue->progress_pc, 0x10000005u);
@@ -197,7 +198,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void persistent_worker(
             dispatch_opcode(
                 inst, grid, &g_gbs,
                 dump_base, dump_capacity, dump_count,
-                op_profile, (int)pc, watchdog
+                op_profile, (int)(pc + pc_base), watchdog
             );
             // Phase 2': AGENT scope (was volatile). Diagnostic write only;
             // CPU reads on timeout, not real-time. Same reasoning as 4fg.5

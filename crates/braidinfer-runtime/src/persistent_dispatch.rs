@@ -270,7 +270,7 @@ pub struct WorkerQueueLayout {
     pub ack: u32,
     pub done: u32, // kernel writes 1 when exiting after shutdown (for Drop polling)
     pub progress_pc: u32, // kernel writes pc before each instruction (for timeout diagnosis)
-    pub _pad2: u32,
+    pub pc_base: u32, // ov5m.5: global instruction offset of this batch; trace dump records pc+pc_base
     // op_profile: GPU-resident u64 buffer for per-op cycle profiling.
     // Null when BRAIDINFER_OP_PROFILE build flag is unset. See
     // crates/braidinfer-runtime/src/op_profile.rs and kernels/op_profile.h.
@@ -653,6 +653,8 @@ impl PersistentDispatch {
         // decode_dump_slot is the shared (pure, testable) slot parser — same
         // logic used by enable_dump's read_dump path, exercised by unit tests
         // in tracer::tests::dump_slot_decode_*. Do NOT reimplement parsing here.
+        let mut slot_imin = u32::MAX;
+        let mut slot_imax = 0u32;
         for i in 0..num_slots {
             let slot_bytes = &host_buf[i * DUMP_SLOT_BYTES..(i + 1) * DUMP_SLOT_BYTES];
             let Some(slot) = crate::tracer::decode_dump_slot(slot_bytes) else {
@@ -661,6 +663,7 @@ impl PersistentDispatch {
             if slot.size == 0 {
                 continue;
             }
+            if xl4o_dbg { slot_imin = slot_imin.min(slot.inst_idx); slot_imax = slot_imax.max(slot.inst_idx); }
             let probe = program
                 .trace_probe_map
                 .iter()
@@ -690,7 +693,9 @@ impl PersistentDispatch {
         }
         if xl4o_dbg {
             dbg_layers.sort_unstable();
-            eprintln!("[xl4o-dbg]   inserted L-probe layers: {dbg_layers:?}");
+            let pm_min = program.trace_probe_map.iter().map(|(i,_)|*i).min().unwrap_or(0);
+            let pm_max = program.trace_probe_map.iter().map(|(i,_)|*i).max().unwrap_or(0);
+            eprintln!("[xl4o-dbg]   dumped-slot inst_idx {slot_imin}..{slot_imax}; probemap inst_idx {pm_min}..{pm_max}; matched-layers {dbg_layers:?}");
         }
 
         Ok(())
@@ -941,6 +946,16 @@ impl PersistentDispatch {
     /// Dispatch a batch of instructions to a GPU. Worker executes all with grid.sync()
     /// between them, acks once at the end. One signal round-trip per batch.
     pub(crate) fn dispatch_batch(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        self.dispatch_batch_with_base(gpu_idx, instructions, 0);
+    }
+
+    /// Like `dispatch_batch`, but stamps `pc_base` into the WorkerQueue so the
+    /// kernel's trace dump records the GLOBAL instruction index (pc + pc_base),
+    /// not the batch-relative pc. `dispatch_batch_slice` passes each chunk's
+    /// global offset so a >256-instruction program's per-op dumps map onto the
+    /// program-global trace_probe_map (ov5m.5: batch-relative pc collided at
+    /// 0..255, so only the first 256 instructions = L0-10 were captured).
+    pub(crate) fn dispatch_batch_with_base(&mut self, gpu_idx: usize, instructions: &[Instruction], pc_base: u32) {
         assert!(instructions.len() <= MAX_BATCH_INSTRUCTIONS);
         let w = self.worker_mut(gpu_idx);
         let q_ptr = w.queue.host_ptr() as *mut WorkerQueueLayout;
@@ -963,6 +978,10 @@ impl PersistentDispatch {
             std::ptr::write_volatile(
                 std::ptr::addr_of_mut!((*q_ptr).num_instructions),
                 instructions.len() as u32,
+            );
+            std::ptr::write_volatile(
+                std::ptr::addr_of_mut!((*q_ptr).pc_base),
+                pc_base,
             );
         }
 
@@ -1020,8 +1039,10 @@ impl PersistentDispatch {
     /// Dispatch a slice of instructions to a GPU, sending in chunks of MAX_BATCH_INSTRUCTIONS.
     /// Avoids the caller needing to collect into an owned Vec first.
     pub(crate) fn dispatch_batch_slice(&mut self, gpu_idx: usize, instructions: &[Instruction]) {
+        let mut pc_base = 0u32;
         for chunk in instructions.chunks(MAX_BATCH_INSTRUCTIONS) {
-            self.dispatch_batch(gpu_idx, chunk);
+            self.dispatch_batch_with_base(gpu_idx, chunk, pc_base);
+            pc_base += chunk.len() as u32;
         }
     }
 
@@ -1060,6 +1081,10 @@ impl PersistentDispatch {
             std::ptr::write_volatile(
                 std::ptr::addr_of_mut!((*q_ptr).num_instructions),
                 instructions.len() as u32,
+            );
+            std::ptr::write_volatile(
+                std::ptr::addr_of_mut!((*q_ptr).pc_base),
+                0,
             );
         }
         // seq=0 is the initial ack state; seq=0xFFFFFFFF is reserved for
