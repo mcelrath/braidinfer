@@ -54,4 +54,16 @@ extern "C" __global__ void op_residual_add_test_entry(const u64* inst, void* out
     }
 }
 
+// op_silu_mul (OP_SILU_MUL, out[i] = silu(gate[i]) * up[i]; silu(x)=x/(1+exp(-x))). bd w1li.3:
+// non-spilling vblock op. The entry ABI is proven end-to-end on vfio (am-rs #4581 — residual_add
+// retired byte-exact), so non-spilling entries validate out-of-the-box. Same single-source
+// pattern (calls the production op_silu_mul dispatch_opcode uses).
+extern "C" __global__ void op_silu_mul_test_entry(const u64* inst, void* out) {
+    (void)out;  // op_silu_mul writes to inst->output, which the encoder sets = out.
+    u32 grid_x = inst_grid_x(inst);
+    for (u32 vb = blockIdx.x; vb < grid_x; vb += gridDim.x) {
+        op_silu_mul(inst, vb);
+    }
+}
+
 #endif  // BRAIDINFER_MEGAKERNEL_TEST_ENTRIES_HIP
