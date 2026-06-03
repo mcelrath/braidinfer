@@ -62,6 +62,18 @@ fn main() {
     let (used, total) = vram_usage_mb();
     println!("VRAM after enable_distributed_moe: {used:.0}/{total:.0} MB");
 
+    // bd-xl4o / bd-4e2m: mailbox warmup-discard before tracing — the gfx1100 cold-start
+    // cure generate.rs uses (generate.rs:138, empty-packet num_inst=0). Without it the
+    // multi-GPU first prefill can hit the cold-start race (worker dispatch timeout, as
+    // seen in the first decode-trace -g2 run). Multi-GPU only; single-GPU's prefill warms
+    // itself (and would return the single-gpu-fallback sentinel here).
+    if multi_gpu {
+        match model.minimal_mailbox_warmup_empty_packet() {
+            Ok(diag) => eprintln!("warmup-empty-packet: OK — {diag}"),
+            Err(diag) => eprintln!("warmup-empty-packet: {diag} (continuing)"),
+        }
+    }
+
     let (tokenizer, _token_config) =
         load_tokenizer_and_config(model_dir, resolved.bqnt_override.as_deref())
             .expect("tokenizer/config");
@@ -133,6 +145,50 @@ fn main() {
     println!("  {cp_logits:<20} n={:<8} max_abs={:.4e} nan={nan_l}", logits.len(), max_abs_l);
     if let Some(ref mut s) = sink {
         s.write_checkpoint(cp_logits, &logits).expect("write logits");
+    }
+
+    // bd-xl4o decode trace: DECODE_STEPS=N runs N greedy decode steps after prefill,
+    // dumping per-step per-layer hidden as "S{step}_L{i}_hidden" + "S{step}_logits".
+    // The production decode dump pipeline (enable_dump_persistent + drain_trace_dump,
+    // decode/mod.rs:155/206) populates the tracer shadows SYNCHRONOUSLY inside
+    // decode_step (drain_trace_dump does hipStreamSynchronize, persistent_dispatch.rs:641),
+    // so read_f32 is valid immediately. Shadows are name-keyed (PostFfn{layer}) and
+    // overwritten each token, so we tag per step here. Compare two such BTRCs (-g1 vs -g2)
+    // to localize the first divergent (step, layer).
+    let decode_steps: usize = std::env::var("DECODE_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if decode_steps > 0 {
+        let mut tok = next_tok;
+        let mut pos = tokens.len() as u32;
+        println!("=== decode trace: {decode_steps} steps from pos={pos} ===");
+        for step in 0..decode_steps {
+            let step_logits = model.decode_step(tok, pos).expect("decode_step");
+            let tracer = model.tracer();
+            for layer_i in 0..num_layers {
+                let hidden = tracer
+                    .read_f32(Probe::PostFfn { layer: layer_i })
+                    .or_else(|| tracer.read_f32(Probe::PostMixer { layer: layer_i }));
+                if let (Some(data), Some(s)) = (hidden, sink.as_mut()) {
+                    s.write_checkpoint(&format!("S{step}_L{layer_i}_hidden"), data)
+                        .expect("write decode-step layer checkpoint");
+                }
+            }
+            let next = step_logits
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+            if let Some(s) = sink.as_mut() {
+                s.write_checkpoint(&format!("S{step}_logits"), &step_logits)
+                    .expect("write decode-step logits");
+            }
+            println!("  decode step {step}: tok_in={tok} -> next={next}");
+            tok = next;
+            pos += 1;
+        }
     }
 
     if let Some(s) = sink {
