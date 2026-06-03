@@ -207,6 +207,9 @@ impl MegakernelProgram {
                         barrier_layer_map.push((barrier_inst_idx, layer_i));
                     } else {
                         let moe = model.moe_weights[layer_i].as_ref().unwrap();
+                        if std::env::var("XL4O_DBG").is_ok() {
+                            eprintln!("[xl4o-dbg] compile_inner(mg=false) L{layer_i} MoE single-arm: expert_gate_up.num_elements()={}", moe.expert_gate_up.num_elements());
+                        }
                         // Skip if weights are lite-loaded (empty expert buffers, multi-GPU model).
                         // When MULTI_GPU=1, expert_gate_up is a zero-size placeholder; using its
                         // pointer in the megakernel would fault.
@@ -219,6 +222,12 @@ impl MegakernelProgram {
                                 act,
                                 &mut instructions,
                             );
+                            // ov5m.1 Phase 1a: PostFfn probe at the MoE block's final op.
+                            // compile_moe_ffn ends on OP_RESIDUAL_ADD -> act.hidden (compile_moe.rs:183,
+                            // dump-eligible). This is the SINGLE-GPU (-g1) decode path (compile_paged ->
+                            // compile_inner(paged, multi_gpu=false)); it had NO MoE probe (Dense FFN got
+                            // one @ the line above; MoE didn't) -> the per-layer decode trace truncated.
+                            trace_probe_map.push((instructions.len() - 1, crate::tracer::Probe::PostFfn { layer: layer_i }));
                         }
                     }
                 }
