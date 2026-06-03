@@ -49,6 +49,11 @@ fn main() {
     let multi_gpu = apply_auto_modes(model_dir);
 
     let mut model = Model::load(model_dir, device).expect("load model");
+    // bd-xl4o: close the Tracer's auto-sink (opened from BRAIDINFER_TRACE_FILE in
+    // Tracer::from_env). This bin writes its OWN sink (below) with per-step-tagged
+    // records; a dual writer to the same path garbles the BTRC (the -g2 file came out
+    // 25x larger with misaligned/EXTRA records). After this, our sink is the sole writer.
+    let _ = model.tracer_mut().close_sink();
     let (used, total) = vram_usage_mb();
     println!("VRAM after load: {used:.0}/{total:.0} MB");
 
