@@ -29,10 +29,20 @@ fn main() {
     // Set BRAIDINFER_TRACE=1 before Model::load so the tracer is initialized
     // with ProbeFilter::All (or whatever regex the operator chose).
     // SAFETY: single-threaded main, no concurrent env readers.
+    // Save the trace-file path, then UNSET it before Model::load so neither the
+    // main Tracer nor the distributed-MoE worker tracers open it as a sink. Those
+    // tracers auto-write their own probe records (top10_logits, L{N}.post_mixer)
+    // on every decode drain; a second writer on the same path interleaves with
+    // our per-step-tagged records and garbles the BTRC (ov5m.5 dual-writer bug —
+    // close_sink only nulled the main tracer, missing the worker tracers created
+    // in enable_distributed_moe). The model still captures probes into shadows
+    // (BRAIDINFER_TRACE=1); this bin is the SOLE file writer (below).
+    let trace_file = std::env::var("BRAIDINFER_TRACE_FILE").ok();
     unsafe {
         if std::env::var("BRAIDINFER_TRACE").is_err() {
             std::env::set_var("BRAIDINFER_TRACE", "1");
         }
+        std::env::remove_var("BRAIDINFER_TRACE_FILE");
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -49,11 +59,9 @@ fn main() {
     let multi_gpu = apply_auto_modes(model_dir);
 
     let mut model = Model::load(model_dir, device).expect("load model");
-    // bd-xl4o: close the Tracer's auto-sink (opened from BRAIDINFER_TRACE_FILE in
-    // Tracer::from_env). This bin writes its OWN sink (below) with per-step-tagged
-    // records; a dual writer to the same path garbles the BTRC (the -g2 file came out
-    // 25x larger with misaligned/EXTRA records). After this, our sink is the sole writer.
-    let _ = model.tracer_mut().close_sink();
+    // (ov5m.5) BRAIDINFER_TRACE_FILE was unset above before Model::load, so the
+    // tracer (and distributed-MoE worker tracers) opened NO sink. This bin is the
+    // sole file writer (below), eliminating the dual-writer BTRC corruption.
     let (used, total) = vram_usage_mb();
     println!("VRAM after load: {used:.0}/{total:.0} MB");
 
@@ -108,7 +116,7 @@ fn main() {
     // Collect probes into BTRC.
     // For each layer: prefer PostFfn (end-of-FFN/MoE residual), fall back to PostMixer
     // (end-of-attention/GDN/SSM residual). This gives "L{i}_hidden" = decoder-layer output.
-    let trace_path = std::env::var("BRAIDINFER_TRACE_FILE").ok();
+    let trace_path = trace_file;
     let mut sink = trace_path.as_ref().map(|p| {
         TraceSink::open(p).unwrap_or_else(|e| {
             eprintln!("TraceSink::open({p}) failed: {e}");
@@ -171,25 +179,15 @@ fn main() {
         for step in 0..decode_steps {
             let step_logits = model.decode_step(tok, pos).expect("decode_step");
             let tracer = model.tracer();
-            let mut dbg_wrote = 0usize;
-            let mut dbg_first_none: Option<usize> = None;
             for layer_i in 0..num_layers {
                 let hidden = tracer
                     .read_f32(Probe::PostFfn { layer: layer_i })
                     .or_else(|| tracer.read_f32(Probe::PostMixer { layer: layer_i }));
-                match (hidden, sink.as_mut()) {
-                    (Some(data), Some(s)) => {
-                        s.write_checkpoint(&format!("S{step}_L{layer_i}_hidden"), data)
-                            .expect("write decode-step layer checkpoint");
-                        dbg_wrote += 1;
-                    }
-                    (None, _) => {
-                        if dbg_first_none.is_none() { dbg_first_none = Some(layer_i); }
-                    }
-                    _ => {}
+                if let (Some(data), Some(s)) = (hidden, sink.as_mut()) {
+                    s.write_checkpoint(&format!("S{step}_L{layer_i}_hidden"), data)
+                        .expect("write decode-step layer checkpoint");
                 }
             }
-            eprintln!("[drv] step {step}: wrote {dbg_wrote}/{num_layers} first_none={dbg_first_none:?}");
             let next = step_logits
                 .iter()
                 .enumerate()
