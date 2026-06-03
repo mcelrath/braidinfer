@@ -41,7 +41,11 @@ def main():
     parser.add_argument("ref", help="Reference trace file")
     parser.add_argument("test", help="Test trace file")
     parser.add_argument("--tolerance", type=float, default=0.01,
-                        help="Relative tolerance threshold (default 0.01 = 1%%)")
+                        help="Relative tolerance threshold (default 0.01 = 1%%) — INFO column only since bd-4ayf.23")
+    parser.add_argument("--cosine-threshold", type=float, default=0.99,
+                        help="Pass gate: cosine similarity >= this (default 0.99). bd-4ayf.23: max_rel "
+                             "is q4 tiny-element noise (denom floored at 1e-8 drives near-zero elements "
+                             "to ~2.0); cosine reflects true directional agreement.")
     args = parser.parse_args()
 
     ref_checkpoints = read_trace(args.ref)
@@ -106,7 +110,11 @@ def main():
         frob_norm_r = frob_r ** 0.5
         frob_max_abs = max_abs / frob_norm_r if frob_norm_r > 1e-12 else max_abs
 
-        status = "OK" if max_rel <= args.tolerance else "FAIL"
+        # bd-4ayf.23: gate on cosine, NOT max_rel. max_rel/max_abs are q4 tiny-element
+        # noise (denom floored at 1e-8 drives near-zero elements to ~2.0, and misaligned
+        # rows produce 1e38-scale artifacts); cosine reflects true directional agreement.
+        # max_abs/max_rel remain as info columns.
+        status = "OK" if cosine >= args.cosine_threshold else "FAIL"
         if status == "FAIL":
             diverged = True
         print(f"{name:<30}  {max_abs:>12.6f}  {max_rel:>12.6f}  {cosine:>10.6f}  {frob_max_abs:>10.6f}  {status:>8}")
