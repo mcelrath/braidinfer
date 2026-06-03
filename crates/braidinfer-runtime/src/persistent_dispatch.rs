@@ -622,6 +622,12 @@ impl PersistentDispatch {
         // GPU atomicAdd into UC host memory is visible to CPU without SDMA D2H.
         let count_val = unsafe { *dump_counter.host_ptr() };
         let num_slots = (count_val.min(program.dump_capacity)) as usize;
+        let xl4o_dbg = std::env::var("XL4O_DBG").is_ok();
+        let mut dbg_layers: Vec<usize> = Vec::new();
+        if xl4o_dbg {
+            eprintln!("[xl4o-dbg] drain gpu={gpu_idx} count={count_val} cap={} num_slots={num_slots} inst={} probemap={}",
+                program.dump_capacity, program.instructions.len(), program.trace_probe_map.len());
+        }
         if num_slots == 0 {
             return Ok(());
         }
@@ -665,6 +671,13 @@ impl PersistentDispatch {
             if !tracer.filter_matches(name.as_ref()) {
                 continue;
             }
+            if xl4o_dbg {
+                if let Some(rest) = name.as_ref().strip_prefix('L') {
+                    if let Some(dot) = rest.find('.') {
+                        if let Ok(l) = rest[..dot].parse::<usize>() { dbg_layers.push(l); }
+                    }
+                }
+            }
             // SAFETY: slot.payload is a &[f32] view into host_buf; reinterpret
             // as &[u8] for insert_shadow (just bytes-as-bytes, no alignment risk).
             let payload_bytes = unsafe {
@@ -674,6 +687,10 @@ impl PersistentDispatch {
                 )
             };
             tracer.insert_shadow(name.into_owned(), payload_bytes);
+        }
+        if xl4o_dbg {
+            dbg_layers.sort_unstable();
+            eprintln!("[xl4o-dbg]   inserted L-probe layers: {dbg_layers:?}");
         }
 
         Ok(())
