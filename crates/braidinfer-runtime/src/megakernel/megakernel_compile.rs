@@ -423,7 +423,11 @@ impl MegakernelProgram {
                         &mut attn_paged_inst_indices,
                         &mut Vec::new(),
                     );
-                    // PostMixer probe at last instruction of attention block.
+                    // ov5m.3: the attn block ends on the BATCHED ResidualAdd (n*hs); dumping it
+                    // caps at DUMP_MAX_FLOATS=8192 != hs. Emit a trace-only in-place no-op ScaleAdd
+                    // (scale=0 => hidden unchanged) on token 0 so the dump records exactly hs (token 0,
+                    // consistent with the FFN's token-0 dump), then probe THAT instead of the n*hs op.
+                    instructions.push(ScaleAddInst::new(div_ceil(hs as u32, 256), prefill_bufs.hidden.as_write_ptr(), prefill_bufs.hidden.as_ptr(), 0.0f32, hs as i32).into_inst());
                     trace_probe_map_pp.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
                     if matches!(cfg.layers[layer_i].ffn_type, crate::config::FfnType::Dense) {
@@ -728,7 +732,9 @@ impl MegakernelProgram {
                         &mut attn_paged_inst_indices,
                         &mut Vec::new(),
                     );
-                    // PostMixer probe at last instruction of attention block.
+                    // ov5m.3: probe a trace-only in-place no-op ScaleAdd (scale=0) on token 0 so the
+                    // dump records hs, not the batched n*hs attn ResidualAdd (which caps at 8192).
+                    instructions.push(ScaleAddInst::new(div_ceil(hs as u32, 256), prefill_bufs.hidden.as_write_ptr(), prefill_bufs.hidden.as_ptr(), 0.0f32, hs as i32).into_inst());
                     trace_probe_map_seg.push((instructions.len() - 1, crate::tracer::Probe::PostMixer { layer: layer_i }));
                     Self::compile_ffn_batched(cfg, layer_i, &model.layers[layer_i], prefill_bufs, n, &mut instructions);
                     if matches!(cfg.layers[layer_i].ffn_type, crate::config::FfnType::Dense) {
