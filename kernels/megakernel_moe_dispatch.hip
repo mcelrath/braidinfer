@@ -14,6 +14,7 @@
 #define RDNA3_PERSISTENT_POLLING_VALIDATED 1
 #include "rdna3/rdna3_persistent.h"
 #include "rdna3/rdna3_barrier.h"
+#include "rdna3/rdna3_mailbox.h"  // yef5.2 P1d: sentinel_spin_load_u32 for the option-c POST
 
 // OP_MOE_DISPATCH_POST (opcode 45): sum output_slots across all GPUs into final_output.
 //
@@ -39,6 +40,45 @@ __device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, 
     int total_gpus = (int)i->num_gpus;
     int gupd = (int)i->gate_up_in_dim;
     if (gupd == 0) gupd = hs;
+
+    // yef5.2 P1d (option c): if result_descs is set, the workers wrote their outputs
+    // into their OWN UC-VRAM (no cross-GPU store) and AGENT-RELEASE-signalled per-worker
+    // result sentinels. GPU0 acquire-spins each sentinel, invalidates L0/L1, then
+    // PEER-READS each worker's UC-VRAM (fresh via §5.3) and sums — no output_slots
+    // (host-UC) read, fixing the B1 §11.19(x)-stale POST. result_descs==0 => old path below.
+    if (i->result_descs != 0) {
+        const MoeResultDesc* descs = (const MoeResultDesc*)(uintptr_t)i->result_descs;
+        int num_workers = total_gpus - 1;
+        unsigned int rseq = (unsigned int)i->seq_counter; // per-step (position+1), bumped by decode loop
+        // Acquire-spin each worker's result sentinel (block 0 / thread 0; bare spin +
+        // s_sleep, NO in-loop stores — §11.4 vscnt-drain-safe, mirrors op_moe_ffn_remote:381).
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            for (int w = 0; w < num_workers; w++) {
+                while (braidinfer::rdna3::sentinel_spin_load_u32(
+                           (const unsigned int*)descs[w].result_sentinel) != rseq) {
+                    __builtin_amdgcn_s_sleep(1);
+                }
+            }
+        }
+        braidinfer::rdna3::atomic_block_barrier(gbs);
+        // §11.18(b) consumer-side invalidation: discard stale L0/L1 lines for the peer
+        // UC-VRAM (gl2_inv n/a on gfx11; the glc+dlc sentinel load already confirmed the
+        // producer write reached VRAM). Mirrors op_moe_ffn_remote:409-415.
+        if ((threadIdx.x & 63) == 0) asm volatile("buffer_gl0_inv" ::: "memory");
+        if (threadIdx.x == 0) asm volatile("buffer_gl1_inv" ::: "memory");
+        __syncthreads();
+        // Sum the workers' UC-VRAM outputs (cross-GPU peer-read, fresh).
+        for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;
+             idx += gridDim.x * blockDim.x) {
+            float sum = 0.0f;
+            for (int w = 0; w < num_workers; w++) {
+                sum += descs[w].local_output_uc[idx];
+            }
+            final_output[idx] = sum;
+        }
+        braidinfer::rdna3::atomic_block_barrier(gbs);
+        return;
+    }
 
     // Sum gupd elements per slot, slot stride = hs.
     // P3 (braidinfer-4n5.7): GPU 0 no longer contributes an expert output to

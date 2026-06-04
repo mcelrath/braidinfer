@@ -966,7 +966,12 @@ pub(crate) struct MoeDispatchInst {
     /// to UC `output_slots[0..gupd]`. See moe_p2p.rs `MoeP2pContext::gpu0_acc`.
     /// Unused by OP_MOE_DISPATCH_POST (it only reads output_slots).
     pub gpu0_acc: u64,
-    pub _pad: u64,
+    /// yef5.2 P1d (option c): pointer (as u64) to a per-worker [num_workers]
+    /// MoeResultDesc {result_sentinel, local_output_uc} array (built by compile
+    /// yef5.2.1). 0 => the pre-yef5.2 output_slots sum (safe old path); non-null =>
+    /// POST acquire-spins each result_sentinel + peer-reads local_output_uc.
+    /// Repurposes the former _pad word; INST_SIZE_WORDS stays 19.
+    pub result_descs: u64,
 }
 assert_inst_size!(MoeDispatchInst);
 impl_inst!(MoeDispatchInst);
@@ -1329,7 +1334,13 @@ pub(crate) struct MoeFfnRemoteInst {
     // kernel via config_array[layer_idx] so each consumer dereferences a VA
     // that is valid in its own context.
     pub layer_idx: u64,
-    pub _pad: [u64; 2],
+    // yef5.2 P1c (option c): worker's RESULT sentinel (host-UC). After writing
+    // output_slot_p2p (= worker-local UC-VRAM) + __threadfence + own-UC-VRAM
+    // drain-probe, the worker AGENT-RELEASE-stores result_seq here; GPU0's POST
+    // acquire-spins on it before peer-reading the worker's UC-VRAM. Repurposes the
+    // former _pad[2] so INST_SIZE_WORDS stays 19. null disables (non-sentinel path).
+    pub result_sentinel_ptr: *const u32,
+    pub result_seq: u64,
 }
 assert_inst_size!(MoeFfnRemoteInst);
 impl_inst!(MoeFfnRemoteInst);
@@ -1376,7 +1387,8 @@ impl MoeFfnRemoteInst {
             wait_ptr: std::ptr::null(),
             wait_seq: 0,
             layer_idx,
-            _pad: [0; 2],
+            result_sentinel_ptr: std::ptr::null(),
+            result_seq: 0,
         }
     }
 
@@ -1387,6 +1399,17 @@ impl MoeFfnRemoteInst {
     pub(crate) fn with_wait(mut self, ptr: *const u32, seq: u64) -> Self {
         self.wait_ptr = ptr;
         self.wait_seq = seq;
+        self
+    }
+
+    /// yef5.2 P1c (option c): attach the worker's RESULT sentinel. The worker
+    /// AGENT-RELEASE-stores `seq` to `ptr` (host-UC) after its UC-VRAM output +
+    /// drain-probe; GPU0's POST acquire-spins on it. `seq` = (position+1) to match
+    /// the monotonic per-step seq. null disables.
+    #[allow(dead_code)]
+    pub(crate) fn with_result_signal(mut self, ptr: *const u32, seq: u64) -> Self {
+        self.result_sentinel_ptr = ptr;
+        self.result_seq = seq;
         self
     }
 }

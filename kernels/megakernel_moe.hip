@@ -472,5 +472,27 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
         out_p2p[idx] = lo[idx];
     }
     __threadfence();
+
+    // yef5.2 P1c (option c): RELEASE the per-worker result sentinel so GPU0's POST
+    // can peer-read out_p2p (= this worker's local_output_uc, UC-VRAM). Mirrors the
+    // op_d2d_copy forward pattern EXACTLY (megakernel_dispatch.hip:208-231): an
+    // all-blocks barrier so every block's UC-VRAM store has ISSUED (UC bypasses L2 →
+    // straight to VRAM), THEN block0/thread0 drain-probes the last element (a UC-VRAM
+    // read returns only after VRAM is reached) and AGENT-RELEASE-stores the sentinel.
+    // Skipping the all-blocks barrier reintroduces the ~2/8 dst-in-flight divergence
+    // that pattern's 10/10 validation fixed. Gated on result_sentinel_ptr (null = the
+    // pre-yef5.2 CPU-ack path; this block is then a no-op).
+    if (i->result_sentinel_ptr != nullptr) {
+        braidinfer::rdna3::atomic_block_barrier(gbs);
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            volatile float drain_probe = ((volatile float*)out_p2p)[gupd - 1];
+            (void)drain_probe;
+            __atomic_store_n(
+                (volatile unsigned int*)i->result_sentinel_ptr,
+                (unsigned int)i->result_seq,
+                __ATOMIC_RELEASE);
+        }
+        braidinfer::rdna3::atomic_block_barrier(gbs);
+    }
 }
 

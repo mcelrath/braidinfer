@@ -318,6 +318,8 @@ impl Model {
                     k, eis, hs, latent_size, has_gate, !has_gate,
                     std::ptr::null(),
                     0,
+                    std::ptr::null(), // yef5.2: prefill uses no result-sentinel (CPU-ack/SDMA path)
+                    0,
                 );
                 let single = std::slice::from_ref(&inst);
                 let seq = pd.dispatch_batch_fire(gpu_id, single);

@@ -305,6 +305,7 @@ impl MegakernelProgram {
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
+            moe_post_seq_indices: Vec::new(),
         })
     }
 
@@ -589,6 +590,7 @@ impl MegakernelProgram {
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
+            moe_post_seq_indices: Vec::new(),
         })
     }
 
@@ -894,6 +896,7 @@ impl MegakernelProgram {
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
+            moe_post_seq_indices: Vec::new(),
         })
     }
 
@@ -969,6 +972,7 @@ impl MegakernelProgram {
             _watchdog: watchdog,
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
+            moe_post_seq_indices: Vec::new(),
         })
     }
 
@@ -1114,6 +1118,37 @@ impl MegakernelProgram {
                         moe_act_d2d_indices_pre_pass2.push((barrier_idx - 1, layer_idx));
                     }
                     prog.instructions[barrier_idx - 1] = weights_copy.into_inst();
+
+                    // yef5.2 P1d (option c, reverse): per-worker RESULT sentinels (host-UC) +
+                    // the GPU-0 VRAM MoeResultDesc array {result_sentinel, local_output_uc} (2 u64
+                    // per worker, matching megakernel_common.h MoeResultDesc). The POST (set in
+                    // Pass 2 below) peer-reads the workers' UC-VRAM gated on result_descs being
+                    // non-null. Allocated once per MoE layer; kept alive in the p2p context. The
+                    // CPU try_wait_acks_many stays for now (belt-and-suspenders) — yef5.2.5 drops
+                    // it as a separate step once the peer-read POST is soak-validated.
+                    // GATE on YEF52_OPTION_C: when unset, leave moe_result_sentinel +
+                    // result_descs_by_layer None so the dispatch (gated on result_sentinel) uses
+                    // output_slots AND the POST (result_descs=0) reads output_slots — consistent
+                    // old path. Filling unconditionally would make the dispatch write local_output_uc
+                    // while the default POST still reads output_slots → broken default. Both the fill
+                    // and the POST result_descs share this one flag so they activate together.
+                    if std::env::var("YEF52_OPTION_C").is_ok() && p2p.result_descs_by_layer[layer_idx].is_none() {
+                        let nw = p2p.workers.len();
+                        let mut sentinels = Vec::with_capacity(nw);
+                        let mut descs: Vec<u64> = Vec::with_capacity(nw * 2);
+                        for w in 0..nw {
+                            let rs = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(1)
+                                .expect("yef5.2: moe_result_sentinel alloc failed");
+                            unsafe { rs.host_ptr().write_volatile(0u32); }
+                            descs.push(rs.host_ptr() as u64);                           // MoeResultDesc.result_sentinel
+                            descs.push(p2p.workers[w].local_output_uc.as_ptr() as u64); // MoeResultDesc.local_output_uc
+                            sentinels.push(rs);
+                        }
+                        let mut desc_buf = braidinfer_hip::memory::DeviceBuffer::<u64>::alloc(model.device, nw * 2)?;
+                        desc_buf.copy_from_host(&descs)?;
+                        p2p.moe_result_sentinel[layer_idx] = Some(sentinels);
+                        p2p.result_descs_by_layer[layer_idx] = Some(desc_buf);
+                    }
                 }
             }
 
@@ -1174,6 +1209,10 @@ impl MegakernelProgram {
                 Vec::with_capacity(prog.instructions.len() + 8 * barrier_map.len());
             // inserted_before[i] = number of instructions inserted before old index i
             let mut inserted_before: Vec<usize> = vec![0usize; prog.instructions.len() + 1];
+            // yef5.2 P1d (option c): collected here (the loop borrows prog.instructions immutably);
+            // assigned to prog.moe_post_seq_indices after the loop. Indices into new_instructions
+            // (== final prog.instructions order) of the OP_MOE_DISPATCH_POST insts to seq-bump.
+            let mut post_seq_indices: Vec<usize> = Vec::new();
             for (i, inst) in prog.instructions.iter().enumerate() {
                 // Nemotron-H (fc1_latent_proj present): fc1 writes its output to
                 // `act.moe_latent` (cached GPU 0 VRAM) at barrier_idx-2 in Pass 1.
@@ -1237,6 +1276,10 @@ impl MegakernelProgram {
 
                     // OP_MOE_DISPATCH_POST: sums output_slots[0..num_gpus * hs] into final_output[0..gupd].
                     // Reuses MoeDispatchInst layout — same fields as OP_MOE_DISPATCH for ABI consistency.
+                    // yef5.2 P1d (option c): record this POST inst's index for the per-step seq_counter bump.
+                    if std::env::var("YEF52_OPTION_C").is_ok() {
+                        post_seq_indices.push(new_instructions.len());
+                    }
                     new_instructions.push(MoeDispatchInst {
                         opcode_gridx: OP_MOE_DISPATCH_POST as u64,
                         work_queue: p2p.work_queue.device_ptr() as u64,
@@ -1261,7 +1304,14 @@ impl MegakernelProgram {
                         // OP_MOE_DISPATCH_POST doesn't use gpu0_acc, but
                         // the field is non-optional in the struct layout.
                         gpu0_acc: 0,
-                        _pad: 0,
+                        // yef5.2 P1d (option c): point at the per-worker MoeResultDesc array built
+                        // in Pass 1, BUT only when YEF52_OPTION_C=1. Default (unset) => result_descs=0
+                        // => POST uses the proven old output_slots sum (working tree stays SAFE; the
+                        // reverse peer-read + the per-step seq bump are not fully wired until the soak
+                        // build). Opt-in flag activates the peer-read POST for the coordinated -g4 soak.
+                        result_descs: if std::env::var("YEF52_OPTION_C").is_ok() {
+                            p2p.result_descs_by_layer[layer_idx].as_ref().map(|b| b.as_ptr() as u64).unwrap_or(0)
+                        } else { 0 },
                     }.into_inst());
 
                     // The rest of the post-MoE insertions only apply to Nemotron-H
@@ -1355,6 +1405,10 @@ impl MegakernelProgram {
             }
             inserted_before[prog.instructions.len()] = new_instructions.len() - prog.instructions.len();
             prog.instructions = new_instructions;
+            // yef5.2 P1d (option c): the POST inst indices were recorded in new_instructions order,
+            // which IS the final prog.instructions order — no inserted_before reindex needed. Empty
+            // unless YEF52_OPTION_C activated the peer-read POST. Consumed per-step in decode/mod.rs.
+            prog.moe_post_seq_indices = post_seq_indices;
 
             // Remap multi_gpu_attn_boundaries: each old index shifts by inserted_before[i].
             prog.multi_gpu_attn_boundaries = prog.multi_gpu_attn_boundaries.iter()

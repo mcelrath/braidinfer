@@ -157,6 +157,11 @@ pub struct MegakernelProgram {
     /// `signal_seq` in these instructions is patched per-step to `(position+1)`.
     /// Populated by `compile_inner_p2p`; empty for non-MoE programs.
     pub(crate) moe_act_d2d_indices: Vec<(usize, usize)>, // (inst_idx, layer_idx)
+    /// yef5.2 P1d (option c): instruction indices of OP_MOE_DISPATCH_POST insts whose
+    /// `seq_counter` (word[6]) is patched per-step to (position+1), so the POST's
+    /// acquire-spin on the worker result sentinels matches the workers' release value.
+    /// Populated by compile_inner_p2p only when YEF52_OPTION_C activates the peer-read POST.
+    pub(crate) moe_post_seq_indices: Vec<usize>,
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,

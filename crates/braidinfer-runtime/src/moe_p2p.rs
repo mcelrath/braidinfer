@@ -71,6 +71,14 @@ pub struct MoeWorkerGpu {
     pub scratch_up: DeviceBuffer<f32>,
     pub scratch_act: DeviceBuffer<f32>,
     pub local_output: DeviceBuffer<f32>,
+    /// yef5.2 P1c (option c): worker-local UC-VRAM output. The worker computes
+    /// its MoE output here (alloc_uncached → MTYPE=UC, bypasses the worker's L2 →
+    /// straight to VRAM); GPU0's POST peer-reads it cross-GPU (UC peer-read is
+    /// fresh, §5.3). LOCAL store (no cross-GPU compute-store → no V7/9gmh wedge);
+    /// the symmetric mirror of activation_staging_vram (forward path). Replaces
+    /// the worker→GPU0-host-UC direct compute-store that made GPU0's POST read
+    /// §11.19(x)-stale (the B1 bug). DevPtr<f32, UncachedDeviceLocal>.
+    pub local_output_uc: DeviceBuffer<f32>,
 }
 
 /// Per-MoE-layer routing parameters needed by the CPU worker-dispatch path
@@ -224,6 +232,20 @@ pub struct MoeP2pContext {
     /// Monotonic seq = (position+1) each step — no per-step reset needed.
     /// Indexed by MoE layer index (same as `decode_params`); `None` if layer is not MoE.
     pub(crate) moe_act_sentinel: Vec<Option<MappedHostBuffer<u32>>>,
+    /// yef5.2 P1a/P1c/P1d (option c): per-MoE-layer, per-worker RESULT sentinel (host-UC).
+    /// Each worker AGENT-RELEASE-stores (position+1) here after writing its UC-VRAM output
+    /// (`local_output_uc`) + a drain-probe; GPU0's POST acquire-spins on ALL workers' result
+    /// sentinels, then peer-reads + sums their UC-VRAM outputs — replacing the CPU
+    /// `try_wait_acks_many`. host-UC (el1f: a VRAM sentinel is invisible to GPU0's UC read).
+    /// Outer Vec indexed by layer_idx (`None` if not MoE); inner Vec by worker_idx (one per
+    /// worker GPU). Monotonic seq = (position+1), no per-step reset. Filled by compile_multi_gpu_p2p.
+    pub(crate) moe_result_sentinel: Vec<Option<Vec<MappedHostBuffer<u32>>>>,
+    /// yef5.2 P1d (option c): per-MoE-layer GPU-0 VRAM array of MoeResultDesc, one
+    /// {result_sentinel_ptr, local_output_uc_ptr} pair (2 u64) per worker — laid out
+    /// to match `MoeResultDesc` in megakernel_common.h. OP_MOE_DISPATCH_POST's
+    /// `result_descs` points here; the kernel casts it to `MoeResultDesc*`. Kept alive
+    /// for the model's lifetime. `None` if layer is not MoE; filled by compile_multi_gpu_p2p.
+    pub(crate) result_descs_by_layer: Vec<Option<DeviceBuffer<u64>>>,
 }
 
 /// Fixed-field size of MoeWorkItem (bytes), excluding the flexible activation_cache[] tail.
@@ -510,6 +532,11 @@ impl MoeP2pContext {
             let scratch_up = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let scratch_act = DeviceBuffer::<f32>::alloc(device, expert_intermediate_size)?;
             let local_output = DeviceBuffer::<f32>::alloc(device, hidden_size)?;
+            // yef5.2 P1c (option c): worker-local UC-VRAM output. alloc_uncached =>
+            // MTYPE=UC (bypasses worker L2 → straight to VRAM → GPU0 peer-reads fresh).
+            // Zero-init for RDNA3 cold-read garbage safety (same as the GPU0 scratch above).
+            let mut local_output_uc = DeviceBuffer::<f32>::alloc_uncached(device, hidden_size)?;
+            local_output_uc.copy_from_host(&vec![0.0f32; hidden_size])?;
 
             workers.push(MoeWorkerGpu {
                 device,
@@ -521,8 +548,31 @@ impl MoeP2pContext {
                 scratch_up,
                 scratch_act,
                 local_output,
+                local_output_uc,
             });
             eprintln!("  MoE worker state allocated on GPU {} (no separate kernel — runs via persistent_worker)", gpu_id);
+        }
+
+        // yef5.2 P1d (option c): GPU0-side UTCL2 TLB warm-up for the workers' local_output_uc.
+        // GPU0's POST peer-reads each worker's UC-VRAM; per §11.18 the GPU0 TLB entry for the
+        // worker VA commits only on first touch → a cold POST peer-read PERMISSION_FAULTs. A 4-byte
+        // D2H read on GPU0 from each worker's local_output_uc VA forces the commit at init (mirror
+        // of the worker-side warm-up above, GPU0 reading the workers' VRAM). Gated on YEF52_OPTION_C.
+        if std::env::var("YEF52_OPTION_C").is_ok() {
+            let _gpu0_guard = DeviceGuard::switch_to(gpu0)?;
+            let mut scratch: u32 = 0;
+            let scratch_ptr = &mut scratch as *mut u32 as *mut std::ffi::c_void;
+            for w in &workers {
+                let peer_view = w.local_output_uc.as_ptr() as *const std::ffi::c_void;
+                unsafe {
+                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpy(
+                        scratch_ptr,
+                        peer_view,
+                        4,
+                        braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                    ))?;
+                }
+            }
         }
 
         // yef5.2 Step A: per-MoE-layer activation sentinels (host-UC, one u32 per layer).
@@ -531,6 +581,10 @@ impl MoeP2pContext {
         // (position+1) written each decode step via op_d2d_copy with_signal.
         // Indexed by layer_idx; None for non-MoE layers (filled by compile_multi_gpu_p2p).
         let moe_act_sentinel: Vec<Option<MappedHostBuffer<u32>>> = (0..num_total_layers).map(|_| None).collect();
+        // yef5.2 P1a: per-layer, per-worker result sentinels — None until compile_multi_gpu_p2p fills them.
+        let moe_result_sentinel: Vec<Option<Vec<MappedHostBuffer<u32>>>> = (0..num_total_layers).map(|_| None).collect();
+        // yef5.2 P1d: per-layer MoeResultDesc array (GPU-0 VRAM) — None until compile_multi_gpu_p2p fills it.
+        let result_descs_by_layer: Vec<Option<DeviceBuffer<u64>>> = (0..num_total_layers).map(|_| None).collect();
 
         Ok(MoeP2pContext {
             work_queue,
@@ -558,6 +612,8 @@ impl MoeP2pContext {
             // bd 1hik: populated by compile_multi_gpu_p2p; None until then.
             decode_params: vec![None; num_total_layers],
             moe_act_sentinel,
+            moe_result_sentinel,
+            result_descs_by_layer,
         })
     }
 
@@ -593,6 +649,18 @@ impl MoeP2pContext {
         self.workers[worker_idx].local_output.as_typed_local()
     }
 
+    /// yef5.2 P1c/P1h (option c): worker's UC-VRAM output pointer, peer-readable by GPU0.
+    ///
+    /// Tagged [`tags::UncachedDeviceLocal`]: `local_output_uc` is `alloc_uncached`
+    /// (MTYPE=UC) on the worker's own GPU. GPU0's POST PEER-READS this cross-GPU — a
+    /// UC peer-read bypasses all caches and reads fresh from VRAM (§5.3), so it is the
+    /// §11.19(x)-correct medium (unlike host-UC, which is asymmetric-stale = the B1 bug).
+    /// Substituting a `HostMapped` ptr here is a compile error. Symmetric mirror of the
+    /// validated forward path (`activation_staging_vram`).
+    pub fn local_output_uc_ptr_for(&self, worker_idx: usize) -> DevPtr<f32, tags::UncachedDeviceLocal> {
+        self.workers[worker_idx].local_output_uc.as_typed_uncached()
+    }
+
     /// Build an OP_MOE_FFN_REMOTE instruction for one token on `worker_idx`
     /// (0-based — worker_idx 0 is GPU 1, etc.). Dispatches into the worker's
     /// persistent_worker mailbox via the caller's `PersistentDispatch`.
@@ -620,6 +688,11 @@ impl MoeP2pContext {
         // (layer_idx + 1) for prefill to match the producer's monotonic seq.
         wait_ptr: *const u32,
         wait_seq: u64,
+        // yef5.2 P1c (option c): the worker's RESULT sentinel (host-UC) + seq.
+        // The worker AGENT-RELEASE-stores result_seq here after its UC-VRAM output;
+        // GPU0's POST acquire-spins on it. null disables (prefill / CPU-ack path).
+        result_sentinel_ptr: *const u32,
+        result_seq: u64,
     ) -> crate::megakernel::Instruction {
         let w = &self.workers[worker_idx];
         // bd 0hu3-b: pass the worker-local config_array (worker VRAM, worker
@@ -649,6 +722,7 @@ impl MoeP2pContext {
             relu_sq,
         )
         .with_wait(wait_ptr, wait_seq)
+        .with_result_signal(result_sentinel_ptr, result_seq)
         .into_inst()
     }
 

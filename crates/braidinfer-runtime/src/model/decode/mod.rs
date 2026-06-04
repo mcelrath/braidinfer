@@ -572,6 +572,13 @@ impl Model {
         for d2d_idx in &moe_act_d2d {
             mk.instructions[*d2d_idx].words[7] = seq_value;
         }
+        // yef5.2 P1d (option c): patch each OP_MOE_DISPATCH_POST seq_counter to (position+1) so the
+        // POST's acquire-spin on the worker result sentinels matches the workers' release value.
+        // MoeDispatchInst layout: words[6] = seq_counter (instructions.rs). Empty unless YEF52_OPTION_C.
+        let moe_post_seq: Vec<usize> = mk.moe_post_seq_indices.clone();
+        for post_idx in &moe_post_seq {
+            mk.instructions[*post_idx].words[6] = seq_value;
+        }
 
         // Update per-step state in p2p megakernel (embedding ptr, mRoPE positions, etc.)
         mk.update_step_host_only(token_id, position)?;
@@ -1352,7 +1359,22 @@ impl Model {
         // We borrow p2p immutably for build; persistent_workers borrowed mutably for dispatch.
         let insts: Vec<(usize, crate::megakernel::Instruction)> = (0..num_workers).map(|w| {
             let gpu_id = w + 1;
-            let out_slot = unsafe { output_slots.add(gpu_id * hs) };
+            // yef5.2 P1c (option c): this worker's RESULT sentinel (host-UC), null until
+            // compile_multi_gpu_p2p fills moe_result_sentinel. Its presence GATES the WHOLE
+            // option-c path, so the working tree stays SAFE (the pre-yef5.2 output_slots +
+            // CPU-ack path) until the kernel result-store + POST peer-read + compile-fill
+            // all land together. When filled: the worker writes its OWN UC-VRAM + AGENT-
+            // RELEASE-signals; GPU0's POST acquire-spins + peer-reads it fresh (UC bypasses
+            // all caches, §5.3 — fixes the B1 §11.19(x)-stale host-UC POST-read).
+            let result_sentinel: *const u32 = p2p.moe_result_sentinel[layer_idx]
+                .as_ref()
+                .map(|v| v[w].host_ptr() as *const u32)
+                .unwrap_or(std::ptr::null());
+            let out_slot = if result_sentinel.is_null() {
+                unsafe { output_slots.add(gpu_id * hs) }  // pre-yef5.2 path (host-UC + CPU ack)
+            } else {
+                p2p.local_output_uc_ptr_for(w).as_raw()    // option c: worker-own UC-VRAM peer-read
+            };
             // yef5.2 Step A H1 fix: workers P2P-read the activation from GPU-0
             // VRAM `activation_staging_vram` (peer-mapped MTYPE_UC via kernel
             // patch 0001) instead of host-mapped UC `moe_act_uc_handoff`, which
@@ -1384,6 +1406,8 @@ impl Model {
                 k, eis, hs, gupd, has_gate, relu_sq,
                 sentinel_ptr,
                 seq_value,
+                result_sentinel,
+                seq_value,
             );
             (gpu_id, inst)
         }).collect();
@@ -1409,8 +1433,16 @@ impl Model {
         if let Some(seq) = gpu0_seq {
             seq_per_gpu.push((0, seq));
         }
-        if let Err(e) = dispatch.try_wait_acks_many(&seq_per_gpu) {
-            panic!("{e}");
+        // yef5.2.5 (Step B): drop the CPU ack ONLY under YEF52_DROP_ACK — kept separate from
+        // YEF52_OPTION_C because the naive drop WEDGES (workers fall behind seq>ack; the single
+        // monotonic per-layer sentinel races without the ack's backpressure — needs an async
+        // backpressure/multi-buffer redesign). So YEF52_OPTION_C=1 alone = the VALIDATED config
+        // (option-c peer-read + CPU ack net; -g2 matched -g1 bit-for-bit). +YEF52_DROP_ACK=1 = the
+        // experimental async (currently deadlocks). Default (neither set): ack kept, old path.
+        if std::env::var("YEF52_DROP_ACK").is_err() {
+            if let Err(e) = dispatch.try_wait_acks_many(&seq_per_gpu) {
+                panic!("{e}");
+            }
         }
         Ok(())
     }

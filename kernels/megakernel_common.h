@@ -542,6 +542,15 @@ typedef struct {
 static_assert(sizeof(SiluMulInst) == INST_SIZE_WORDS * 8, "SiluMulInst size mismatch");
 static_assert(offsetof(SiluMulInst, output) == 8, "SiluMulInst.output offset");
 
+// yef5.2 P1d (option c): per-worker result descriptor. OP_MOE_DISPATCH_POST's
+// MoeDispatchInst.result_descs points to an array [num_workers] of these. The POST
+// acquire-spins each result_sentinel (host-UC), then PEER-READS local_output_uc
+// (worker UC-VRAM, fresh via §5.3) instead of the host-UC output_slots (the B1 fix).
+typedef struct {
+    const uint32_t* result_sentinel;  // host-UC; POST acquire-spins == seq before reading
+    const float* local_output_uc;     // worker's own UC-VRAM; POST peer-reads (gl0/gl1_inv)
+} MoeResultDesc;
+
 // OP_MOE_DISPATCH (opcode 34)
 typedef struct {
     uint64_t opcode_gridx;
@@ -566,7 +575,11 @@ typedef struct {
     // does a final barrierless copy to UC output_slots[0..gupd]. Unused
     // by OP_MOE_DISPATCH_POST (which only reads output_slots).
     uint64_t gpu0_acc;
-    uint64_t _pad;
+    // yef5.2 P1d (option c): pointer to a per-worker [num_workers] MoeResultDesc
+    // array. null => the pre-yef5.2 output_slots[0..num_gpus*hs] sum (safe old path);
+    // non-null => POST acquire-spins each result_sentinel + peer-reads local_output_uc.
+    // Repurposes the former _pad word; INST_SIZE_WORDS stays 19.
+    const MoeResultDesc* result_descs;
 } MoeDispatchInst;
 static_assert(sizeof(MoeDispatchInst) == INST_SIZE_WORDS * 8, "MoeDispatchInst size mismatch");
 
@@ -640,7 +653,13 @@ typedef struct {
     // bd 0hu3-b: index into config_array (above). Kernel reads
     // config_array[layer_idx] to obtain its own per-context MoeWorkerConfig*.
     uint64_t layer_idx;
-    uint64_t _pad[2];
+    // yef5.2 P1c (option c): worker's RESULT sentinel (host-UC). Worker
+    // AGENT-RELEASE-stores result_seq here after writing output_slot_p2p
+    // (= worker-local UC-VRAM) + __threadfence + own-UC-VRAM drain-probe; GPU0's
+    // POST acquire-spins on it before peer-reading the UC-VRAM. Repurposes _pad[2]
+    // (INST_SIZE_WORDS stays 19). 0 disables (non-sentinel path).
+    const uint32_t* result_sentinel_ptr;
+    uint64_t result_seq;
 } MoeFfnRemoteInst;
 static_assert(sizeof(MoeFfnRemoteInst) == INST_SIZE_WORDS * 8, "MoeFfnRemoteInst size mismatch");
 static_assert(offsetof(MoeFfnRemoteInst, activation_p2p) == 8, "MoeFfnRemoteInst.activation_p2p offset");
