@@ -225,7 +225,7 @@ impl Model {
             // Keep the explicit capture as a fallback if trace_probe_map is incomplete.
             let _ = self.tracer.capture_f32(0, Probe::FinalNorm, &self.activations.normed);
             let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1)); // NaN-safe (was partial_cmp().unwrap() — panicked on NaN logits)
             let top10: Vec<f32> = indexed.iter().take(10)
                 .flat_map(|&(id, val)| [id as f32, val])
                 .collect();
@@ -827,7 +827,7 @@ impl Model {
             use crate::tracer::Probe;
             let mut indexed: Vec<(usize, f32)> =
                 logits.iter().copied().enumerate().collect();
-            indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            indexed.sort_unstable_by(|a, b| b.1.total_cmp(&a.1)); // NaN-safe (was partial_cmp().unwrap() — panicked on NaN logits)
             let top10: Vec<f32> = indexed
                 .iter()
                 .take(10)
@@ -1430,16 +1430,23 @@ impl Model {
         // braidinfer-wks Phase 1: use parallel-poll helper instead of
         // sequential wait_ack so the polling thread can service all GPUs
         // in one shared loop (foundation of the daemon's 1-core dispatcher).
-        if let Some(seq) = gpu0_seq {
-            seq_per_gpu.push((0, seq));
-        }
-        // yef5.2.5 (Step B): drop the CPU ack ONLY under YEF52_DROP_ACK — kept separate from
-        // YEF52_OPTION_C because the naive drop WEDGES (workers fall behind seq>ack; the single
-        // monotonic per-layer sentinel races without the ack's backpressure — needs an async
-        // backpressure/multi-buffer redesign). So YEF52_OPTION_C=1 alone = the VALIDATED config
-        // (option-c peer-read + CPU ack net; -g2 matched -g1 bit-for-bit). +YEF52_DROP_ACK=1 = the
-        // experimental async (currently deadlocks). Default (neither set): ack kept, old path.
-        if std::env::var("YEF52_DROP_ACK").is_err() {
+        // yef5.2.5: the GPU0-PRE ack is LOAD-BEARING for the FORWARD activation signal — the
+        // iter-3 host-buffer dump showed that without it the workers never observe the activation
+        // sentinel (act obs=0, spin-forever / self-break to garbage). So under YEF52_DROP_ACK we
+        // wait ONLY on GPU0's PRE and drop the per-worker acks (the reverse rides its result
+        // sentinel, validated). That reclaims the worker-fanout wait while keeping the forward
+        // CPU-synced. Default (neither flag): full ack — the proven old path. YEF52_OPTION_C=1
+        // alone (no DROP_ACK) = the validated peer-read config with the full ack net.
+        if std::env::var("YEF52_DROP_ACK").is_ok() {
+            if let Some(seq) = gpu0_seq {
+                if let Err(e) = dispatch.try_wait_acks_many(&[(0, seq)]) {
+                    panic!("{e}");
+                }
+            }
+        } else {
+            if let Some(seq) = gpu0_seq {
+                seq_per_gpu.push((0, seq));
+            }
             if let Err(e) = dispatch.try_wait_acks_many(&seq_per_gpu) {
                 panic!("{e}");
             }
