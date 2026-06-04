@@ -207,9 +207,7 @@ impl MegakernelProgram {
                         barrier_layer_map.push((barrier_inst_idx, layer_i));
                     } else {
                         let moe = model.moe_weights[layer_i].as_ref().unwrap();
-                        if std::env::var("XL4O_DBG").is_ok() {
-                            eprintln!("[xl4o-dbg] compile_inner(mg=false) L{layer_i} MoE single-arm: expert_gate_up.num_elements()={}", moe.expert_gate_up.num_elements());
-                        }
+                        tracing::debug!(target: "xl4o", layer = layer_i, expert_gate_up = moe.expert_gate_up.num_elements(), "compile_inner(mg=false) MoE single-arm");
                         // Skip if weights are lite-loaded (empty expert buffers, multi-GPU model).
                         // When MULTI_GPU=1, expert_gate_up is a zero-size placeholder; using its
                         // pointer in the megakernel would fault.

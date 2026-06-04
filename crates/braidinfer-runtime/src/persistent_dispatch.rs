@@ -622,11 +622,14 @@ impl PersistentDispatch {
         // GPU atomicAdd into UC host memory is visible to CPU without SDMA D2H.
         let count_val = unsafe { *dump_counter.host_ptr() };
         let num_slots = (count_val.min(program.dump_capacity)) as usize;
-        let xl4o_dbg = std::env::var("XL4O_DBG").is_ok();
+        // xl4o trace-drain diagnostics, on the `xl4o` tracing target at DEBUG (RUST_LOG=xl4o=debug).
+        // Gating the per-drain bookkeeping (dbg_layers / slot inst_idx range) on enabled!() keeps it
+        // free when disabled — a cached sub-ns level-load, not a getenv per drain.
+        let xl4o_dbg = tracing::enabled!(target: "xl4o", tracing::Level::DEBUG);
         let mut dbg_layers: Vec<usize> = Vec::new();
         if xl4o_dbg {
-            eprintln!("[xl4o-dbg] drain gpu={gpu_idx} count={count_val} cap={} num_slots={num_slots} inst={} probemap={}",
-                program.dump_capacity, program.instructions.len(), program.trace_probe_map.len());
+            tracing::debug!(target: "xl4o", gpu = gpu_idx, count = count_val, cap = program.dump_capacity,
+                num_slots, inst = program.instructions.len(), probemap = program.trace_probe_map.len(), "trace drain");
         }
         if num_slots == 0 {
             return Ok(());
@@ -695,7 +698,7 @@ impl PersistentDispatch {
             dbg_layers.sort_unstable();
             let pm_min = program.trace_probe_map.iter().map(|(i,_)|*i).min().unwrap_or(0);
             let pm_max = program.trace_probe_map.iter().map(|(i,_)|*i).max().unwrap_or(0);
-            eprintln!("[xl4o-dbg]   dumped-slot inst_idx {slot_imin}..{slot_imax}; probemap inst_idx {pm_min}..{pm_max}; matched-layers {dbg_layers:?}");
+            tracing::debug!(target: "xl4o", slot_imin, slot_imax, pm_min, pm_max, ?dbg_layers, "dumped-slot inst_idx ranges");
         }
 
         Ok(())

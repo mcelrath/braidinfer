@@ -26,6 +26,12 @@ use braidinfer_runtime::model::Model;
 use braidinfer_runtime::tracer::{Probe, TraceSink};
 
 fn main() {
+    // xl4o trace diagnostics now go through tracing (RUST_LOG=xl4o=debug). EnvFilter +
+    // structured fields replace the old XL4O_DBG env-gated eprintlns. try_init is no-op
+    // if a subscriber is already set. Host-only: no GPU access (am-rs c6 validation, #4679).
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .try_init();
     // Set BRAIDINFER_TRACE=1 before Model::load so the tracer is initialized
     // with ProbeFilter::All (or whatever regex the operator chose).
     // SAFETY: single-threaded main, no concurrent env readers.
