@@ -466,10 +466,15 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     // writes triggered. __threadfence makes local stores visible at agent
     // scope before the cooperative kernel retires; ack ordering downstream
     // is handled by the SDMA copy on the worker's dedicated stream.
+    // yef5.2.8 double-buffer: write the (seq%2) output slot so step k+1's worker can't clobber
+    // step k's slot while GPU0's POST is still peer-reading it. stride = gupd (= hidden_size);
+    // local_output_uc is 2*hidden_size. Always-on (correct for both the gpu0_pre reclaim and the
+    // fully-async path — the slot just alternates). POST reads the same (rseq%2) slot.
+    const unsigned long dbuf_off = (unsigned long)(i->result_seq & 1u) * (unsigned long)gupd;
     __threadfence();
     for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < gupd;
          idx += gridDim.x * blockDim.x) {
-        out_p2p[idx] = lo[idx];
+        out_p2p[dbuf_off + idx] = lo[idx];
     }
     __threadfence();
 
@@ -485,10 +490,11 @@ __device__ __attribute__((noinline)) void op_moe_ffn_remote(const u64* inst, Gri
     if (i->result_sentinel_ptr != nullptr) {
         braidinfer::rdna3::atomic_block_barrier(gbs);
         if (blockIdx.x == 0 && threadIdx.x == 0) {
-            volatile float drain_probe = ((volatile float*)out_p2p)[gupd - 1];
+            volatile float drain_probe = ((volatile float*)out_p2p)[dbuf_off + gupd - 1];
             (void)drain_probe;
+            // yef5.2.8: signal the (seq%2) result-sentinel slot; GPU0's POST spins on the same slot.
             __atomic_store_n(
-                (volatile unsigned int*)i->result_sentinel_ptr,
+                ((volatile unsigned int*)i->result_sentinel_ptr) + (i->result_seq & 1u),
                 (unsigned int)i->result_seq,
                 __ATOMIC_RELEASE);
         }

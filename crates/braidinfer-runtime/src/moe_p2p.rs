@@ -535,8 +535,12 @@ impl MoeP2pContext {
             // yef5.2 P1c (option c): worker-local UC-VRAM output. alloc_uncached =>
             // MTYPE=UC (bypasses worker L2 → straight to VRAM → GPU0 peer-reads fresh).
             // Zero-init for RDNA3 cold-read garbage safety (same as the GPU0 scratch above).
-            let mut local_output_uc = DeviceBuffer::<f32>::alloc_uncached(device, hidden_size)?;
-            local_output_uc.copy_from_host(&vec![0.0f32; hidden_size])?;
+            // yef5.2.8 double-buffer: 2 slots of hidden_size (worker writes slot (seq%2)*hidden_size,
+            // GPU0 POST reads the same). The kernel computes the offset from seq + gupd; the stride
+            // is hidden_size. Lets the producer (step k+1) write the OTHER slot without clobbering
+            // step k's in-flight slot — so the CPU can fire-and-forget (no cross-step ack wait).
+            let mut local_output_uc = DeviceBuffer::<f32>::alloc_uncached(device, 2 * hidden_size)?;
+            local_output_uc.copy_from_host(&vec![0.0f32; 2 * hidden_size])?;
 
             workers.push(MoeWorkerGpu {
                 device,

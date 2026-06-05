@@ -50,12 +50,16 @@ __device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, 
         const MoeResultDesc* descs = (const MoeResultDesc*)(uintptr_t)i->result_descs;
         int num_workers = total_gpus - 1;
         unsigned int rseq = (unsigned int)i->seq_counter; // per-step (position+1), bumped by decode loop
+        // yef5.2.8 double-buffer: spin on + read the (rseq%2) slot (the worker signals/writes the
+        // same slot). stride = gupd. Always-on (correct for both the gpu0_pre reclaim and async).
+        const unsigned int dbuf_slot = rseq & 1u;
+        const unsigned long dbuf_off = (unsigned long)dbuf_slot * (unsigned long)gupd;
         // Acquire-spin each worker's result sentinel (block 0 / thread 0; bare spin +
         // s_sleep, NO in-loop stores — §11.4 vscnt-drain-safe, mirrors op_moe_ffn_remote:381).
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             for (int w = 0; w < num_workers; w++) {
                 while (braidinfer::rdna3::sentinel_spin_load_u32(
-                           (const unsigned int*)descs[w].result_sentinel) != rseq) {
+                           ((const unsigned int*)descs[w].result_sentinel) + dbuf_slot) != rseq) {
                     __builtin_amdgcn_s_sleep(1);
                 }
             }
@@ -72,7 +76,7 @@ __device__ __attribute__((noinline)) void op_moe_dispatch_post(const u64* inst, 
              idx += gridDim.x * blockDim.x) {
             float sum = 0.0f;
             for (int w = 0; w < num_workers; w++) {
-                sum += descs[w].local_output_uc[idx];
+                sum += descs[w].local_output_uc[dbuf_off + idx]; // yef5.2.8: read the (rseq%2) slot
             }
             final_output[idx] = sum;
         }

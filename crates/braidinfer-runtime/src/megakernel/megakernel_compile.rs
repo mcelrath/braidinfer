@@ -1070,9 +1070,13 @@ impl MegakernelProgram {
                         // yef5.2 Step A: allocate per-layer host-UC sentinel (if not yet done),
                         // then emit D2D with_signal so workers acquire-spin on it.
                         if p2p.moe_act_sentinel[layer_idx].is_none() {
-                            let s = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(1)
+                            // yef5.2.8 double-buffer: 2 sentinel slots. Producer signals slot
+                            // (seq%2) = seq; consumer acquire-spins on slot (seq%2). The slotted
+                            // ptr (base + seq%2) is set CPU-side per decode step, so step k+1's
+                            // signal (slot ~k+1) never clobbers step k's slot still being read.
+                            let s = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(2)
                                 .expect("yef5.2: moe_act_sentinel alloc failed");
-                            unsafe { s.host_ptr().write_volatile(0u32); }
+                            unsafe { s.host_ptr().write_volatile(0u32); s.host_ptr().add(1).write_volatile(0u32); }
                             p2p.moe_act_sentinel[layer_idx] = Some(s);
                         }
                         // xl4o: activation copy moves to barrier_idx-4; the sentinel is REMOVED
@@ -1137,11 +1141,15 @@ impl MegakernelProgram {
                         let mut sentinels = Vec::with_capacity(nw);
                         let mut descs: Vec<u64> = Vec::with_capacity(nw * 2);
                         for w in 0..nw {
-                            let rs = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(1)
+                            // yef5.2.8 double-buffer: 2 result-sentinel slots (worker signals slot
+                            // (seq%2), POST spins on slot (seq%2)). Descs hold the BASE ptr of each
+                            // doubled buffer; the worker + POST kernels slot by (rseq%2). local_output_uc
+                            // is also 2-slot (2*hidden_size); its base ptr is pushed below.
+                            let rs = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(2)
                                 .expect("yef5.2: moe_result_sentinel alloc failed");
-                            unsafe { rs.host_ptr().write_volatile(0u32); }
-                            descs.push(rs.host_ptr() as u64);                           // MoeResultDesc.result_sentinel
-                            descs.push(p2p.workers[w].local_output_uc.as_ptr() as u64); // MoeResultDesc.local_output_uc
+                            unsafe { rs.host_ptr().write_volatile(0u32); rs.host_ptr().add(1).write_volatile(0u32); }
+                            descs.push(rs.host_ptr() as u64);                           // MoeResultDesc.result_sentinel (base of 2 slots)
+                            descs.push(p2p.workers[w].local_output_uc.as_ptr() as u64); // MoeResultDesc.local_output_uc (base of 2 slots)
                             sentinels.push(rs);
                         }
                         let mut desc_buf = braidinfer_hip::memory::DeviceBuffer::<u64>::alloc(model.device, nw * 2)?;

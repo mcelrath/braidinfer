@@ -1337,6 +1337,19 @@ impl Model {
         // words — decoupling worker dispatch from the GPU-0 PRE opcode's
         // wire layout (unblocks bd 0hu.3 option (b)).
         let p2p = self.moe_p2p.as_ref().expect("moe_p2p must be initialized for MoE decode");
+        // yef5.2.5 mechanism confirmation (YEF52_TRACE): CPU-side — survives the GPU abort.
+        // At each MoE-layer dispatch print the seq the CPU is FIRING and the CURRENT
+        // sentinel values (GPU0's activation progress + the workers' result progress). If the
+        // firing seq climbs while a sentinel stalls -> the CPU is racing ahead of a stuck GPU,
+        // confirming the cross-step overwrite + showing the lead (gap) and which side is stuck.
+        if std::env::var("YEF52_TRACE").is_ok() {
+            let act = p2p.moe_act_sentinel[layer_idx].as_ref()
+                .map(|b| unsafe { b.host_ptr().read_volatile() });
+            let res: Vec<u32> = p2p.moe_result_sentinel[layer_idx].as_ref()
+                .map(|ws| ws.iter().map(|b| unsafe { b.host_ptr().read_volatile() }).collect())
+                .unwrap_or_default();
+            eprintln!("[yef52trace] L{layer_idx} firing seq={seq_value} | act_sentinel={act:?} result={res:?}");
+        }
         let params = p2p.decode_params[layer_idx]
             .as_ref()
             .expect("decode_params not populated for MoE layer (compile_multi_gpu_p2p must run first)");
@@ -1437,7 +1450,14 @@ impl Model {
         // sentinel, validated). That reclaims the worker-fanout wait while keeping the forward
         // CPU-synced. Default (neither flag): full ack — the proven old path. YEF52_OPTION_C=1
         // alone (no DROP_ACK) = the validated peer-read config with the full ack net.
-        if std::env::var("YEF52_DROP_ACK").is_ok() {
+        if std::env::var("YEF52_DROP_ALL_ACK").is_ok() {
+            // PW1 (yef5.2.8): fully async — drop BOTH the worker acks AND the gpu0_pre wait.
+            // Tests whether the forward activation signal survives without the gpu0_pre CPU ack
+            // (the iter-3 "act obs=0 without gpu0_pre" finding may be broken-pool-confounded).
+            // CLEAN POOL ONLY. If it wedges clean, the gpu0_pre ack is a real forward dependency;
+            // if it survives, double-buffer can drop the gpu0_pre wait outright.
+            let _ = (gpu0_seq, &seq_per_gpu, &dispatch);
+        } else if std::env::var("YEF52_DROP_ACK").is_ok() {
             if let Some(seq) = gpu0_seq {
                 if let Err(e) = dispatch.try_wait_acks_many(&[(0, seq)]) {
                     panic!("{e}");
