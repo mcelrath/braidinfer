@@ -162,6 +162,11 @@ pub struct MegakernelProgram {
     /// acquire-spin on the worker result sentinels matches the workers' release value.
     /// Populated by compile_inner_p2p only when YEF52_OPTION_C activates the peer-read POST.
     pub(crate) moe_post_seq_indices: Vec<usize>,
+    /// yef5.2.8 GPU-BP: 0-based decode-step counter, incremented once per decode step.
+    /// Used to skip the slot-free back-pressure acquire for steps 0,1 (no worker N-2 exists
+    /// yet) — a real counter, NOT the buggy "result-sentinel==0" heuristic (which can't tell a
+    /// fresh slot from a worker that's merely behind in the fully-async path). Reset on prefill.
+    pub(crate) decode_step: u64,
     /// Shared watchdog (Arc from Model). Kept alive here so the thread is not
     /// stopped while this program is in use.
     pub(crate) _watchdog: std::sync::Arc<WatchdogThread>,

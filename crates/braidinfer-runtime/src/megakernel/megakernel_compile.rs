@@ -306,6 +306,7 @@ impl MegakernelProgram {
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
             moe_post_seq_indices: Vec::new(),
+            decode_step: 0,
         })
     }
 
@@ -591,6 +592,7 @@ impl MegakernelProgram {
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
             moe_post_seq_indices: Vec::new(),
+            decode_step: 0,
         })
     }
 
@@ -897,6 +899,7 @@ impl MegakernelProgram {
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
             moe_post_seq_indices: Vec::new(),
+            decode_step: 0,
         })
     }
 
@@ -973,6 +976,7 @@ impl MegakernelProgram {
             _not_send: std::marker::PhantomData,
             moe_act_d2d_indices: Vec::new(),
             moe_post_seq_indices: Vec::new(),
+            decode_step: 0,
         })
     }
 

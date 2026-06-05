@@ -575,6 +575,11 @@ impl Model {
              p2p.routing_weights_staging_vram.as_ptr(), sents, rsents)
         };
         let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
+        // yef5.2.8 GPU-BP: 0-based decode-step counter for this step (then increment). Steps 0,1
+        // have no worker N-2 to acquire, so the back-pressure is skipped for them via this counter
+        // — NOT via a result-sentinel==0 heuristic (which can't distinguish fresh from behind).
+        let bp_step = mk.decode_step;
+        mk.decode_step = mk.decode_step.wrapping_add(1);
         let boundaries: Vec<usize> = mk
             .multi_gpu_attn_boundaries
             .iter()
@@ -608,9 +613,10 @@ impl Model {
             // (the first 2 decode steps have no worker N-2) -> wait_ptr=0, no acquire.
             if gpu_bp {
                 let rs0 = db_result_sent0[*layer];
-                let (wp, ws) = if !rs0.is_null() {
-                    let cur = unsafe { rs0.add(dbuf_slot).read_volatile() };
-                    if cur != 0 { (rs0.wrapping_add(dbuf_slot) as u64, seq_value - 2) } else { (0u64, 0u64) }
+                // back-pressure only for decode steps >= 2 (steps 0,1 have no worker N-2). A real
+                // counter, NOT result==0 (which skips when the worker is merely behind -> the bug).
+                let (wp, ws) = if bp_step >= 2 && !rs0.is_null() {
+                    (rs0.wrapping_add(dbuf_slot) as u64, seq_value - 2)
                 } else { (0u64, 0u64) };
                 mk.instructions[act_idx].words[4] = wp; // D2dCopyInst.wait_ptr
                 mk.instructions[act_idx].words[5] = ws; // D2dCopyInst.wait_seq
