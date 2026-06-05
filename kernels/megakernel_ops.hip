@@ -1934,7 +1934,7 @@ __device__ __attribute__((noinline)) void op_d2d_copy(const u64* inst, u32 vbloc
             // fresh from L2. (mes-researcher co-design, bridge #3868.)
             while (braidinfer::rdna3::sentinel_spin_load_u32(
                        (const unsigned int*)i->wait_ptr) != (unsigned int)i->wait_seq) {
-                /* spin */
+                /* spin — fresh each iter (glc+dlc); result sentinel is worker-VRAM peer-UC (L2-bypass) */
             }
         }
         __syncthreads();

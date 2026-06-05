@@ -569,7 +569,7 @@ impl Model {
             // yef5.2.8 GPU-BP: worker-0 result sentinel per layer (the slot-free signal GPU0's PRE
             // acquires before reusing a slot). -g2 (1 worker); -g4 would need ALL workers (TODO).
             let rsents: Vec<*mut u32> = p2p.moe_result_sentinel.iter()
-                .map(|opt| opt.as_ref().map(|ws| ws[0].host_ptr()).unwrap_or(std::ptr::null_mut()))
+                .map(|opt| opt.as_ref().map(|ws| ws[0].as_ptr() as *mut u32).unwrap_or(std::ptr::null_mut()))
                 .collect();
             (p2p.activation_staging_vram.as_ptr(), p2p.routing_ids_staging_vram.as_ptr(),
              p2p.routing_weights_staging_vram.as_ptr(), sents, rsents)
@@ -620,6 +620,10 @@ impl Model {
                 } else { (0u64, 0u64) };
                 mk.instructions[act_idx].words[4] = wp; // D2dCopyInst.wait_ptr
                 mk.instructions[act_idx].words[5] = ws; // D2dCopyInst.wait_seq
+                if std::env::var("YEF52_TRACE").is_ok() && *layer == 0 {
+                    let live = if !rs0.is_null() { unsafe { rs0.add(dbuf_slot).read_volatile() } } else { u32::MAX };
+                    eprintln!("[bp] step={bp_step} seq={seq_value} L0 slot={dbuf_slot} armed={} wait_seq={ws} result_live={live}", wp != 0);
+                }
             }
         }
         // yef5.2 P1d (option c): patch each OP_MOE_DISPATCH_POST seq_counter to (position+1) so the
@@ -1394,12 +1398,13 @@ impl Model {
         // firing seq climbs while a sentinel stalls -> the CPU is racing ahead of a stuck GPU,
         // confirming the cross-step overwrite + showing the lead (gap) and which side is stuck.
         if std::env::var("YEF52_TRACE").is_ok() {
-            let act = p2p.moe_act_sentinel[layer_idx].as_ref()
-                .map(|b| unsafe { b.host_ptr().read_volatile() });
-            let res: Vec<u32> = p2p.moe_result_sentinel[layer_idx].as_ref()
-                .map(|ws| ws.iter().map(|b| unsafe { b.host_ptr().read_volatile() }).collect())
+            let slot = (seq_value & 1) as usize;
+            let act: Vec<u32> = p2p.moe_act_sentinel[layer_idx].as_ref()
+                .map(|b| unsafe { vec![b.host_ptr().read_volatile(), b.host_ptr().add(1).read_volatile()] })
                 .unwrap_or_default();
-            eprintln!("[yef52trace] L{layer_idx} firing seq={seq_value} | act_sentinel={act:?} result={res:?}");
+            // yef5.2.8: result-sentinel moved to worker-VRAM (peer-UC, CPU-unreadable) — trace empty.
+            let res: Vec<[u32; 2]> = Vec::new();
+            eprintln!("[yef52trace] L{layer_idx} seq={seq_value} slot={slot} BPwant=result[{slot}]=={} | act[0,1]={act:?} result[w][0,1]={res:?}", seq_value.saturating_sub(2));
         }
         let params = p2p.decode_params[layer_idx]
             .as_ref()
@@ -1434,7 +1439,7 @@ impl Model {
             // all caches, §5.3 — fixes the B1 §11.19(x)-stale host-UC POST-read).
             let result_sentinel: *const u32 = p2p.moe_result_sentinel[layer_idx]
                 .as_ref()
-                .map(|v| v[w].host_ptr() as *const u32)
+                .map(|v| v[w].as_ptr() as *const u32)
                 .unwrap_or(std::ptr::null());
             let out_slot = if result_sentinel.is_null() {
                 unsafe { output_slots.add(gpu_id * hs) }  // pre-yef5.2 path (host-UC + CPU ack)
@@ -1505,15 +1510,26 @@ impl Model {
         // sentinel, validated). That reclaims the worker-fanout wait while keeping the forward
         // CPU-synced. Default (neither flag): full ack — the proven old path. YEF52_OPTION_C=1
         // alone (no DROP_ACK) = the validated peer-read config with the full ack net.
-        if std::env::var("YEF52_DROP_ALL_ACK").is_ok() || std::env::var("YEF52_GPU_BP").is_ok() {
-            // yef5.2.8 fire-and-forget: drop BOTH the worker acks AND the gpu0_pre wait. Under
-            // YEF52_GPU_BP this is SAFE — GPU0's PRE self-throttles via the slot-free back-pressure
-            // (the activation copy acquires the worker's result-of-N-2 before reusing a slot), so
-            // the leader can't lap the worker and the 2 double-buffer slots hold. The CPU is OUT of
-            // the per-layer dispatch loop (only the inherent per-step logits sync remains).
-            // YEF52_DROP_ALL_ACK alone (no GPU_BP) = the unthrottled variant that WEDGED (lead-race).
+        // yef5.2.8 GPU-BP HYBRID: steps 0,1 have no worker N-2 for the back-pressure to acquire, so
+        // the leader is unthrottled there and the fully-async forward handoff races (trace: step-0
+        // worker wedge). So keep the gpu0_pre wait for steps 0,1 (prime the 2-deep pipeline); from
+        // step >=2 the slot-free back-pressure self-throttles GPU0 -> CPU out for the steady state.
+        let bp_step = self.megakernel_multi_gpu_p2p.as_ref().map(|m| m.decode_step.saturating_sub(1)).unwrap_or(0);
+        let gpu_bp_flag = std::env::var("YEF52_GPU_BP").is_ok();
+        if gpu_bp_flag && bp_step >= 2 {
+            // GPU-BP steady state: GPU0 self-throttles via the slot-free back-pressure — now reading
+            // the worker result-sentinel FRESH from worker-VRAM (MTYPE_UC peer map; the L2-stale read
+            // that deadlocked it is fixed, mes #4913). So the CPU FIRES-AND-FORGETS — out of the
+            // per-layer dispatch loop. No in-flight cap: the back-pressure bounds GPU0<->worker to
+            // <=2 slots, and the synchronous LM-head tail (dispatch_batch) bounds CPU<->GPU0 to ~1
+            // step. (The earlier cap used try_wait_acks_many(==) which overshot once the worker ran
+            // AHEAD — ack>seq — exactly the healthy steady state.)
             let _ = (gpu0_seq, &seq_per_gpu, &dispatch);
-        } else if std::env::var("YEF52_DROP_ACK").is_ok() {
+        } else if std::env::var("YEF52_DROP_ALL_ACK").is_ok() {
+            // unthrottled fire-and-forget (PW-only diagnostic; wedges via the lead-race).
+            let _ = (gpu0_seq, &seq_per_gpu, &dispatch);
+        } else if std::env::var("YEF52_DROP_ACK").is_ok() || gpu_bp_flag {
+            // forward-only ack (gpu0_pre kept). For GPU_BP this covers steps 0,1 only.
             if let Some(seq) = gpu0_seq {
                 if let Err(e) = dispatch.try_wait_acks_many(&[(0, seq)]) {
                     panic!("{e}");

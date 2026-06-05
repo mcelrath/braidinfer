@@ -1149,10 +1149,30 @@ impl MegakernelProgram {
                             // (seq%2), POST spins on slot (seq%2)). Descs hold the BASE ptr of each
                             // doubled buffer; the worker + POST kernels slot by (rseq%2). local_output_uc
                             // is also 2-slot (2*hidden_size); its base ptr is pushed below.
-                            let rs = braidinfer_hip::memory::MappedHostBuffer::<u32>::alloc(2)
-                                .expect("yef5.2: moe_result_sentinel alloc failed");
-                            unsafe { rs.host_ptr().write_volatile(0u32); rs.host_ptr().add(1).write_volatile(0u32); }
-                            descs.push(rs.host_ptr() as u64);                           // MoeResultDesc.result_sentinel (base of 2 slots)
+                            // yef5.2.8 L2-fresh fix (mes #4913): the result-sentinel lives in the
+                            // WORKER's VRAM (alloc_uncached => MTYPE_UC), NOT host-UC. GPU0's peer
+                            // reads (POST + the back-pressure) go through patch-0001's MTYPE_UC PTE
+                            // -> bypass GPU0's L2 -> always fresh from DRAM. host-UC was L2-stale on
+                            // GPU0's 2-steps-old back-pressure read (the CPU-out deadlock). The worker
+                            // writes its own VRAM coherently (local L2 sees its own writes).
+                            let mut rs = braidinfer_hip::memory::DeviceBuffer::<u32>::alloc_uncached(p2p.workers[w].device, 2)
+                                .expect("yef5.2: moe_result_sentinel worker-VRAM alloc failed");
+                            rs.copy_from_host(&[0u32, 0u32]).expect("yef5.2: result_sentinel zero-init failed");
+                            // yef5.2.8: warm GPU0's TLB for this worker-VRAM sentinel VA — a cold GPU0
+                            // peer-read PERMISSION_FAULTs (§11.18); mirror the local_output_uc warmup.
+                            {
+                                let _g = braidinfer_hip::DeviceGuard::switch_to(model.device)?;
+                                let mut scratch: u32 = 0;
+                                unsafe {
+                                    braidinfer_hip::error::check(braidinfer_hip::ffi::hipMemcpy(
+                                        &mut scratch as *mut u32 as *mut std::ffi::c_void,
+                                        rs.as_ptr() as *const std::ffi::c_void,
+                                        4,
+                                        braidinfer_hip::ffi::hipMemcpyDeviceToHost,
+                                    ))?;
+                                }
+                            }
+                            descs.push(rs.as_ptr() as u64);                            // MoeResultDesc.result_sentinel (worker VA, peer-UC from GPU0)
                             descs.push(p2p.workers[w].local_output_uc.as_ptr() as u64); // MoeResultDesc.local_output_uc (base of 2 slots)
                             sentinels.push(rs);
                         }

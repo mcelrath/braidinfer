@@ -239,7 +239,7 @@ pub struct MoeP2pContext {
     /// `try_wait_acks_many`. host-UC (el1f: a VRAM sentinel is invisible to GPU0's UC read).
     /// Outer Vec indexed by layer_idx (`None` if not MoE); inner Vec by worker_idx (one per
     /// worker GPU). Monotonic seq = (position+1), no per-step reset. Filled by compile_multi_gpu_p2p.
-    pub(crate) moe_result_sentinel: Vec<Option<Vec<MappedHostBuffer<u32>>>>,
+    pub(crate) moe_result_sentinel: Vec<Option<Vec<DeviceBuffer<u32>>>>,
     /// yef5.2 P1d (option c): per-MoE-layer GPU-0 VRAM array of MoeResultDesc, one
     /// {result_sentinel_ptr, local_output_uc_ptr} pair (2 u64) per worker — laid out
     /// to match `MoeResultDesc` in megakernel_common.h. OP_MOE_DISPATCH_POST's
@@ -586,7 +586,7 @@ impl MoeP2pContext {
         // Indexed by layer_idx; None for non-MoE layers (filled by compile_multi_gpu_p2p).
         let moe_act_sentinel: Vec<Option<MappedHostBuffer<u32>>> = (0..num_total_layers).map(|_| None).collect();
         // yef5.2 P1a: per-layer, per-worker result sentinels — None until compile_multi_gpu_p2p fills them.
-        let moe_result_sentinel: Vec<Option<Vec<MappedHostBuffer<u32>>>> = (0..num_total_layers).map(|_| None).collect();
+        let moe_result_sentinel: Vec<Option<Vec<DeviceBuffer<u32>>>> = (0..num_total_layers).map(|_| None).collect();
         // yef5.2 P1d: per-layer MoeResultDesc array (GPU-0 VRAM) — None until compile_multi_gpu_p2p fills it.
         let result_descs_by_layer: Vec<Option<DeviceBuffer<u64>>> = (0..num_total_layers).map(|_| None).collect();
 
