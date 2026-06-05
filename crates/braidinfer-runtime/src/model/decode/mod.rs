@@ -556,6 +556,18 @@ impl Model {
         // → all-workers simultaneous NaN at later pos (Sig B canonical T6).
         // Patch producer D2dCopy signal_seq at each attn flush boundary.
         let seq_value = (position as u64) + 1;
+        // yef5.2.8 double-buffer: extract the staging/sentinel bases BEFORE the mk borrow (the
+        // per-step bump overwrites the inst dst/signal words, so the base cannot be re-derived
+        // from them). slot = seq%2.
+        let dbuf_slot = (seq_value & 1) as usize;
+        let (db_act_ptr, db_rids_ptr, db_rweights_ptr, db_act_sentinels): (*const f32, *const i32, *const f32, Vec<*mut u32>) = {
+            let p2p = self.moe_p2p.as_ref().unwrap();
+            let sents: Vec<*mut u32> = p2p.moe_act_sentinel.iter()
+                .map(|s| s.as_ref().map(|b| b.host_ptr()).unwrap_or(std::ptr::null_mut()))
+                .collect();
+            (p2p.activation_staging_vram.as_ptr(), p2p.routing_ids_staging_vram.as_ptr(),
+             p2p.routing_weights_staging_vram.as_ptr(), sents)
+        };
         let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
         let boundaries: Vec<usize> = mk
             .multi_gpu_attn_boundaries
@@ -566,11 +578,23 @@ impl Model {
             // D2dCopyInst layout: words[7] = signal_seq (see instructions.rs).
             mk.instructions[*flush_idx].words[7] = seq_value;
         }
-        // yef5.2 Step A: patch moe_act D2D signal_seq to (position+1).
-        // D2dCopyInst layout: words[7] = signal_seq.
-        let moe_act_d2d: Vec<usize> = mk.moe_act_d2d_indices.iter().map(|(i, _)| *i).collect();
-        for d2d_idx in &moe_act_d2d {
-            mk.instructions[*d2d_idx].words[7] = seq_value;
+        // yef5.2 Step A + yef5.2.8 double-buffer: per step, slot the 3 activation-side D2D dsts
+        // + the act-sentinel signal to (seq%2), and set signal_seq. The recorded index is the
+        // routing_weights copy (the signaled one); the activation copy is at rw_idx-3, routing_ids
+        // at rw_idx-1 (the in-order Pass-2 clone preserves the relative positions). Strides =
+        // each copy's n_elems (words[3]). D2dCopyInst: dst=words[1], signal_ptr=words[6],
+        // signal_seq=words[7]. Bases from p2p (the inst words are overwritten each step).
+        let moe_act_d2d: Vec<(usize, usize)> = mk.moe_act_d2d_indices.clone();
+        for (rw_idx, layer) in &moe_act_d2d {
+            let act_idx = rw_idx - 3;
+            let rids_idx = rw_idx - 1;
+            let act_n = mk.instructions[act_idx].words[3] as usize; // activation n_elems (hs)
+            let rt_n = mk.instructions[*rw_idx].words[3] as usize;  // routing n_elems (k)
+            mk.instructions[act_idx].words[1]  = db_act_ptr.wrapping_add(dbuf_slot * act_n) as u64;
+            mk.instructions[rids_idx].words[1] = db_rids_ptr.wrapping_add(dbuf_slot * rt_n) as u64;
+            mk.instructions[*rw_idx].words[1]  = db_rweights_ptr.wrapping_add(dbuf_slot * rt_n) as u64;
+            mk.instructions[*rw_idx].words[6]  = db_act_sentinels[*layer].wrapping_add(dbuf_slot) as u64;
+            mk.instructions[*rw_idx].words[7]  = seq_value;
         }
         // yef5.2 P1d (option c): patch each OP_MOE_DISPATCH_POST seq_counter to (position+1) so the
         // POST's acquire-spin on the worker result sentinels matches the workers' release value.
@@ -1337,6 +1361,7 @@ impl Model {
         // words — decoupling worker dispatch from the GPU-0 PRE opcode's
         // wire layout (unblocks bd 0hu.3 option (b)).
         let p2p = self.moe_p2p.as_ref().expect("moe_p2p must be initialized for MoE decode");
+        let dbuf_slot = (seq_value & 1) as usize; // yef5.2.8 double-buffer slot for this step (seq%2)
         // yef5.2.5 mechanism confirmation (YEF52_TRACE): CPU-side — survives the GPU abort.
         // At each MoE-layer dispatch print the seq the CPU is FIRING and the CURRENT
         // sentinel values (GPU0's activation progress + the workers' result progress). If the
@@ -1354,8 +1379,10 @@ impl Model {
             .as_ref()
             .expect("decode_params not populated for MoE layer (compile_multi_gpu_p2p must run first)");
         let output_slots = params.output_slots;
-        let expert_ids = params.expert_ids;
-        let expert_weights = params.expert_weights;
+        // yef5.2.8 double-buffer: read the (seq%2) routing slot (the PRE wrote the same slot; stride
+        // = k = the routing n_elems). routing_*_staging_vram reuse their MAX_PREFILL_BATCH capacity.
+        let expert_ids = params.expert_ids.wrapping_add(dbuf_slot * params.k as usize);
+        let expert_weights = params.expert_weights.wrapping_add(dbuf_slot * params.k as usize);
         let hs = params.hs as usize;
         let k = params.k as usize;
         let eis = params.eis as usize;
@@ -1398,16 +1425,18 @@ impl Model {
             // handoff as k_norm_ptr_gpu0 / normed_base in
             // dispatch_head_parallel_attention). Single source buffer at offset
             // 0; no per-gpu peer-view accessor or gpu_id offset needed.
-            let activation = p2p.activation_staging_vram.as_ptr() as *const f32;
+            // yef5.2.8 double-buffer: read the (seq%2) activation slot (the PRE wrote the same; stride=hs).
+            let activation = (p2p.activation_staging_vram.as_ptr() as *const f32).wrapping_add(dbuf_slot * hs);
             // bd el1f: decode is single-token; the multi-token Step 1 drain
             // race doesn't apply, so wait_ptr=null (no acquire). The decode
             // path uses OP_MOE_DISPATCH (megakernel-internal) which handles
             // its own ordering.
             // yef5.2 Step A: acquire-spin on the per-layer activation sentinel.
             // sentinel_ptr is host-UC (MappedHostBuffer<u32>); wait_seq = (position+1).
+            // yef5.2.8 double-buffer: spin on the (seq%2) act-sentinel slot (the PRE signals the same).
             let sentinel_ptr: *const u32 = p2p.moe_act_sentinel[layer_idx]
                 .as_ref()
-                .map(|s| s.host_ptr() as *const u32)
+                .map(|s| (s.host_ptr() as *const u32).wrapping_add(dbuf_slot))
                 .unwrap_or(std::ptr::null());
             let inst = p2p.build_ffn_remote_inst(
                 w,
