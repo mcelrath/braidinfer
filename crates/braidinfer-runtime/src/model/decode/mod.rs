@@ -560,13 +560,19 @@ impl Model {
         // per-step bump overwrites the inst dst/signal words, so the base cannot be re-derived
         // from them). slot = seq%2.
         let dbuf_slot = (seq_value & 1) as usize;
-        let (db_act_ptr, db_rids_ptr, db_rweights_ptr, db_act_sentinels): (*const f32, *const i32, *const f32, Vec<*mut u32>) = {
+        let gpu_bp = std::env::var("YEF52_GPU_BP").is_ok();
+        let (db_act_ptr, db_rids_ptr, db_rweights_ptr, db_act_sentinels, db_result_sent0): (*const f32, *const i32, *const f32, Vec<*mut u32>, Vec<*mut u32>) = {
             let p2p = self.moe_p2p.as_ref().unwrap();
             let sents: Vec<*mut u32> = p2p.moe_act_sentinel.iter()
                 .map(|s| s.as_ref().map(|b| b.host_ptr()).unwrap_or(std::ptr::null_mut()))
                 .collect();
+            // yef5.2.8 GPU-BP: worker-0 result sentinel per layer (the slot-free signal GPU0's PRE
+            // acquires before reusing a slot). -g2 (1 worker); -g4 would need ALL workers (TODO).
+            let rsents: Vec<*mut u32> = p2p.moe_result_sentinel.iter()
+                .map(|opt| opt.as_ref().map(|ws| ws[0].host_ptr()).unwrap_or(std::ptr::null_mut()))
+                .collect();
             (p2p.activation_staging_vram.as_ptr(), p2p.routing_ids_staging_vram.as_ptr(),
-             p2p.routing_weights_staging_vram.as_ptr(), sents)
+             p2p.routing_weights_staging_vram.as_ptr(), sents, rsents)
         };
         let mk = self.megakernel_multi_gpu_p2p.as_mut().unwrap();
         let boundaries: Vec<usize> = mk
@@ -595,6 +601,20 @@ impl Model {
             mk.instructions[*rw_idx].words[1]  = db_rweights_ptr.wrapping_add(dbuf_slot * rt_n) as u64;
             mk.instructions[*rw_idx].words[6]  = db_act_sentinels[*layer].wrapping_add(dbuf_slot) as u64;
             mk.instructions[*rw_idx].words[7]  = seq_value;
+            // yef5.2.8 GPU-BP: the activation copy (act_idx) ACQUIRES the slot-free signal — the
+            // worker's RESULT sentinel of the step that last used this slot (== seq-2) — BEFORE
+            // overwriting it. GPU0 self-throttles (<=2 steps in flight) so the CPU can fire-and-
+            // forget (no gpu0_pre wait). A result sentinel still 0 = a fresh (never-used) slot
+            // (the first 2 decode steps have no worker N-2) -> wait_ptr=0, no acquire.
+            if gpu_bp {
+                let rs0 = db_result_sent0[*layer];
+                let (wp, ws) = if !rs0.is_null() {
+                    let cur = unsafe { rs0.add(dbuf_slot).read_volatile() };
+                    if cur != 0 { (rs0.wrapping_add(dbuf_slot) as u64, seq_value - 2) } else { (0u64, 0u64) }
+                } else { (0u64, 0u64) };
+                mk.instructions[act_idx].words[4] = wp; // D2dCopyInst.wait_ptr
+                mk.instructions[act_idx].words[5] = ws; // D2dCopyInst.wait_seq
+            }
         }
         // yef5.2 P1d (option c): patch each OP_MOE_DISPATCH_POST seq_counter to (position+1) so the
         // POST's acquire-spin on the worker result sentinels matches the workers' release value.
@@ -1479,12 +1499,13 @@ impl Model {
         // sentinel, validated). That reclaims the worker-fanout wait while keeping the forward
         // CPU-synced. Default (neither flag): full ack — the proven old path. YEF52_OPTION_C=1
         // alone (no DROP_ACK) = the validated peer-read config with the full ack net.
-        if std::env::var("YEF52_DROP_ALL_ACK").is_ok() {
-            // PW1 (yef5.2.8): fully async — drop BOTH the worker acks AND the gpu0_pre wait.
-            // Tests whether the forward activation signal survives without the gpu0_pre CPU ack
-            // (the iter-3 "act obs=0 without gpu0_pre" finding may be broken-pool-confounded).
-            // CLEAN POOL ONLY. If it wedges clean, the gpu0_pre ack is a real forward dependency;
-            // if it survives, double-buffer can drop the gpu0_pre wait outright.
+        if std::env::var("YEF52_DROP_ALL_ACK").is_ok() || std::env::var("YEF52_GPU_BP").is_ok() {
+            // yef5.2.8 fire-and-forget: drop BOTH the worker acks AND the gpu0_pre wait. Under
+            // YEF52_GPU_BP this is SAFE — GPU0's PRE self-throttles via the slot-free back-pressure
+            // (the activation copy acquires the worker's result-of-N-2 before reusing a slot), so
+            // the leader can't lap the worker and the 2 double-buffer slots hold. The CPU is OUT of
+            // the per-layer dispatch loop (only the inherent per-step logits sync remains).
+            // YEF52_DROP_ALL_ACK alone (no GPU_BP) = the unthrottled variant that WEDGED (lead-race).
             let _ = (gpu0_seq, &seq_per_gpu, &dispatch);
         } else if std::env::var("YEF52_DROP_ACK").is_ok() {
             if let Some(seq) = gpu0_seq {
